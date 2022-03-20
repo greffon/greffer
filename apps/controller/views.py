@@ -10,7 +10,9 @@ from apps.utils.auth import is_logged
 
 
 register()
+
 @api_view(['POST'])
+@is_logged
 def start_greffon(request):
     greffon_form = GreffonStartSerializer(data=json.loads(request.body))
     if not greffon_form.is_valid():
@@ -31,6 +33,7 @@ def start_greffon(request):
         'ports': greffon_info['ports']}, 
                         status=200)
 @api_view(['POST'])
+@is_logged
 def stop_greffon(request):
     greffon_form = GreffonStopSerializer(data=json.loads(request.body))
     if not greffon_form.is_valid():

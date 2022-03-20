@@ -55,6 +55,8 @@ def get_greffon_path(greffon_info):
 
 def create_compose(compose, greffon_info):
     greffon_path = os.path.join(os.getenv('GREFFON_PATH', '/data'), greffon_info['id'])
+    if not os.path.exists(greffon_path):
+        os.makedirs(greffon_path)
     t = Template(yaml.dump(compose))
     compose_file = t.render(**greffon_info)
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
