@@ -47,5 +47,5 @@ def stop_greffon(request):
 
 @api_view(['GET'])
 @is_logged
-def greffon_status(request, id):
+def greffon_status(_, id):
     return JsonResponse(compose.status(id), status=200) 
