@@ -2,9 +2,11 @@ import yaml
 import json
 from datauri import DataURI
 from jinja2 import Template
-from docker.client import containers
+import docker
 import subprocess
 import os
+
+client = docker.from_env()
 
 from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create_volume, docker_is_volume_exist
 
@@ -118,7 +120,7 @@ def stop(greffon_info):
 def status(greffon_id): 
     containers = []
     compose_status = 'running'
-    for container in containers.list(all=True, filter=f'{greffon_id}_*'):
+    for container in client.containers.list(all=True, filter=f'{greffon_id}_*'):
         container_status = container.status
         if container_status != 'running': 
             container_status = 'stopped'
