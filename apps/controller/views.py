@@ -43,3 +43,9 @@ def stop_greffon(request):
                         status=400)
     compose.stop(greffon_form.data)
     return JsonResponse({}, status=200) 
+
+
+@api_view(['GET'])
+@is_logged
+def greffon_status(request, id):
+    return JsonResponse(compose.status(id), status=200) 

@@ -2,6 +2,7 @@ import yaml
 import json
 from datauri import DataURI
 from jinja2 import Template
+from docker.client import containers
 import subprocess
 import os
 
@@ -112,3 +113,19 @@ def start(greffon_info):
 def stop(greffon_info):
     return subprocess.Popen(['docker-compose', '-f', os.path.join(get_greffon_path(greffon_info), 
     'docker-compose.yml'), 'stop'])
+
+
+def status(greffon_id): 
+    containers = []
+    compose_status = 'running'
+    for container in containers.list(all=True, filter=f'{greffon_id}_*'):
+        container_status = container.status
+        if container_status != 'running': 
+            container_status = 'stopped'
+        containers.append({
+            'status': container.status
+        })
+    return {
+        'status': compose_status,
+        containers: containers
+    }
