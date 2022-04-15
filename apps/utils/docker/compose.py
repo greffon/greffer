@@ -1,4 +1,5 @@
 import yaml
+import asyncio
 import json
 from datauri import DataURI
 from jinja2 import Template
@@ -119,6 +120,7 @@ def stop(greffon_info):
 
 def status(greffon_id): 
     containers = []
+    #Todo should find a way to have all status pullling error...
     compose_status = 'running'
     for container in client.containers.list(all=True, filter=f'{greffon_id}_*'):
         container_status = container.status
