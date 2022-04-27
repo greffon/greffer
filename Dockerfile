@@ -9,7 +9,8 @@ RUN apt-get update -y  \
                     gnupg-agent                                                   \
                     software-properties-common -y                                 \
       && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -  \
-      && add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+      
+      && add-apt-repository "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
       && apt-get update -y \
       && apt-get install docker-ce docker-ce-cli -y\
       && curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose\
