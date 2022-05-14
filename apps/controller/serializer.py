@@ -7,7 +7,7 @@ class GreffonFieldSerializer(serializers.Serializer):
 class GreffonStartSerializer(serializers.Serializer):
     id = serializers.CharField(label='ID')
     repository_url = serializers.CharField(label='Repository Url')
-    configurations = GreffonFieldSerializer(many=True)
+    configurations = GreffonFieldSerializer(many=True, required=False)
 
 class GreffonStopSerializer(serializers.Serializer):
     id = serializers.CharField(label='ID')
