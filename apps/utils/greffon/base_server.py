@@ -10,7 +10,7 @@ import logging
 from django.conf import settings
 
 # Get an instance of a logger
-logger = logging.getLogger(LOGGER_NAME)
+logger = logging.getLogger(settings.LOGGER_NAME)
 
 def register():
     base_server = os.getenv('GREFFON_BASE_SERVER', 'https://greffon.io')
