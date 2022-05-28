@@ -11,6 +11,8 @@ https://docs.djangoproject.com/en/3.2/ref/settings/
 """
 
 from pathlib import Path
+import logging
+import sys
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -135,3 +137,12 @@ STATIC_URL = '/static/'
 # https://docs.djangoproject.com/en/3.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+LOGGER_NAME = 'greffer'
+_logger = logging.getLogger(LOGGER_NAME)
+_logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+
+formatter = logging.Formatter('%(asctime)s - %(name)s - lvl=%(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+_logger.addHandler(handler)

@@ -7,9 +7,11 @@ from apps.utils.docker.base import copy_file_into_container
 from apps.utils.auth import get_token
 
 import logging
+from django.conf import settings
 
 # Get an instance of a logger
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(LOGGER_NAME)
+
 def register():
     base_server = os.getenv('GREFFON_BASE_SERVER', 'https://greffon.io')
     greffer_url = os.getenv('GREFFER_ADDRESS')
