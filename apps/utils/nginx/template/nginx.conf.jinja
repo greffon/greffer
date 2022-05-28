@@ -49,11 +49,11 @@ http {
   {% for port in ports %}
   server {
   #listen 443 ssl default_server;
-  listen {{port.port_container}};
+  listen {{port.port_container}} ssl;
   server_name {{port.container_name}}.{{port.port_container}};
   
-  #ssl_certificate /app/conf/certificates/pem.crt;
-  #ssl_certificate_key /app/conf/certificates/cert.key;
+  ssl_certificate /etc/nginx/pem.crt;
+  ssl_certificate_key /etc/nginx/cert.key;
 
   large_client_header_buffers 32 4096k;
 

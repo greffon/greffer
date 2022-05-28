@@ -29,7 +29,7 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['*']
 
-
+LOGGER_NAME = 'greffer'
 # Application definition
 
 INSTALLED_APPS = [
