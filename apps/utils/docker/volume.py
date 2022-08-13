@@ -20,7 +20,6 @@ def docker_copy_file_into_volume(volume):
     subprocess.run(['docker',  'container', 'create', '--name',
                    container_name, '-v', f'{volume["value"]}:/root', 'hello-world'])
     for file in volume.get('files', []):
-        logger.info(file)
         file_src = None
         if file['type'] == 'path':
             file_src = file['src']

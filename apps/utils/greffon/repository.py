@@ -3,7 +3,6 @@ import os
 import yaml
 from apps.utils.os.network import get_free_ports
 
-
 def get_compose_file_from_repository(greffon):
   r = requests.get(greffon['repository_url'])
   return yaml.safe_load(r.text)
@@ -46,9 +45,20 @@ def create_greffon_info(compose, greffon):
                 },
                 'files': [
                     {
+                        'type': 'path',
                         'src': os.path.join(greffon_path, 'nginx.conf'),
                         'dest': 'nginx.conf',
-                    }
+                    },
+                    {
+                        'type': 'content',
+                        'content': greffon['cert']['certificate'],
+                        'dest': 'pem.crt',
+                    },
+                    {
+                        'type': 'content',
+                        'content': greffon['cert']['private_key'],
+                        'dest': 'cert.key',
+                    },
                 ]
             }
         },

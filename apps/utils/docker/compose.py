@@ -118,18 +118,23 @@ def stop(greffon_info):
     'docker-compose.yml'), 'stop'])
 
 
-def status(greffon_id): 
+def get_status(greffon_id): 
     containers = []
+    is_all_stopped = True
+    is_all_running = True
     #Todo should find a way to have all status pullling error...
     compose_status = 'running'
-    for container in client.containers.list(all=True, filter=f'{greffon_id}_*'):
+    for container in client.containers.list(all=True, filters={'name': f'{greffon_id}_*'}):
         container_status = container.status
         if container_status != 'running': 
             container_status = 'stopped'
+            is_all_running = False
+        else:
+            is_all_stopped = False
         containers.append({
-            'status': container.status
+            'status': container_status
         })
     return {
-        'status': compose_status,
-        containers: containers
+        'status': 'running' if is_all_running else 'stopped',
+        'containers': containers
     }

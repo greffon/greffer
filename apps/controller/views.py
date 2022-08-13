@@ -1,4 +1,5 @@
 import json
+import threading
 from apps.controller.serializer import GreffonStartSerializer, GreffonStopSerializer
 from apps.utils.docker import compose
 from apps.utils.greffon import repository
@@ -7,10 +8,14 @@ from django.http import JsonResponse
 from apps.utils.greffon.base_server import register
 from rest_framework.decorators import api_view
 from apps.utils.auth import is_logged
+from apps.utils.greffon.monitoring import monitor_status
 
-
+def async_task(task_func, *args, **kwargs):
+    task = threading.Thread(target=task_func, daemon=True, args=args, kwargs=kwargs)
+    task.start()
+    return task
 register()
-
+async_task(monitor_status)
 @api_view(['POST'])
 @is_logged
 def start_greffon(request):

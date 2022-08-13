@@ -12,12 +12,14 @@ from django.conf import settings
 # Get an instance of a logger
 logger = logging.getLogger(settings.LOGGER_NAME)
 
+base_server = os.getenv('GREFFON_BASE_SERVER', 'https://greffon.io')
+greffer_protocol = os.getenv('GREFFER_PROTOCOL')
+ssl_verify = os.getenv("GREFFER_SSL_VERIFY", 'true').lower() in ('true', '1', 't')
+
 def register():
-    base_server = os.getenv('GREFFON_BASE_SERVER', 'https://greffon.io')
     greffer_url = os.getenv('GREFFER_ADDRESS')
     greffer_port = os.getenv('GREFFER_PORT')
     greffer_id = os.getenv('GREFFER_ID')
-    greffer_protocol = os.getenv('GREFFER_PROTOCOL')
     if not greffer_url:
         hostname = socket.gethostname()
         greffer_url = socket.gethostbyname(hostname)
@@ -26,9 +28,10 @@ def register():
         'port': greffer_port,
         'token': get_token(),
         'protocol': greffer_protocol,
-    })
+    }, verify=ssl_verify)
+    #Todo Maybe we should expose api
     while True:
-        res = requests.get(f'{base_server}/api/greffer/certificate/{greffer_id}/')
+        res = requests.get(f'{base_server}/api/greffer/certificate/{greffer_id}/', verify=ssl_verify)
         if res.status_code == 200:
             data = res.json()
             #Todo: use right docker id
@@ -36,3 +39,8 @@ def register():
             copy_file_into_container('greffer_nginx_1', '/root', 'cert.key', data['private_key'])
             break
         time.sleep(5)
+
+def change_status(greffon_id, status):
+    return requests.post(f'{base_server}/api/greffer/instances/{greffon_id}/',json={
+        'status': status,
+    }, verify=ssl_verify)
