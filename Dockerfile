@@ -18,4 +18,5 @@ WORKDIR /app
 COPY pyproject.toml poetry.lock /app/
 ENV PATH="${PATH}:/root/.local/bin"
 RUN poetry install
-COPY . /
+COPY . /app
+CMD ["poetry", "run", "python", "manage.py", "runserver", "0.0.0.0:8000"]
