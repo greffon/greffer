@@ -12,7 +12,8 @@ from django.conf import settings
 # Get an instance of a logger
 logger = logging.getLogger(settings.LOGGER_NAME)
 
-base_server = os.getenv('GREFFON_BASE_SERVER', 'https://greffon.io')
+base_server = os.getenv('GREFFON_BASE_SERVER', 'https://api.greffon.io')
+docker_nginx_name = os.getenv('DOCKER_NGINX_NAME', 'greffer-nginx-1')
 greffer_protocol = os.getenv('GREFFER_PROTOCOL')
 ssl_verify = os.getenv("GREFFER_SSL_VERIFY", 'true').lower() in ('true', '1', 't')
 
@@ -35,8 +36,8 @@ def register():
         if res.status_code == 200:
             data = res.json()
             #Todo: use right docker id
-            copy_file_into_container('greffer_nginx_1', '/root','pem.crt', data['certificate'])
-            copy_file_into_container('greffer_nginx_1', '/root', 'cert.key', data['private_key'])
+            copy_file_into_container(docker_nginx_name, '/root','pem.crt', data['certificate'])
+            copy_file_into_container(docker_nginx_name, '/root', 'cert.key', data['private_key'])
             break
         time.sleep(5)
 
