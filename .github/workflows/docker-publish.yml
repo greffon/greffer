@@ -25,7 +25,7 @@ jobs:
         name: Build and push Greffer Nginx
         uses: docker/build-push-action@v3
         with:
-          directory: ./nginx
+          file: ./nginx/Dockerfile
           push: true
           tags: user/app:latest
       -
