@@ -27,10 +27,10 @@ jobs:
         with:
           context: "{{defaultContext}}:nginx"
           push: true
-          tags: user/app:latest
+          tags: greffon/greffer-nginx:latest
       -
         name: Build and push Greffer
         uses: docker/build-push-action@v3
         with:
           push: true
-          tags: user/app:latest
+          tags: greffon/greffer:latest
