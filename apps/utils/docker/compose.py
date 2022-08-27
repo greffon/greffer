@@ -124,15 +124,16 @@ def get_status(greffon_id):
     is_all_running = True
     #Todo should find a way to have all status pullling error...
     for container in client.containers.list(all=True, filters={'name': f'{greffon_id}_*'}):
-        container_status = container.status
-        if container_status != 'running': 
-            container_status = 'stopped'
-            is_all_running = False
-        else:
-            is_all_stopped = False
-        containers.append({
-            'status': container_status
-        })
+        if 'migrate' not in container.name:
+            container_status = container.status
+            if container_status != 'running': 
+                container_status = 'stopped'
+                is_all_running = False
+            else:
+                is_all_stopped = False
+            containers.append({
+                'status': container_status
+            })
     return {
         'status': 'running' if is_all_running and not is_all_stopped else 'stopped',
         'containers': containers
