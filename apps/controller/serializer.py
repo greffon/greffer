@@ -13,6 +13,7 @@ class GreffonStartSerializer(serializers.Serializer):
     repository_url = serializers.CharField(label='Repository Url')
     cert = CerificateSerializer(required=True)
     configurations = GreffonFieldSerializer(many=True, required=False)
+    ports = serializers.DictField(required=False)
 
 class GreffonStopSerializer(serializers.Serializer):
     id = serializers.CharField(label='ID')

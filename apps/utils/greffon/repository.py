@@ -87,18 +87,22 @@ def create_greffon_info(compose, greffon):
         if type(ports) == list:
             for port in ports:
                 port_splited = port.split(':')
+                port_name =  f'{name}_{port_splited[-1]}'
                 greffon_info['ports'].append({
                     'port_container': port_splited[-1],
                     'container_name': name,
-                    'port_name': f'{name}_{port_splited[-1]}'
+                    'port_name': port_name,
+                    'url': greffon.get('ports', {}).get(port_name, {}).get('url'),
                 })
         else:
             greffon_info['ports'].setdefault(name, {})
             _, port_container = port.split(':')
+            port_name = f'{name}_{port_container}'
             greffon_info['ports'].append({
                 'port_container': port_container,
                 'container_name': name,
-                'port_name': f'{name}_{port_container}'
+                'port_name': port_name,
+                'url': greffon.get('ports', {}).get(port_name, {}).get('url'),
             })
         volumes = service.get('volumes', [])
         if type(volumes) == list:
