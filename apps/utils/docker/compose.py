@@ -89,6 +89,7 @@ def apply_configuration(greffon_info, compose):
                 with open(file_path, "w") as f:   # Opens file and casts as f 
                     f.write(json.dumps(configuration['value']))
                 greffon_info['volumes'][destination['volume']]['files'].append({
+                            'type': 'path',
                             'src': file_path,
                             'dest': destination['name'],
                         })
@@ -103,6 +104,7 @@ def apply_configuration(greffon_info, compose):
                 with open(file_path, "wb") as f:   # Opens file and casts as f 
                     f.write(uri.data)
                 greffon_info['volumes'][destination['volume']]['files'].append({
+                            'type': 'path',
                             'src': file_path,
                             'dest': destination['name'],
                         })

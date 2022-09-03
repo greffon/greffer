@@ -4,8 +4,8 @@ import yaml
 from apps.utils.os.network import get_free_ports
 
 def get_compose_file_from_repository(greffon):
-  r = requests.get(greffon['repository_url'])
-  return yaml.safe_load(r.text)
+    r = requests.get(greffon['repository_url'])
+    return yaml.safe_load(r.text)
 
 
 def get_greffon_info(compose, greffon):
@@ -73,7 +73,7 @@ def create_greffon_info(compose, greffon):
             'name': volume_name,
             'value': volume_name,
             'containers': {},
-             'files': []
+            'files': []
         }
     for _, network_name in enumerate(compose.get('networks', [])):
         greffon_info['networks'][network_name] = {
@@ -87,7 +87,7 @@ def create_greffon_info(compose, greffon):
         if type(ports) == list:
             for port in ports:
                 port_splited = port.split(':')
-                port_name =  f'{name}_{port_splited[-1]}'
+                port_name = f'{name}_{port_splited[-1]}'
                 greffon_info['ports'].append({
                     'port_container': port_splited[-1],
                     'container_name': name,
@@ -109,7 +109,7 @@ def create_greffon_info(compose, greffon):
             for volume in service.get('volumes', []):
                 volume_host, volume_container = volume.split(':')
                 if volume_host not in greffon_info['volumes']:
-                    #todo should handle multi containers
+                    # todo should handle multi containers
                     greffon_info['volumes'][volume_host] = {
                         'name': volume_host,
                         'value': volume_host,
@@ -119,6 +119,10 @@ def create_greffon_info(compose, greffon):
                             }
                         },
                         'files': []
+                    }
+                else:
+                    greffon_info['volumes'][volume_host]['containers'][name] = {
+                        'path': volume_container
                     }
         else:
             volume_host, volume_container = volume.split(':')
@@ -132,6 +136,10 @@ def create_greffon_info(compose, greffon):
                         }
                     },
                     'files': []
+                }
+            else:
+                greffon_info['volumes'][volume_host]['containers'][name] = {
+                    'path': volume_container
                 }
         networks = service.get('networks', [])
         if type(networks) == list:
