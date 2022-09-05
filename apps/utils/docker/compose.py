@@ -136,7 +136,13 @@ def get_status(greffon_id):
             containers.append({
                 'status': container_status
             })
+    if is_all_running and not is_all_stopped:
+        status = 'running'
+    elif not is_all_running and is_all_stopped:
+        status = 'stopped'
+    else:
+        status = 'unknow'
     return {
-        'status': 'running' if is_all_running and not is_all_stopped else 'stopped',
+        'status': status,
         'containers': containers
     }
