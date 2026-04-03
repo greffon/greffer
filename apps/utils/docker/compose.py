@@ -96,7 +96,10 @@ def apply_configuration(greffon_info, compose):
             elif destination['type'] == 'env':
                 remove_compose_file(greffon_info)
                 compose['services'][destination['container']].setdefault('environment', [])
-                compose['services'][destination['container']]['environment'].append(f'{destination["key"]}={configuration["value"]["value"]}')
+                if isinstance(compose['services'][destination['container']]['environment'], dict):
+                    compose['services'][destination['container']]['environment'][destination['key']] = configuration['value'].get('value', '')
+                else:
+                    compose['services'][destination['container']]['environment'].append(f'{destination["key"]}={configuration["value"].get("value", "")}')
             elif destination['type'] == 'file':
                 remove_compose_file(greffon_info)
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
