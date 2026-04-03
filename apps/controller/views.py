@@ -14,6 +14,7 @@ def async_task(task_func, *args, **kwargs):
     task = threading.Thread(target=task_func, daemon=True, args=args, kwargs=kwargs)
     task.start()
     return task
+
 register()
 async_task(monitor_status)
 @api_view(['POST'])
