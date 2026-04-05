@@ -11,18 +11,19 @@ services:
       - env.env
     extra_hosts:
       - "greffon.io:host-gateway"
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./:/app
-      - //var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
   nginx:
     build: ./nginx
     restart: unless-stopped
     networks:
       - internal
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
     extra_hosts:
-      - myhost:host-gateway
+      - "host.docker.internal:host-gateway"
     ports:
       - 8001:443
 networks:
