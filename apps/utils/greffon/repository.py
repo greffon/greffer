@@ -5,6 +5,11 @@ from apps.utils.os.network import get_free_ports
 
 def get_compose_file_from_repository(greffon):
     r = requests.get(greffon['repository_url'])
+    if r.status_code != 200:
+        raise Exception(
+            f"Failed to fetch compose file from {greffon['repository_url']}: "
+            f"HTTP {r.status_code}"
+        )
     return yaml.safe_load(r.text)
 
 

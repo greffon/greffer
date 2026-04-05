@@ -2,8 +2,13 @@ FROM python:3.11-alpine
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 WORKDIR /
-RUN apk update  \
-      && apk add docker docker-compose poetry
+RUN apk update \
+      && apk add --no-cache \
+            build-base \
+            libffi-dev \
+            docker \
+            docker-compose \
+      && pip install --no-cache-dir "poetry==1.4.2"
 
 WORKDIR /app
 COPY pyproject.toml poetry.lock /app/
