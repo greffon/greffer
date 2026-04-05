@@ -24,12 +24,19 @@ def register():
     if not greffer_url:
         hostname = socket.gethostname()
         greffer_url = socket.gethostbyname(hostname)
-    requests.post(f'{base_server}/api/greffer/register/{greffer_id}/',json={
-        'address': greffer_url,
-        'port': greffer_port,
-        'token': get_token(),
-        'protocol': greffer_protocol,
-    }, verify=ssl_verify)
+    # Retry registration until the manager is reachable
+    while True:
+        try:
+            requests.post(f'{base_server}/api/greffer/register/{greffer_id}/',json={
+                'address': greffer_url,
+                'port': greffer_port,
+                'token': get_token(),
+                'protocol': greffer_protocol,
+            }, verify=ssl_verify)
+            break
+        except requests.ConnectionError:
+            logger.info(f'Manager not reachable at {base_server}, retrying in 3s...')
+            time.sleep(3)
     #Todo Maybe we should expose api
     while True:
         res = requests.get(f'{base_server}/api/greffer/certificate/{greffer_id}/', verify=ssl_verify)
