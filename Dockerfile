@@ -15,4 +15,5 @@ COPY pyproject.toml poetry.lock /app/
 ENV PATH="${PATH}:/root/.local/bin"
 RUN poetry install --no-root && poetry run pip install "setuptools<78"
 COPY . /app
+RUN mkdir -p /app/data
 CMD ["poetry", "run", "python", "manage.py", "runserver", "0.0.0.0:8000"]
