@@ -96,16 +96,6 @@ http {
     proxy_request_buffering off;
 
     proxy_pass http://{{port.container_name}}_{{port.port_container}}/;
-
-    #proxy_ssl_certificate_key ${APPDATA}/nginx/nginx.pk;
-    #proxy_ssl_certificate ${APPDATA}/nginx/nginx.pem;
-    #proxy_ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-    #proxy_ssl_ciphers HIGH:!aNULL:!MD5;
-    #proxy_ssl_crl ${APPDATA}/crl/revoked.crl;
-    #proxy_ssl_trusted_certificate ${APPDATA}/ca/ca.pem;
-    #proxy_ssl_verify        on;
-    #proxy_ssl_verify_depth  1;
-    #proxy_ssl_session_reuse off;
   }
 }
  {% endfor %}
