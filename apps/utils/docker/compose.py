@@ -57,10 +57,31 @@ def get_greffon_path(greffon_info):
         os.makedirs(path)
     return path
 
+def _compute_instance_context(greffon_info):
+    """Expose instance_url / instance_host / instance_port / instance_id to
+    the Jinja render context so catalog metadata default_value strings can
+    reference `{{ instance_url }}`, `{{ instance_host }}`, etc. The greffer's
+    public hostname is read from GREFFER_PUBLIC_HOST (set by the greffer's
+    compose) with a dev-friendly `host.docker.internal` fallback."""
+    host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
+    ports = greffon_info.get('ports') or []
+    port = ports[0].get('port_host') if ports and isinstance(ports[0], dict) else ''
+    scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
+    greffon_info.setdefault('instance_id', greffon_info.get('id', ''))
+    greffon_info.setdefault('instance_host', host)
+    greffon_info.setdefault('instance_port', port)
+    greffon_info.setdefault(
+        'instance_url',
+        f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}",
+    )
+    return greffon_info
+
+
 def create_compose(compose, greffon_info):
     greffon_path = os.path.join(os.getenv('GREFFON_PATH', '/data'), greffon_info['id'])
     if not os.path.exists(greffon_path):
         os.makedirs(greffon_path)
+    greffon_info = _compute_instance_context(greffon_info)
     t = Template(yaml.dump(compose))
     compose_file = t.render(**greffon_info)
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:

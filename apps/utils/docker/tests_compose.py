@@ -4,9 +4,73 @@ import os
 import tempfile
 from unittest.mock import patch, MagicMock, mock_open
 
+import yaml
+from jinja2 import Template
+
 from django.test import TestCase
 
 from tests.helpers import SAMPLE_COMPOSE, SAMPLE_START_PAYLOAD
+
+
+class ComputeInstanceContextTests(TestCase):
+    """Tests for _compute_instance_context — the Jinja context helper that
+    exposes instance_url / host / port / id for catalog metadata templating."""
+
+    def test_defaults_for_host_and_scheme(self):
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 4242}]})
+
+        self.assertEqual(info['instance_id'], 'abc')
+        self.assertEqual(info['instance_host'], 'host.docker.internal')
+        self.assertEqual(info['instance_port'], 4242)
+        self.assertEqual(info['instance_url'], 'https://host.docker.internal:4242')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker1.example.com', 'GREFFER_PUBLIC_SCHEME': 'http'})
+    def test_honors_public_host_and_scheme_env(self):
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 8080}]})
+
+        self.assertEqual(info['instance_host'], 'worker1.example.com')
+        self.assertEqual(info['instance_url'], 'http://worker1.example.com:8080')
+
+    def test_no_ports_yields_empty_port_and_portless_url(self):
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({'id': 'abc', 'ports': []})
+
+        self.assertEqual(info['instance_port'], '')
+        self.assertEqual(info['instance_url'], 'https://host.docker.internal')
+
+    def test_jinja_render_substitutes_instance_vars_in_env(self):
+        """End-to-end: a compose env var containing {{ instance_host }} is
+        resolved when the compose is rendered via Template(yaml.dump(...))."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({'id': 'xyz', 'ports': [{'port_host': 5555}]})
+        compose = {
+            'services': {
+                'app': {
+                    'environment': [
+                        'TRUSTED_DOMAINS={{ instance_host }} localhost',
+                        'BASE_URL={{ instance_url }}',
+                    ],
+                },
+            },
+        }
+        rendered = Template(yaml.dump(compose)).render(**info)
+
+        self.assertIn('TRUSTED_DOMAINS=host.docker.internal localhost', rendered)
+        self.assertIn('BASE_URL=https://host.docker.internal:5555', rendered)
+
+    def test_does_not_clobber_existing_instance_keys(self):
+        from apps.utils.docker.compose import _compute_instance_context
+
+        pre = {'id': 'abc', 'ports': [{'port_host': 1}], 'instance_url': 'https://override'}
+        info = _compute_instance_context(pre)
+
+        self.assertEqual(info['instance_url'], 'https://override')
 
 
 class GetNginxServiceTests(TestCase):
