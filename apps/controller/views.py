@@ -1,14 +1,19 @@
 import json
+import logging
 import threading
 from apps.controller.serializer import GreffonStartSerializer, GreffonStopSerializer
 from apps.utils.docker import compose
+from apps.utils.docker import volume_migration
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
+from django.conf import settings
 from django.http import JsonResponse
 from apps.utils.greffon.base_server import register, sync_crl
 from rest_framework.decorators import api_view
 from apps.utils.auth import is_logged
 from apps.utils.greffon.monitoring import monitor_status
+
+logger = logging.getLogger(settings.LOGGER_NAME)
 
 
 def async_task(task_func, *args, **kwargs):
@@ -20,6 +25,16 @@ def async_task(task_func, *args, **kwargs):
 async_task(register)
 async_task(monitor_status)
 async_task(sync_crl)
+
+# One-time migration: rename un-prefixed docker volumes on pre-namespacing
+# greffons to the new <instance_id>_<name> scheme. Idempotent via sentinel
+# file; wrapped in try/except so a bad migration can never prevent startup.
+try:
+    _mig_summary = volume_migration.run()
+    if _mig_summary["migrated"] or _mig_summary["errors"]:
+        logger.info(f"volume migration: {_mig_summary}")
+except Exception as e:
+    logger.exception(f"volume migration: unexpected failure, continuing: {e}")
 
 
 @api_view(['POST'])
