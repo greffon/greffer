@@ -111,6 +111,26 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
         )
     duration = round(time.time() - started, 3)
     backups = list(summary.pop("backups", []) or [])
+
+    # Don't mark applied if the migration reported per-item errors. A migration
+    # that copied 3 of 5 volumes and logged 2 errors has NOT succeeded; marking
+    # it applied would prevent the retry that fixes the remaining 2 (transient
+    # docker failures are the common case). The migration body is responsible
+    # for making per-item ops idempotent — next run picks up where this left off.
+    error_count = int(summary.get("errors") or 0)
+    if error_count > 0:
+        logger.error(
+            f"ops-migration {mig.id}: completed with {error_count} per-item errors "
+            f"in {duration}s — NOT marked applied; will retry next run."
+        )
+        return Result(
+            id=mig.id,
+            ok=False,
+            summary=summary,
+            error=f"{error_count} per-item error(s)",
+            duration_seconds=duration,
+        )
+
     ledger.mark_applied(
         mig.id,
         summary=summary,

@@ -127,7 +127,9 @@ class NamespaceCatalogVolumesTests(TestCase):
         "apps.utils.ops_migrations.migrations._0001_namespace_catalog_volumes.subprocess.run"
     )
     def test_errors_counted_without_raising(self, mock_run):
-        """If docker volume create fails, errors increments; summary still returns."""
+        """If docker volume create fails, errors increments + summary still
+        returns. (Runner uses the non-zero errors count to refuse marking
+        the migration applied — see tests_runner.py.)"""
         _write_compose(
             os.path.join(self.tmp, "abc"),
             {"db_data": {"name": "db_data"}},

@@ -187,6 +187,39 @@ class RunnerTests(TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "half_written")))
 
     @_with_fresh_registry
+    def test_per_item_errors_prevent_marking_applied(self):
+        """Regression: a migration that reports `{errors: N}` in its summary
+        (instead of raising) must NOT be marked applied — otherwise failed
+        per-item ops like transient docker errors never get retried."""
+        class PartialErrors(Migration):
+            id = "0001_some_errors_test"
+            def run(self, data_root):
+                return {"migrated": 3, "skipped": 0, "errors": 2}
+
+        registry.register(PartialErrors)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        # Runner returns the summary (so operators see what happened), but
+        # reports ok=False and does NOT mark the migration applied.
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertEqual(results[0].summary, {"migrated": 3, "skipped": 0, "errors": 2})
+        self.assertFalse(Ledger.load(self.tmp).is_applied("0001_some_errors_test"))
+
+        # Next boot retries. Make it succeed this time.
+        registry.reset_for_tests()
+
+        class Retried(Migration):
+            id = "0001_some_errors_test"
+            def run(self, data_root):
+                return {"migrated": 2, "skipped": 3, "errors": 0}
+
+        registry.register(Retried)
+        results = runner.apply_pending(data_root=self.tmp)
+        self.assertTrue(results[0].ok)
+        self.assertTrue(Ledger.load(self.tmp).is_applied("0001_some_errors_test"))
+
+    @_with_fresh_registry
     def test_skip_env_var_bypasses_runner(self):
         calls = []
 
