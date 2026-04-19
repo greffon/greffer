@@ -74,9 +74,12 @@ def create_greffon_info(compose, greffon):
         'value': 'greffon_nginx'
     }
     for _, volume_name in enumerate(compose.get('volumes', [])):
+        # Namespace each compose-declared named volume by instance ID so two
+        # greffons (or two instances of the same greffon) that both declare
+        # e.g. `db_data` don't collide on a shared docker volume.
         greffon_info['volumes'][volume_name] = {
             'name': volume_name,
-            'value': volume_name,
+            'value': f'{greffon["id"]}_{volume_name}',
             'containers': {},
             'files': []
         }

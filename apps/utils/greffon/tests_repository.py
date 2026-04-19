@@ -97,6 +97,41 @@ class CreateGreffonInfoTests(TestCase):
         self.assertIn('app', vol['containers'])
         self.assertEqual(vol['containers']['app']['path'], '/var/www/html')
 
+    def test_compose_volumes_are_namespaced_by_instance_id(self):
+        """Catalog-declared volumes must be namespaced per greffon instance so
+        two instances that both declare e.g. `db_data` don't end up sharing
+        the same docker volume (we observed this breaking Nextcloud ×
+        GlitchTip on the same greffer)."""
+        compose = copy.deepcopy(SAMPLE_COMPOSE)
+        greffon = copy.deepcopy(SAMPLE_START_PAYLOAD)
+
+        result = self._call_create_greffon_info(compose, greffon)
+
+        # `name` stays the compose-author's raw label for reference, but
+        # `value` — which is what the greffer writes into the rendered
+        # compose and uses to tag the real docker volume — must be
+        # prefixed with the greffon instance ID.
+        vol = result['volumes']['app_data']
+        self.assertEqual(vol['name'], 'app_data')
+        self.assertEqual(vol['value'], f'{greffon["id"]}_app_data')
+
+    def test_two_instances_get_distinct_volume_values(self):
+        """Same compose rendered for two different greffon IDs must produce
+        two distinct docker volume names."""
+        compose1 = copy.deepcopy(SAMPLE_COMPOSE)
+        compose2 = copy.deepcopy(SAMPLE_COMPOSE)
+        g1 = copy.deepcopy(SAMPLE_START_PAYLOAD); g1['id'] = 'instance-one'
+        g2 = copy.deepcopy(SAMPLE_START_PAYLOAD); g2['id'] = 'instance-two'
+
+        r1 = self._call_create_greffon_info(compose1, g1)
+        r2 = self._call_create_greffon_info(compose2, g2)
+
+        v1 = r1['volumes']['app_data']['value']
+        v2 = r2['volumes']['app_data']['value']
+        self.assertEqual(v1, 'instance-one_app_data')
+        self.assertEqual(v2, 'instance-two_app_data')
+        self.assertNotEqual(v1, v2)
+
     def test_create_greffon_info_nginx(self):
         """greffon_nginx service should be added with cert files in volume."""
         compose = copy.deepcopy(SAMPLE_COMPOSE)
