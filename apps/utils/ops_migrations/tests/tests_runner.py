@@ -220,6 +220,33 @@ class RunnerTests(TestCase):
         self.assertTrue(Ledger.load(self.tmp).is_applied("0001_some_errors_test"))
 
     @_with_fresh_registry
+    def test_malformed_errors_key_becomes_normal_failure(self):
+        """A migration that returns a non-numeric `errors` shape (e.g. a
+        string) must produce a `Result(ok=False)` instead of crashing the
+        whole batch with TypeError."""
+        class Buggy(Migration):
+            id = "0001_bad_errors_shape_test"
+            def run(self, data_root):
+                return {"migrated": 0, "skipped": 0, "errors": "transient"}
+
+        class AfterBuggy(Migration):
+            id = "0002_after_buggy_test"
+            def run(self, data_root):
+                return {"migrated": 1}
+
+        registry.register(Buggy)
+        registry.register(AfterBuggy)
+
+        results = runner.apply_pending(data_root=self.tmp)
+        # Both migrations processed — the bad one is a handled failure, not a crash.
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[0].ok)
+        self.assertIn("malformed", results[0].error or "")
+        self.assertTrue(results[1].ok)
+        self.assertFalse(Ledger.load(self.tmp).is_applied("0001_bad_errors_shape_test"))
+        self.assertTrue(Ledger.load(self.tmp).is_applied("0002_after_buggy_test"))
+
+    @_with_fresh_registry
     def test_skip_env_var_bypasses_runner(self):
         calls = []
 
