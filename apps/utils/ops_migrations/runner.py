@@ -117,7 +117,21 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
     # it applied would prevent the retry that fixes the remaining 2 (transient
     # docker failures are the common case). The migration body is responsible
     # for making per-item ops idempotent — next run picks up where this left off.
-    error_count = int(summary.get("errors") or 0)
+    #
+    # Defensive: a malformed summary (non-numeric `errors`) from a misbehaving
+    # migration becomes a normal failure result instead of crashing the batch.
+    try:
+        error_count = int(summary.get("errors") or 0)
+    except (TypeError, ValueError):
+        logger.error(
+            f"ops-migration {mig.id}: returned non-numeric 'errors' key "
+            f"({summary.get('errors')!r}); treating as failure (not marking applied)."
+        )
+        return Result(
+            id=mig.id, ok=False, summary=summary,
+            error=f"malformed summary.errors={summary.get('errors')!r}",
+            duration_seconds=duration,
+        )
     if error_count > 0:
         logger.error(
             f"ops-migration {mig.id}: completed with {error_count} per-item errors "
