@@ -156,9 +156,9 @@ class ClientAuthTests(unittest.TestCase):
         self.assertEqual(auth, {'verify': True})
 
     @patch('apps.utils.greffon.base_server.os.path.exists', return_value=True)
-    def test_mtls_when_cert_files_present(self, mock_exists):
-        """Post-registration, verify against the manager-issued CA and present
-        the greffer's client cert."""
+    def test_mtls_when_all_cert_material_present(self, mock_exists):
+        """Post-registration with issuing_ca: verify against the manager-issued
+        CA and present the greffer's client cert."""
         import apps.utils.greffon.base_server as mod
 
         auth = mod._client_auth()
@@ -167,6 +167,27 @@ class ClientAuthTests(unittest.TestCase):
             auth,
             {
                 'verify': mod.CA_PATH,
+                'cert': (mod.CERT_PATH, mod.KEY_PATH),
+            },
+        )
+
+    def test_presents_cert_when_ca_missing(self):
+        """register() treats issuing_ca as optional. When cert+key exist but
+        ca.pem doesn't, still present the client cert (falling back to
+        system-CA verification). Previous behavior silently dropped the cert,
+        breaking manager-side mTLS enforcement (flagged by Codex P1 on PR #13)."""
+        import apps.utils.greffon.base_server as mod
+
+        def exists(path):
+            return path in (mod.CERT_PATH, mod.KEY_PATH)
+
+        with patch('apps.utils.greffon.base_server.os.path.exists', side_effect=exists):
+            auth = mod._client_auth()
+
+        self.assertEqual(
+            auth,
+            {
+                'verify': True,
                 'cert': (mod.CERT_PATH, mod.KEY_PATH),
             },
         )

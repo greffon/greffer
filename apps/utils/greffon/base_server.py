@@ -34,13 +34,17 @@ def _write_local_cert(file_name, content, mode=0o644):
 
 
 def _client_auth():
-    """Return requests kwargs. Once cert material is on disk, calls present the
-    greffer's client cert and verify the manager against the CA it issued us.
-    Before registration (bootstrap window) we have no cert yet, so fall back to
-    system-CA verification."""
-    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH) and os.path.exists(CA_PATH):
-        return {'verify': CA_PATH, 'cert': (CERT_PATH, KEY_PATH)}
-    return {'verify': True}
+    """Return requests kwargs. Present the greffer's client cert whenever
+    cert+key are on disk (post-registration); CA presence is an independent
+    verify-override since ``issuing_ca`` is optional in the cert response.
+    Falls back to system-CA verification when the manager didn't (or couldn't)
+    ship its CA bundle."""
+    kwargs = {'verify': True}
+    if os.path.exists(CA_PATH):
+        kwargs['verify'] = CA_PATH
+    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+        kwargs['cert'] = (CERT_PATH, KEY_PATH)
+    return kwargs
 
 
 def register():
