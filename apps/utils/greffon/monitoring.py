@@ -8,6 +8,10 @@ logger = logging.getLogger(settings.LOGGER_NAME)
 
 
 def monitor_status(delay=5):
+    # Block until register() has cert material on disk. Otherwise status
+    # callbacks fire in the bootstrap posture (no client cert) and get
+    # rejected once manager-side mTLS enforcement is live.
+    base_server.wait_for_registration()
     greffon_dir = os.getenv('GREFFON_PATH')
     prev_status = {}
     try:
