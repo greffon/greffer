@@ -15,9 +15,34 @@ logger = logging.getLogger(settings.LOGGER_NAME)
 base_server = os.getenv('GREFFON_BASE_SERVER', 'https://api.greffon.io')
 docker_nginx_name = os.getenv('DOCKER_NGINX_NAME', 'greffer-nginx-1')
 greffer_protocol = os.getenv('GREFFER_PROTOCOL')
-ssl_verify = os.getenv('GREFFER_SSL_VERIFY', 'true').lower() in ('true', '1', 't')
+
+# Local cert material used by this process for mTLS outbound to the manager.
+# Nginx keeps its own copy at /root/ (for TLS termination on inbound) via
+# copy_file_into_container below.
+CERT_DIR = '/etc/greffer/certs'
+CERT_PATH = f'{CERT_DIR}/pem.crt'
+KEY_PATH = f'{CERT_DIR}/cert.key'
+CA_PATH = f'{CERT_DIR}/ca.pem'
 
 CRL_SYNC_INTERVAL = int(os.getenv('CRL_SYNC_INTERVAL', '300'))
+
+
+def _write_local_cert(file_name, content, mode=0o644):
+    os.makedirs(CERT_DIR, exist_ok=True)
+    path = f'{CERT_DIR}/{file_name}'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w') as f:
+        f.write(content)
+
+
+def _client_auth():
+    """Return requests kwargs. Once cert material is on disk, calls present the
+    greffer's client cert and verify the manager against the CA it issued us.
+    Before registration (bootstrap window) we have no cert yet, so fall back to
+    system-CA verification."""
+    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH) and os.path.exists(CA_PATH):
+        return {'verify': CA_PATH, 'cert': (CERT_PATH, KEY_PATH)}
+    return {'verify': True}
 
 
 def register():
@@ -37,7 +62,7 @@ def register():
                     'token': get_token(),
                     'protocol': greffer_protocol,
                 },
-                verify=ssl_verify,
+                **_client_auth(),
             )
             break
         except requests.ConnectionError:
@@ -45,9 +70,16 @@ def register():
             time.sleep(3)
 
     while True:
-        res = requests.get(f'{base_server}/api/greffer/certificate/{greffer_id}/', verify=ssl_verify)
+        res = requests.get(
+            f'{base_server}/api/greffer/certificate/{greffer_id}/',
+            **_client_auth(),
+        )
         if res.status_code == 200:
             data = res.json()
+            _write_local_cert('pem.crt', data['certificate'])
+            _write_local_cert('cert.key', data['private_key'], mode=0o600)
+            if 'issuing_ca' in data:
+                _write_local_cert('ca.pem', data['issuing_ca'])
             copy_file_into_container(docker_nginx_name, '/root', 'pem.crt', data['certificate'])
             copy_file_into_container(docker_nginx_name, '/root', 'cert.key', data['private_key'])
             if 'issuing_ca' in data:
@@ -62,7 +94,11 @@ def _fetch_and_store_crl():
     The greffer nginx's inotifywait loop auto-reloads when files change in /root/.
     """
     try:
-        res = requests.get(f'{base_server}/api/greffer/ca/crl/', verify=ssl_verify, timeout=10)
+        res = requests.get(
+            f'{base_server}/api/greffer/ca/crl/',
+            timeout=10,
+            **_client_auth(),
+        )
         if res.status_code == 200:
             copy_file_into_container(docker_nginx_name, '/root', 'revoked.crl', res.text)
             logger.info('CRL updated successfully')
@@ -84,5 +120,5 @@ def change_status(greffon_id, status):
         json={
             'status': status,
         },
-        verify=ssl_verify,
+        **_client_auth(),
     )
