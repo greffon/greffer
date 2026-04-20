@@ -5,7 +5,7 @@ from apps.utils.docker import compose
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 from django.http import JsonResponse
-from apps.utils.greffon.base_server import register, sync_crl
+from apps.utils.greffon.base_server import register
 from rest_framework.decorators import api_view
 from apps.utils.auth import is_logged
 from apps.utils.greffon.monitoring import monitor_status
@@ -19,7 +19,6 @@ def async_task(task_func, *args, **kwargs):
 
 async_task(register)
 async_task(monitor_status)
-async_task(sync_crl)
 
 # Ops migrations no longer run here. They're executed by
 #   python manage.py apply_ops_migrations

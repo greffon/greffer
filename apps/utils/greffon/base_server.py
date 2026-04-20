@@ -24,8 +24,6 @@ CERT_PATH = f'{CERT_DIR}/pem.crt'
 KEY_PATH = f'{CERT_DIR}/cert.key'
 CA_PATH = f'{CERT_DIR}/ca.pem'
 
-CRL_SYNC_INTERVAL = int(os.getenv('CRL_SYNC_INTERVAL', '300'))
-
 
 def _write_local_cert(file_name, content, mode=0o644):
     os.makedirs(CERT_DIR, exist_ok=True)
@@ -84,34 +82,8 @@ def register():
             copy_file_into_container(docker_nginx_name, '/root', 'cert.key', data['private_key'])
             if 'issuing_ca' in data:
                 copy_file_into_container(docker_nginx_name, '/root', 'ca.pem', data['issuing_ca'])
-            _fetch_and_store_crl()
             break
         time.sleep(5)
-
-
-def _fetch_and_store_crl():
-    """Fetch CRL from manager and copy into nginx container.
-    The greffer nginx's inotifywait loop auto-reloads when files change in /root/.
-    """
-    try:
-        res = requests.get(
-            f'{base_server}/api/greffer/ca/crl/',
-            timeout=10,
-            **_client_auth(),
-        )
-        if res.status_code == 200:
-            copy_file_into_container(docker_nginx_name, '/root', 'revoked.crl', res.text)
-            logger.info('CRL updated successfully')
-        else:
-            logger.warning(f'Failed to fetch CRL: HTTP {res.status_code}')
-    except Exception as e:
-        logger.warning(f'Failed to fetch CRL: {e}')
-
-
-def sync_crl():
-    while True:
-        time.sleep(CRL_SYNC_INTERVAL)
-        _fetch_and_store_crl()
 
 
 def change_status(greffon_id, status):

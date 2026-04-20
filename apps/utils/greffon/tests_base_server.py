@@ -134,16 +134,12 @@ class RegisterTests(unittest.TestCase):
                 'private_key': 'KEY',
             }
 
-            crl_response = MagicMock()
-            crl_response.status_code = 200
-            crl_response.text = 'CRL_DATA'
-
-            mock_requests.get.side_effect = [fail_response, success_response, crl_response]
+            mock_requests.get.side_effect = [fail_response, success_response]
 
             mod.register()
 
         mock_time.sleep.assert_called_once_with(5)
-        self.assertEqual(mock_requests.get.call_count, 3)
+        self.assertEqual(mock_requests.get.call_count, 2)
 
 
 class ClientAuthTests(unittest.TestCase):
