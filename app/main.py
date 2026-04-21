@@ -4,9 +4,10 @@ import secrets
 
 from fastapi import FastAPI
 
+from app.errors import register_exception_handlers
 from app.lifespan import lifespan
 from app.logging import configure_logging
-from app.routers import health
+from app.routers import controller, health
 from app.settings import Settings, get_settings
 
 # Intentionally no module-level `app = create_app()`.
@@ -24,4 +25,6 @@ def create_app(
     app.state.greffer_token = token or secrets.token_urlsafe(32)
     app.state.settings = settings
     app.include_router(health.router)
+    app.include_router(controller.router)
+    register_exception_handlers(app)
     return app

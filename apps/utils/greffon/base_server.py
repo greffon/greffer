@@ -8,9 +8,11 @@ from apps.utils.auth import get_token
 from apps.utils.docker.base import copy_file_into_container
 
 import logging
-from django.conf import settings
 
-logger = logging.getLogger(settings.LOGGER_NAME)
+# LOGGER_NAME is hardcoded to 'greffer' in greffer/settings.py; the env
+# var override is kept for parity with the FastAPI settings. Decoupled
+# from django.conf so this module imports in both runtimes.
+logger = logging.getLogger(os.getenv('LOGGER_NAME', 'greffer'))
 
 base_server = os.getenv('GREFFON_BASE_SERVER', 'https://api.greffon.io')
 docker_nginx_name = os.getenv('DOCKER_NGINX_NAME', 'greffer-nginx-1')
