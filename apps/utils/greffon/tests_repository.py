@@ -32,6 +32,7 @@ class GetComposeFileFromRepositoryTests(TestCase):
             "  internal: {}\n"
         )
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.text = yaml_text
         mock_requests.get.return_value = mock_response
 
