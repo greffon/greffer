@@ -6,15 +6,17 @@ from unittest.mock import patch, MagicMock, call
 class RegisterTests(unittest.TestCase):
     """Tests for the register function."""
 
+    @patch('apps.utils.greffon.base_server._fetch_and_store_crl')
     @patch('apps.utils.greffon.base_server.copy_file_into_container')
     @patch('apps.utils.greffon.base_server.get_token', return_value='fake-token')
     @patch('apps.utils.greffon.base_server.requests')
     @patch('apps.utils.greffon.base_server.socket')
     def test_register_posts_to_base_server(
-        self, mock_socket, mock_requests, mock_get_token, mock_copy_file
+        self, mock_socket, mock_requests, mock_get_token, mock_copy_file, mock_fetch_crl
     ):
         """register() should POST to the base server with correct payload and
-        copy certificate files into the nginx container on 200 response."""
+        copy certificate files into the nginx container on 200 response.
+        CRL fetch is mocked out — tested separately in FetchAndStoreCrlTests."""
         import apps.utils.greffon.base_server as mod
 
         # Configure module-level variables
@@ -58,12 +60,13 @@ class RegisterTests(unittest.TestCase):
         mock_copy_file.assert_any_call('test-nginx', '/root', 'cert.key', 'KEY_DATA')
         self.assertEqual(mock_copy_file.call_count, 2)
 
+    @patch('apps.utils.greffon.base_server._fetch_and_store_crl')
     @patch('apps.utils.greffon.base_server.copy_file_into_container')
     @patch('apps.utils.greffon.base_server.get_token', return_value='fake-token')
     @patch('apps.utils.greffon.base_server.requests')
     @patch('apps.utils.greffon.base_server.socket')
     def test_register_uses_hostname_when_no_address_env(
-        self, mock_socket, mock_requests, mock_get_token, mock_copy_file
+        self, mock_socket, mock_requests, mock_get_token, mock_copy_file, mock_fetch_crl
     ):
         """When GREFFER_ADDRESS is not set, register() should resolve the local
         hostname and use its IP address."""
@@ -102,13 +105,14 @@ class RegisterTests(unittest.TestCase):
         mock_socket.gethostname.assert_called_once()
         mock_socket.gethostbyname.assert_called_once_with('my-host')
 
+    @patch('apps.utils.greffon.base_server._fetch_and_store_crl')
     @patch('apps.utils.greffon.base_server.time')
     @patch('apps.utils.greffon.base_server.copy_file_into_container')
     @patch('apps.utils.greffon.base_server.get_token', return_value='fake-token')
     @patch('apps.utils.greffon.base_server.requests')
     @patch('apps.utils.greffon.base_server.socket')
     def test_register_retries_cert_fetch(
-        self, mock_socket, mock_requests, mock_get_token, mock_copy_file, mock_time
+        self, mock_socket, mock_requests, mock_get_token, mock_copy_file, mock_time, mock_fetch_crl
     ):
         """When the certificate endpoint returns a non-200 status, register()
         should retry after sleeping and succeed on the next 200 response."""

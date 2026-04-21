@@ -211,13 +211,18 @@ class RemoveComposeFileTests(unittest.TestCase):
     def test_remove_compose_file_skips_missing(
         self, mock_exists, mock_remove, mock_client
     ):
-        """When files do not exist, os.remove should not be called."""
+        """When files do not exist, os.remove should not be called.
+
+        os.path.exists is mocked to False globally, which also forces
+        get_greffon_path() to call os.makedirs(). The test does NOT
+        pre-create the instance dir so that makedirs succeeds on a fresh
+        path under the tempdir; asserting on mock_remove is what we care
+        about.
+        """
         from apps.utils.docker.compose import remove_compose_file
 
         with tempfile.TemporaryDirectory() as tmpdir:
             greffon_info = {'id': 'test-skip'}
-            greffon_path = os.path.join(tmpdir, 'test-skip')
-            os.makedirs(greffon_path, exist_ok=True)
 
             with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
                 # os.path.exists is mocked to False, so no removals should happen
