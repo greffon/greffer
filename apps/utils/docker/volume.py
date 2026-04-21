@@ -1,8 +1,11 @@
+import os
 import subprocess
 from uuid import uuid4
 import logging
-from django.conf import settings
-logger = logging.getLogger(settings.LOGGER_NAME)
+# LOGGER_NAME is hardcoded to 'greffer' in greffer/settings.py; the env
+# var override is kept for parity with the FastAPI settings. Decoupled
+# from django.conf so this module imports in both runtimes.
+logger = logging.getLogger(os.getenv('LOGGER_NAME', 'greffer'))
 
 def docker_is_volume_exist(volume):
     res = subprocess.run(['docker', 'volume', 'ls',

@@ -3,8 +3,10 @@ import os
 from apps.utils.docker import compose
 from apps.utils.greffon import base_server
 import logging
-from django.conf import settings
-logger = logging.getLogger(settings.LOGGER_NAME)
+# LOGGER_NAME is hardcoded to 'greffer' in greffer/settings.py; the env
+# var override is kept for parity with the FastAPI settings. Decoupled
+# from django.conf so this module imports in both runtimes.
+logger = logging.getLogger(os.getenv('LOGGER_NAME', 'greffer'))
 
 
 def monitor_status(delay=5):
