@@ -69,3 +69,12 @@ def test_create_app_mints_token_when_none_passed(settings: Settings) -> None:
 def test_create_app_uses_provided_token(settings: Settings) -> None:
     app = create_app(token="fixed-token", settings=settings)
     assert app.state.greffer_token == "fixed-token"
+
+
+def test_create_app_mints_when_token_is_empty_string(settings: Settings) -> None:
+    """Empty-string token is falsy; the ``or``-fallback in create_app mints
+    a fresh random token. Guards against a silent-auth-bypass regression if
+    someone changes the mint to ``if token is None`` instead of ``or``."""
+    app = create_app(token="", settings=settings)
+    assert app.state.greffer_token != ""
+    assert len(app.state.greffer_token) >= 32

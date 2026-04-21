@@ -36,7 +36,10 @@ router = APIRouter(
 
 @router.post("/start/")
 def start_greffon(payload: GreffonStartRequest) -> GreffonStartResponse:
-    greffon = payload.model_dump(exclude_none=True)
+    # No `exclude_none=True` — the DRF legacy path kept `null` values in
+    # `.data` (missing-vs-null distinct). Downstream code uses `.get('ports',
+    # {})` etc., so both None and missing work today; dropping would drift.
+    greffon = payload.model_dump()
     compose_file = repository.get_compose_file_from_repository(greffon)
     greffon_info = repository.get_greffon_info(compose_file, greffon)
     compose_template = compose.get_compose_template(compose_file, greffon_info)

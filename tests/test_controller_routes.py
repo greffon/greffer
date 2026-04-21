@@ -108,6 +108,73 @@ async def test_start_rejects_missing_token(client: AsyncClient) -> None:
     assert r.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_start_401_body_is_empty_object(client: AsyncClient) -> None:
+    """Preserve Django contract: 401 body is ``{}``, not ``{"detail": ...}``."""
+    r = await client.post(
+        "/api/controller/start/",
+        json=SAMPLE_START_PAYLOAD,
+    )
+    assert r.status_code == 401
+    assert r.json() == {}
+
+
+@pytest.mark.asyncio
+async def test_start_accepts_empty_configurations_list(
+    client: AsyncClient,
+) -> None:
+    """``configurations: []`` is semantically "no configs" and must succeed."""
+    payload = {**SAMPLE_START_PAYLOAD, "configurations": []}
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ), patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_start_ignores_unknown_extra_fields(client: AsyncClient) -> None:
+    """Pydantic default is ``extra="ignore"``. Locks that in — a future
+    ``extra="forbid"`` change would silently reject manager traffic and this
+    test would catch it."""
+    payload = {**SAMPLE_START_PAYLOAD, "new_future_field": "whatever"}
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ), patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_path_traversal_id(client: AsyncClient) -> None:
+    """Defense-in-depth: ``id`` is path-joined with $GREFFON_PATH downstream.
+    A payload with dots/slashes must be rejected at the validation layer."""
+    payload = {**SAMPLE_START_PAYLOAD, "id": "../../etc/passwd"}
+    r = await client.post(
+        "/api/controller/start/",
+        json=payload,
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["message"] == "Invalid Fields"
+    assert "id" in body["errors"]
+
+
 # ---------------------------------------------------------------------------
 # POST /api/controller/stop/
 # ---------------------------------------------------------------------------

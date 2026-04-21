@@ -47,11 +47,20 @@ def test_drf_shape_handles_empty_loc() -> None:
 
 
 def test_drf_shape_handles_path_param() -> None:
-    """For path-param errors, loc = ('path', 'greffon_id') — no 'body' prefix."""
+    """Path prefix is stripped like ``body`` so the key matches the HLD
+    contract (``greffon_id``, not ``path.greffon_id``)."""
     errs = [
         {"loc": ("path", "greffon_id"), "msg": "Invalid UUID"},
     ]
-    assert _drf_shape(errs) == {"path.greffon_id": ["Invalid UUID"]}
+    assert _drf_shape(errs) == {"greffon_id": ["Invalid UUID"]}
+
+
+def test_drf_shape_handles_query_param() -> None:
+    """Same treatment for query-param errors."""
+    errs = [
+        {"loc": ("query", "since"), "msg": "Invalid datetime"},
+    ]
+    assert _drf_shape(errs) == {"since": ["Invalid datetime"]}
 
 
 # ---------------------------------------------------------------------------
@@ -104,5 +113,46 @@ async def test_validation_error_path_param_uuid(client: AsyncClient) -> None:
     assert r.status_code == 400
     body = r.json()
     assert body["message"] == "Invalid Fields"
-    # path errors have loc=('path', 'greffon_id')
-    assert "path.greffon_id" in body["errors"]
+    # Path prefix is stripped, matching the HLD contract.
+    assert "greffon_id" in body["errors"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_body_returns_400_with_drf_shape(
+    client: AsyncClient,
+) -> None:
+    """Non-JSON body should still produce the DRF envelope, not a raw
+    FastAPI 422 or an unhandled 500.
+    """
+    r = await client.post(
+        "/api/controller/stop/",
+        content=b"not-json",
+        headers={TOKEN_HEADER: "test-token", "Content-Type": "application/json"},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["message"] == "Invalid Fields"
+    assert isinstance(body["errors"], dict)
+
+
+@pytest.mark.asyncio
+async def test_cert_with_both_subfields_missing_groups_errors(
+    client: AsyncClient,
+) -> None:
+    """``cert: {}`` — both nested fields missing — produces two dotted-key
+    entries, one per subfield.
+    """
+    r = await client.post(
+        "/api/controller/start/",
+        json={
+            "id": "x",
+            "repository_url": "u",
+            "cert": {},
+        },
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["message"] == "Invalid Fields"
+    assert "cert.certificate" in body["errors"]
+    assert "cert.private_key" in body["errors"]
