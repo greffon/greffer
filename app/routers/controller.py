@@ -36,10 +36,15 @@ router = APIRouter(
 
 @router.post("/start/")
 def start_greffon(payload: GreffonStartRequest) -> GreffonStartResponse:
-    # No `exclude_none=True` — the DRF legacy path kept `null` values in
-    # `.data` (missing-vs-null distinct). Downstream code uses `.get('ports',
-    # {})` etc., so both None and missing work today; dropping would drift.
-    greffon = payload.model_dump()
+    # ``exclude_unset=True`` mirrors DRF's missing-vs-explicit distinction:
+    # omitted optional fields stay out of the dict entirely, so downstream
+    # ``greffon.get('ports', {}).get(...)`` in apps/utils/greffon/repository.py
+    # and ``greffon_info.get('configurations', [])`` in compose.py see their
+    # defaults. With plain ``model_dump()`` those sites would ``None.get(...)``
+    # → AttributeError → 500 for every start request that omits the field.
+    # Explicit ``null`` is rejected upstream by ``_reject_explicit_null``
+    # (see app/models/controller.py).
+    greffon = payload.model_dump(exclude_unset=True)
     compose_file = repository.get_compose_file_from_repository(greffon)
     greffon_info = repository.get_greffon_info(compose_file, greffon)
     compose_template = compose.get_compose_template(compose_file, greffon_info)

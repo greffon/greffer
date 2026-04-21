@@ -120,6 +120,41 @@ async def test_start_401_body_is_empty_object(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_omits_unset_optional_fields_from_downstream_dict(
+    client: AsyncClient,
+) -> None:
+    """REGRESSION: ``model_dump()`` without ``exclude_unset=True`` materializes
+    omitted optional fields as ``None`` in the dict; downstream
+    ``greffon.get('ports', {}).get(...)`` then calls ``None.get(...)`` →
+    500. Verify the dict passed to the downstream orchestration code omits
+    the keys entirely when the client did not send them.
+    """
+    payload = {
+        "id": "test-instance-123",
+        "repository_url": "https://example.com/docker-compose.yml",
+        "cert": SAMPLE_CERT,
+        # intentionally no "configurations", no "ports"
+    }
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ), patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    # The call to downstream must NOT carry the optional keys as None.
+    dict_passed = mock_repo.get_compose_file_from_repository.call_args[0][0]
+    assert "configurations" not in dict_passed
+    assert "ports" not in dict_passed
+
+
+@pytest.mark.asyncio
 async def test_start_accepts_empty_configurations_list(
     client: AsyncClient,
 ) -> None:
