@@ -34,8 +34,10 @@ def test_start_request_minimal_valid() -> None:
         cert=Certificate(**SAMPLE_CERT),
     )
     assert req.id == "test-123"
-    assert req.configurations is None
-    assert req.ports is None
+    # Omitted fields default to empty containers (not None) so the dumped
+    # dict always has the keys present for downstream strict-access code.
+    assert req.configurations == []
+    assert req.ports == {}
 
 
 def test_start_request_full_payload() -> None:
@@ -115,7 +117,8 @@ def test_start_request_accepts_any_shape_in_configurations() -> None:
 
 def test_start_request_rejects_explicit_null_configurations() -> None:
     """DRF semantics: `required=False` w/o `allow_null=True` accepts missing
-    but rejects explicit null. Locked in by a field validator."""
+    but rejects explicit null. Pydantic rejects null on type grounds
+    because the field is typed ``list[...]`` (not ``list[...] | None``)."""
     with pytest.raises(ValidationError):
         GreffonStartRequest.model_validate(
             {
@@ -139,13 +142,29 @@ def test_start_request_rejects_explicit_null_ports() -> None:
         )
 
 
-def test_start_request_missing_configurations_ok() -> None:
-    """Field omitted entirely → default None, no validator error."""
+def test_start_request_missing_configurations_defaults_to_empty() -> None:
+    """Field omitted entirely → default empty container (not None), so the
+    dumped dict always carries the key for downstream strict access in
+    ``apps/utils/greffon/repository.py:create_greffon_info``."""
     req = GreffonStartRequest.model_validate(
         {"id": "x", "repository_url": "u", "cert": SAMPLE_CERT}
     )
-    assert req.configurations is None
-    assert req.ports is None
+    assert req.configurations == []
+    assert req.ports == {}
+    dumped = req.model_dump()
+    assert dumped["configurations"] == []
+    assert dumped["ports"] == {}
+
+
+def test_start_request_rejects_blank_repository_url() -> None:
+    """DRF ``CharField`` rejects blank values by default. Blank here would
+    reach ``requests.get('')`` and 500 instead of returning 400."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="x",
+            repository_url="",
+            cert=Certificate(**SAMPLE_CERT),
+        )
 
 
 def test_start_request_id_rejects_empty_string() -> None:

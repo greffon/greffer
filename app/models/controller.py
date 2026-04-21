@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 # Defense-in-depth: restrict `id` to safe filename-like characters. The id
@@ -31,28 +31,19 @@ class GreffonStartRequest(BaseModel):
     # sends today (e.g. "test-instance-123"). Pattern kept permissive to
     # accept UUIDs and existing ID formats; rejects path-traversal.
     id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
-    repository_url: str
+    # `min_length=1` matches DRF's `CharField` default (rejects blank).
+    # Otherwise an empty URL reaches `requests.get('')` and 500s instead
+    # of returning a 400 validation error.
+    repository_url: str = Field(min_length=1)
     cert: Certificate
-    configurations: list[GreffonField] | None = None
-    ports: dict[str, Any] | None = None
-
-    @field_validator("configurations", "ports", mode="before")
-    @classmethod
-    def _reject_explicit_null(cls, v: Any) -> Any:
-        """Match DRF semantics: ``required=False`` without ``allow_null=True``
-        accepts a missing key (→ default None) but rejects an explicit
-        ``null`` in the payload. Pydantic would otherwise silently coerce
-        explicit null to None; this validator closes the gap.
-
-        With ``mode="before"``, this runs only when the field is present in
-        the input dict — Pydantic uses the default without calling the
-        validator when the field is omitted entirely.
-        """
-        if v is None:
-            raise ValueError(
-                "explicit null is not accepted; omit the field instead"
-            )
-        return v
+    # Optional in the DRF sense (may be omitted from the payload), but
+    # defaulted to an empty container here so the dumped dict always has
+    # the key present. `create_greffon_info` in
+    # apps/utils/greffon/repository.py uses strict `greffon['configurations']`
+    # access, not `.get(...)`, so omitting the key → KeyError → 500.
+    # Explicit `null` is rejected on type grounds (list, not list | None).
+    configurations: list[GreffonField] = Field(default_factory=list)
+    ports: dict[str, Any] = Field(default_factory=dict)
 
 
 class GreffonStopRequest(BaseModel):

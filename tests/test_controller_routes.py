@@ -120,14 +120,21 @@ async def test_start_401_body_is_empty_object(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_omits_unset_optional_fields_from_downstream_dict(
+async def test_start_defaults_unset_optional_fields_to_empty_containers(
     client: AsyncClient,
 ) -> None:
-    """REGRESSION: ``model_dump()`` without ``exclude_unset=True`` materializes
-    omitted optional fields as ``None`` in the dict; downstream
-    ``greffon.get('ports', {}).get(...)`` then calls ``None.get(...)`` →
-    500. Verify the dict passed to the downstream orchestration code omits
-    the keys entirely when the client did not send them.
+    """REGRESSION: the dict passed to the downstream orchestration code
+    must carry ``configurations`` and ``ports`` as empty containers (not
+    absent, not None) when the client omits them:
+
+      - ``apps/utils/greffon/repository.py:create_greffon_info`` does
+        strict ``greffon['configurations']`` → KeyError if absent.
+      - ``apps/utils/greffon/repository.py:create_greffon_info`` reads
+        ``greffon.get('ports', {}).get(port_name, {}).get('url')`` —
+        tolerates missing, but None.get(...) would raise.
+
+    The Pydantic model uses ``default_factory=list/dict`` to give the
+    dump predictable shape on these paths.
     """
     payload = {
         "id": "test-instance-123",
@@ -148,10 +155,24 @@ async def test_start_omits_unset_optional_fields_from_downstream_dict(
         )
 
     assert r.status_code == 200
-    # The call to downstream must NOT carry the optional keys as None.
     dict_passed = mock_repo.get_compose_file_from_repository.call_args[0][0]
-    assert "configurations" not in dict_passed
-    assert "ports" not in dict_passed
+    assert dict_passed["configurations"] == []
+    assert dict_passed["ports"] == {}
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_blank_repository_url(client: AsyncClient) -> None:
+    """Blank repository_url must 400, not reach ``requests.get('')`` and 500."""
+    payload = {**SAMPLE_START_PAYLOAD, "repository_url": ""}
+    r = await client.post(
+        "/api/controller/start/",
+        json=payload,
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["message"] == "Invalid Fields"
+    assert "repository_url" in body["errors"]
 
 
 @pytest.mark.asyncio
