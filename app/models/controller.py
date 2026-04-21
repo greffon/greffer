@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # Defense-in-depth: restrict `id` to safe filename-like characters. The id
@@ -35,6 +35,24 @@ class GreffonStartRequest(BaseModel):
     cert: Certificate
     configurations: list[GreffonField] | None = None
     ports: dict[str, Any] | None = None
+
+    @field_validator("configurations", "ports", mode="before")
+    @classmethod
+    def _reject_explicit_null(cls, v: Any) -> Any:
+        """Match DRF semantics: ``required=False`` without ``allow_null=True``
+        accepts a missing key (→ default None) but rejects an explicit
+        ``null`` in the payload. Pydantic would otherwise silently coerce
+        explicit null to None; this validator closes the gap.
+
+        With ``mode="before"``, this runs only when the field is present in
+        the input dict — Pydantic uses the default without calling the
+        validator when the field is omitted entirely.
+        """
+        if v is None:
+            raise ValueError(
+                "explicit null is not accepted; omit the field instead"
+            )
+        return v
 
 
 class GreffonStopRequest(BaseModel):

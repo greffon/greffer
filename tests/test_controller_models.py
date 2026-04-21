@@ -111,3 +111,62 @@ def test_start_request_accepts_any_shape_in_configurations() -> None:
     assert req.configurations is not None
     assert req.configurations[0].value == "plain-string"
     assert req.configurations[0].destinations == ["plain-list"]
+
+
+def test_start_request_rejects_explicit_null_configurations() -> None:
+    """DRF semantics: `required=False` w/o `allow_null=True` accepts missing
+    but rejects explicit null. Locked in by a field validator."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest.model_validate(
+            {
+                "id": "x",
+                "repository_url": "u",
+                "cert": SAMPLE_CERT,
+                "configurations": None,
+            }
+        )
+
+
+def test_start_request_rejects_explicit_null_ports() -> None:
+    with pytest.raises(ValidationError):
+        GreffonStartRequest.model_validate(
+            {
+                "id": "x",
+                "repository_url": "u",
+                "cert": SAMPLE_CERT,
+                "ports": None,
+            }
+        )
+
+
+def test_start_request_missing_configurations_ok() -> None:
+    """Field omitted entirely → default None, no validator error."""
+    req = GreffonStartRequest.model_validate(
+        {"id": "x", "repository_url": "u", "cert": SAMPLE_CERT}
+    )
+    assert req.configurations is None
+    assert req.ports is None
+
+
+def test_start_request_id_rejects_empty_string() -> None:
+    """Defense-in-depth: empty id path-joins to $GREFFON_PATH root."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="",
+            repository_url="u",
+            cert=Certificate(**SAMPLE_CERT),
+        )
+
+
+def test_stop_request_id_rejects_empty_string() -> None:
+    with pytest.raises(ValidationError):
+        GreffonStopRequest(id="")
+
+
+def test_start_request_id_rejects_path_traversal() -> None:
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="../../etc/passwd",
+            repository_url="u",
+            cert=Certificate(**SAMPLE_CERT),
+        )

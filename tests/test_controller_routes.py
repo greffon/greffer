@@ -160,6 +160,22 @@ async def test_start_ignores_unknown_extra_fields(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_rejects_explicit_null_configurations(
+    client: AsyncClient,
+) -> None:
+    """Match DRF: explicit null is 400, not silently coerced to None."""
+    payload = {**SAMPLE_START_PAYLOAD, "configurations": None}
+    r = await client.post(
+        "/api/controller/start/",
+        json=payload,
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code == 400
+    assert r.json()["message"] == "Invalid Fields"
+    assert "configurations" in r.json()["errors"]
+
+
+@pytest.mark.asyncio
 async def test_start_rejects_path_traversal_id(client: AsyncClient) -> None:
     """Defense-in-depth: ``id`` is path-joined with $GREFFON_PATH downstream.
     A payload with dots/slashes must be rejected at the validation layer."""
