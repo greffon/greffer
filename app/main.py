@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 
 from fastapi import FastAPI
@@ -24,6 +25,10 @@ def create_app(
     app = FastAPI(lifespan=lifespan)
     app.state.greffer_token = token or secrets.token_urlsafe(32)
     app.state.settings = settings
+    # Set by register_worker once cert material is on disk. monitor_worker
+    # waits on it before firing status callbacks (which require the
+    # client cert once the manager's mTLS gate is live).
+    app.state.registered = asyncio.Event()
     app.include_router(health.router)
     app.include_router(controller.router)
     register_exception_handlers(app)

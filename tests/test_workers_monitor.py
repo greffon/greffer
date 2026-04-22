@@ -96,8 +96,33 @@ def test_report_status_change_posts_correct_payload(settings: Settings) -> None:
     kwargs = mock_requests.post.call_args.kwargs
     assert url.endswith("/api/greffer/instances/inst-42/")
     assert kwargs["json"] == {"status": "running"}
-    assert kwargs["verify"] == settings.greffer_ssl_verify
+    # No cert material on disk in this unit test → bootstrap verify=True
+    # branch, no client cert presented. The mTLS presentation is covered
+    # in test_workers_register.py against _client_auth().
+    assert kwargs["verify"] is True
+    assert "cert" not in kwargs
     assert kwargs["timeout"] == 10.0
+
+
+def test_report_status_change_presents_client_cert_when_available(
+    settings: Settings, tmp_path
+) -> None:
+    """When cert+key are on disk, the outbound status POST presents the
+    greffer's client cert — the wire-level primitive behind the mTLS
+    callback."""
+    from app.workers.monitor import _report_status_change
+
+    settings.greffer_cert_dir = tmp_path  # type: ignore[misc]
+    (tmp_path / "pem.crt").write_text("CERT")
+    (tmp_path / "cert.key").write_text("KEY")
+    (tmp_path / "ca.pem").write_text("CA")
+
+    with patch("app.workers.monitor.requests") as mock_requests:
+        _report_status_change(settings, "inst-42", "running")
+
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["cert"] == (str(tmp_path / "pem.crt"), str(tmp_path / "cert.key"))
+    assert kwargs["verify"] == str(tmp_path / "ca.pem")
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +131,43 @@ def test_report_status_change_posts_correct_payload(settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_monitor_worker_waits_for_registration_before_first_tick(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: ``monitor_worker`` must block on ``app.state.registered``
+    before the first tick. Without it, a restart with leftover instance
+    dirs fires status callbacks in the bootstrap posture (no client cert)
+    and gets 403'd by the manager's mTLS location gate."""
+    app = create_app(token="t", settings=settings)
+
+    ticks = 0
+
+    def _counting_tick(_settings, _prev):
+        nonlocal ticks
+        ticks += 1
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _counting_tick)
+
+    task = asyncio.create_task(monitor_worker(app))
+    # Give the worker a moment to reach the wait; if it skipped the wait
+    # it would have already hit the tick and been cancelled.
+    await asyncio.sleep(0.05)
+    assert ticks == 0, "tick ran before registered was set"
+
+    app.state.registered.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+    assert ticks == 1
+
+
+@pytest.mark.asyncio
 async def test_monitor_worker_continues_after_tick_exception(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """DEVIATION FROM LEGACY: a failing tick does not kill the worker."""
     app = create_app(token="t", settings=settings)
+    app.state.registered.set()
 
     call_count = 0
 
@@ -140,6 +197,7 @@ async def test_monitor_worker_cancellable_during_sleep(
 ) -> None:
     """Cancellation during asyncio.sleep propagates cleanly."""
     app = create_app(token="t", settings=settings)
+    app.state.registered.set()
 
     def _noop_tick(_settings, _prev):
         return
@@ -165,6 +223,7 @@ async def test_monitor_worker_cancel_is_snappy_during_blocking_tick(
     import time
 
     app = create_app(token="t", settings=settings)
+    app.state.registered.set()
     tick_started = threading.Event()
     never_complete = threading.Event()
 

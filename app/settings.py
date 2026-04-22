@@ -18,9 +18,21 @@ class Settings(BaseSettings):
 
     greffon_base_server: str = "https://api.greffon.io"
     greffer_protocol: Literal["http", "https"] = "https"
-    greffer_ssl_verify: bool = True
     greffer_address: str | None = None
     greffer_port: int = 8000
+
+    # Local on-disk home for cert material pulled from the manager during
+    # registration. This process reads from here to present a client cert
+    # on outbound calls; the same files are also copied into the greffer's
+    # nginx container so nginx can terminate TLS on inbound.
+    greffer_cert_dir: Path = Path("/etc/greffer/certs")
+
+    # Registration carries the greffer token and receives the signed
+    # private key in the response body. If GREFFON_BASE_SERVER is not
+    # https:// the process refuses to start, unless this opt-in is set.
+    # Dev stacks that terminate TLS elsewhere (e.g. the root dev-proxy)
+    # can enable it; prod must leave it off.
+    greffer_allow_insecure_bootstrap: bool = False
 
     greffer_public_host: str = "host.docker.internal"
     greffer_public_scheme: Literal["http", "https"] = "https"

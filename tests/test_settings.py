@@ -25,9 +25,10 @@ def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     s = Settings()
     assert s.greffon_base_server == "https://api.greffon.io"
     assert s.greffer_protocol == "https"
-    assert s.greffer_ssl_verify is True
     assert s.greffer_address is None
     assert s.greffer_port == 8000
+    assert s.greffer_cert_dir == Path("/etc/greffer/certs")
+    assert s.greffer_allow_insecure_bootstrap is False
     assert s.greffer_public_host == "host.docker.internal"
     assert s.greffer_public_scheme == "https"
     assert s.greffon_path == Path("/data")
@@ -42,11 +43,13 @@ def test_env_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GREFFER_ID", "x")
     monkeypatch.setenv("GREFFON_PATH", "/tmp/alt")
     monkeypatch.setenv("CRL_SYNC_INTERVAL", "60")
-    monkeypatch.setenv("GREFFER_SSL_VERIFY", "false")
+    monkeypatch.setenv("GREFFER_ALLOW_INSECURE_BOOTSTRAP", "true")
+    monkeypatch.setenv("GREFFER_CERT_DIR", "/tmp/certs")
     s = Settings()
     assert s.greffon_path == Path("/tmp/alt")
     assert s.crl_sync_interval == 60
-    assert s.greffer_ssl_verify is False
+    assert s.greffer_allow_insecure_bootstrap is True
+    assert s.greffer_cert_dir == Path("/tmp/certs")
 
 
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:

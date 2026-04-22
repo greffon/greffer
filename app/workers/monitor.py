@@ -20,6 +20,7 @@ import requests
 from fastapi import FastAPI
 
 from app.settings import Settings
+from app.workers.register import _client_auth
 
 logger = logging.getLogger("greffer")
 
@@ -29,6 +30,12 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 async def monitor_worker(app: FastAPI) -> None:
     settings: Settings = app.state.settings
     prev_status: dict[str, str] = {}
+    # Wait for register_worker to install cert material before firing any
+    # callbacks. Without this, the first tick can hit the manager's mTLS
+    # location gate with no client cert and get rejected.
+    registered: asyncio.Event | None = getattr(app.state, "registered", None)
+    if registered is not None:
+        await registered.wait()
     try:
         while True:
             logger.info("monitoring begin")
@@ -81,6 +88,6 @@ def _report_status_change(
     requests.post(
         f"{settings.greffon_base_server}/api/greffer/instances/{greffon_id}/",
         json={"status": status},
-        verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
+        **_client_auth(settings),
     )
