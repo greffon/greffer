@@ -15,11 +15,11 @@ logger = logging.getLogger("greffer")
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """App lifespan — start the three background workers if enabled.
 
-    ``workers_enabled`` defaults to False. Feature #4's cutover PR flips
-    it to True at the moment Django is removed, so the FastAPI workers
-    never run alongside Django's daemon threads in the same container.
+    ``greffer_workers_enabled`` defaults to False so unit tests don't
+    accidentally spawn real workers. Production sets
+    ``GREFFER_WORKERS_ENABLED=true`` in docker-compose.yml.
     """
-    if not app.state.settings.workers_enabled:
+    if not app.state.settings.greffer_workers_enabled:
         logger.info("workers disabled (GREFFER_WORKERS_ENABLED unset)")
         yield
         return

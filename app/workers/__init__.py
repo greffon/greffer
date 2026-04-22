@@ -6,9 +6,10 @@ Three workers port the Django daemon threads at ``apps/controller/views.py:14-22
 * ``monitor_worker`` — forever loop; reports greffon instance status changes.
 * ``crl_sync_worker`` — forever loop; fetches updated CRL periodically.
 
-Startup is gated by ``Settings.workers_enabled`` (default False) so that during
-the parallel-tree phase the Django runtime keeps owning the real register +
-status callbacks; flipping the flag is feature #4's atomic cutover act.
+Startup is gated by ``Settings.greffer_workers_enabled`` (env var
+``GREFFER_WORKERS_ENABLED``, default False) so unit tests don't
+accidentally spawn real workers. Production sets it to ``true`` in
+``docker-compose.yml``.
 
 Single-worker uvicorn only. Multi-worker would spawn N × 3 pollers per
 container, each with a distinct token, fighting over manager state.
