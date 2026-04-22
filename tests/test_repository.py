@@ -2,7 +2,7 @@ import copy
 import os
 from unittest.mock import patch, MagicMock
 
-from django.test import TestCase
+from unittest import TestCase
 
 from tests.helpers import SAMPLE_COMPOSE, SAMPLE_CERT, SAMPLE_START_PAYLOAD
 

@@ -10,7 +10,7 @@ import tempfile
 from unittest.mock import patch, MagicMock
 
 import yaml
-from django.test import TestCase
+from unittest import TestCase
 
 
 def _write_compose(instance_dir, volumes_spec):

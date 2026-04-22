@@ -1,5 +1,5 @@
 """Tests for the Migration registry — id validation + dedup."""
-from django.test import TestCase
+from unittest import TestCase
 
 from apps.utils.ops_migrations import registry
 from apps.utils.ops_migrations.base import (

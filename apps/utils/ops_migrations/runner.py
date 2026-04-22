@@ -55,7 +55,7 @@ def apply_pending(
     if os.getenv("GREFFER_SKIP_OPS_MIGRATIONS"):
         logger.warning(
             "GREFFER_SKIP_OPS_MIGRATIONS is set — skipping all ops migrations. "
-            "You must run `python manage.py apply_ops_migrations` manually to recover."
+            "You must run `python -m app.cli apply_ops_migrations` manually to recover."
         )
         return []
 

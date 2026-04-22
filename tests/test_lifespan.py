@@ -1,4 +1,5 @@
-"""Tests for the FastAPI lifespan — gates worker startup on workers_enabled.
+"""Tests for the FastAPI lifespan — gates worker startup on
+``greffer_workers_enabled``.
 
 Lifespan is exercised by driving the ``lifespan(app)`` async context
 manager directly. Note: ``httpx.AsyncClient + ASGITransport`` does *not*
@@ -14,7 +15,7 @@ import pytest
 
 from app.lifespan import lifespan
 from app.main import create_app
-from app.settings import Settings
+from app.settings import Settings, get_settings
 from app.workers import stop_workers
 
 
@@ -22,8 +23,8 @@ from app.workers import stop_workers
 async def test_lifespan_no_tasks_when_workers_disabled(
     settings: Settings,
 ) -> None:
-    """Default settings.workers_enabled=False → start_workers is not called."""
-    assert settings.workers_enabled is False
+    """Default ``greffer_workers_enabled=False`` → start_workers is not called."""
+    assert settings.greffer_workers_enabled is False
     app = create_app(token="t", settings=settings)
 
     with patch("app.lifespan.start_workers") as mock_start, patch(
@@ -40,9 +41,9 @@ async def test_lifespan_no_tasks_when_workers_disabled(
 async def test_lifespan_starts_three_workers_when_enabled(
     settings: Settings,
 ) -> None:
-    """workers_enabled=True → three tasks started with expected names,
-    cancelled on shutdown."""
-    settings.workers_enabled = True  # type: ignore[misc]
+    """``greffer_workers_enabled=True`` → three tasks started with expected
+    names, cancelled on shutdown."""
+    settings.greffer_workers_enabled = True  # type: ignore[misc]
     app = create_app(token="t", settings=settings)
 
     async def _noop_worker(_app):
@@ -67,6 +68,50 @@ async def test_lifespan_starts_three_workers_when_enabled(
     assert "greffer-register" not in leftover
     assert "greffer-monitor" not in leftover
     assert "greffer-crl-sync" not in leftover
+
+
+def test_greffer_workers_enabled_env_var_binds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION (Codex P1 on #17): pydantic-settings maps field names
+    (case-insensitive) to env vars. A bare ``workers_enabled`` field
+    would bind to ``WORKERS_ENABLED``, silently ignoring the
+    ``GREFFER_WORKERS_ENABLED`` env var the compose file sets — meaning
+    the cutover would ship with workers DORMANT. This test confirms the
+    field name carries the ``greffer_`` prefix so the env var lands.
+    """
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("GREFFER_WORKERS_ENABLED", "true")
+    get_settings.cache_clear()
+    s = get_settings()
+    assert s.greffer_workers_enabled is True
+
+
+def test_greffer_workers_enabled_env_var_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard against an accidental `default=True` flip."""
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.delenv("GREFFER_WORKERS_ENABLED", raising=False)
+    get_settings.cache_clear()
+    s = get_settings()
+    assert s.greffer_workers_enabled is False
+
+
+def test_bare_workers_enabled_env_var_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric guard: ``WORKERS_ENABLED`` (no prefix) must NOT bind,
+    because the field is ``greffer_workers_enabled``. If someone ever
+    renames the field back to bare ``workers_enabled`` as "cleanup",
+    this test flips red.
+    """
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("WORKERS_ENABLED", "true")  # intentionally wrong name
+    monkeypatch.delenv("GREFFER_WORKERS_ENABLED", raising=False)
+    get_settings.cache_clear()
+    s = get_settings()
+    assert s.greffer_workers_enabled is False
 
 
 @pytest.mark.asyncio
