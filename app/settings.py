@@ -34,6 +34,14 @@ class Settings(BaseSettings):
 
     skip_ops_migrations: bool = False
 
+    # Workers (register / monitor_status / CRL sync). Disabled by default
+    # so feature #3 ships dormant alongside the still-live Django runtime.
+    # Feature #4's cutover PR flips this to True in the new compose config
+    # at the same moment the Django entrypoint is removed. Enabling this
+    # while Django is also running causes double-registration and races
+    # over the nginx cert files inside the DOCKER_NGINX_NAME container.
+    workers_enabled: bool = False
+
     logger_name: str = "greffer"
 
 

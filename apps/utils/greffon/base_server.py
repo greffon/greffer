@@ -81,10 +81,16 @@ def sync_crl():
 
 
 def change_status(greffon_id, status):
+    # Timeout prevents the monitor worker (both Django's sync thread and
+    # the FastAPI async equivalent in app/workers/monitor.py) from hanging
+    # indefinitely on a stalled manager. Without this, ``run_sync`` in the
+    # async path would block lifespan shutdown; the sync path would freeze
+    # the entire monitor thread.
     return requests.post(
         f'{base_server}/api/greffer/instances/{greffon_id}/',
         json={
             'status': status,
         },
         verify=ssl_verify,
+        timeout=10,
     )

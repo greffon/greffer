@@ -12,15 +12,19 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME', 'greffer'))
 def monitor_status(delay=5):
     greffon_dir = os.getenv('GREFFON_PATH')
     prev_status = {}
-    try:
-        while True:
-            logger.info("monitoring begin")
+    # Per-tick try/except. The previous version placed try/except outside
+    # the while loop, so the first exception (including transient network
+    # errors from base_server.change_status — now that it carries a 10s
+    # timeout) killed monitoring permanently until process restart. Now
+    # a bad tick is logged and the next iteration tries again.
+    while True:
+        logger.info("monitoring begin")
+        try:
             for greffon_id in os.listdir(greffon_dir):
                 status = compose.get_status(greffon_id)['status']
                 if prev_status.get(greffon_id) != status:
                     base_server.change_status(greffon_id, status)
                 prev_status[greffon_id] = status
-            time.sleep(delay)
-    except Exception as e:
-        logger.error(e)
-        time.sleep(delay*2)
+        except Exception as e:
+            logger.error("monitor tick failed: %s", e)
+        time.sleep(delay)
