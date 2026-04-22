@@ -13,9 +13,16 @@ RUN apk update \
 WORKDIR /app
 COPY pyproject.toml poetry.lock /app/
 ENV PATH="${PATH}:/root/.local/bin"
-RUN poetry install --no-root && poetry run pip install "setuptools<78"
+RUN poetry install --no-root
 COPY . /app
-# Run pending ops migrations BEFORE the HTTP surface opens so they can't race
-# with request handlers that touch $GREFFON_PATH. Non-blocking on soft failure:
-# the framework's partial-apply prevention means next boot retries.
-CMD ["sh", "-c", "poetry run python manage.py apply_ops_migrations; exec poetry run python manage.py runserver 0.0.0.0:8000"]
+
+# Run pending ops migrations BEFORE uvicorn binds, so they can't race with
+# request handlers that touch $GREFFON_PATH. `&&` (not `;`): if
+# apply_ops_migrations exits non-zero, refuse to start the server — safer
+# than the pre-cutover `;` which started anyway.
+#
+# --workers 1 is a hard requirement: multi-worker uvicorn would spawn N
+# copies of each background task (register / monitor / CRL sync), each
+# minting its own token and fighting the manager over cert state. See
+# HLD #3 § Single-worker uvicorn constraint.
+CMD ["sh", "-c", "poetry run python -m app.cli apply_ops_migrations && exec poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8000 --workers 1"]

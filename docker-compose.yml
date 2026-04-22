@@ -6,18 +6,27 @@ services:
     restart: unless-stopped
     networks:
       - internal
-    # Run pending ops migrations BEFORE the HTTP surface opens so they
-    # can't race with request handlers that touch $GREFFON_PATH. On first
-    # boot after an upgrade this migrates pre-namespacing catalog volumes;
-    # steady state it's a no-op in <100ms.
+    # Run pending ops migrations BEFORE uvicorn binds so they can't race
+    # with request handlers that touch $GREFFON_PATH. `&&` not `;`: a
+    # non-zero exit from apply_ops_migrations refuses to start the server.
+    # --workers 1 is a hard requirement (HLD #3 § Single-worker uvicorn
+    # constraint) — multi-worker would spawn N copies of the background
+    # tasks, each with its own token, fighting the manager.
     command:
       - sh
       - -c
       - |
-        poetry run python manage.py apply_ops_migrations
-        exec poetry run python manage.py runserver 0.0.0.0:8000
+        poetry run python -m app.cli apply_ops_migrations && \
+        exec poetry run uvicorn --factory app.main:create_app \
+          --host 0.0.0.0 --port 8000 --workers 1
     env_file: &envfile
       - env.env
+    environment:
+      # Feature #3 shipped dormant; flip it on here at the cutover moment.
+      # Without this, the greffer would boot with the HTTP surface alive
+      # but no register / monitor / CRL workers — the manager would never
+      # see a cert handshake or instance-status callbacks.
+      - GREFFER_WORKERS_ENABLED=true
     extra_hosts:
       - "greffon.io:host-gateway"
       - "host.docker.internal:host-gateway"

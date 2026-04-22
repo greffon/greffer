@@ -4,14 +4,23 @@ version = "0.1.0"
 description = ""
 authors = ["Greffon <admin@greffon.io>"]
 license = "MIT"
+# This repo is an application (FastAPI service), not a distributable
+# library. Prior to cutover, the ``greffer`` Django project module was
+# the implicit "package" poetry looked for; now that Django is gone,
+# there's no top-level module matching the project name. Turning off
+# package mode tells poetry to manage dependencies only.
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
-Django = "~3.2"
-djangorestframework = "^3.13.1"
-django-q = "^1.3.9"
 Jinja2 = "^3.0.3"
-requests = "^2.26.0"
+# Pinned to the 2.26 line because docker SDK 5.0.3 + urllib3 v1 assume
+# the older ``requests`` HTTP-adapter behavior. Newer requests (2.30+)
+# require urllib3 v2 which rejects the ``http+docker://`` scheme the
+# docker SDK uses. Drop these pins when docker SDK is upgraded to ^7.0
+# (out of scope for this epic).
+requests = "~2.26"
+urllib3 = "<2"
 python-datauri = "^1.1.0"
 docker = "^5.0.3"
 pyyaml = "^6.0.1"
@@ -26,9 +35,9 @@ pytest = "^8.0"
 pytest-asyncio = "^0.23"
 httpx = "^0.27"
 # docker SDK 5.0.3 uses `distutils`, removed from stdlib in Python 3.12.
-# The production Dockerfile installs `setuptools<78` as a post-install step
-# to vendor distutils back in. We mirror that here so pytest works on local
-# Python 3.12+ interpreters. Remove once docker SDK is upgraded to ^7.0
+# The production container runs Python 3.11 (distutils still stdlib) so
+# the production image does not need this workaround. Local dev on Python
+# 3.12+ does. Removable entirely once docker SDK is upgraded to ^7.0
 # (out of scope for this epic).
 setuptools = "<70"
 

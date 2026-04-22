@@ -3,7 +3,7 @@ import os
 import tempfile
 from unittest.mock import patch
 
-from django.test import TestCase
+from unittest import TestCase
 
 from apps.utils.ops_migrations import registry, runner
 from apps.utils.ops_migrations.base import Migration

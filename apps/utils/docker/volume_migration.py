@@ -4,7 +4,7 @@ This module keeps a thin `run(data_root=None)` callable so any external code
 (none found in-tree beyond the old views.py import that's now removed)
 still works through one deprecation cycle. New callers should prefer
 
-    python manage.py apply_ops_migrations
+    python -m app.cli apply_ops_migrations
 
 or, programmatically,
 
@@ -28,7 +28,7 @@ def run(data_root: str | None = None) -> dict:
     """Deprecated entry point. Delegates to the 0001 migration's run()."""
     warnings.warn(
         "apps.utils.docker.volume_migration.run is deprecated. Use the "
-        "`apply_ops_migrations` management command, or call "
+        "`python -m app.cli apply_ops_migrations` entrypoint, or call "
         "`apps.utils.ops_migrations.runner.apply_pending(data_root)`.",
         DeprecationWarning,
         stacklevel=2,
