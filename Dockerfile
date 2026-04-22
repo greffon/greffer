@@ -8,7 +8,10 @@ RUN apk update \
             libffi-dev \
             docker \
             docker-compose \
-      && pip install --no-cache-dir "poetry==1.4.2"
+      && pip install --no-cache-dir "poetry==1.8.5"
+# Poetry 1.8+ is required because pyproject.toml uses `package-mode = false`
+# (introduced in 1.8.0). With 1.4.2 the container build fails at
+# `poetry install` with an unknown-key parse error.
 
 WORKDIR /app
 COPY pyproject.toml poetry.lock /app/
