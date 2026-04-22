@@ -137,3 +137,53 @@ async def test_monitor_worker_cancellable_during_sleep(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_cancel_is_snappy_during_blocking_tick(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: If ``anyio.to_thread.run_sync`` were called without
+    ``abandon_on_cancel=True``, cancellation during a hung ``requests.get``
+    would block lifespan shutdown until the call eventually returned.
+
+    This test simulates a blocking tick and verifies cancellation returns
+    within a short budget. Without the fix, the test would hang for
+    several seconds waiting for the thread.
+    """
+    import threading
+    import time
+
+    app = create_app(token="t", settings=settings)
+    tick_started = threading.Event()
+    never_complete = threading.Event()
+
+    def _blocking_tick(_settings, _prev):
+        tick_started.set()
+        # Block the thread until test-teardown releases it.
+        never_complete.wait(timeout=10)
+
+    monkeypatch.setattr(
+        "app.workers.monitor._one_monitor_tick", _blocking_tick
+    )
+
+    task = asyncio.create_task(monitor_worker(app))
+    # Wait until the blocking tick has actually started in the threadpool.
+    for _ in range(50):
+        if tick_started.is_set():
+            break
+        await asyncio.sleep(0.02)
+    assert tick_started.is_set(), "blocking tick never started"
+
+    cancel_t0 = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+    cancel_duration = time.monotonic() - cancel_t0
+    # Must return in well under the 10s fake-block. Small budget chosen
+    # to catch regressions — on a healthy machine abandon_on_cancel
+    # returns in a few ms.
+    assert cancel_duration < 1.0, f"cancel took {cancel_duration}s"
+
+    # Cleanup: unblock the leaked thread so pytest doesn't hang on exit.
+    never_complete.set()

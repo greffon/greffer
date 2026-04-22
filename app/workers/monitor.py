@@ -29,8 +29,13 @@ async def monitor_worker(app: FastAPI) -> None:
         while True:
             logger.info("monitoring begin")
             try:
+                # abandon_on_cancel=True — lifespan shutdown returns
+                # immediately even if a tick is mid-docker-API call.
                 await anyio.to_thread.run_sync(
-                    _one_monitor_tick, settings, prev_status
+                    _one_monitor_tick,
+                    settings,
+                    prev_status,
+                    abandon_on_cancel=True,
                 )
             except asyncio.CancelledError:
                 raise

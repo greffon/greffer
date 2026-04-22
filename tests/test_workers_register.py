@@ -176,11 +176,12 @@ async def test_register_worker_retries_post_on_connection_error(
     with patch("app.workers.register.requests") as mock_requests, patch(
         "apps.utils.docker.base.copy_file_into_container"
     ):
-        # Patching the whole `requests` module replaces `requests.ConnectionError`
-        # with a MagicMock child, which isn't a real exception class — so
-        # `except requests.ConnectionError:` in the worker raises TypeError.
-        # Pin the real class on the mock so the except clause still works.
+        # Patching the whole `requests` module replaces exception classes
+        # with MagicMock children, which aren't real exception classes —
+        # the `except (ConnectionError, Timeout):` clause raises TypeError
+        # unless we pin the real classes on the mock.
         mock_requests.ConnectionError = requests.ConnectionError
+        mock_requests.Timeout = requests.Timeout
         mock_requests.post.side_effect = [
             requests.ConnectionError(),
             MagicMock(),  # second POST succeeds
@@ -198,6 +199,65 @@ async def test_register_worker_retries_post_on_connection_error(
     assert mock_requests.post.call_count == 2
     # The first sleep must be the register-retry delay.
     assert 3.0 in sleeps
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_post_on_timeout(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``requests.Timeout`` is not a ``ConnectionError`` subclass. Verify
+    the except clause covers both so a slow manager doesn't crash the
+    worker."""
+    app = create_app(token="tok", settings=settings)
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.ConnectionError = requests.ConnectionError
+        mock_requests.Timeout = requests.Timeout
+        mock_requests.post.side_effect = [
+            requests.Timeout(),  # first POST times out
+            MagicMock(),  # second POST succeeds
+        ]
+        cert_response = MagicMock()
+        cert_response.status_code = 200
+        cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock()
+        crl.status_code = 200
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [cert_response, crl]
+
+        await register_worker(app)
+
+    assert mock_requests.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_post_register_carries_timeout(settings: Settings) -> None:
+    """_post_register must pass ``timeout`` so the thread can't hang on a
+    stalled manager."""
+    with patch("app.workers.register.requests") as mock_requests:
+        _post_register(settings, "10.0.0.1", "tok")
+    assert "timeout" in mock_requests.post.call_args.kwargs
+    assert mock_requests.post.call_args.kwargs["timeout"] == 10.0
+
+
+def test_fetch_cert_carries_timeout(settings: Settings) -> None:
+    """_fetch_cert must pass ``timeout`` so the cert-poll thread can't
+    hang."""
+    with patch("app.workers.register.requests") as mock_requests:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {}
+        mock_requests.get.return_value = mock_response
+        _fetch_cert(settings)
+    assert "timeout" in mock_requests.get.call_args.kwargs
+    assert mock_requests.get.call_args.kwargs["timeout"] == 10.0
 
 
 @pytest.mark.asyncio

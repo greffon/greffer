@@ -27,9 +27,13 @@ async def crl_sync_worker(app: FastAPI) -> None:
             # Sleep first to match legacy order — register_worker has
             # already fetched the initial CRL.
             await asyncio.sleep(settings.crl_sync_interval)
-            # _fetch_and_store_crl owns its own exception handling (logs and
-            # continues); no outer try/except needed here.
-            await anyio.to_thread.run_sync(_fetch_and_store_crl, settings)
+            # _fetch_and_store_crl owns its own exception handling (logs
+            # and continues); no outer try/except needed here.
+            # abandon_on_cancel=True keeps shutdown snappy even if the
+            # fetch is mid-flight.
+            await anyio.to_thread.run_sync(
+                _fetch_and_store_crl, settings, abandon_on_cancel=True
+            )
     except asyncio.CancelledError:
         logger.info("crl_sync cancelled")
         raise

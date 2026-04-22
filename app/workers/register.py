@@ -26,25 +26,41 @@ logger = logging.getLogger("greffer")
 
 _REGISTER_RETRY_SECONDS = 3.0
 _CERT_POLL_SECONDS = 5.0
+_HTTP_TIMEOUT_SECONDS = 10.0
 
 
 async def register_worker(app: FastAPI) -> None:
-    """Register with the manager and block until cert is installed."""
+    """Register with the manager and block until cert is installed.
+
+    All ``anyio.to_thread.run_sync`` calls use ``abandon_on_cancel=True`` so
+    that lifespan shutdown doesn't block waiting for a hung HTTP call — the
+    async task returns immediately on cancel and the thread finishes (or
+    gets killed at process exit) in the background. Every HTTP call also
+    carries a ``timeout`` so the thread can't hang forever in the first
+    place.
+    """
     settings: Settings = app.state.settings
     token: str = app.state.greffer_token
 
     address = settings.greffer_address or await anyio.to_thread.run_sync(
-        _resolve_hostname
+        _resolve_hostname, abandon_on_cancel=True
     )
 
     # Phase 1: POST until the manager is reachable at all.
     while True:
         try:
             await anyio.to_thread.run_sync(
-                _post_register, settings, address, token
+                _post_register,
+                settings,
+                address,
+                token,
+                abandon_on_cancel=True,
             )
             break
-        except requests.ConnectionError:
+        except (requests.ConnectionError, requests.Timeout):
+            # Timeout covers both ConnectTimeout and ReadTimeout — the
+            # latter isn't a subclass of ConnectionError, so we need it
+            # explicitly to retry the POST on a slow/hung manager.
             logger.info(
                 "manager not reachable at %s, retrying in %ss",
                 settings.greffon_base_server,
@@ -54,10 +70,16 @@ async def register_worker(app: FastAPI) -> None:
 
     # Phase 2: poll for cert until 200.
     while True:
-        data = await anyio.to_thread.run_sync(_fetch_cert, settings)
+        data = await anyio.to_thread.run_sync(
+            _fetch_cert, settings, abandon_on_cancel=True
+        )
         if data is not None:
-            await anyio.to_thread.run_sync(_install_cert, settings, data)
-            await anyio.to_thread.run_sync(_fetch_and_store_crl, settings)
+            await anyio.to_thread.run_sync(
+                _install_cert, settings, data, abandon_on_cancel=True
+            )
+            await anyio.to_thread.run_sync(
+                _fetch_and_store_crl, settings, abandon_on_cancel=True
+            )
             logger.info("register complete")
             return
         await asyncio.sleep(_CERT_POLL_SECONDS)
@@ -86,6 +108,10 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
             "protocol": settings.greffer_protocol,
         },
         verify=settings.greffer_ssl_verify,
+        # Timeout is a safety net so the thread can't hang forever on a
+        # stalled manager. Paired with abandon_on_cancel=True on the caller
+        # side so shutdown is snappy regardless.
+        timeout=_HTTP_TIMEOUT_SECONDS,
     )
 
 
@@ -93,6 +119,7 @@ def _fetch_cert(settings: Settings) -> dict[str, Any] | None:
     res = requests.get(
         f"{settings.greffon_base_server}/api/greffer/certificate/{settings.greffer_id}/",
         verify=settings.greffer_ssl_verify,
+        timeout=_HTTP_TIMEOUT_SECONDS,
     )
     return res.json() if res.status_code == 200 else None
 

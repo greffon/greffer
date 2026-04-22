@@ -167,6 +167,7 @@ class ChangeStatusTests(unittest.TestCase):
             'https://test.greffon.io/api/greffer/instances/instance-42/',
             json={'status': 'running'},
             verify=False,
+            timeout=10,
         )
 
     @patch('apps.utils.greffon.base_server.requests')
