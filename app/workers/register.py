@@ -68,11 +68,21 @@ async def register_worker(app: FastAPI) -> None:
             )
             await asyncio.sleep(_REGISTER_RETRY_SECONDS)
 
-    # Phase 2: poll for cert until 200.
+    # Phase 2: poll for cert until 200. Catch transient network errors
+    # so a blip after the initial POST doesn't terminate the worker and
+    # leave the greffer stuck unregistered until process restart.
     while True:
-        data = await anyio.to_thread.run_sync(
-            _fetch_cert, settings, abandon_on_cancel=True
-        )
+        try:
+            data = await anyio.to_thread.run_sync(
+                _fetch_cert, settings, abandon_on_cancel=True
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            logger.info(
+                "manager cert endpoint unreachable, retrying in %ss",
+                _CERT_POLL_SECONDS,
+            )
+            await asyncio.sleep(_CERT_POLL_SECONDS)
+            continue
         if data is not None:
             await anyio.to_thread.run_sync(
                 _install_cert, settings, data, abandon_on_cancel=True

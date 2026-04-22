@@ -261,6 +261,50 @@ def test_fetch_cert_carries_timeout(settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_register_worker_survives_cert_poll_transient_error(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: a transient ConnectionError/Timeout during the cert
+    poll (phase 2) must be caught and retried — otherwise the one-shot
+    worker terminates and the greffer sits unregistered until process
+    restart, even though the initial POST succeeded.
+    """
+    app = create_app(token="tok", settings=settings)
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.ConnectionError = requests.ConnectionError
+        mock_requests.Timeout = requests.Timeout
+        mock_requests.post.return_value = MagicMock()
+
+        cert_response = MagicMock()
+        cert_response.status_code = 200
+        cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock()
+        crl.status_code = 200
+        crl.text = "CRL"
+        # Sequence: connection error, timeout, success, CRL.
+        mock_requests.get.side_effect = [
+            requests.ConnectionError("blip"),
+            requests.Timeout("slow"),
+            cert_response,
+            crl,
+        ]
+
+        # Must complete without propagating the transient errors.
+        await register_worker(app)
+
+    # Two failed polls + one successful cert fetch + one CRL fetch = 4 GETs.
+    assert mock_requests.get.call_count == 4
+
+
+@pytest.mark.asyncio
 async def test_register_worker_polls_cert_until_200(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
