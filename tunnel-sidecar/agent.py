@@ -62,6 +62,30 @@ def _load_token() -> str:
     return token
 
 
+def _resolve_ca_bundle():
+    """Return the verify= value for ``requests``.
+
+    If CA_BUNDLE_PATH is explicitly set, use it verbatim — requests will
+    raise at call-time if the file is missing, which is the right signal
+    for a misconfigured operator intent.
+
+    If CA_BUNDLE_PATH is not set and the default `/secrets/ca.pem` is
+    absent, fall back to ``True`` (system CA store). This keeps the
+    sidecar functional in deployments that rely on Let's Encrypt /
+    public CA for the manager, without forcing a dummy secret mount.
+    """
+    explicit = os.environ.get('CA_BUNDLE_PATH')
+    if explicit:
+        return explicit
+    default_path = '/secrets/ca.pem'
+    if Path(default_path).exists():
+        return default_path
+    logger.info(
+        'ca_bundle_using_system_store default_path=%s absent', default_path,
+    )
+    return True
+
+
 def _atomic_write(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + '.tmp')
@@ -107,7 +131,7 @@ def main() -> int:
     except (KeyError, RuntimeError) as exc:
         logger.error('startup_config_missing error=%s', exc)
         return 2
-    ca_bundle = os.environ.get('CA_BUNDLE_PATH', '/secrets/ca.pem')
+    ca_bundle = _resolve_ca_bundle()
     url = f'{manager_url}/api/greffer/{greffer_id}/tunnel-config/'
     session = requests.Session()
     state = {'rathole': None}

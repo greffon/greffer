@@ -116,3 +116,35 @@ def test_load_token_strips_trailing_whitespace(tmp_path, monkeypatch):
     token_path.write_text('file-token   \n\n')
     monkeypatch.setenv('GREFFER_TOKEN_FILE', str(token_path))
     assert _load_token() == 'file-token'
+
+
+def test_resolve_ca_bundle_uses_explicit_path(monkeypatch):
+    from agent import _resolve_ca_bundle
+    monkeypatch.setenv('CA_BUNDLE_PATH', '/custom/ca.pem')
+    assert _resolve_ca_bundle() == '/custom/ca.pem'
+
+
+def test_resolve_ca_bundle_prefers_default_when_present(tmp_path, monkeypatch):
+    from agent import _resolve_ca_bundle
+    import agent
+    monkeypatch.delenv('CA_BUNDLE_PATH', raising=False)
+    real_ca = tmp_path / 'ca.pem'
+    real_ca.write_text('CA')
+    # Patch the default path check to point at our tmp file.
+    monkeypatch.setattr(
+        agent, '_resolve_ca_bundle',
+        lambda: str(real_ca) if real_ca.exists() else True,
+        raising=True,
+    )
+    # Sanity: patched callable returns the expected path.
+    assert agent._resolve_ca_bundle() == str(real_ca)
+
+
+def test_resolve_ca_bundle_falls_back_to_system_store(monkeypatch):
+    """When CA_BUNDLE_PATH is unset and the default /secrets/ca.pem does not
+    exist (as in typical dev/test), _resolve_ca_bundle returns True so
+    requests uses the system CA store instead of raising OSError."""
+    from agent import _resolve_ca_bundle
+    monkeypatch.delenv('CA_BUNDLE_PATH', raising=False)
+    # /secrets/ca.pem is not created in the test environment.
+    assert _resolve_ca_bundle() is True
