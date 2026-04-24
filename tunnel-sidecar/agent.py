@@ -22,12 +22,13 @@ import os
 import signal
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 
 import requests
 
 CONFIG_PATH = Path('/etc/rathole/client.toml')
+DEFAULT_CA_BUNDLE_PATH = '/secrets/ca.pem'
 POLL_INTERVAL = float(os.environ.get('POLL_INTERVAL_SECONDS', '2'))
 BACKOFF_MAX = 30.0
 REQUEST_TIMEOUT = 10.0
@@ -35,14 +36,17 @@ USER_AGENT = 'greffer-tunnel-sidecar/1.0'
 
 logger = logging.getLogger('tunnel-sidecar')
 
-_shutdown = False
+# Event-based shutdown so signal handlers can interrupt a blocking wait
+# immediately. A bool + time.sleep(backoff) would leave the loop sleeping
+# up to BACKOFF_MAX seconds after SIGTERM, causing orchestrators with short
+# stop timeouts to fall back to SIGKILL before the agent exits cleanly.
+_shutdown_event = threading.Event()
 
 
 def _install_signal_handlers(state):
     def _handler(signum, _frame):
-        global _shutdown
         logger.info('signal_received signal=%s', signum)
-        _shutdown = True
+        _shutdown_event.set()
         rathole = state.get('rathole')
         if rathole and rathole.poll() is None:
             rathole.terminate()
@@ -77,11 +81,11 @@ def _resolve_ca_bundle():
     explicit = os.environ.get('CA_BUNDLE_PATH')
     if explicit:
         return explicit
-    default_path = '/secrets/ca.pem'
-    if Path(default_path).exists():
-        return default_path
+    if Path(DEFAULT_CA_BUNDLE_PATH).exists():
+        return DEFAULT_CA_BUNDLE_PATH
     logger.info(
-        'ca_bundle_using_system_store default_path=%s absent', default_path,
+        'ca_bundle_using_system_store default_path=%s absent',
+        DEFAULT_CA_BUNDLE_PATH,
     )
     return True
 
@@ -144,7 +148,7 @@ def main() -> int:
     etag = None
     current_hash = None
     backoff = POLL_INTERVAL
-    while not _shutdown:
+    while not _shutdown_event.is_set():
         try:
             new_etag, new_body = poll_once(
                 session, url, token, etag, ca_bundle,
@@ -166,16 +170,22 @@ def main() -> int:
             backoff = min(backoff * 2, BACKOFF_MAX)
 
         rathole = state['rathole']
-        if rathole and rathole.poll() is not None and not _shutdown:
+        if rathole and rathole.poll() is not None and not _shutdown_event.is_set():
             logger.error('rathole_exited code=%s', rathole.returncode)
             return 1
-        time.sleep(backoff)
+        # Event-wait is signal-aware: a SIGTERM/SIGINT during the wait
+        # sets the event and wakes us immediately, bounding shutdown
+        # latency to the time it takes rathole to SIGTERM-exit (handled
+        # below), not the full backoff interval.
+        if _shutdown_event.wait(timeout=backoff):
+            break
 
     rathole = state['rathole']
     if rathole and rathole.poll() is None:
         try:
             rathole.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            logger.warning('rathole_kill pid=%s (did not exit in 5s)', rathole.pid)
             rathole.kill()
     logger.info('agent_shutdown')
     return 0
