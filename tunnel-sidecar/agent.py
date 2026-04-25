@@ -31,7 +31,12 @@ CONFIG_PATH = Path('/etc/rathole/client.toml')
 DEFAULT_CA_BUNDLE_PATH = '/secrets/ca.pem'
 POLL_INTERVAL = float(os.environ.get('POLL_INTERVAL_SECONDS', '2'))
 BACKOFF_MAX = 30.0
-REQUEST_TIMEOUT = 10.0
+# Short per-request timeout bounds the worst-case shutdown delay: on
+# SIGTERM the signal handler also calls session.close(), so any in-flight
+# request raises promptly. Kept at 3s so a slow but healthy manager
+# (mid-reload) is still tolerated — the 5s container-stop grace period
+# common in container runtimes stays clear of SIGKILL.
+REQUEST_TIMEOUT = 3.0
 USER_AGENT = 'greffer-tunnel-sidecar/1.0'
 
 logger = logging.getLogger('tunnel-sidecar')
@@ -50,6 +55,16 @@ def _install_signal_handlers(state):
         rathole = state.get('rathole')
         if rathole and rathole.poll() is None:
             rathole.terminate()
+        session = state.get('session')
+        if session is not None:
+            # Best-effort: closing the session drops the underlying sockets,
+            # so an in-flight session.get() raises promptly via
+            # requests.RequestException rather than blocking for REQUEST_TIMEOUT
+            # while shutdown is already in progress.
+            try:
+                session.close()
+            except Exception:
+                pass
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _handler)
 
@@ -138,7 +153,7 @@ def main() -> int:
     ca_bundle = _resolve_ca_bundle()
     url = f'{manager_url}/api/greffer/{greffer_id}/tunnel-config/'
     session = requests.Session()
-    state = {'rathole': None}
+    state = {'rathole': None, 'session': session}
     _install_signal_handlers(state)
     logger.info(
         'agent_started greffer_id=%s manager=%s poll_interval_s=%s',
