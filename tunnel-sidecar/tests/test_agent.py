@@ -24,6 +24,13 @@ class _Resp:
         self.text = text
         self.headers = {'ETag': etag} if etag else {}
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests as _r
+            raise _r.HTTPError(
+                f'{self.status_code} from server', response=self,
+            )
+
 
 def test_poll_once_200_returns_etag_and_body():
     from agent import poll_once
@@ -43,13 +50,28 @@ def test_poll_once_304_returns_existing_etag_no_body():
     assert body is None
 
 
-def test_poll_once_non_2xx_does_not_raise():
+def test_poll_once_4xx_does_not_raise():
+    """4xx: log and keep polling at base interval — typically operator-fixable
+    state (bad token, greffer not provisioned, mode masked as 404)."""
     from agent import poll_once
     session = MagicMock()
-    for status in (401, 403, 404, 500):
+    for status in (401, 403, 404):
         session.get.return_value = _Resp(status)
         etag, body = poll_once(session, 'http://m', 'tok', 'v1', '/ca')
         assert body is None, f'status {status}'
+
+
+def test_poll_once_5xx_raises_for_backoff():
+    """5xx: re-raise so main loop's RequestException branch applies
+    exponential backoff during a manager outage, instead of every sidecar
+    re-polling at the base interval and amplifying load."""
+    import requests
+    from agent import poll_once
+    session = MagicMock()
+    for status in (500, 502, 503, 504):
+        session.get.return_value = _Resp(status)
+        with pytest.raises(requests.HTTPError):
+            poll_once(session, 'http://m', 'tok', 'v1', '/ca')
 
 
 def test_poll_once_sends_if_none_match_when_etag_known():
@@ -116,6 +138,16 @@ def test_load_token_strips_trailing_whitespace(tmp_path, monkeypatch):
     token_path.write_text('file-token   \n\n')
     monkeypatch.setenv('GREFFER_TOKEN_FILE', str(token_path))
     assert _load_token() == 'file-token'
+
+
+def test_load_token_raises_on_empty_file(tmp_path, monkeypatch):
+    """Whitespace-only secret file → fail loud, not endless 401s."""
+    from agent import _load_token
+    token_path = tmp_path / 'token'
+    token_path.write_text('   \n\n')
+    monkeypatch.setenv('GREFFER_TOKEN_FILE', str(token_path))
+    with pytest.raises(RuntimeError, match='empty'):
+        _load_token()
 
 
 def test_resolve_ca_bundle_uses_explicit_path(monkeypatch):

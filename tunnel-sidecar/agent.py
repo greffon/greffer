@@ -72,7 +72,15 @@ def _install_signal_handlers(state):
 def _load_token() -> str:
     token_file = os.environ.get('GREFFER_TOKEN_FILE')
     if token_file:
-        return Path(token_file).read_text().strip()
+        token = Path(token_file).read_text().strip()
+        if not token:
+            # Empty / whitespace-only secret file would produce endless
+            # 401 polling against manager — fail loud with the file path
+            # so an operator can fix the mount or the secret.
+            raise RuntimeError(
+                f'GREFFER_TOKEN_FILE={token_file} is empty or whitespace-only'
+            )
+        return token
     token = os.environ.get('GREFFER_TOKEN')
     if not token:
         raise RuntimeError(
@@ -119,7 +127,15 @@ def _start_rathole() -> subprocess.Popen:
 
 
 def poll_once(session, url, token, etag, ca_bundle):
-    """Single GET against /tunnel-config/. Returns (etag, body_or_None)."""
+    """Single GET against /tunnel-config/. Returns (etag, body_or_None).
+
+    Raises ``requests.HTTPError`` on 5xx so the main loop's RequestException
+    branch applies exponential backoff — without this, many sidecars
+    re-poll a struggling manager every POLL_INTERVAL (2s by default) and
+    amplify load during an outage. 4xx responses are logged at base
+    interval since they typically reflect operator-fixable state
+    (bad token, greffer not provisioned yet) rather than overload.
+    """
     headers = {'X-GREFFON-TOKEN': token, 'User-Agent': USER_AGENT}
     if etag:
         headers['If-None-Match'] = etag
@@ -130,10 +146,12 @@ def poll_once(session, url, token, etag, ca_bundle):
         return etag, None
     if resp.status_code == 200:
         return resp.headers.get('ETag'), resp.text
-    # 401/403 (bad token), 404 (greffer gone / not ready yet / not tunnel
-    # mode — manager masks mode mismatch as 404 to avoid oracles), 5xx.
-    # Log and keep polling — operator can fix manager-side state and the
-    # agent recovers on the next 200.
+    if 500 <= resp.status_code < 600:
+        # Triggers the main loop's exponential backoff via the existing
+        # except requests.RequestException branch (HTTPError is a subclass).
+        resp.raise_for_status()
+    # 401/403 (bad token), 404 (greffer gone / not ready yet / mode-mismatch
+    # masked as 404 to avoid oracles). Operator-fixable; keep polling.
     logger.warning('unexpected_status status=%s', resp.status_code)
     return etag, None
 
