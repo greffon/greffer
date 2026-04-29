@@ -34,3 +34,10 @@ jobs:
         with:
           push: true
           tags: greffon/greffer:latest
+      -
+        name: Build and push Tunnel Sidecar
+        uses: docker/build-push-action@v3
+        with:
+          context: "{{defaultContext}}:tunnel-sidecar"
+          push: true
+          tags: greffon/tunnel-sidecar:latest
