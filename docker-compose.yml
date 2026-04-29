@@ -77,10 +77,19 @@ services:
     restart: unless-stopped
     depends_on:
       - greffer
+    # env_file (NOT ``environment: - GREFFER_ID=${GREFFER_ID}``):
+    # Compose ``${VAR}`` interpolation reads from the CLI environment /
+    # project-root .env at parse time — *not* from env_file on a
+    # sibling service. With the ``docker compose --profile tunnel up``
+    # flow documented in the runbook, the operator only edits
+    # ``greffer/env.env``; the CLI env is empty, so interpolation
+    # would inject empty GREFFER_ID / MANAGER_URL into the sidecar
+    # and the agent would 401-loop forever. Reusing the same
+    # ``env.env`` via env_file injects values at container start.
+    env_file: *envfile
     environment:
-      - GREFFER_ID=${GREFFER_ID}
+      # Sidecar-specific values that override / supplement env.env.
       - GREFFER_TOKEN_FILE=/secrets/greffer-token
-      - MANAGER_URL=${MANAGER_URL}
       - POLL_INTERVAL_SECONDS=2
       # CA_BUNDLE_PATH unset → agent falls back to system CA store.
       # Set to a mounted bundle when the manager is signed by a
