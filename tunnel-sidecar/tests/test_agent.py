@@ -140,6 +140,22 @@ def test_load_token_strips_trailing_whitespace(tmp_path, monkeypatch):
     assert _load_token() == 'file-token'
 
 
+def test_load_token_picks_up_file_rotation(tmp_path, monkeypatch):
+    """Greffer can mint a new token on its own restart and rewrite the
+    shared file. _load_token() must always re-read so a subsequent poll
+    sees the new value. Codex P1 on PR #21: previously the agent cached
+    the token at startup and 401-looped indefinitely after greffer
+    rotated."""
+    from agent import _load_token
+    token_path = tmp_path / 'token'
+    token_path.write_text('first-token\n')
+    monkeypatch.setenv('GREFFER_TOKEN_FILE', str(token_path))
+    assert _load_token() == 'first-token'
+    # Simulate greffer restart writing a new value.
+    token_path.write_text('rotated-token\n')
+    assert _load_token() == 'rotated-token'
+
+
 def test_load_token_rejects_empty_file(tmp_path, monkeypatch):
     """Blank or whitespace-only secret file would let the agent loop on
     401 forever with no clear diagnostic. Fail fast at startup instead."""
