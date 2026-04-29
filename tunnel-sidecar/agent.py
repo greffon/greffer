@@ -29,7 +29,7 @@ import requests
 
 CONFIG_PATH = Path('/etc/rathole/client.toml')
 DEFAULT_CA_BUNDLE_PATH = '/secrets/ca.pem'
-POLL_INTERVAL = float(os.environ.get('POLL_INTERVAL_SECONDS', '2'))
+DEFAULT_POLL_INTERVAL = 2.0
 BACKOFF_MAX = 30.0
 # Short per-request timeout bounds the worst-case shutdown delay: on
 # SIGTERM the signal handler also calls session.close(), so any in-flight
@@ -72,7 +72,16 @@ def _install_signal_handlers(state):
 def _load_token() -> str:
     token_file = os.environ.get('GREFFER_TOKEN_FILE')
     if token_file:
-        token = Path(token_file).read_text().strip()
+        try:
+            token = Path(token_file).read_text().strip()
+        except OSError as exc:
+            # Translate unreadable / missing file into RuntimeError so
+            # main()'s startup-config-error path runs and exits cleanly,
+            # rather than letting the OSError escape as an unhandled
+            # traceback.
+            raise RuntimeError(
+                f'cannot read GREFFER_TOKEN_FILE={token_file}: {exc}'
+            ) from exc
         if not token:
             # Empty / whitespace-only secret file would produce endless
             # 401 polling against manager — fail loud with the file path
@@ -87,6 +96,27 @@ def _load_token() -> str:
             'one of GREFFER_TOKEN or GREFFER_TOKEN_FILE must be set'
         )
     return token
+
+
+def _resolve_poll_interval() -> float:
+    """Validate POLL_INTERVAL_SECONDS at startup. Without this, ``0`` /
+    negative values produce a hot loop (wait(timeout=0) returns
+    immediately) and a non-numeric value would crash module import
+    before main() can emit a structured startup error log."""
+    raw = os.environ.get('POLL_INTERVAL_SECONDS')
+    if raw is None or raw == '':
+        return DEFAULT_POLL_INTERVAL
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f'POLL_INTERVAL_SECONDS must be numeric, got {raw!r}'
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            f'POLL_INTERVAL_SECONDS must be > 0, got {value}'
+        )
+    return value
 
 
 def _resolve_ca_bundle():
@@ -165,6 +195,7 @@ def main() -> int:
         greffer_id = os.environ['GREFFER_ID']
         manager_url = os.environ['MANAGER_URL'].rstrip('/')
         token = _load_token()
+        poll_interval = _resolve_poll_interval()
     except (KeyError, RuntimeError) as exc:
         logger.error('startup_config_missing error=%s', exc)
         return 2
@@ -175,12 +206,12 @@ def main() -> int:
     _install_signal_handlers(state)
     logger.info(
         'agent_started greffer_id=%s manager=%s poll_interval_s=%s',
-        greffer_id, manager_url, POLL_INTERVAL,
+        greffer_id, manager_url, poll_interval,
     )
 
     etag = None
     current_hash = None
-    backoff = POLL_INTERVAL
+    backoff = poll_interval
     while not _shutdown_event.is_set():
         try:
             new_etag, new_body = poll_once(
@@ -197,7 +228,7 @@ def main() -> int:
                     current_hash = new_hash
                     logger.info('config_applied etag=%s', new_etag)
             etag = new_etag
-            backoff = POLL_INTERVAL
+            backoff = poll_interval
         except requests.RequestException as exc:
             logger.warning('poll_error error=%s', exc)
             backoff = min(backoff * 2, BACKOFF_MAX)

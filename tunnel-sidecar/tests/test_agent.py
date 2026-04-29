@@ -140,14 +140,62 @@ def test_load_token_strips_trailing_whitespace(tmp_path, monkeypatch):
     assert _load_token() == 'file-token'
 
 
-def test_load_token_raises_on_empty_file(tmp_path, monkeypatch):
-    """Whitespace-only secret file → fail loud, not endless 401s."""
+def test_load_token_rejects_empty_file(tmp_path, monkeypatch):
+    """Blank or whitespace-only secret file would let the agent loop on
+    401 forever with no clear diagnostic. Fail fast at startup instead."""
     from agent import _load_token
     token_path = tmp_path / 'token'
     token_path.write_text('   \n\n')
     monkeypatch.setenv('GREFFER_TOKEN_FILE', str(token_path))
     with pytest.raises(RuntimeError, match='empty'):
         _load_token()
+
+
+def test_load_token_translates_missing_file_to_runtime_error(
+    tmp_path, monkeypatch,
+):
+    """An unreadable file would crash main() with an unhandled OSError;
+    translating to RuntimeError lets the existing startup-config-error
+    path run and exit cleanly."""
+    from agent import _load_token
+    monkeypatch.setenv(
+        'GREFFER_TOKEN_FILE', str(tmp_path / 'does-not-exist'),
+    )
+    with pytest.raises(RuntimeError, match='cannot read'):
+        _load_token()
+
+
+def test_resolve_poll_interval_default_when_unset(monkeypatch):
+    from agent import _resolve_poll_interval, DEFAULT_POLL_INTERVAL
+    monkeypatch.delenv('POLL_INTERVAL_SECONDS', raising=False)
+    assert _resolve_poll_interval() == DEFAULT_POLL_INTERVAL
+
+
+def test_resolve_poll_interval_uses_explicit_value(monkeypatch):
+    from agent import _resolve_poll_interval
+    monkeypatch.setenv('POLL_INTERVAL_SECONDS', '5')
+    assert _resolve_poll_interval() == 5.0
+
+
+def test_resolve_poll_interval_rejects_non_numeric(monkeypatch):
+    from agent import _resolve_poll_interval
+    monkeypatch.setenv('POLL_INTERVAL_SECONDS', 'fast')
+    with pytest.raises(RuntimeError, match='must be numeric'):
+        _resolve_poll_interval()
+
+
+def test_resolve_poll_interval_rejects_zero(monkeypatch):
+    from agent import _resolve_poll_interval
+    monkeypatch.setenv('POLL_INTERVAL_SECONDS', '0')
+    with pytest.raises(RuntimeError, match='must be > 0'):
+        _resolve_poll_interval()
+
+
+def test_resolve_poll_interval_rejects_negative(monkeypatch):
+    from agent import _resolve_poll_interval
+    monkeypatch.setenv('POLL_INTERVAL_SECONDS', '-1')
+    with pytest.raises(RuntimeError, match='must be > 0'):
+        _resolve_poll_interval()
 
 
 def test_resolve_ca_bundle_uses_explicit_path(monkeypatch):
