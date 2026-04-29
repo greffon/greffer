@@ -194,7 +194,15 @@ def main() -> int:
     try:
         greffer_id = os.environ['GREFFER_ID']
         manager_url = os.environ['MANAGER_URL'].rstrip('/')
-        token = _load_token()
+        # Validate one of the token sources is configured at startup —
+        # but DO NOT cache the loaded value. Greffer can mint a fresh
+        # token on its own restart (it's the default behavior) and
+        # rewrite the shared file; the agent re-loads on every poll
+        # below so a fresh token propagates within one POLL_INTERVAL.
+        if not os.environ.get('GREFFER_TOKEN_FILE') and not os.environ.get('GREFFER_TOKEN'):
+            raise RuntimeError(
+                'one of GREFFER_TOKEN or GREFFER_TOKEN_FILE must be set'
+            )
         poll_interval = _resolve_poll_interval()
     except (KeyError, RuntimeError) as exc:
         logger.error('startup_config_missing error=%s', exc)
@@ -213,6 +221,18 @@ def main() -> int:
     current_hash = None
     backoff = poll_interval
     while not _shutdown_event.is_set():
+        try:
+            token = _load_token()
+        except RuntimeError as exc:
+            # Token file missing / empty — greffer hasn't published yet,
+            # the shared volume isn't mounted, or the file got truncated
+            # mid-rotation. Back off and retry. Without this, a brief
+            # transient (greffer restart) would crash the agent.
+            logger.warning('token_load_failed error=%s', exc)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            if _shutdown_event.wait(timeout=backoff):
+                break
+            continue
         try:
             new_etag, new_body = poll_once(
                 session, url, token, etag, ca_bundle,
