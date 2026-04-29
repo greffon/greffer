@@ -33,6 +33,11 @@ services:
     volumes:
       - ./:/app
       - /var/run/docker.sock:/var/run/docker.sock
+      # Shared with tunnel-sidecar so the agent can read the FastAPI
+      # token (settings.greffer_token_file_path). Always mounted so
+      # proxy-mode deployments don't need a separate compose layer; the
+      # token write itself is a no-op when the sidecar isn't running.
+      - tunnel-secrets:/run/tunnel-secrets
   nginx:
     build: ./nginx
     restart: unless-stopped
@@ -44,5 +49,55 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - 8001:443
+  # Tunnel-mode sidecar. Started only when the operator opts in via
+  # `docker compose --profile tunnel up`. Proxy-mode greffers pay zero
+  # cost — the container is never created.
+  #
+  # network_mode: host so rathole-client can reach manager outbound and
+  # 127.0.0.1 services on the host. Note: this gives rathole-client
+  # access to ANY 127.0.0.1 service on the host (sshd, local DBs);
+  # operator runbook recommends running the greffer host in a VM.
+  # Tunnel-mode sidecar. Started only when the operator opts in via
+  # `docker compose --profile tunnel up`. Proxy-mode greffers pay zero
+  # cost — the container is never created.
+  #
+  # network_mode: host so rathole-client can reach manager outbound and
+  # 127.0.0.1 services on the host. Note: this gives rathole-client
+  # access to ANY 127.0.0.1 service on the host (sshd, local DBs);
+  # operator runbook recommends running the greffer host in a VM.
+  #
+  # Auth: the FastAPI greffer's lifespan writes its active token to the
+  # tunnel-secrets shared volume; sidecar reads via GREFFER_TOKEN_FILE.
+  # Token rotates automatically on greffer restart. **v1 design** —
+  # see app/main.py for the rationale and the planned mTLS migration.
+  tunnel-sidecar:
+    build: ./tunnel-sidecar
+    profiles: ["tunnel"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - greffer
+    environment:
+      - GREFFER_ID=${GREFFER_ID}
+      - GREFFER_TOKEN_FILE=/secrets/greffer-token
+      - MANAGER_URL=${MANAGER_URL}
+      - POLL_INTERVAL_SECONDS=2
+      # CA_BUNDLE_PATH unset → agent falls back to system CA store.
+      # Set to a mounted bundle when the manager is signed by a
+      # private CA.
+    volumes:
+      # Read-only mount of the shared volume the FastAPI greffer
+      # publishes its token into. Sidecar never writes here.
+      - tunnel-secrets:/secrets:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "agent.py"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+volumes:
+  # Token handoff between FastAPI greffer (writer) and tunnel-sidecar
+  # (reader). Named volume keeps it inside the docker-managed area;
+  # nothing on the host filesystem to chmod.
+  tunnel-secrets:
 networks:
   internal: {}
