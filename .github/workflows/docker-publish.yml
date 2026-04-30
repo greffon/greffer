@@ -41,3 +41,21 @@ jobs:
           context: "{{defaultContext}}:tunnel-sidecar"
           push: true
           tags: greffon/tunnel-sidecar:latest
+          # Multi-arch: amd64 + arm64. The tunnel-sidecar Dockerfile
+          # downloads the correct rathole binary per TARGETARCH; the
+          # smoke-test on greffon/greffon root confirmed Debian-slim
+          # base runs both arches cleanly.
+          platforms: linux/amd64,linux/arm64
+      -
+        name: Build and push Rathole Server
+        uses: docker/build-push-action@v3
+        with:
+          context: "{{defaultContext}}:rathole-server"
+          push: true
+          tags: greffon/rathole-server:latest
+          # Multi-arch wraps rapiz1/rathole's published Linux artefacts
+          # (amd64 gnu, arm64 musl). Replaces direct use of
+          # rapiz1/rathole:v0.5.0 in greffon/greffon root compose, which
+          # only ships an amd64 manifest and forces emulation on
+          # ARM hosts (Apple Silicon, Graviton, Pi).
+          platforms: linux/amd64,linux/arm64
