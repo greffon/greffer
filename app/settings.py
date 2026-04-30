@@ -23,6 +23,17 @@ class Settings(BaseSettings):
     # ``app/lifespan.py`` for the write side.
     greffer_token: str | None = None
 
+    # Optional mode declaration, included in the register payload so the
+    # manager can validate the greffer-side intent matches the stored
+    # ``Greffer.mode``. Operators flipping a registered greffer between
+    # proxy ↔ tunnel via ``PATCH /api/greffer/{id}/mode/`` MUST also set
+    # this on the greffer host (env.env: ``GREFFER_MODE=tunnel``) and
+    # restart the greffer; otherwise the next register call sends no
+    # mode (defaulting to ``proxy`` server-side) and 400s with
+    # ``mode_mismatch`` against the new stored value, leaving the greffer
+    # stuck on its old cert. Surfaced by the QA on 2026-04-30.
+    greffer_mode: Literal["proxy", "tunnel"] | None = None
+
     # Where ``app/lifespan.py`` writes the active token on startup so the
     # tunnel-sidecar can authenticate against the manager with the same
     # ``X-GREFFON-TOKEN``. The compose tunnel profile mounts this path

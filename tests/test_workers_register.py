@@ -40,6 +40,22 @@ def test_post_register_passes_correct_payload(settings: Settings) -> None:
     # port must be posted as a str — legacy wire format.
     assert kwargs["json"]["port"] == str(settings.greffer_port)
     assert kwargs["verify"] == settings.greffer_ssl_verify
+    # mode is omitted when settings.greffer_mode is unset — preserves the
+    # pre-tunnel-feature behaviour for proxy greffers (manager treats a
+    # missing mode as MODE_PROXY default).
+    assert "mode" not in kwargs["json"]
+
+
+def test_post_register_includes_mode_when_set(settings: Settings) -> None:
+    """Operator flipping a greffer to tunnel mode at the manager (PATCH
+    /api/greffer/{id}/mode/) must also set GREFFER_MODE=tunnel here so
+    the register payload carries the matching mode and avoids
+    400 mode_mismatch on the next poll."""
+    settings.greffer_mode = "tunnel"  # type: ignore[misc]
+    with patch("app.workers.register.requests") as mock_requests:
+        _post_register(settings, "10.0.0.1", "tok")
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["json"]["mode"] == "tunnel"
 
 
 def test_fetch_cert_returns_data_on_200(settings: Settings) -> None:
