@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,13 +13,6 @@ class Settings(BaseSettings):
         env_file=None,
         case_sensitive=False,
         extra="ignore",
-        # Treat ``FOO=`` (empty string) the same as if FOO weren't set at
-        # all. Required so optional fields with constrained types (e.g.
-        # ``greffer_mode: Literal[...] | None``) don't ValidationError on
-        # the empty defaults env.env documents — operators who don't
-        # opt into tunnel mode shouldn't have to delete the variable
-        # to make greffer boot. Codex P1 on greffer#23.
-        env_ignore_empty=True,
     )
 
     greffer_id: str
@@ -40,6 +34,21 @@ class Settings(BaseSettings):
     # ``mode_mismatch`` against the new stored value, leaving the greffer
     # stuck on its old cert. Surfaced by the QA on 2026-04-30.
     greffer_mode: Literal["proxy", "tunnel"] | None = None
+
+    @field_validator("greffer_mode", mode="before")
+    @classmethod
+    def _empty_string_is_none(cls, v):
+        # env.env documents an empty default ``GREFFER_MODE=`` for the
+        # common case where operators haven't opted into tunnel mode.
+        # Without this validator, pydantic-settings would feed the
+        # empty string into the Literal validation and fail.
+        # Scope: this field only — a model-wide ``env_ignore_empty=True``
+        # would silently turn empty values into defaults for fields
+        # whose contract is "empty disables" (e.g. greffer_token_file_path).
+        # Codex P2 on greffer#23.
+        if isinstance(v, str) and v == "":
+            return None
+        return v
 
     # Where ``app/lifespan.py`` writes the active token on startup so the
     # tunnel-sidecar can authenticate against the manager with the same
