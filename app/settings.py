@@ -12,6 +12,13 @@ class Settings(BaseSettings):
         env_file=None,
         case_sensitive=False,
         extra="ignore",
+        # Treat ``FOO=`` (empty string) the same as if FOO weren't set at
+        # all. Required so optional fields with constrained types (e.g.
+        # ``greffer_mode: Literal[...] | None``) don't ValidationError on
+        # the empty defaults env.env documents — operators who don't
+        # opt into tunnel mode shouldn't have to delete the variable
+        # to make greffer boot. Codex P1 on greffer#23.
+        env_ignore_empty=True,
     )
 
     greffer_id: str

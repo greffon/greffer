@@ -58,6 +58,20 @@ def test_post_register_includes_mode_when_set(settings: Settings) -> None:
     assert kwargs["json"]["mode"] == "tunnel"
 
 
+def test_settings_empty_greffer_mode_treated_as_unset(monkeypatch) -> None:
+    """env.env documents an empty default ``GREFFER_MODE=`` for operators
+    who don't opt into tunnel mode. Without ``env_ignore_empty`` on the
+    Settings model, ``Literal["proxy","tunnel"] | None`` would
+    ValidationError on the empty string and the greffer wouldn't boot.
+    Codex P1 on greffer#23."""
+    from app.settings import Settings, get_settings
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("GREFFER_MODE", "")
+    get_settings.cache_clear()
+    s = Settings()
+    assert s.greffer_mode is None
+
+
 def test_fetch_cert_returns_data_on_200(settings: Settings) -> None:
     with patch("app.workers.register.requests") as mock_requests:
         mock_response = MagicMock()
