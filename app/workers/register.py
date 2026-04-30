@@ -107,16 +107,29 @@ def _resolve_hostname() -> str:
 
 
 def _post_register(settings: Settings, address: str, token: str) -> None:
+    payload = {
+        "address": address,
+        # The legacy code posts ``port`` as a str (reads from env as-is).
+        # Pydantic-settings types it as int; coerce at the wire boundary.
+        "port": str(settings.greffer_port),
+        "token": token,
+        "protocol": settings.greffer_protocol,
+    }
+    # Include greffer_mode in the register payload only when the operator
+    # has set it explicitly. The manager's register endpoint accepts an
+    # optional ``mode`` field and validates against ``Greffer.mode`` —
+    # match → 200, mismatch → 400. With ``greffer_mode`` unset, manager
+    # defaults the validation against MODE_PROXY (preserving the
+    # pre-tunnel-feature behaviour for any greffer that hasn't been
+    # flipped to tunnel mode at the manager). Operators who flip mode
+    # via ``PATCH /api/greffer/{id}/mode/`` must also set
+    # ``GREFFER_MODE=tunnel`` here and restart greffer so its register
+    # payload aligns with the new stored mode.
+    if settings.greffer_mode:
+        payload["mode"] = settings.greffer_mode
     requests.post(
         f"{settings.greffon_base_server}/api/greffer/register/{settings.greffer_id}/",
-        json={
-            "address": address,
-            # The legacy code posts ``port`` as a str (reads from env as-is).
-            # Pydantic-settings types it as int; coerce at the wire boundary.
-            "port": str(settings.greffer_port),
-            "token": token,
-            "protocol": settings.greffer_protocol,
-        },
+        json=payload,
         verify=settings.greffer_ssl_verify,
         # Timeout is a safety net so the thread can't hang forever on a
         # stalled manager. Paired with abandon_on_cancel=True on the caller
