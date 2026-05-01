@@ -57,6 +57,90 @@ def get_greffon_path(greffon_info):
         os.makedirs(path)
     return path
 
+# Feature #4 (integrations): the set of integration types the catalog
+# may reference via `{{ <type>.<field> }}` in compose YAML AND via
+# `destination.type: <type>` in metadata.json. V1 ships SMTP only; new
+# types slot in additively here AND in the manager (per-type FK on
+# GreffonInstance) AND in the catalog validator.
+KNOWN_INTEGRATION_TYPES = ('smtp',)
+
+
+def _is_integration_set(value):
+    """Returns True iff the type's config payload is a non-empty dict.
+
+    None, missing, and `{}` all map to "user didn't pick this integration"
+    — we treat empty config the same as absence so the greffer doesn't
+    render half-configured env vars (e.g. host without password) that
+    would silently fail the underlying greffon's first SMTP attempt.
+    """
+    return isinstance(value, dict) and bool(value)
+
+
+def _compute_integrations_context(greffon_info):
+    """Lift each known integration type out of `greffon_info['integrations']`
+    and into a top-level Jinja variable so catalog templates can reference
+    e.g. `{{ smtp.host }}` directly.
+
+    Unset types become empty dicts — Jinja's default Undefined resolves
+    `{{ smtp.host }}` on `{}` to an empty string rather than blowing up
+    with AttributeError on None. The companion delete-on-unset pass
+    strips those keys from the compose entirely; the empty-dict default
+    is purely belt-and-braces in case a future delete-pass bug leaves
+    a stray `{{ smtp.* }}` in place.
+    """
+    integrations = greffon_info.get('integrations') or {}
+    for t in KNOWN_INTEGRATION_TYPES:
+        value = integrations.get(t)
+        # Always set the key so the Jinja context has a stable shape;
+        # never overwrite a key the caller already populated (paranoia).
+        greffon_info.setdefault(t, value if _is_integration_set(value) else {})
+    return greffon_info
+
+
+def _delete_unset_integration_env_keys(compose, greffon_info):
+    """For each known integration type whose config is unset, walk the
+    metadata destinations and pop the matching env key from the rendered
+    compose dict. This makes the "absent ⇒ no env var" guarantee
+    independent of how Jinja renders `{{ smtp.host }}` on an empty dict.
+
+    Mirrors `apply_configuration`'s walk for the regular `type='env'`
+    case but goes the other direction: deletes instead of assigns,
+    keyed on integration types instead of per-configuration values.
+
+    Defensive on shape: catalog metadata is supposed to use mapping-form
+    `environment:` per the Feature #2 validator, but compose YAML also
+    permits list form (`KEY=value`); we handle both so a future catalog
+    that drifts on this still gets the SMTP env stripped on unset.
+    """
+    integrations = greffon_info.get('integrations') or {}
+    services = compose.get('services', {}) if isinstance(compose, dict) else {}
+    for t in KNOWN_INTEGRATION_TYPES:
+        if _is_integration_set(integrations.get(t)):
+            continue
+        for configuration in greffon_info.get('configurations', []) or []:
+            for destination in configuration.get('destinations', []) or []:
+                if not isinstance(destination, dict):
+                    continue
+                if destination.get('type') != t:
+                    continue
+                container = destination.get('container')
+                key = destination.get('key')
+                if not container or not key:
+                    continue
+                service = services.get(container)
+                if not isinstance(service, dict):
+                    continue
+                env = service.get('environment')
+                if isinstance(env, dict):
+                    env.pop(key, None)
+                elif isinstance(env, list):
+                    prefix = f'{key}='
+                    service['environment'] = [
+                        e for e in env if not (isinstance(e, str) and e.startswith(prefix))
+                    ]
+    return compose
+
+
 def _compute_instance_context(greffon_info):
     """Expose instance_url / instance_host / instance_port / instance_id to
     the Jinja render context so catalog metadata default_value strings can
@@ -82,6 +166,14 @@ def create_compose(compose, greffon_info):
     if not os.path.exists(greffon_path):
         os.makedirs(greffon_path)
     greffon_info = _compute_instance_context(greffon_info)
+    # Feature #4: bring per-type integration configs into the Jinja
+    # context BEFORE rendering, and strip catalog-declared env keys for
+    # any integration type the user didn't pick. Order matters — the
+    # delete pass runs against the post-template-mutation compose dict
+    # but BEFORE Jinja substitution; it pops the SMTP env keys whose
+    # values would otherwise be templated `{{ smtp.host }}` strings.
+    greffon_info = _compute_integrations_context(greffon_info)
+    _delete_unset_integration_env_keys(compose, greffon_info)
     t = Template(yaml.dump(compose))
     compose_file = t.render(**greffon_info)
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:

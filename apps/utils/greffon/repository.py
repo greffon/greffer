@@ -32,6 +32,14 @@ def create_greffon_info(compose, greffon):
         'volumes': {},
         'id': greffon['id'],
         'configurations': greffon['configurations'],
+        # Feature #4 (integrations): per-type config blobs forwarded
+        # verbatim from the start request. compose.py's render pipeline
+        # consumes this dict — it lifts each known integration type
+        # (e.g. 'smtp') into the Jinja context as a top-level variable
+        # AND deletes catalog-declared env keys for types the user
+        # didn't pick. `.get('integrations', {})` keeps backwards-compat
+        # with old manager versions whose payload omits the field.
+        'integrations': greffon.get('integrations') or {},
         'networks': {
             internal_network_id: {
                 'name': 'internal',
