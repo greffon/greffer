@@ -44,6 +44,22 @@ class GreffonStartRequest(BaseModel):
     # Explicit `null` is rejected on type grounds (list, not list | None).
     configurations: list[GreffonField] = Field(default_factory=list)
     ports: dict[str, Any] = Field(default_factory=dict)
+    # Feature #4 (integrations): per-type config blobs the manager
+    # resolves from the user's selected Integration rows. Each top-level
+    # key is an integration type ("smtp", later "telegram", "slack");
+    # the value is the type-specific config (e.g. for smtp: host, port,
+    # username, password, from_address, tls_mode).
+    #
+    # Default empty dict is the wire-compat story: an old manager that
+    # doesn't send this field at all just looks like "user picked no
+    # integrations" — the greffer renders compose with the catalog-
+    # declared SMTP env keys stripped (see compose.py's
+    # _delete_unset_integration_env_keys). Symmetric on the other
+    # direction: a new manager → old greffer trip ignores this field
+    # via `extra=ignore` rather than 422-ing.
+    integrations: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    model_config = {"extra": "ignore"}
 
 
 class GreffonStopRequest(BaseModel):
