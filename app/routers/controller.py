@@ -89,7 +89,15 @@ def start_greffon(
     # rathole-client retries. Wait for compose to report 'running'
     # before writing. Bounded timeout — on slow/stuck images we write
     # anyway and rely on rathole-client's reconnect to bridge the gap.
-    _wait_for_compose_running(greffon_info["id"])
+    #
+    # Only wait when there's actually a config to write. For proxy-mode
+    # greffers and the v2-manager-+-v3-greffer rollout combo (no
+    # tunnel_client_toml in the payload), the wait would add up to 10s
+    # of pointless latency to every start with no benefit — there's no
+    # tunnel-side race to guard against because no client.toml is
+    # being pushed. (Codex P1 on greffer#25.)
+    if payload.tunnel_client_toml is not None:
+        _wait_for_compose_running(greffon_info["id"])
     config_write_status = _write_pushed_client_toml(payload, request)
 
     return GreffonStartResponse(
