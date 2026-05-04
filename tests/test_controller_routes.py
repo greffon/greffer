@@ -611,6 +611,36 @@ async def test_start_writes_config_anyway_on_compose_ready_timeout(
 
 
 @pytest.mark.asyncio
+async def test_start_skips_wait_when_config_path_disabled(
+    client: AsyncClient, patch_compose_repo_conf,
+) -> None:
+    """When greffer_tunnel_client_config_path is empty (the documented
+    'disabled' mode), the wait MUST be skipped even if tunnel_client_toml
+    is present in the payload — the subsequent write is a no-op so the
+    polling cost would be pure latency. Codex P2 on greffer#25.
+
+    Verifies by patching the path to '' and asserting compose.get_status
+    is never called even though the payload carries tunnel_client_toml."""
+    _mock_repo, mock_compose, _mock_conf = patch_compose_repo_conf
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        "",  # disabled
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    # Wait was skipped — compose.get_status never polled.
+    assert mock_compose.get_status.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_start_swallows_compose_status_errors_during_wait(
     client: AsyncClient, patch_compose_repo_conf, tmp_path,
     monkeypatch: pytest.MonkeyPatch,

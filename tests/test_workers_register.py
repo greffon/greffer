@@ -468,6 +468,35 @@ def test_initial_tunnel_config_skips_when_field_absent(
     assert not target.exists()
 
 
+def test_initial_tunnel_config_non_string_payload_is_non_fatal(
+    settings: Settings, tmp_path
+) -> None:
+    """A misbehaving / compromised manager could return
+    ``tunnel_client_toml`` as something other than a string (dict, list,
+    int) — the underlying f.write() would raise TypeError, NOT OSError.
+    The non-fatal contract requires catching that too; otherwise the
+    register-worker aborts mid-flow.
+
+    Codex P2 on greffer#25."""
+    target = tmp_path / "client.toml"
+    settings.greffer_tunnel_client_config_path = str(target)
+    # Non-string payload — manager bug or hostile peer.
+    data = {
+        "certificate": "C",
+        "private_key": "K",
+        "tunnel_client_toml": {"this": "should-be-a-string"},
+    }
+    with patch("app.workers.register.logger") as mock_logger:
+        # Must not raise — register flow continues.
+        _maybe_install_initial_tunnel_config(settings, data)
+
+    assert mock_logger.warning.called
+    msg = mock_logger.warning.call_args.args[0]
+    assert "non-fatal" in msg
+    # File not created (write failed before atomicity could complete).
+    assert not target.exists()
+
+
 def test_initial_tunnel_config_failure_is_non_fatal(
     settings: Settings, tmp_path
 ) -> None:

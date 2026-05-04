@@ -194,16 +194,21 @@ def _maybe_install_initial_tunnel_config(
     """
     # Lazy import so unit tests can mock the helper without instantiating
     # the FastAPI app.
-    from app.tunnel_config import (
-        TunnelConfigWriteError,
-        maybe_write_client_toml,
-    )
+    from app.tunnel_config import maybe_write_client_toml
 
     content = data.get("tunnel_client_toml")
     target = settings.greffer_tunnel_client_config_path
+    # Catch broadly: ``data`` is the parsed JSON body of the cert response;
+    # a misbehaving / compromised manager could return ``tunnel_client_toml``
+    # as something other than a string (dict, list, int) and the underlying
+    # f.write() would raise TypeError — escaping past a narrow OSError
+    # except, aborting the register-worker, and breaking a flow whose
+    # docstring promises non-fatal behaviour. The non-fatal contract is
+    # the entire reason this branch exists; honouring it requires
+    # catching everything. (Codex P2 on greffer#25.)
     try:
         wrote = maybe_write_client_toml(content, target)
-    except TunnelConfigWriteError as exc:
+    except Exception as exc:
         logger.warning(
             "initial_tunnel_config_write_failed (non-fatal): %s", exc
         )
