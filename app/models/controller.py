@@ -71,16 +71,6 @@ class GreffonStartRequest(BaseModel):
     # and the rollout-ordering section.
     tunnel_client_toml: str | None = None
 
-    # v3 manager-pushed rathole client config. When present (tunnel-mode
-    # greffer with a v3 manager), the controller atomically writes it to
-    # the shared volume rathole-client file-watches. Absent for proxy-
-    # mode greffers and for the transitional v2-manager-+-v3-greffer
-    # combination during rollout step 1 (in that combination, tunnel
-    # config still flows via the v2 polling path). See tunnel-support
-    # epic v3 §4 "Pull-based sidecar replaced by manager-pushed config"
-    # and the rollout-ordering section.
-    tunnel_client_toml: str | None = None
-
 
 class GreffonStopRequest(BaseModel):
     id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
