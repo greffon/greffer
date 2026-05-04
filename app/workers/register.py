@@ -87,6 +87,21 @@ async def register_worker(app: FastAPI) -> None:
             await anyio.to_thread.run_sync(
                 _install_cert, settings, data, abandon_on_cancel=True
             )
+            # v3 push: the manager embeds the initial rathole client.toml
+            # in the cert response on accept (tunnel mode only). Write it
+            # before the worker exits so rathole-client can come up
+            # immediately. Absent for proxy-mode greffers and for the
+            # transitional v2-manager-+-v3-greffer combo (in which case
+            # the v2 polling sidecar handles updates instead). Failure
+            # is logged but does NOT abort the register flow — without
+            # this file the greffer is still functional in proxy mode
+            # and the next start/stop push will retry.
+            await anyio.to_thread.run_sync(
+                _maybe_install_initial_tunnel_config,
+                settings,
+                data,
+                abandon_on_cancel=True,
+            )
             await anyio.to_thread.run_sync(
                 _fetch_and_store_crl, settings, abandon_on_cancel=True
             )
@@ -157,6 +172,44 @@ def _install_cert(settings: Settings, data: dict[str, Any]) -> None:
     copy_file_into_container(nginx, "/root", "cert.key", data["private_key"])
     if "issuing_ca" in data:
         copy_file_into_container(nginx, "/root", "ca.pem", data["issuing_ca"])
+
+
+def _maybe_install_initial_tunnel_config(
+    settings: Settings, data: dict[str, Any]
+) -> None:
+    """Write the manager-pushed initial ``client.toml`` if present.
+
+    The manager only includes ``tunnel_client_toml`` in the cert
+    response when the greffer is in tunnel mode AND its status reached
+    GREFFER_REGISTERED (i.e. admin accepted). Field absence is the
+    common case (proxy-mode greffer, or v2 manager that doesn't
+    push). Treat both branches as success — the greffer is still
+    functional regardless.
+
+    Failure here is non-fatal: log and continue. The greffer's nginx,
+    docker-compose lifecycle, and proxy-mode operations don't depend
+    on this file. The next start/stop push will retry; the operator
+    will notice via the manager's surfaced ``config_write_status`` if
+    the issue persists.
+    """
+    # Lazy import so unit tests can mock the helper without instantiating
+    # the FastAPI app.
+    from app.tunnel_config import (
+        TunnelConfigWriteError,
+        maybe_write_client_toml,
+    )
+
+    content = data.get("tunnel_client_toml")
+    target = settings.greffer_tunnel_client_config_path
+    try:
+        wrote = maybe_write_client_toml(content, target)
+    except TunnelConfigWriteError as exc:
+        logger.warning(
+            "initial_tunnel_config_write_failed (non-fatal): %s", exc
+        )
+        return
+    if wrote:
+        logger.info("initial_tunnel_config_installed path=%s", target)
 
 
 def _fetch_and_store_crl(settings: Settings) -> None:

@@ -11,9 +11,10 @@ runs sync handlers in a threadpool automatically.
 """
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from app.auth import require_token
 from app.models.controller import (
@@ -21,12 +22,16 @@ from app.models.controller import (
     GreffonStartResponse,
     GreffonStatusResponse,
     GreffonStopRequest,
+    GreffonStopResponse,
 )
+from app.tunnel_config import TunnelConfigWriteError, maybe_write_client_toml
 
 # Framework-agnostic shared code imported directly — no rewrite.
 from apps.utils.docker import compose
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
+
+logger = logging.getLogger("greffer")
 
 router = APIRouter(
     prefix="/api/controller",
@@ -34,8 +39,14 @@ router = APIRouter(
 )
 
 
+def _settings(request: Request):
+    return request.app.state.settings
+
+
 @router.post("/start/")
-def start_greffon(payload: GreffonStartRequest) -> GreffonStartResponse:
+def start_greffon(
+    payload: GreffonStartRequest, request: Request
+) -> GreffonStartResponse:
     # Plain ``model_dump()``. ``configurations``/``ports`` have
     # ``default_factory`` on the model so an omitted key becomes an empty
     # container (not None and not absent), matching the strict vs safe
@@ -43,6 +54,10 @@ def start_greffon(payload: GreffonStartRequest) -> GreffonStartResponse:
     # (``greffon['configurations']``) and apps/utils/docker/compose.py
     # (``.get('configurations', [])``). Explicit ``null`` is rejected by
     # Pydantic on type grounds.
+    #
+    # ``model_dump()`` also includes ``tunnel_client_toml`` — but the
+    # downstream compose / repository code only reads keys it knows
+    # about, so the extra field is harmless to pass through.
     greffon = payload.model_dump()
     compose_file = repository.get_compose_file_from_repository(greffon)
     greffon_info = repository.get_greffon_info(compose_file, greffon)
@@ -52,13 +67,63 @@ def start_greffon(payload: GreffonStartRequest) -> GreffonStartResponse:
     conf.create_nginx_conf(greffon_info)
     compose.create_volumes_then_copy_files(greffon_info)
     compose.start(greffon_info)
-    return GreffonStartResponse(ports=greffon_info["ports"])
+
+    # v3 push: write the manager-rendered client.toml AFTER the docker
+    # compose lifecycle finishes — at this point the new instance's
+    # nginx is binding the user-facing port, and rathole-client's
+    # file-watcher will pick up the change and open a forwarding pair
+    # within ~100ms. Doing the file write earlier would race against
+    # rathole-client trying to forward to a port nginx hasn't bound yet.
+    config_write_status = _write_pushed_client_toml(payload, request)
+
+    return GreffonStartResponse(
+        ports=greffon_info["ports"],
+        config_write_status=config_write_status,
+    )
 
 
 @router.post("/stop/")
-def stop_greffon(payload: GreffonStopRequest) -> dict:
+def stop_greffon(
+    payload: GreffonStopRequest, request: Request
+) -> GreffonStopResponse:
     compose.stop(payload.model_dump())
-    return {}
+
+    # v3 push: write the manager-rendered client.toml AFTER the
+    # container is stopped. The dropped server.toml service on the
+    # manager side is what actually severs traffic; the greffer-side
+    # file write here just lets rathole-client close its idle
+    # forwarding pair. A failure is non-fatal — the manager logs it
+    # and the next start will re-push the latest content.
+    config_write_status = _write_pushed_client_toml(payload, request)
+
+    return GreffonStopResponse(config_write_status=config_write_status)
+
+
+def _write_pushed_client_toml(
+    payload: GreffonStartRequest | GreffonStopRequest,
+    request: Request,
+) -> str:
+    """Shared helper used by both start and stop handlers.
+
+    Returns ``"ok"`` or ``"failed"`` matching the response model's
+    ``ConfigWriteStatus`` literal. Never raises — even an unexpected
+    exception (other than the documented OSError chain) is mapped to
+    ``"failed"`` so the start/stop response shape stays predictable.
+    """
+    settings = _settings(request)
+    target = settings.greffer_tunnel_client_config_path
+    try:
+        wrote = maybe_write_client_toml(payload.tunnel_client_toml, target)
+    except TunnelConfigWriteError:
+        # Already logged inside the helper; surface to manager.
+        return "failed"
+    except Exception:  # pragma: no cover — paranoid wrap
+        logger.exception("tunnel_client_toml_write_unexpected_error")
+        return "failed"
+    if wrote:
+        logger.debug("tunnel_client_toml_pushed_for_id=%s",
+                     getattr(payload, "id", "?"))
+    return "ok"
 
 
 @router.get("/greffon/{greffon_id}/")
