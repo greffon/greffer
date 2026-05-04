@@ -12,6 +12,7 @@ runs sync handlers in a threadpool automatically.
 from __future__ import annotations
 
 import logging
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -32,6 +33,17 @@ from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
+
+# Time budget for ``_wait_for_compose_running`` after ``compose.start``
+# returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
+# without ``wait``), so we have to poll ``compose.get_status`` to know
+# when nginx has actually bound the user-facing port. 10s covers
+# already-pulled images by a wide margin; cold-pull misses the budget
+# and we write client.toml anyway, relying on rathole-client's
+# reconnect-on-failure behavior to bridge the brief gap. Codex P1 on
+# greffer#25 caught the race.
+_COMPOSE_READY_TIMEOUT_SECONDS = 10.0
+_COMPOSE_READY_POLL_INTERVAL_SECONDS = 0.5
 
 router = APIRouter(
     prefix="/api/controller",
@@ -68,12 +80,16 @@ def start_greffon(
     compose.create_volumes_then_copy_files(greffon_info)
     compose.start(greffon_info)
 
-    # v3 push: write the manager-rendered client.toml AFTER the docker
-    # compose lifecycle finishes — at this point the new instance's
-    # nginx is binding the user-facing port, and rathole-client's
-    # file-watcher will pick up the change and open a forwarding pair
-    # within ~100ms. Doing the file write earlier would race against
-    # rathole-client trying to forward to a port nginx hasn't bound yet.
+    # v3 push race fix: compose.start uses subprocess.Popen and returns
+    # before docker-compose has actually brought up the containers and
+    # bound the user-facing port. Writing client.toml at this point
+    # would let rathole-client's file-watcher pick up a config that
+    # points at a not-yet-listening backend; rathole-client would
+    # forward → connection refused → user sees a transient 502 until
+    # rathole-client retries. Wait for compose to report 'running'
+    # before writing. Bounded timeout — on slow/stuck images we write
+    # anyway and rely on rathole-client's reconnect to bridge the gap.
+    _wait_for_compose_running(greffon_info["id"])
     config_write_status = _write_pushed_client_toml(payload, request)
 
     return GreffonStartResponse(
@@ -97,6 +113,42 @@ def stop_greffon(
     config_write_status = _write_pushed_client_toml(payload, request)
 
     return GreffonStopResponse(config_write_status=config_write_status)
+
+
+def _wait_for_compose_running(greffon_id: str) -> None:
+    """Poll compose.get_status until containers are running, or timeout.
+
+    Bounded by _COMPOSE_READY_TIMEOUT_SECONDS. Logs a warning on timeout
+    and returns — the caller writes client.toml anyway and rathole-
+    client's reconnect-on-failure handles the brief gap. Never raises:
+    a transient docker-socket error during polling counts as "still
+    starting" and the loop continues.
+    """
+    deadline = time.monotonic() + _COMPOSE_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            status = compose.get_status(greffon_id)
+        except Exception as exc:  # docker socket issues, race with stop, etc.
+            logger.debug(
+                "compose_status_transient_error greffon_id=%s err=%s",
+                greffon_id, exc,
+            )
+            time.sleep(_COMPOSE_READY_POLL_INTERVAL_SECONDS)
+            continue
+        if status.get("status") == "running":
+            logger.info(
+                "compose_ready greffon_id=%s elapsed=%.2fs",
+                greffon_id,
+                _COMPOSE_READY_TIMEOUT_SECONDS - max(0, deadline - time.monotonic()),
+            )
+            return
+        time.sleep(_COMPOSE_READY_POLL_INTERVAL_SECONDS)
+    logger.warning(
+        "compose_not_ready_within_timeout greffon_id=%s timeout=%.1fs — "
+        "writing client.toml anyway; rathole-client will reconnect "
+        "once backend binds",
+        greffon_id, _COMPOSE_READY_TIMEOUT_SECONDS,
+    )
 
 
 def _write_pushed_client_toml(
