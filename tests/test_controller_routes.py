@@ -54,6 +54,9 @@ async def test_start_success(client: AsyncClient) -> None:
             "id": "test-instance-123",
         }
         mock_compose.get_compose_template.return_value = {}
+        # _wait_for_compose_running polls get_status; without this the
+        # default MagicMock return loops until the 10s timeout.
+        mock_compose.get_status.return_value = {"status": "running"}
 
         r = await client.post(
             "/api/controller/start/",
@@ -144,9 +147,11 @@ async def test_start_defaults_unset_optional_fields_to_empty_containers(
     }
     with patch("app.routers.controller.repository") as mock_repo, patch(
         "app.routers.controller.compose"
-    ), patch("app.routers.controller.conf"):
+    ) as mock_compose, patch("app.routers.controller.conf"):
         mock_repo.get_compose_file_from_repository.return_value = {}
         mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+        # Short-circuit _wait_for_compose_running.
+        mock_compose.get_status.return_value = {"status": "running"}
 
         r = await client.post(
             "/api/controller/start/",
@@ -183,9 +188,11 @@ async def test_start_accepts_empty_configurations_list(
     payload = {**SAMPLE_START_PAYLOAD, "configurations": []}
     with patch("app.routers.controller.repository") as mock_repo, patch(
         "app.routers.controller.compose"
-    ), patch("app.routers.controller.conf"):
+    ) as mock_compose, patch("app.routers.controller.conf"):
         mock_repo.get_compose_file_from_repository.return_value = {}
         mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+        # Short-circuit _wait_for_compose_running.
+        mock_compose.get_status.return_value = {"status": "running"}
 
         r = await client.post(
             "/api/controller/start/",
@@ -203,9 +210,11 @@ async def test_start_ignores_unknown_extra_fields(client: AsyncClient) -> None:
     payload = {**SAMPLE_START_PAYLOAD, "new_future_field": "whatever"}
     with patch("app.routers.controller.repository") as mock_repo, patch(
         "app.routers.controller.compose"
-    ), patch("app.routers.controller.conf"):
+    ) as mock_compose, patch("app.routers.controller.conf"):
         mock_repo.get_compose_file_from_repository.return_value = {}
         mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+        # Short-circuit _wait_for_compose_running.
+        mock_compose.get_status.return_value = {"status": "running"}
 
         r = await client.post(
             "/api/controller/start/",
@@ -262,8 +271,14 @@ async def test_stop_success(client: AsyncClient) -> None:
         )
 
     assert r.status_code == 200
-    assert r.json() == {}
-    mock_compose.stop.assert_called_once_with({"id": "test-instance-123"})
+    # v3 stop response carries config_write_status so the manager can
+    # surface greffer-side push failures. With no tunnel_client_toml in
+    # the request body (proxy-mode greffer / v2 manager), nothing was
+    # written and the status is 'ok' — but the field is always present.
+    assert r.json() == {"config_write_status": "ok"}
+    mock_compose.stop.assert_called_once_with(
+        {"id": "test-instance-123", "tunnel_client_toml": None}
+    )
 
 
 @pytest.mark.asyncio
@@ -352,3 +367,308 @@ async def test_status_rejects_non_uuid(client: AsyncClient) -> None:
 async def test_status_rejects_missing_token(client: AsyncClient) -> None:
     r = await client.get(f"/api/controller/greffon/{uuid.uuid4()}/")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# v3 push: tunnel_client_toml in start/stop request bodies
+#
+# These exercise the manager → greffer push path added in tunnel-support
+# epic v3. The shared writer is unit-tested in test_tunnel_config.py;
+# here we verify the router wires it in correctly: file is written when
+# the field is present, response carries config_write_status, write
+# failures are surfaced as ``failed`` rather than 500.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patch_compose_repo_conf():
+    """Stub out the docker compose / repo / nginx side so the tunnel-
+    config tests below don't require a real docker daemon."""
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf") as mock_conf:
+        mock_repo.get_compose_file_from_repository.return_value = {
+            "services": {"app": {"image": "nginx"}}
+        }
+        mock_repo.get_greffon_info.return_value = {
+            "ports": [{"port_host": 9000, "port_name": "app_80"}],
+            "id": "test-instance-123",
+        }
+        mock_compose.get_compose_template.return_value = {}
+        # Short-circuit _wait_for_compose_running.
+        mock_compose.get_status.return_value = {"status": "running"}
+        yield mock_repo, mock_compose, mock_conf
+
+
+@pytest.mark.asyncio
+async def test_start_omits_tunnel_field_returns_ok(
+    client: AsyncClient, patch_compose_repo_conf
+) -> None:
+    """Proxy-mode greffer / v2 manager — payload has no
+    ``tunnel_client_toml``. Handler skips the file write and returns
+    config_write_status='ok' (nothing failed because nothing was
+    attempted)."""
+    r = await client.post(
+        "/api/controller/start/",
+        json=SAMPLE_START_PAYLOAD,
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_start_with_tunnel_field_writes_file(
+    client: AsyncClient, patch_compose_repo_conf, tmp_path
+) -> None:
+    """Tunnel-mode greffer + v3 manager — payload carries
+    ``tunnel_client_toml``. Handler writes it atomically to the
+    configured path and returns ``ok``."""
+    target = tmp_path / "client.toml"
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(target),
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "ok"
+    assert target.read_text() == "[client]\n"
+
+
+@pytest.mark.asyncio
+async def test_start_with_tunnel_field_failure_returns_failed(
+    client: AsyncClient, patch_compose_repo_conf, tmp_path
+) -> None:
+    """Tunnel-mode greffer + v3 manager + filesystem error (e.g.
+    parent directory missing) — handler returns 200 with
+    config_write_status='failed', NOT a 500. Manager surfaces the
+    failed status to the API caller; instance start itself succeeded."""
+    bogus_target = tmp_path / "does-not-exist" / "client.toml"
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(bogus_target),
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_stop_with_tunnel_field_writes_file(
+    client: AsyncClient, tmp_path
+) -> None:
+    """Stop path mirrors start: tunnel_client_toml is consumed and
+    config_write_status surfaced. Stop typically pushes a file with
+    the stopping instance's services removed (filtered server-side
+    by the GREFFON_STOPPING status check in render_client_toml)."""
+    target = tmp_path / "client.toml"
+
+    with patch("app.routers.controller.compose") as mock_compose, patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(target),
+    ):
+        mock_compose.stop.return_value = None
+        r = await client.post(
+            "/api/controller/stop/",
+            json={
+                "id": "test-instance-123",
+                "tunnel_client_toml": "[client]\nservices=[]\n",
+            },
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "ok"
+    assert target.read_text() == "[client]\nservices=[]\n"
+
+
+@pytest.mark.asyncio
+async def test_stop_omits_tunnel_field_returns_ok(
+    client: AsyncClient, tmp_path
+) -> None:
+    """Proxy mode / v2 manager — stop payload has no tunnel field.
+    Handler returns ok without writing anything."""
+    with patch("app.routers.controller.compose") as mock_compose:
+        mock_compose.stop.return_value = None
+        r = await client.post(
+            "/api/controller/stop/",
+            json={"id": "test-instance-123"},
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# v3 push race fix: wait for compose ready before writing client.toml
+#
+# compose.start uses subprocess.Popen and returns before docker-compose
+# has actually bound the user-facing port. Writing client.toml without
+# waiting would let rathole-client open a forwarding pair to a not-yet-
+# listening backend → connection refused for users hitting the URL in
+# that window. Codex P1 caught this on PR #25.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_waits_for_compose_running_before_writing_config(
+    client: AsyncClient, patch_compose_repo_conf, tmp_path
+) -> None:
+    """Verify that the file write is sequenced AFTER compose reports
+    running. We track the order of calls: get_status must be called
+    before write_client_toml's tempfile creation.
+
+    Approach: install a side_effect on get_status that returns
+    'starting' once and then 'running'. Assert at the end that
+    client.toml was written exactly once and only after the status
+    transition. This is the property — not the timing — Codex flagged.
+    """
+    _mock_repo, mock_compose, _mock_conf = patch_compose_repo_conf
+    # Override the fixture default so we get a real progression.
+    mock_compose.get_status.side_effect = [
+        {"status": "starting"},
+        {"status": "running"},
+    ]
+
+    target = tmp_path / "client.toml"
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(target),
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["config_write_status"] == "ok"
+    assert target.read_text() == "[client]\n"
+    # Both polls happened (the wait actually loops, not no-op).
+    assert mock_compose.get_status.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_start_writes_config_anyway_on_compose_ready_timeout(
+    client: AsyncClient, patch_compose_repo_conf, tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded timeout: if compose.get_status never reports running,
+    the wait gives up and writes client.toml anyway. rathole-client's
+    reconnect-on-failure handles the brief gap. Without this fallback,
+    a slow/stuck container would block the start handler indefinitely.
+    """
+    # Drive the timeout to ~0 so the test is fast.
+    monkeypatch.setattr(
+        "app.routers.controller._COMPOSE_READY_TIMEOUT_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "app.routers.controller._COMPOSE_READY_POLL_INTERVAL_SECONDS", 0.005
+    )
+
+    _mock_repo, mock_compose, _mock_conf = patch_compose_repo_conf
+    mock_compose.get_status.return_value = {"status": "starting"}
+
+    target = tmp_path / "client.toml"
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(target),
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    # File was still written despite the timeout — the alternative
+    # (blocking forever) is worse.
+    assert target.read_text() == "[client]\n"
+
+
+@pytest.mark.asyncio
+async def test_start_skips_wait_when_config_path_disabled(
+    client: AsyncClient, patch_compose_repo_conf,
+) -> None:
+    """When greffer_tunnel_client_config_path is empty (the documented
+    'disabled' mode), the wait MUST be skipped even if tunnel_client_toml
+    is present in the payload — the subsequent write is a no-op so the
+    polling cost would be pure latency. Codex P2 on greffer#25.
+
+    Verifies by patching the path to '' and asserting compose.get_status
+    is never called even though the payload carries tunnel_client_toml."""
+    _mock_repo, mock_compose, _mock_conf = patch_compose_repo_conf
+    payload = {**SAMPLE_START_PAYLOAD, "tunnel_client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        "",  # disabled
+    ):
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    # Wait was skipped — compose.get_status never polled.
+    assert mock_compose.get_status.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_start_swallows_compose_status_errors_during_wait(
+    client: AsyncClient, patch_compose_repo_conf, tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient docker-socket error during get_status polling must
+    not propagate from the wait helper — the loop continues and either
+    finds 'running' eventually or times out cleanly. Otherwise a
+    midflight docker daemon hiccup would 500 the start handler."""
+    monkeypatch.setattr(
+        "app.routers.controller._COMPOSE_READY_TIMEOUT_SECONDS", 0.05
+    )
+    monkeypatch.setattr(
+        "app.routers.controller._COMPOSE_READY_POLL_INTERVAL_SECONDS", 0.005
+    )
+
+    _mock_repo, mock_compose, _mock_conf = patch_compose_repo_conf
+    mock_compose.get_status.side_effect = [
+        OSError("docker socket transient"),
+        OSError("docker socket transient"),
+        {"status": "running"},
+    ]
+
+    payload = {**SAMPLE_START_PAYLOAD}  # no tunnel_client_toml — focus on the wait
+
+    r = await client.post(
+        "/api/controller/start/",
+        json=payload,
+        headers={TOKEN_HEADER: "test-token"},
+    )
+
+    assert r.status_code == 200

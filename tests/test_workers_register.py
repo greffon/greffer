@@ -16,6 +16,7 @@ from app.workers.register import (
     _fetch_and_store_crl,
     _fetch_cert,
     _install_cert,
+    _maybe_install_initial_tunnel_config,
     _post_register,
     _resolve_hostname,
     register_worker,
@@ -427,3 +428,105 @@ async def test_register_worker_falls_back_to_hostname(
         await register_worker(app)
 
     assert mock_requests.post.call_args.kwargs["json"]["address"] == "9.9.9.9"
+
+
+# ---------------------------------------------------------------------------
+# v3 push: initial tunnel client.toml shipped in the cert response
+#
+# When admin accepts a tunnel-mode greffer's registration, the manager
+# embeds the rendered client.toml in the cert response body. The
+# register-worker writes it to the shared volume so rathole-client can
+# come up immediately. Failure here is non-fatal — the greffer is
+# still functional in proxy mode and the next start/stop push retries.
+# ---------------------------------------------------------------------------
+
+
+def test_initial_tunnel_config_writes_when_field_present(
+    settings: Settings, tmp_path
+) -> None:
+    target = tmp_path / "client.toml"
+    settings.greffer_tunnel_client_config_path = str(target)
+    data = {
+        "certificate": "C",
+        "private_key": "K",
+        "tunnel_client_toml": '[client]\nremote_addr = "x"\n',
+    }
+    _maybe_install_initial_tunnel_config(settings, data)
+    assert target.read_text() == '[client]\nremote_addr = "x"\n'
+
+
+def test_initial_tunnel_config_skips_when_field_absent(
+    settings: Settings, tmp_path
+) -> None:
+    """Proxy-mode greffer (or v2 manager not pushing the field) — the
+    cert response has no ``tunnel_client_toml`` key. Helper is a no-op,
+    no file is created, no exception raised."""
+    target = tmp_path / "client.toml"
+    settings.greffer_tunnel_client_config_path = str(target)
+    data = {"certificate": "C", "private_key": "K"}
+    _maybe_install_initial_tunnel_config(settings, data)
+    assert not target.exists()
+
+
+def test_initial_tunnel_config_non_string_payload_is_non_fatal(
+    settings: Settings, tmp_path
+) -> None:
+    """A misbehaving / compromised manager could return
+    ``tunnel_client_toml`` as something other than a string (dict, list,
+    int) — the underlying f.write() would raise TypeError, NOT OSError.
+    The non-fatal contract requires catching that too; otherwise the
+    register-worker aborts mid-flow.
+
+    Codex P2 on greffer#25."""
+    target = tmp_path / "client.toml"
+    settings.greffer_tunnel_client_config_path = str(target)
+    # Non-string payload — manager bug or hostile peer.
+    data = {
+        "certificate": "C",
+        "private_key": "K",
+        "tunnel_client_toml": {"this": "should-be-a-string"},
+    }
+    with patch("app.workers.register.logger") as mock_logger:
+        # Must not raise — register flow continues.
+        _maybe_install_initial_tunnel_config(settings, data)
+
+    assert mock_logger.warning.called
+    msg = mock_logger.warning.call_args.args[0]
+    assert "non-fatal" in msg
+    # File not created (write failed before atomicity could complete).
+    assert not target.exists()
+
+
+def test_initial_tunnel_config_failure_is_non_fatal(
+    settings: Settings, tmp_path
+) -> None:
+    """OS-level write failure (e.g. directory missing) must NOT raise —
+    register flow continues and eventually completes. The register
+    worker log line gets a 'non-fatal' marker so operators searching
+    for 'failed' in logs can distinguish this from a hard error.
+
+    We assert on the logger call directly rather than via ``caplog``
+    because pytest's ``caplog`` only captures records propagated to
+    the root logger, and the greffer logger is a top-level named
+    logger (``logging.getLogger("greffer")``) whose propagation
+    behaviour depends on sibling test ordering. Patching is
+    deterministic across test orderings.
+    """
+    settings.greffer_tunnel_client_config_path = str(
+        tmp_path / "no-such-dir" / "client.toml"
+    )
+    data = {
+        "certificate": "C",
+        "private_key": "K",
+        "tunnel_client_toml": "[client]\n",
+    }
+    with patch("app.workers.register.logger") as mock_logger:
+        # Must not raise.
+        _maybe_install_initial_tunnel_config(settings, data)
+
+    # The warning message structure matters — operators grep for
+    # 'non-fatal' to distinguish recoverable greffer-side write errors
+    # from hard register failures.
+    assert mock_logger.warning.called
+    msg = mock_logger.warning.call_args.args[0]
+    assert "non-fatal" in msg

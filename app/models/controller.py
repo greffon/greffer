@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -61,13 +61,43 @@ class GreffonStartRequest(BaseModel):
 
     model_config = {"extra": "ignore"}
 
+    # v3 manager-pushed rathole client config. When present (tunnel-mode
+    # greffer with a v3 manager), the controller atomically writes it to
+    # the shared volume rathole-client file-watches. Absent for proxy-
+    # mode greffers and for the transitional v2-manager-+-v3-greffer
+    # combination during rollout step 1 (in that combination, tunnel
+    # config still flows via the v2 polling path). See tunnel-support
+    # epic v3 §4 "Pull-based sidecar replaced by manager-pushed config"
+    # and the rollout-ordering section.
+    tunnel_client_toml: str | None = None
+
 
 class GreffonStopRequest(BaseModel):
     id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
+    # Same shape as start: optional client.toml pushed by manager. Stop
+    # is the only place where a stale client.toml on the greffer is
+    # harmless until next start (the dropped server.toml service severs
+    # traffic regardless), but a fresh stop push lets rathole-client
+    # close its idle forwarding pair right away.
+    tunnel_client_toml: str | None = None
+
+
+# config_write_status — surfaced in start/stop responses so the manager
+# can report a greffer-side write failure to the API caller. ``ok``
+# means the file was written atomically (or the field was absent and
+# nothing needed writing); ``failed`` means an OSError on write — the
+# instance start/stop itself still succeeded but the tunnel config is
+# now stale on disk and the next start/stop will re-push.
+ConfigWriteStatus = Literal["ok", "failed"]
 
 
 class GreffonStartResponse(BaseModel):
     ports: list[Any]
+    config_write_status: ConfigWriteStatus = "ok"
+
+
+class GreffonStopResponse(BaseModel):
+    config_write_status: ConfigWriteStatus = "ok"
 
 
 class GreffonStatusResponse(BaseModel):

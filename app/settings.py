@@ -54,7 +54,24 @@ class Settings(BaseSettings):
     # tunnel-sidecar can authenticate against the manager with the same
     # ``X-GREFFON-TOKEN``. The compose tunnel profile mounts this path
     # as a shared volume between greffer and sidecar. Empty disables.
+    #
+    # End-state in v3 cleanup: this whole token-file machinery goes away
+    # (the v3 sidecar is rathole-client + dumb-init only, no agent.py
+    # consuming the token). Kept alive through rollout step 1 so a v2
+    # manager calling a v3 greffer continues to work via the polling
+    # path. See tunnel-support epic v3 §"Deployment / rollout ordering".
     greffer_token_file_path: str = "/run/tunnel-secrets/greffer-token"
+
+    # Where the greffer-side controller handler writes the rathole
+    # ``client.toml`` pushed by the manager (in cert-poll responses,
+    # start/stop request bodies). The compose tunnel profile mounts this
+    # path as a shared volume between greffer and rathole-client; the
+    # sidecar's file-watcher hot-reloads on change. Empty disables the
+    # v3 push behaviour — the handler accepts ``tunnel_client_toml`` in
+    # payloads but does not write it. (Useful in tests and in the
+    # transitional step-1 deployment where a v2 manager isn't sending
+    # the field at all.)
+    greffer_tunnel_client_config_path: str = "/config/client.toml"
 
     greffon_base_server: str = "https://api.greffon.io"
     greffer_protocol: Literal["http", "https"] = "https"
