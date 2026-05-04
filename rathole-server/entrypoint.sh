@@ -70,14 +70,28 @@ while true; do
     if [ -f "$CONFIG" ] && grep -q '^\[server\.services\.' "$CONFIG" 2>/dev/null; then
         echo "rathole-server: config has services, running pre-flight port check"
 
-        # Extract ``bind_addr = "..."`` values from the config — both
+        # Extract ``bind_addr = ...`` values from the config — both
         # the top-level ``[server]`` block (control port) and each
-        # ``[server.services.*]`` block (data ports). Tolerates mixed
-        # quoting and arbitrary whitespace around the ``=``. Emits one
-        # ``host:port`` per matched line.
-        bind_pairs=$(grep -oE 'bind_addr[[:space:]]*=[[:space:]]*"[^"]+"' "$CONFIG" \
-            | sed -E 's/bind_addr[[:space:]]*=[[:space:]]*"([^"]+)"/\1/' \
-            || true)
+        # ``[server.services.*]`` block (data ports). Tolerates:
+        #   - Either TOML string form: "..." (basic) or '...' (literal).
+        #     Manager always renders double quotes, but a hand-edited
+        #     or future-formatter-touched config may use either.
+        #     (Codex P2 on greffer#27.)
+        #   - Arbitrary whitespace around the ``=``.
+        #   - A trailing ``# ...`` line comment.
+        # Emits one ``host:port`` per matched line.
+        bind_pairs=$(awk '
+          /^[[:space:]]*bind_addr[[:space:]]*=/ {
+            # Drop the "key = " prefix.
+            sub(/^[^=]*=[[:space:]]*/, "")
+            # Drop trailing whitespace + optional line-comment.
+            sub(/[[:space:]]*(#.*)?$/, "")
+            # Strip a single leading or trailing quote of either type.
+            # \x27 is the single-quote escape inside an awk regex.
+            gsub(/^["\x27]|["\x27]$/, "")
+            print
+          }
+        ' "$CONFIG")
 
         # Snapshot of currently-listening ports — read once instead of
         # per-port to keep the check O(N + M) rather than O(N·M).
