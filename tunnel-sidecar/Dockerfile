@@ -1,16 +1,19 @@
-FROM python:3.11-slim
+FROM debian:bookworm-slim
 
+# v3 sidecar is "rathole-client + dumb-init only" — no agent.py
+# polling loop, no python runtime in the image. The greffer's
+# FastAPI controller writes client.toml on the shared volume in
+# response to manager pushes (POST /api/controller/tunnel-config/);
+# rathole-client picks up the change via its built-in file watcher
+# and connects out to rathole-server. See greffer#28 for the push
+# endpoint and greffon/manager#33 for the manager side.
+#
 # slim doesn't include bash, curl, unzip, or dumb-init by default.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash curl ca-certificates dumb-init unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# rathole 0.5.0 ships the built-in file watcher as a default Cargo.toml
-# feature. The agent triggers reloads by atomic-writing client.toml —
-# no SIGHUP, no Docker socket. Connection preservation on unchanged
-# services is verified in greffon/greffon docs/features/tunnel-support/spike/.
-#
 # rathole 0.5.0's published Linux artefacts are asymmetric: amd64 ships
 # only as glibc-linked (x86_64-unknown-linux-gnu), arm64 only as a
 # statically-linked musl build. The Debian-slim base satisfies both —
@@ -36,9 +39,7 @@ RUN set -eux; \
     chmod +x /usr/local/bin/rathole
 
 WORKDIR /sidecar
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY agent.py entrypoint.sh ./
+COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]

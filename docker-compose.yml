@@ -33,11 +33,13 @@ services:
     volumes:
       - ./:/app
       - /var/run/docker.sock:/var/run/docker.sock
-      # Shared with tunnel-sidecar so the agent can read the FastAPI
-      # token (settings.greffer_token_file_path). Always mounted so
-      # proxy-mode deployments don't need a separate compose layer; the
-      # token write itself is a no-op when the sidecar isn't running.
-      - tunnel-secrets:/run/tunnel-secrets
+      # Shared volume that the greffer's FastAPI controller writes
+      # client.toml into (manager pushes via /api/controller/tunnel-config/
+      # and via the cert-poll response on accept). The tunnel-sidecar
+      # reads it through the same mount so rathole-client's file watcher
+      # picks up changes. Always mounted so proxy-mode deployments
+      # don't need a separate compose layer.
+      - rathole-client-config:/config
   nginx:
     build: ./nginx
     restart: unless-stopped
@@ -53,23 +55,16 @@ services:
   # `docker compose --profile tunnel up`. Proxy-mode greffers pay zero
   # cost — the container is never created.
   #
-  # network_mode: host so rathole-client can reach manager outbound and
-  # 127.0.0.1 services on the host. Note: this gives rathole-client
-  # access to ANY 127.0.0.1 service on the host (sshd, local DBs);
-  # operator runbook recommends running the greffer host in a VM.
-  # Tunnel-mode sidecar. Started only when the operator opts in via
-  # `docker compose --profile tunnel up`. Proxy-mode greffers pay zero
-  # cost — the container is never created.
+  # v3: rathole-client + dumb-init only. No agent.py, no python runtime,
+  # no manager polling, no shared-secret token on disk. The greffer's
+  # FastAPI controller writes client.toml on the shared volume in
+  # response to manager pushes (POST /api/controller/tunnel-config/);
+  # rathole-client picks up the change via its built-in file watcher.
   #
-  # network_mode: host so rathole-client can reach manager outbound and
-  # 127.0.0.1 services on the host. Note: this gives rathole-client
-  # access to ANY 127.0.0.1 service on the host (sshd, local DBs);
-  # operator runbook recommends running the greffer host in a VM.
-  #
-  # Auth: the FastAPI greffer's lifespan writes its active token to the
-  # tunnel-secrets shared volume; sidecar reads via GREFFER_TOKEN_FILE.
-  # Token rotates automatically on greffer restart. **v1 design** —
-  # see app/main.py for the rationale and the planned mTLS migration.
+  # network_mode: host so rathole-client can reach the manager's
+  # rathole-server out through the host's network. Note: this still
+  # gives rathole-client access to host loopback services; operator
+  # runbook recommends running the greffer host in a dedicated VM.
   tunnel-sidecar:
     build: ./tunnel-sidecar
     profiles: ["tunnel"]
@@ -77,36 +72,20 @@ services:
     restart: unless-stopped
     depends_on:
       - greffer
-    # env_file (NOT ``environment: - GREFFER_ID=${GREFFER_ID}``):
-    # Compose ``${VAR}`` interpolation reads from the CLI environment /
-    # project-root .env at parse time — *not* from env_file on a
-    # sibling service. With the ``docker compose --profile tunnel up``
-    # flow documented in the runbook, the operator only edits
-    # ``greffer/env.env``; the CLI env is empty, so interpolation
-    # would inject empty GREFFER_ID / MANAGER_URL into the sidecar
-    # and the agent would 401-loop forever. Reusing the same
-    # ``env.env`` via env_file injects values at container start.
-    env_file: *envfile
-    environment:
-      # Sidecar-specific values that override / supplement env.env.
-      - GREFFER_TOKEN_FILE=/secrets/greffer-token
-      - POLL_INTERVAL_SECONDS=2
-      # CA_BUNDLE_PATH unset → agent falls back to system CA store.
-      # Set to a mounted bundle when the manager is signed by a
-      # private CA.
     volumes:
-      # Read-only mount of the shared volume the FastAPI greffer
-      # publishes its token into. Sidecar never writes here.
-      - tunnel-secrets:/secrets:ro
+      # Read-only mount of the shared client.toml the greffer's
+      # controller writes. Sidecar never writes here.
+      - rathole-client-config:/config:ro
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "agent.py"]
+      test: ["CMD", "pgrep", "-f", "rathole"]
       interval: 15s
       timeout: 3s
       retries: 3
 volumes:
-  # Token handoff between FastAPI greffer (writer) and tunnel-sidecar
-  # (reader). Named volume keeps it inside the docker-managed area;
-  # nothing on the host filesystem to chmod.
-  tunnel-secrets:
+  # Shared client.toml between greffer's FastAPI controller (writer)
+  # and tunnel-sidecar's rathole-client (reader). Named volume keeps
+  # it inside the docker-managed area; nothing on the host filesystem
+  # to chmod.
+  rathole-client-config:
 networks:
   internal: {}

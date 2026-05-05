@@ -114,55 +114,10 @@ def test_bare_workers_enabled_env_var_is_ignored(
     assert s.greffer_workers_enabled is False
 
 
-@pytest.mark.asyncio
-async def test_lifespan_publishes_token_to_sidecar_volume(
-    settings: Settings, tmp_path,
-) -> None:
-    """Lifespan startup writes the active greffer_token to the path
-    configured in settings, with 0600 perms, atomically. The sidecar
-    reads from the same path on its own mount of the shared volume."""
-    target = tmp_path / 'greffer-token'
-    settings.greffer_token_file_path = str(target)  # type: ignore[misc]
-    app = create_app(token='shared-tok', settings=settings)
-    async with lifespan(app):
-        assert target.exists()
-        assert target.read_text() == 'shared-tok'
-        # 0600 — only the greffer process and the sidecar (via shared
-        # volume mount) should ever see it.
-        assert oct(target.stat().st_mode)[-3:] == '600'
-        # No leftover tmp file — atomic rename, not partial write.
-        assert list(tmp_path.glob('*.tmp')) == []
-
-
-@pytest.mark.asyncio
-async def test_lifespan_token_publish_disabled_when_path_empty(
-    settings: Settings, tmp_path,
-) -> None:
-    settings.greffer_token_file_path = ''  # type: ignore[misc]
-    app = create_app(token='ignored', settings=settings)
-    async with lifespan(app):
-        # No file should be created in tmp_path or anywhere else
-        # detectable here. The behavior is "do nothing"; we just need
-        # the lifespan to not raise.
-        pass
-
-
-@pytest.mark.asyncio
-async def test_lifespan_token_publish_swallows_oserror(
-    settings: Settings,
-) -> None:
-    """If the shared volume isn't mounted (proxy-mode misconfig, missing
-    parent dir on a read-only fs), startup must continue. The sidecar
-    is the only consumer; it backs off on auth failure. This test
-    asserts non-fatal behavior: lifespan completes, no exception leaks."""
-    # /dev/null/forbidden cannot be created (parent is not a directory).
-    # mkdir(parents=True) raises NotADirectoryError, write_text never
-    # runs. The function must catch and continue.
-    settings.greffer_token_file_path = '/dev/null/forbidden/greffer-token'  # type: ignore[misc]
-    app = create_app(token='t', settings=settings)
-    # If the function let the OSError propagate, this would raise.
-    async with lifespan(app):
-        pass
+# Three v2 tests covering ``_publish_token_to_sidecar`` (token-on-disk
+# handoff to the polling sidecar) were deleted in the v3 cleanup PR.
+# The function and its setting are gone; the v3 sidecar runs only
+# rathole-client + dumb-init and reads no manager tokens.
 
 
 def test_settings_greffer_token_env_var_binds(

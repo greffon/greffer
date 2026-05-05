@@ -19,20 +19,16 @@ class Settings(BaseSettings):
 
     # Optional token override; primarily for tests and operator-driven
     # explicit rotation. When unset, ``create_app`` mints a fresh random
-    # token each process. Sibling services (e.g. tunnel-sidecar) read the
-    # active token via the file at ``greffer_token_file_path`` — see
-    # ``app/lifespan.py`` for the write side.
+    # token each process. Used as ``X-GREFFON-TOKEN`` on the manager →
+    # greffer auth path (start/stop/tunnel-config endpoints).
     greffer_token: str | None = None
 
     # Optional mode declaration, included in the register payload so the
-    # manager can validate the greffer-side intent matches the stored
-    # ``Greffer.mode``. Operators flipping a registered greffer between
-    # proxy ↔ tunnel via ``PATCH /api/greffer/{id}/mode/`` MUST also set
-    # this on the greffer host (env.env: ``GREFFER_MODE=tunnel``) and
-    # restart the greffer; otherwise the next register call sends no
-    # mode (defaulting to ``proxy`` server-side) and 400s with
-    # ``mode_mismatch`` against the new stored value, leaving the greffer
-    # stuck on its old cert. Surfaced by the QA on 2026-04-30.
+    # manager can stamp ``Greffer.mode`` on first register or validate
+    # against the stored value on re-register. v3 source-of-truth is this
+    # env var: operators bring up a tunnel greffer by setting
+    # ``GREFFER_MODE=tunnel`` here and starting compose; no admin pre-
+    # configuration is needed.
     greffer_mode: Literal["proxy", "tunnel"] | None = None
 
     @field_validator("greffer_mode", mode="before")
@@ -44,23 +40,12 @@ class Settings(BaseSettings):
         # empty string into the Literal validation and fail.
         # Scope: this field only — a model-wide ``env_ignore_empty=True``
         # would silently turn empty values into defaults for fields
-        # whose contract is "empty disables" (e.g. greffer_token_file_path).
+        # whose contract is "empty disables" (e.g.
+        # greffer_tunnel_client_config_path).
         # Codex P2 on greffer#23.
         if isinstance(v, str) and v == "":
             return None
         return v
-
-    # Where ``app/lifespan.py`` writes the active token on startup so the
-    # tunnel-sidecar can authenticate against the manager with the same
-    # ``X-GREFFON-TOKEN``. The compose tunnel profile mounts this path
-    # as a shared volume between greffer and sidecar. Empty disables.
-    #
-    # End-state in v3 cleanup: this whole token-file machinery goes away
-    # (the v3 sidecar is rathole-client + dumb-init only, no agent.py
-    # consuming the token). Kept alive through rollout step 1 so a v2
-    # manager calling a v3 greffer continues to work via the polling
-    # path. See tunnel-support epic v3 §"Deployment / rollout ordering".
-    greffer_token_file_path: str = "/run/tunnel-secrets/greffer-token"
 
     # Where the greffer-side controller handler writes the rathole
     # ``client.toml`` pushed by the manager (in cert-poll responses,
