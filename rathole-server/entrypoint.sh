@@ -28,37 +28,44 @@ POLL_SECONDS="${RATHOLE_BOOTSTRAP_POLL_SECONDS:-1}"
 
 echo "rathole-server: waiting for at least one [server.services.*] block in $CONFIG"
 
-# Enumerate every TCP port currently in LISTEN state on this network
-# namespace, regardless of which local IP the listener is bound to.
-#
-# We must not just probe 127.0.0.1 — Codex P1 on greffer#27 caught the
-# false-negative: a process bound to 127.0.0.2:N or eth0:N would still
-# conflict with rathole's later 0.0.0.0:N bind (kernel: EADDRINUSE),
-# but a TCP-connect to 127.0.0.1:N would refuse and report "free".
-# Reading /proc/net/tcp{,6} sees ALL local listeners.
-#
-# Returns ports as decimal integers, one per line, deduped + sorted.
-# Works against /proc inside the container's network namespace, which
-# is what matters: rathole's bind happens here too.
+# Enumerate every L4 socket currently in a "bound" state on this network
+# namespace, broken out by protocol so the per-service check below can
+# match TCP services against TCP listeners and UDP services against UDP
+# listeners. TCP and UDP can legitimately coexist on the same port
+# number; checking against a single combined snapshot would either:
+#   - falsely flag a TCP-listener-vs-UDP-service combination as a
+#     collision (Codex P2 on greffer#27), or
+#   - miss a real UDP-vs-UDP collision because the snapshot only saw
+#     TCP listeners.
 #
 # Implementation notes:
-#  - /proc/net/tcp format: "  sl  local_address rem_address st ...". Field
-#    4 is the connection state in hex; "0A" = LISTEN.
-#  - Field 2 is "IP_HEX:PORT_HEX". The port is the last 4 hex chars
-#    after the colon. We don't care about the IP for collision
-#    detection — manager renders 0.0.0.0 binds, and any local listener
-#    on the same port conflicts with that.
-#  - Uses pure bash + awk (mawk-compatible) — no iproute2 / netcat /
-#    python dependency added to the rathole-server image.
-get_listening_ports() {
+#   - /proc/net/{tcp,tcp6}: field 4 is the connection state in hex.
+#     "0A" = LISTEN; ESTABLISHED / TIME_WAIT / etc. don't conflict
+#     with rathole's bind. We filter strictly for LISTEN.
+#   - /proc/net/{udp,udp6}: UDP has no LISTEN state. Any entry in
+#     these files indicates a bound UDP socket on the local port —
+#     that conflicts with rathole's UDP bind. No state filter applied.
+#   - Field 2 is "IP_HEX:PORT_HEX"; we discard the IP because manager
+#     renders 0.0.0.0 binds and any same-port listener (on any local
+#     IP) conflicts with a wildcard bind via EADDRINUSE.
+#   - Pure bash + awk (mawk-compatible). No iproute2 / netcat / python
+#     dependency in the rathole-server image.
+get_listening_ports_proto() {
+    local proto=$1   # "tcp" or "udp"
+    local proc4="/proc/net/${proto}"
+    local proc6="/proc/net/${proto}6"
     {
-        for proc in /proc/net/tcp /proc/net/tcp6; do
+        for proc in "$proc4" "$proc6"; do
             [ -r "$proc" ] || continue
-            tail -n +2 "$proc" | awk '$4 == "0A" {print $2}'
+            if [ "$proto" = "tcp" ]; then
+                # LISTEN sockets only.
+                tail -n +2 "$proc" | awk '$4 == "0A" {print $2}'
+            else
+                # UDP — every entry is a bound socket.
+                tail -n +2 "$proc" | awk '{print $2}'
+            fi
         done
     } | while IFS= read -r addr; do
-        # addr is "IP_HEX:PORT_HEX"; take the part after the last colon,
-        # convert from hex to decimal via bash arithmetic.
         port_hex="${addr##*:}"
         # Skip rare malformed lines that don't fit the format.
         [[ "$port_hex" =~ ^[0-9A-Fa-f]+$ ]] || continue
@@ -70,52 +77,80 @@ while true; do
     if [ -f "$CONFIG" ] && grep -q '^\[server\.services\.' "$CONFIG" 2>/dev/null; then
         echo "rathole-server: config has services, running pre-flight port check"
 
-        # Extract ``bind_addr = ...`` values from the config — both
-        # the top-level ``[server]`` block (control port) and each
-        # ``[server.services.*]`` block (data ports). Tolerates:
-        #   - Either TOML string form: "..." (basic) or '...' (literal).
-        #     Manager always renders double quotes, but a hand-edited
-        #     or future-formatter-touched config may use either.
-        #     (Codex P2 on greffer#27.)
-        #   - Arbitrary whitespace around the ``=``.
+        # Walk the config as a state machine: track the current section's
+        # ``type`` (tcp by default; rathole spec) and ``bind_addr``, then
+        # flush a (proto, host:port) tuple per section. Both keys can
+        # appear in any order within a section — manager renders
+        # bind_addr first, but hand-edited configs are free-form. The
+        # top-level ``[server]`` block has only a bind_addr (the rathole
+        # control port, always TCP) — no ``type`` line, so proto stays
+        # at the "tcp" default.
+        #
+        # Tolerates:
+        #   - Both TOML string forms: "..." (basic) and '...' (literal).
+        #     Manager renders double quotes, but a hand-edited or
+        #     future-formatter-touched config may use either.
+        #   - Arbitrary whitespace around ``=``.
         #   - A trailing ``# ...`` line comment.
-        # Emits one ``host:port`` per matched line.
-        bind_pairs=$(awk '
+        # Emits one tab-separated ``proto<TAB>host:port`` per service.
+        service_binds=$(awk '
+          /^[[:space:]]*\[/ {
+            if (bind != "") print proto "\t" bind
+            proto = "tcp"
+            bind = ""
+            next
+          }
+          /^[[:space:]]*type[[:space:]]*=/ {
+            line = $0
+            sub(/^[^=]*=[[:space:]]*/, "", line)
+            sub(/[[:space:]]*(#.*)?$/, "", line)
+            gsub(/^["\x27]|["\x27]$/, "", line)
+            proto = line
+            next
+          }
           /^[[:space:]]*bind_addr[[:space:]]*=/ {
-            # Drop the "key = " prefix.
-            sub(/^[^=]*=[[:space:]]*/, "")
-            # Drop trailing whitespace + optional line-comment.
-            sub(/[[:space:]]*(#.*)?$/, "")
-            # Strip a single leading or trailing quote of either type.
-            # \x27 is the single-quote escape inside an awk regex.
-            gsub(/^["\x27]|["\x27]$/, "")
-            print
+            line = $0
+            sub(/^[^=]*=[[:space:]]*/, "", line)
+            sub(/[[:space:]]*(#.*)?$/, "", line)
+            gsub(/^["\x27]|["\x27]$/, "", line)
+            bind = line
+          }
+          END {
+            if (bind != "") print proto "\t" bind
           }
         ' "$CONFIG")
 
-        # Snapshot of currently-listening ports — read once instead of
-        # per-port to keep the check O(N + M) rather than O(N·M).
-        listening_ports=$(get_listening_ports)
+        # Snapshot of currently-bound ports per protocol — read once
+        # instead of per-port to keep the check O(N + M).
+        tcp_ports=$(get_listening_ports_proto tcp)
+        udp_ports=$(get_listening_ports_proto udp)
 
         collision_count=0
-        for pair in $bind_pairs; do
+        while IFS=$'\t' read -r proto pair; do
+            [ -z "$pair" ] && continue
             port="${pair##*:}"
             host="${pair%:*}"
-            # Sanity-check the port parsed cleanly.
             [[ "$port" =~ ^[0-9]+$ ]] || continue
 
-            # If ANY local listener is on this port, rathole's later
-            # 0.0.0.0:port bind will fail with EADDRINUSE — regardless
-            # of whether the existing listener is on loopback, eth0,
-            # or any other interface. Port-only check is the right
-            # granularity given manager always renders 0.0.0.0 binds.
-            if grep -qx "$port" <<< "$listening_ports"; then
-                echo "rathole-server: WARNING — pre-flight port collision: ${host}:${port} is already bound on this host (some local interface is listening)." >&2
-                echo "rathole-server: WARNING — rathole will fail to bind this port and the corresponding service will not carry traffic." >&2
+            # Pick the snapshot matching this service's protocol.
+            # Default ("tcp" or any unrecognized value) → tcp_ports.
+            if [ "$proto" = "udp" ]; then
+                snapshot="$udp_ports"
+            else
+                snapshot="$tcp_ports"
+            fi
+
+            # Port-only match against the protocol-specific snapshot.
+            # Same port + same protocol = real EADDRINUSE waiting to
+            # happen at rathole's bind; same port + different protocol
+            # = no conflict (TCP/UDP coexist).
+            if grep -qx "$port" <<< "$snapshot"; then
+                echo "rathole-server: WARNING — pre-flight ${proto} port collision: ${host}:${port} is already bound on this host (some local interface is listening)." >&2
+                echo "rathole-server: WARNING — rathole will fail to bind this ${proto} port and the corresponding service will not carry traffic." >&2
                 echo "rathole-server: WARNING — fix: stop the conflicting process, OR shift TUNNEL_PORT_RANGE to an unused window, OR reserve the range via /proc/sys/net/ipv4/ip_local_reserved_ports." >&2
                 collision_count=$((collision_count + 1))
             fi
-        done
+        done <<< "$service_binds"
 
         if [ "$collision_count" -gt 0 ]; then
             echo "rathole-server: ${collision_count} port collision(s) detected; rathole starting anyway (it will report bind failures in its own log)" >&2
