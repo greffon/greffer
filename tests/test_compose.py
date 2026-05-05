@@ -184,6 +184,51 @@ class ApplyConfigurationTests(TestCase):
 
     @patch('apps.utils.docker.compose.client')
     @patch('apps.utils.docker.compose.remove_compose_file')
+    def test_apply_configuration_env_value_path(self, mock_remove, mock_client):
+        """Env destination: extract a nested value with destination.value_path."""
+        from apps.utils.docker.compose import apply_configuration
+
+        greffon_info = {
+            'id': 'test-env-nested',
+            'configurations': [
+                {
+                    'value': {
+                        'runner_scope': 'org',
+                        'target': {
+                            'org_name': 'greffon',
+                        },
+                    },
+                    'destinations': [
+                        {
+                            'type': 'env',
+                            'container': 'app',
+                            'key': 'RUNNER_SCOPE',
+                            'value_path': 'runner_scope',
+                        },
+                        {
+                            'type': 'env',
+                            'container': 'app',
+                            'key': 'ORG_NAME',
+                            'value_path': 'target.org_name',
+                        },
+                    ],
+                }
+            ],
+            'volumes': {},
+        }
+        compose = {
+            'services': {
+                'app': {}
+            }
+        }
+
+        apply_configuration(greffon_info, compose)
+
+        self.assertIn('RUNNER_SCOPE=org', compose['services']['app']['environment'])
+        self.assertIn('ORG_NAME=greffon', compose['services']['app']['environment'])
+
+    @patch('apps.utils.docker.compose.client')
+    @patch('apps.utils.docker.compose.remove_compose_file')
     @patch('apps.utils.docker.compose.DataURI')
     def test_apply_configuration_file(self, mock_datauri_cls, mock_remove, mock_client):
         """File destination: decode data-URI, write binary file."""

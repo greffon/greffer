@@ -140,7 +140,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     ]
     return compose
 
-
 def _compute_instance_context(greffon_info):
     """Expose instance_url / instance_host / instance_port / instance_id to
     the Jinja render context so catalog metadata default_value strings can
@@ -194,6 +193,24 @@ def create_volumes_then_copy_files(greffon_info):
             docker_create_volume(volume)
         docker_copy_file_into_volume(volume)
 
+def _get_destination_value(configuration_value, destination):
+    if not isinstance(configuration_value, dict):
+        return ''
+
+    value_path = destination.get('value_path')
+    if not value_path:
+        return configuration_value.get('value', '')
+
+    current = configuration_value
+    for part in value_path.split('.'):
+        if not isinstance(current, dict):
+            return ''
+        current = current.get(part, '')
+
+    if current is None:
+        return ''
+    return current
+
 def apply_configuration(greffon_info, compose):
     for configuration in greffon_info.get('configurations', []):
         for destination in configuration.get('destinations', []):
@@ -209,10 +226,11 @@ def apply_configuration(greffon_info, compose):
             elif destination['type'] == 'env':
                 remove_compose_file(greffon_info)
                 compose['services'][destination['container']].setdefault('environment', [])
+                env_value = _get_destination_value(configuration.get('value'), destination)
                 if isinstance(compose['services'][destination['container']]['environment'], dict):
-                    compose['services'][destination['container']]['environment'][destination['key']] = configuration['value'].get('value', '')
+                    compose['services'][destination['container']]['environment'][destination['key']] = env_value
                 else:
-                    compose['services'][destination['container']]['environment'].append(f'{destination["key"]}={configuration["value"].get("value", "")}')
+                    compose['services'][destination['container']]['environment'].append(f'{destination["key"]}={env_value}')
             elif destination['type'] == 'file':
                 remove_compose_file(greffon_info)
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
