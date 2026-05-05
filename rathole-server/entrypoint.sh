@@ -13,14 +13,26 @@
 # rathole after startup; signal forwarding is dumb-init's job.
 #
 # v3 hardening: before exec'ing rathole, parse the bind ports from the
-# config and warn if any of them is already bound on this host. Symptom
-# without the check: rathole starts, tries to bind on a colliding port,
-# logs the failure deep in its own output, and the operator only finds
-# out when traffic doesn't flow. This complements manager's
-# tunnel_port_collisions_total metric (which guards allocation time);
-# this check guards startup time, when rathole-server is first coming
-# up against a config that may have been written long before the
-# container started.
+# config and warn if any of them is already bound INSIDE THIS
+# CONTAINER'S NETWORK NAMESPACE. /proc/net/tcp here reflects only this
+# container's sockets — the host's network namespace is not visible.
+#
+# What this catches in practice:
+#   - A previous rathole-server crash left TIME_WAIT sockets that
+#     would block rathole's wildcard bind (state 06, no SO_REUSEADDR).
+#   - An unexpected process inside the rathole-server container
+#     namespace bound to a config port (rare; sanity check).
+#
+# What this does NOT catch:
+#   - Host-level port conflicts. Those manifest as ``docker compose
+#     up`` failing the port-publish, before the entrypoint runs.
+#   - Conflicts in unrelated containers (different namespace).
+#
+# Manager's complementary tunnel_port_collisions_total metric (PR #31)
+# is the better defense for "operator misconfigured TUNNEL_PORT_RANGE"
+# — it probes from manager's namespace via the docker port mapping
+# at allocation time. This pre-flight is the narrower defense for
+# "rathole's own previous instance state is still in the kernel."
 set -euo pipefail
 
 CONFIG="${RATHOLE_CONFIG_PATH:-/config/server.toml}"
@@ -58,8 +70,21 @@ get_listening_ports_proto() {
         for proc in "$proc4" "$proc6"; do
             [ -r "$proc" ] || continue
             if [ "$proto" = "tcp" ]; then
-                # LISTEN sockets only.
-                tail -n +2 "$proc" | awk '$4 == "0A" {print $2}'
+                # Match states that BLOCK a new bind:
+                #   0A LISTEN — another listener exists on this port.
+                #   06 TIME_WAIT — classic post-close blocker for a
+                #     subsequent bind without SO_REUSEADDR. Common after
+                #     a rathole crash-restart while the kernel still
+                #     holds the 4-tuple in the wait window.
+                # We deliberately do NOT match every state (Codex P2
+                # on greffer#27 raised this). ESTABLISHED (01) outbound
+                # connections do not generally block a wildcard bind on
+                # Linux — the kernel disambiguates by 5-tuple. Including
+                # them would generate false positives on every active
+                # rathole tunnel data connection during a graceful
+                # restart, which is operationally noisier than the
+                # pathological cases it would catch.
+                tail -n +2 "$proc" | awk '$4 == "0A" || $4 == "06" {print $2}'
             else
                 # UDP — every entry is a bound socket.
                 tail -n +2 "$proc" | awk '{print $2}'
