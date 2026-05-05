@@ -70,21 +70,30 @@ get_listening_ports_proto() {
         for proc in "$proc4" "$proc6"; do
             [ -r "$proc" ] || continue
             if [ "$proto" = "tcp" ]; then
-                # Match states that BLOCK a new bind:
-                #   0A LISTEN — another listener exists on this port.
-                #   06 TIME_WAIT — classic post-close blocker for a
-                #     subsequent bind without SO_REUSEADDR. Common after
-                #     a rathole crash-restart while the kernel still
-                #     holds the 4-tuple in the wait window.
-                # We deliberately do NOT match every state (Codex P2
-                # on greffer#27 raised this). ESTABLISHED (01) outbound
-                # connections do not generally block a wildcard bind on
-                # Linux — the kernel disambiguates by 5-tuple. Including
-                # them would generate false positives on every active
-                # rathole tunnel data connection during a graceful
-                # restart, which is operationally noisier than the
-                # pathological cases it would catch.
-                tail -n +2 "$proc" | awk '$4 == "0A" || $4 == "06" {print $2}'
+                # LISTEN sockets only (state 0A).
+                #
+                # Two states could theoretically block a new bind:
+                # LISTEN (0A) and TIME_WAIT (06). We match LISTEN only
+                # because rathole binds via Tokio's TcpListener, which
+                # sets SO_REUSEADDR on Unix by default — so TIME_WAIT
+                # entries do NOT actually block rathole's rebind.
+                # Including state 06 would generate false-positive
+                # warnings on every restart (TIME_WAIT entries from
+                # in-flight connections at shutdown persist for ~60s)
+                # without ever catching a real blocker.
+                #
+                # ESTABLISHED (01) is also excluded: on Linux a
+                # wildcard bind coexists with established outbound
+                # sockets via 5-tuple disambiguation. Including it
+                # would flag every active tunnel data connection
+                # during a graceful restart.
+                #
+                # Codex went back and forth on this within two review
+                # rounds (P2 round 3 said "include more states", P2
+                # round 4 said "exclude TIME_WAIT"). LISTEN-only is
+                # the kernel-behavior-correct answer for rathole's
+                # actual runtime configuration.
+                tail -n +2 "$proc" | awk '$4 == "0A" {print $2}'
             else
                 # UDP — every entry is a bound socket.
                 tail -n +2 "$proc" | awk '{print $2}'
