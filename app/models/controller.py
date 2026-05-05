@@ -103,3 +103,30 @@ class GreffonStopResponse(BaseModel):
 class GreffonStatusResponse(BaseModel):
     status: str
     containers: list[dict[str, Any]]
+
+
+class TunnelConfigPushRequest(BaseModel):
+    """v3 manager-pushed rathole client.toml — second-phase push for
+    start/stop flows.
+
+    Manager makes the controller-start/stop call FIRST, gets the
+    greffer's port_host allocation in the response, then renders
+    client.toml against the post-allocation state and pushes it via
+    this endpoint. The split exists because the rendered file's
+    ``local_addr`` lines depend on port_host, which manager doesn't
+    know until the greffer responds. See manager-side PR E and epic
+    v3 § "start_stop_greffon — start path".
+
+    On accept_register, the initial client.toml ships in the cert
+    response body instead (the greffer is the caller of that hop;
+    response-body delivery is the natural shape there). See
+    ``app/workers/register.py``.
+    """
+    client_toml: str = Field(min_length=1)
+
+
+class TunnelConfigPushResponse(BaseModel):
+    """Mirrors ``GreffonStartResponse.config_write_status`` so the
+    manager's surfacing logic can use the same field name across
+    every push call site."""
+    config_write_status: ConfigWriteStatus = "ok"

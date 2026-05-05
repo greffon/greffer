@@ -499,6 +499,114 @@ async def test_stop_with_tunnel_field_writes_file(
     assert target.read_text() == "[client]\nservices=[]\n"
 
 
+# ---------------------------------------------------------------------------
+# v3 push (second phase): POST /api/controller/tunnel-config/
+#
+# Manager calls this AFTER start/stop has returned with port_host
+# allocations, then renders client.toml against the post-allocation
+# state and pushes here. The split exists because manager doesn't
+# know port_host until the greffer responds.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tunnel_config_push_writes_file_and_returns_ok(
+    client: AsyncClient, tmp_path
+) -> None:
+    target = tmp_path / "client.toml"
+    payload = {"client_toml": "[client]\nremote_addr = \"x\"\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(target),
+    ):
+        r = await client.post(
+            "/api/controller/tunnel-config/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json() == {"config_write_status": "ok"}
+    assert target.read_text() == "[client]\nremote_addr = \"x\"\n"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_config_push_failed_write_returns_failed(
+    client: AsyncClient, tmp_path
+) -> None:
+    """Filesystem error → 200 with config_write_status='failed'.
+    NOT a 500 — manager surfaces the failed status to the API caller."""
+    bogus = tmp_path / "missing-dir" / "client.toml"
+    payload = {"client_toml": "[client]\n"}
+
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        str(bogus),
+    ):
+        r = await client.post(
+            "/api/controller/tunnel-config/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json() == {"config_write_status": "failed"}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_config_push_empty_path_no_ops_returns_ok(
+    client: AsyncClient,
+) -> None:
+    """Empty config path is the documented 'disabled' mode (e.g.
+    test envs). Endpoint returns ok without writing — no failure
+    because no write was attempted."""
+    payload = {"client_toml": "[client]\n"}
+    with patch.object(
+        client._transport.app.state.settings,
+        "greffer_tunnel_client_config_path",
+        "",
+    ):
+        r = await client.post(
+            "/api/controller/tunnel-config/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200
+    assert r.json() == {"config_write_status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_config_push_rejects_empty_client_toml(
+    client: AsyncClient,
+) -> None:
+    """Pydantic min_length=1 — empty string 422s. Defensive: an empty
+    client.toml would erase all the rathole services on the greffer,
+    which is almost certainly a manager bug rather than a desired
+    end state."""
+    r = await client.post(
+        "/api/controller/tunnel-config/",
+        json={"client_toml": ""},
+        headers={TOKEN_HEADER: "test-token"},
+    )
+    assert r.status_code in (400, 422)
+
+
+@pytest.mark.asyncio
+async def test_tunnel_config_push_rejects_missing_token(
+    client: AsyncClient,
+) -> None:
+    """Auth gate is the same as start/stop — uses require_token."""
+    r = await client.post(
+        "/api/controller/tunnel-config/",
+        json={"client_toml": "[client]\n"},
+    )
+    assert r.status_code == 401
+
+
 @pytest.mark.asyncio
 async def test_stop_omits_tunnel_field_returns_ok(
     client: AsyncClient, tmp_path

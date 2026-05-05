@@ -24,8 +24,14 @@ from app.models.controller import (
     GreffonStatusResponse,
     GreffonStopRequest,
     GreffonStopResponse,
+    TunnelConfigPushRequest,
+    TunnelConfigPushResponse,
 )
-from app.tunnel_config import TunnelConfigWriteError, maybe_write_client_toml
+from app.tunnel_config import (
+    TunnelConfigWriteError,
+    maybe_write_client_toml,
+    write_client_toml,
+)
 
 # Framework-agnostic shared code imported directly — no rewrite.
 from apps.utils.docker import compose
@@ -205,3 +211,54 @@ def greffon_status(greffon_id: UUID) -> GreffonStatusResponse:
     # as part of the port; see hld-api-parity.md § Latent bug.
     result = compose.get_status(str(greffon_id))
     return GreffonStatusResponse(**result)
+
+
+@router.post("/tunnel-config/")
+def push_tunnel_config(
+    payload: TunnelConfigPushRequest, request: Request
+) -> TunnelConfigPushResponse:
+    """v3 second-phase push of the rathole client.toml.
+
+    Manager calls this AFTER ``/api/controller/start/`` or ``/stop/``
+    has returned with port_host allocations, then renders client.toml
+    against the post-allocation state and pushes the rendered file
+    here. This split exists because manager doesn't know port_host
+    until the greffer responds, and ``render_client_toml``'s
+    ``local_addr`` lines depend on it.
+
+    The bootstrap leg (initial client.toml after first accept) is
+    delivered via the cert-poll response body instead — see
+    ``app/workers/register.py``. Different shape because the greffer
+    is the caller of that hop.
+
+    Failure mode: if the file write fails (disk full, permission
+    denied, etc.), we return ``config_write_status='failed'`` rather
+    than raising. The manager surfaces it to the API caller. This
+    keeps the start/stop end-to-end shape predictable — instance is
+    up regardless of tunnel-config push outcome; operator sees the
+    failed status and can retry by triggering another start/stop.
+
+    Empty path setting (``settings.greffer_tunnel_client_config_path``)
+    treats this as a no-op — useful in test environments. Returns
+    ``ok`` rather than ``failed`` since no write was attempted.
+    """
+    settings = _settings(request)
+    target = settings.greffer_tunnel_client_config_path
+    if not target:
+        logger.debug("tunnel_config_push: path empty, no-op")
+        return TunnelConfigPushResponse(config_write_status="ok")
+
+    try:
+        write_client_toml(payload.client_toml, target)
+    except TunnelConfigWriteError:
+        # Already logged in the helper.
+        return TunnelConfigPushResponse(config_write_status="failed")
+    except Exception:  # pragma: no cover — paranoid wrap
+        logger.exception("tunnel_config_push_unexpected_error")
+        return TunnelConfigPushResponse(config_write_status="failed")
+
+    logger.info(
+        "tunnel_config_push_succeeded path=%s bytes=%d",
+        target, len(payload.client_toml),
+    )
+    return TunnelConfigPushResponse(config_write_status="ok")
