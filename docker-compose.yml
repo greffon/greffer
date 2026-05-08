@@ -72,6 +72,15 @@ services:
     restart: unless-stopped
     depends_on:
       - greffer
+    # rathole-client forwards inbound tunnel traffic to whatever host the
+    # manager renders in client.toml (settings.GREFFER_API_LOCAL_HOST,
+    # default ``host.docker.internal``). With ``network_mode: host`` on
+    # Linux Docker Engine, ``host-gateway`` resolves to the docker bridge
+    # gateway IP, from which the bridge port mappings of the greffer
+    # nginx are reachable. Docker Desktop (macOS / Windows) provides the
+    # same mapping out of the box; the entry is harmless there.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Read-only mount of the shared client.toml the greffer's
       # controller writes. Sidecar never writes here.
