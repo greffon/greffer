@@ -72,6 +72,36 @@ class ComputeInstanceContextTests(TestCase):
 
         self.assertEqual(info['instance_url'], 'https://override')
 
+    def test_manager_supplied_url_wins_over_greffer_public_host(self):
+        """The manager sends ``ports[0].url = https://<field-id>.my.<domain>``
+        in the start payload. ``instance_url`` must surface THAT — the
+        user-facing wildcard subdomain — not the greffer-direct
+        ``GREFFER_PUBLIC_HOST:port_host`` form, otherwise greffons like
+        Plausible bake an internal port into emails/OAuth/share-links
+        and users get sent to a host that doesn't resolve from elsewhere."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'abc',
+            'ports': [{
+                'port_host': 51019,
+                'url': 'https://1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+            }],
+        })
+
+        self.assertEqual(
+            info['instance_url'],
+            'https://1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+        self.assertEqual(
+            info['instance_host'],
+            '1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+        # No explicit port in the manager URL → instance_port falls back
+        # to the greffer-local port_host so existing `{{ instance_port }}`
+        # references in catalog metadata still resolve to a real number.
+        self.assertEqual(info['instance_port'], 51019)
+
 
 class GetNginxServiceTests(TestCase):
     """Tests for get_nginx_service."""

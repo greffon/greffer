@@ -6,6 +6,7 @@ from jinja2 import Template
 import docker
 import subprocess
 import os
+from urllib.parse import urlparse
 
 client = docker.from_env()
 
@@ -144,20 +145,39 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 def _compute_instance_context(greffon_info):
     """Expose instance_url / instance_host / instance_port / instance_id to
     the Jinja render context so catalog metadata default_value strings can
-    reference `{{ instance_url }}`, `{{ instance_host }}`, etc. The greffer's
-    public hostname is read from GREFFER_PUBLIC_HOST (set by the greffer's
-    compose) with a dev-friendly `host.docker.internal` fallback."""
-    host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
+    reference `{{ instance_url }}`, `{{ instance_host }}`, etc.
+
+    Source of truth for ``instance_url`` is the URL the manager renders
+    for the first port (``ports[0].url`` — the wildcard subdomain
+    ``https://<field-id>.my.<domain>``). That's what users actually hit
+    in the browser and what greffons should bake into emails / OAuth
+    redirects / share links. Falling back to ``GREFFER_PUBLIC_HOST +
+    port_host`` only when the manager didn't supply a URL would point
+    Plausible / Nextcloud / etc. at the greffer's local nginx port,
+    which is unroutable from any host other than the greffer itself.
+    """
     ports = greffon_info.get('ports') or []
-    port = ports[0].get('port_host') if ports and isinstance(ports[0], dict) else ''
+    first_port = ports[0] if ports and isinstance(ports[0], dict) else {}
+    manager_supplied_url = first_port.get('url') or ''
+    port_host = first_port.get('port_host') or ''
     scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
+    fallback_host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
+    if manager_supplied_url:
+        parsed = urlparse(manager_supplied_url)
+        instance_host = parsed.hostname or fallback_host
+        instance_port = str(parsed.port) if parsed.port else port_host
+        instance_url = manager_supplied_url
+    else:
+        instance_host = fallback_host
+        instance_port = port_host
+        instance_url = (
+            f"{scheme}://{instance_host}:{instance_port}"
+            if instance_port else f"{scheme}://{instance_host}"
+        )
     greffon_info.setdefault('instance_id', greffon_info.get('id', ''))
-    greffon_info.setdefault('instance_host', host)
-    greffon_info.setdefault('instance_port', port)
-    greffon_info.setdefault(
-        'instance_url',
-        f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}",
-    )
+    greffon_info.setdefault('instance_host', instance_host)
+    greffon_info.setdefault('instance_port', instance_port)
+    greffon_info.setdefault('instance_url', instance_url)
     return greffon_info
 
 
