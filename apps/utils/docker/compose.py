@@ -158,14 +158,33 @@ def _compute_instance_context(greffon_info):
     """
     ports = greffon_info.get('ports') or []
     first_port = ports[0] if ports and isinstance(ports[0], dict) else {}
-    manager_supplied_url = first_port.get('url') or ''
+    manager_supplied_url_raw = first_port.get('url') or ''
+    # ``GreffonStartRequest.ports`` is permissive (``dict[str, Any]``)
+    # so the URL field can in principle be a non-string or an
+    # unparseable string. Guard the urlparse + ``.port`` access so a
+    # malformed value (e.g. ``https://host:abc``) falls back to the
+    # greffer-local ``port_host`` / ``GREFFER_PUBLIC_HOST`` defaults
+    # instead of raising ValueError during start (Codex P2 on PR #34).
+    manager_supplied_url = manager_supplied_url_raw if isinstance(manager_supplied_url_raw, str) else ''
     port_host = first_port.get('port_host') or ''
     scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
     fallback_host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
+
+    parsed = None
+    parsed_port = None
     if manager_supplied_url:
-        parsed = urlparse(manager_supplied_url)
+        try:
+            parsed = urlparse(manager_supplied_url)
+            # ``parsed.port`` is a property that re-parses the netloc and
+            # raises ValueError on a non-int port; wrap it specifically.
+            parsed_port = parsed.port
+        except (ValueError, TypeError):
+            parsed = None
+            parsed_port = None
+
+    if parsed is not None:
         instance_host = parsed.hostname or fallback_host
-        instance_port = str(parsed.port) if parsed.port else port_host
+        instance_port = str(parsed_port) if parsed_port else port_host
         instance_url = manager_supplied_url
     else:
         instance_host = fallback_host
