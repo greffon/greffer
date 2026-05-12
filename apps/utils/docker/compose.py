@@ -182,11 +182,35 @@ def _compute_instance_context(greffon_info):
             parsed = None
             parsed_port = None
 
-    if parsed is not None:
-        instance_host = parsed.hostname or fallback_host
-        instance_port = str(parsed_port) if parsed_port else port_host
+    # Codex P2 on PR #34: ``urlparse("abc")`` does NOT raise — it
+    # returns a ParseResult with empty scheme/hostname. Treat such
+    # half-parsed values as invalid so we fall back to the greffer-
+    # local defaults instead of leaking a malformed URL into
+    # ``instance_url`` (which leaks into Plausible BASE_URL, share
+    # links, OAuth redirects, etc.).
+    manager_url_valid = (
+        parsed is not None
+        and bool(parsed.scheme)
+        and bool(parsed.hostname)
+    )
+
+    if manager_url_valid:
+        instance_host = parsed.hostname
+        # ``instance_port`` is the USER-FACING port. When the manager-
+        # rendered URL has no explicit port (TLS default 443, as for
+        # the wildcard subdomain), it stays empty — catalog templates
+        # that want a host:port form can render it conditionally. The
+        # previous fallback to ``port_host`` conflated the user-facing
+        # port with the greffer-local bridge-bound port (e.g. 51019)
+        # and made OVERWRITEHOST-style env values point at the
+        # greffer-internal address (Codex P1 on greffon-catalog#15).
+        instance_port = str(parsed_port) if parsed_port else ''
         instance_url = manager_supplied_url
     else:
+        # Fallback: greffer-local URL. ``instance_port`` reflects the
+        # greffer-local bridge port — appropriate here because that's
+        # also the user-facing port in this fallback path (no separate
+        # public proxy in front of the greffer).
         instance_host = fallback_host
         instance_port = port_host
         instance_url = (
