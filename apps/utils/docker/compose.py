@@ -164,15 +164,19 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # Pass 2 — template-driven pop. We want to pop any env value that
     # would expand to a reference of an unset integration type, e.g.
     # ``{{ smtp.host }}``, ``{{ smtp.from_address.split('@')[0] }}``,
-    # or even the dict-index form
-    # ``{{ {"tls": "ssl", "starttls": "tls", "none": ""}[smtp.tls_mode] }}``.
-    # A ``[^}]*`` regex between ``{{`` and ``<type>`` misses the last
-    # form (the dict literal's ``}`` truncates the match). Cheaper +
-    # robust: just require both ``{{`` and ``<type>.<attr>`` to appear
-    # in the value, with ``\b`` to avoid matching ``foo_smtp.bar``.
+    # the dict-index form
+    # ``{{ {"tls": "ssl", "starttls": "tls", "none": ""}[smtp.tls_mode] }}``,
+    # AND the bracket-key form ``{{ smtp['from_address'] }}`` (valid
+    # Jinja, semantically identical to ``smtp.from_address`` for our
+    # purposes — Codex P2 on PR #35).
+    #
+    # Cheap + robust: require both ``{{`` and a word-bounded ``<type>``
+    # immediately followed by ``.`` (attr) or ``[`` (bracket) in the
+    # value. ``\b`` before the type prevents ``foo_smtp.bar`` false
+    # positives.
     import re
     type_patterns = {
-        t: re.compile(r'\b' + re.escape(t) + r'\.\w')
+        t: re.compile(r'\b' + re.escape(t) + r'(?:\.\w|\[)')
         for t in unset_types
     }
 
