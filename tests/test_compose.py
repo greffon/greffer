@@ -107,6 +107,47 @@ class ComputeInstanceContextTests(TestCase):
         # OVERWRITEHOST leak ``host:51019`` into redirect URLs
         # (the bug greffon-catalog#15 fixes).
         self.assertEqual(info['instance_port'], '')
+        # ``instance_authority`` collapses to bare host when the port is
+        # empty — matches what a browser sends in the Host header for
+        # the user-facing URL on TLS default 443. Catalog templates
+        # use this directly instead of building host:port themselves.
+        self.assertEqual(
+            info['instance_authority'],
+            '1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+
+    def test_instance_authority_includes_explicit_non_default_port(self):
+        """When the manager-rendered URL carries an explicit non-default
+        port, ``instance_authority`` carries it through so catalog
+        templates emit ``host:port`` correctly."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'abc',
+            'ports': [{
+                'port_host': 51019,
+                'url': 'https://example.com:8443',
+            }],
+        })
+
+        self.assertEqual(info['instance_host'], 'example.com')
+        self.assertEqual(info['instance_port'], '8443')
+        self.assertEqual(info['instance_authority'], 'example.com:8443')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
+    def test_instance_authority_falls_back_to_greffer_local_port(self):
+        """Greffer-direct (no manager URL) deployment: the user reaches
+        the instance at ``host:port_host`` directly, so the authority
+        carries the greffer-local port — matches the URL the user
+        types into the browser."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'abc',
+            'ports': [{'port_host': 51019}],
+        })
+
+        self.assertEqual(info['instance_authority'], 'worker.example.com:51019')
 
 
 class GetNginxServiceTests(TestCase):

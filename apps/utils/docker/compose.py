@@ -143,9 +143,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
 
 def _compute_instance_context(greffon_info):
-    """Expose instance_url / instance_host / instance_port / instance_id to
-    the Jinja render context so catalog metadata default_value strings can
-    reference `{{ instance_url }}`, `{{ instance_host }}`, etc.
+    """Expose instance_url / instance_host / instance_port / instance_authority
+    / instance_id to the Jinja render context so catalog metadata
+    default_value strings can reference `{{ instance_url }}`,
+    `{{ instance_host }}`, `{{ instance_authority }}`, etc.
 
     Source of truth for ``instance_url`` is the URL the manager renders
     for the first port (``ports[0].url`` — the wildcard subdomain
@@ -217,9 +218,26 @@ def _compute_instance_context(greffon_info):
             f"{scheme}://{instance_host}:{instance_port}"
             if instance_port else f"{scheme}://{instance_host}"
         )
+    # ``instance_authority`` = ``host`` when the port is empty (default
+    # 443/80 case), ``host:port`` when an explicit port is in play.
+    # Saves catalog authors from writing the
+    # ``{% if instance_port %}:{{ instance_port }}{% endif %}`` dance
+    # in every template that needs a Host-header-shaped value
+    # (Nextcloud's ``OVERWRITEHOST``, ``TRUSTED_DOMAINS``, etc.).
+    # Mirrors the URL's authority component (RFC 3986 §3.2): the
+    # host[:port] form a browser sends in the ``Host:`` header for
+    # the user-facing URL. Catalog metadata referencing this variable
+    # remains correct under all three runtime shapes:
+    #   - manager URL with default 443    → ``host``
+    #   - manager URL with custom port    → ``host:port``
+    #   - no manager URL (greffer-direct) → ``host:port_host``
+    instance_authority = (
+        f'{instance_host}:{instance_port}' if instance_port else instance_host
+    )
     greffon_info.setdefault('instance_id', greffon_info.get('id', ''))
     greffon_info.setdefault('instance_host', instance_host)
     greffon_info.setdefault('instance_port', instance_port)
+    greffon_info.setdefault('instance_authority', instance_authority)
     greffon_info.setdefault('instance_url', instance_url)
     return greffon_info
 
