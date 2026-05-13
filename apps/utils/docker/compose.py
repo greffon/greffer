@@ -98,25 +98,47 @@ def _compute_integrations_context(greffon_info):
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
-    """For each known integration type whose config is unset, walk the
-    metadata destinations and pop the matching env key from the rendered
-    compose dict. This makes the "absent ⇒ no env var" guarantee
-    independent of how Jinja renders `{{ smtp.host }}` on an empty dict.
+    """For each known integration type whose config is unset, pop every
+    env key in the compose that would expand to an unset-integration
+    Jinja reference. This guarantees ``absent ⇒ no env var`` regardless
+    of how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
+    crucially, regardless of whether the catalog destination metadata
+    actually reached the greffer for this start.
 
-    Mirrors `apply_configuration`'s walk for the regular `type='env'`
-    case but goes the other direction: deletes instead of assigns,
-    keyed on integration types instead of per-configuration values.
+    Two passes:
 
-    Defensive on shape: catalog metadata is supposed to use mapping-form
-    `environment:` per the Feature #2 validator, but compose YAML also
-    permits list form (`KEY=value`); we handle both so a future catalog
-    that drifts on this still gets the SMTP env stripped on unset.
+    1. **Metadata-driven**: walk ``greffon_info['configurations']``
+       (the manager-sent destination list) and pop keys whose
+       ``destination.type`` matches an unset integration. Works when
+       the manager sent the full catalog destination set.
+
+    2. **Template-driven** (new — fixes Nextcloud install on no-SMTP):
+       walk every service's environment and pop any entry whose value
+       contains ``{{ <unset-type>.* }}``. Works even when the manager
+       only sent user-submitted configurations (the historical shape):
+       Nextcloud's ``MAIL_FROM_ADDRESS: '{{ smtp.from_address.split(...) }}'``
+       has no per-instance value (user didn't pick SMTP, so the manager
+       has nothing to send) so the metadata pass alone can't see it;
+       the template pass catches it directly from the compose body
+       before Jinja renders.
+
+    Defensive on shape: catalog metadata is supposed to use mapping-
+    form ``environment:`` per the Feature #2 validator, but compose
+    YAML also permits list form (``KEY=value``); both passes handle
+    each form.
     """
     integrations = greffon_info.get('integrations') or {}
     services = compose.get('services', {}) if isinstance(compose, dict) else {}
-    for t in KNOWN_INTEGRATION_TYPES:
-        if _is_integration_set(integrations.get(t)):
-            continue
+
+    unset_types = [
+        t for t in KNOWN_INTEGRATION_TYPES
+        if not _is_integration_set(integrations.get(t))
+    ]
+    if not unset_types:
+        return compose
+
+    # Pass 1 — metadata-driven pop (unchanged behavior).
+    for t in unset_types:
         for configuration in greffon_info.get('configurations', []) or []:
             for destination in configuration.get('destinations', []) or []:
                 if not isinstance(destination, dict):
@@ -138,6 +160,45 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     service['environment'] = [
                         e for e in env if not (isinstance(e, str) and e.startswith(prefix))
                     ]
+
+    # Pass 2 — template-driven pop. We want to pop any env value that
+    # would expand to a reference of an unset integration type, e.g.
+    # ``{{ smtp.host }}``, ``{{ smtp.from_address.split('@')[0] }}``,
+    # the dict-index form
+    # ``{{ {"tls": "ssl", "starttls": "tls", "none": ""}[smtp.tls_mode] }}``,
+    # AND the bracket-key form ``{{ smtp['from_address'] }}`` (valid
+    # Jinja, semantically identical to ``smtp.from_address`` for our
+    # purposes — Codex P2 on PR #35).
+    #
+    # Cheap + robust: require both ``{{`` and a word-bounded ``<type>``
+    # immediately followed by ``.`` (attr) or ``[`` (bracket) in the
+    # value. ``\b`` before the type prevents ``foo_smtp.bar`` false
+    # positives.
+    import re
+    type_patterns = {
+        t: re.compile(r'\b' + re.escape(t) + r'(?:\.\w|\[)')
+        for t in unset_types
+    }
+
+    def value_references_unset(value):
+        if not isinstance(value, str):
+            return False
+        if '{{' not in value:
+            return False
+        return any(p.search(value) for p in type_patterns.values())
+
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        env = service.get('environment')
+        if isinstance(env, dict):
+            for key in [k for k, v in env.items() if value_references_unset(v)]:
+                env.pop(key, None)
+        elif isinstance(env, list):
+            service['environment'] = [
+                e for e in env
+                if not (isinstance(e, str) and '=' in e and value_references_unset(e.split('=', 1)[1]))
+            ]
     return compose
 
 
