@@ -6,8 +6,6 @@ from jinja2 import Template
 import docker
 import subprocess
 import os
-from urllib.parse import urlparse
-
 client = docker.from_env()
 
 from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create_volume, docker_is_volume_exist
@@ -143,101 +141,59 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
 
 def _compute_instance_context(greffon_info):
-    """Expose instance_url / instance_host / instance_port / instance_authority
-    / instance_id to the Jinja render context so catalog metadata
-    default_value strings can reference `{{ instance_url }}`,
-    `{{ instance_host }}`, `{{ instance_authority }}`, etc.
+    """Expose ``instance_url`` and ``instance_id`` to the Jinja render
+    context so catalog ``default_value`` strings can reference
+    ``{{ instance_url }}`` and ``{{ instance_id }}``.
 
     Source of truth for ``instance_url`` is the URL the manager renders
     for the first port (``ports[0].url`` — the wildcard subdomain
     ``https://<field-id>.my.<domain>``). That's what users actually hit
     in the browser and what greffons should bake into emails / OAuth
-    redirects / share links. Falling back to ``GREFFER_PUBLIC_HOST +
-    port_host`` only when the manager didn't supply a URL would point
-    Plausible / Nextcloud / etc. at the greffer's local nginx port,
-    which is unroutable from any host other than the greffer itself.
+    redirects / share links.
+
+    Falls back to a greffer-direct URL built from
+    ``GREFFER_PUBLIC_HOST`` + ``port_host`` only when the manager
+    didn't supply a URL — for the dev / test path where the greffer
+    is reached directly with no public proxy in front. Malformed or
+    non-string manager values trigger the same fallback so a bad
+    payload doesn't leak into ``instance_url`` (and from there into
+    Plausible BASE_URL, share links, etc.).
+
+    Catalogs that need the host (or host:port) component of the URL
+    apply standard Jinja string ops at the call site, e.g.::
+
+        NEXTCLOUD_TRUSTED_DOMAINS:
+          "{{ instance_url.split('://')[1] }} localhost"
+
+    Keeping a single source-of-truth variable (``instance_url``)
+    avoids the maintenance + cross-PR-contract burden of exposing
+    pre-parsed pieces (``instance_host`` / ``instance_port`` /
+    ``instance_authority``) that catalogs would each interpret
+    slightly differently.
     """
     ports = greffon_info.get('ports') or []
     first_port = ports[0] if ports and isinstance(ports[0], dict) else {}
-    manager_supplied_url_raw = first_port.get('url') or ''
-    # ``GreffonStartRequest.ports`` is permissive (``dict[str, Any]``)
-    # so the URL field can in principle be a non-string or an
-    # unparseable string. Guard the urlparse + ``.port`` access so a
-    # malformed value (e.g. ``https://host:abc``) falls back to the
-    # greffer-local ``port_host`` / ``GREFFER_PUBLIC_HOST`` defaults
-    # instead of raising ValueError during start (Codex P2 on PR #34).
-    manager_supplied_url = manager_supplied_url_raw if isinstance(manager_supplied_url_raw, str) else ''
-    port_host = first_port.get('port_host') or ''
-    scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
-    fallback_host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
-
-    parsed = None
-    parsed_port = None
-    if manager_supplied_url:
-        try:
-            parsed = urlparse(manager_supplied_url)
-            # ``parsed.port`` is a property that re-parses the netloc and
-            # raises ValueError on a non-int port; wrap it specifically.
-            parsed_port = parsed.port
-        except (ValueError, TypeError):
-            parsed = None
-            parsed_port = None
-
-    # Codex P2 on PR #34: ``urlparse("abc")`` does NOT raise — it
-    # returns a ParseResult with empty scheme/hostname. Treat such
-    # half-parsed values as invalid so we fall back to the greffer-
-    # local defaults instead of leaking a malformed URL into
-    # ``instance_url`` (which leaks into Plausible BASE_URL, share
-    # links, OAuth redirects, etc.).
-    manager_url_valid = (
-        parsed is not None
-        and bool(parsed.scheme)
-        and bool(parsed.hostname)
-    )
-
-    if manager_url_valid:
-        instance_host = parsed.hostname
-        # ``instance_port`` is the USER-FACING port. When the manager-
-        # rendered URL has no explicit port (TLS default 443, as for
-        # the wildcard subdomain), it stays empty — catalog templates
-        # that want a host:port form can render it conditionally. The
-        # previous fallback to ``port_host`` conflated the user-facing
-        # port with the greffer-local bridge-bound port (e.g. 51019)
-        # and made OVERWRITEHOST-style env values point at the
-        # greffer-internal address (Codex P1 on greffon-catalog#15).
-        instance_port = str(parsed_port) if parsed_port else ''
-        instance_url = manager_supplied_url
+    raw = first_port.get('url')
+    # A manager-supplied URL is "valid" when it's a string and starts
+    # with an http(s) scheme. We deliberately don't call urlparse here
+    # — the only thing we do with the URL is pass it through to Jinja
+    # as ``instance_url``, so a stricter validation buys nothing and
+    # turns the function into a parse-error-handling exercise. Bad
+    # values just fall back to the greffer-local URL below.
+    if isinstance(raw, str) and (raw.startswith('https://') or raw.startswith('http://')):
+        instance_url = raw
     else:
-        # Fallback: greffer-local URL. ``instance_port`` reflects the
-        # greffer-local bridge port — appropriate here because that's
-        # also the user-facing port in this fallback path (no separate
-        # public proxy in front of the greffer).
-        instance_host = fallback_host
-        instance_port = port_host
-        instance_url = (
-            f"{scheme}://{instance_host}:{instance_port}"
-            if instance_port else f"{scheme}://{instance_host}"
-        )
-    # ``instance_authority`` = ``host`` when the port is empty (default
-    # 443/80 case), ``host:port`` when an explicit port is in play.
-    # Saves catalog authors from writing the
-    # ``{% if instance_port %}:{{ instance_port }}{% endif %}`` dance
-    # in every template that needs a Host-header-shaped value
-    # (Nextcloud's ``OVERWRITEHOST``, ``TRUSTED_DOMAINS``, etc.).
-    # Mirrors the URL's authority component (RFC 3986 §3.2): the
-    # host[:port] form a browser sends in the ``Host:`` header for
-    # the user-facing URL. Catalog metadata referencing this variable
-    # remains correct under all three runtime shapes:
-    #   - manager URL with default 443    → ``host``
-    #   - manager URL with custom port    → ``host:port``
-    #   - no manager URL (greffer-direct) → ``host:port_host``
-    instance_authority = (
-        f'{instance_host}:{instance_port}' if instance_port else instance_host
-    )
+        # Greffer-direct fallback. Used by unit tests + dev paths
+        # where no public proxy fronts the greffer. ``GREFFER_PUBLIC_HOST``
+        # / ``GREFFER_PUBLIC_SCHEME`` env vars let operators override
+        # the defaults for bare-metal deployments without Docker
+        # Desktop's ``host.docker.internal`` magic.
+        scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
+        host = os.getenv('GREFFER_PUBLIC_HOST', 'host.docker.internal')
+        port = first_port.get('port_host') or ''
+        instance_url = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+
     greffon_info.setdefault('instance_id', greffon_info.get('id', ''))
-    greffon_info.setdefault('instance_host', instance_host)
-    greffon_info.setdefault('instance_port', instance_port)
-    greffon_info.setdefault('instance_authority', instance_authority)
     greffon_info.setdefault('instance_url', instance_url)
     return greffon_info
 
