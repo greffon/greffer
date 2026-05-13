@@ -97,10 +97,16 @@ class ComputeInstanceContextTests(TestCase):
             info['instance_host'],
             '1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
         )
-        # No explicit port in the manager URL → instance_port falls back
-        # to the greffer-local port_host so existing `{{ instance_port }}`
-        # references in catalog metadata still resolve to a real number.
-        self.assertEqual(info['instance_port'], 51019)
+        # No explicit port in the manager URL ⇒ ``instance_port`` is an
+        # empty string, NOT a fallback to the greffer-local port_host.
+        # The user-facing URL has no port (TLS default 443), and the
+        # greffer-local port (51019) is not user-routable. Catalog
+        # templates that need a host:port form render it conditionally:
+        # ``{{ instance_host }}{% if instance_port %}:{{ instance_port }}{% endif %}``.
+        # Falling back to port_host here is what made Nextcloud's
+        # OVERWRITEHOST leak ``host:51019`` into redirect URLs
+        # (the bug greffon-catalog#15 fixes).
+        self.assertEqual(info['instance_port'], '')
 
 
 class GetNginxServiceTests(TestCase):
