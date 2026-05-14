@@ -14,15 +14,19 @@ from tests.helpers import SAMPLE_COMPOSE, SAMPLE_START_PAYLOAD
 
 class ComputeInstanceContextTests(TestCase):
     """Tests for _compute_instance_context — the Jinja context helper that
-    exposes ``instance_url`` and ``instance_id`` for catalog metadata
-    templating. Catalogs that need pieces of the URL (host, host:port,
-    etc.) apply standard Jinja string ops at the call site; we do NOT
-    expose pre-parsed ``instance_host`` / ``instance_port`` /
-    ``instance_authority`` vars (single source of truth)."""
+    exposes ``instance_url`` (source of truth), plus the parsed-out
+    ``instance_host`` / ``instance_port`` back-compat companions for
+    catalogs that pre-date the manager-URL contract.
+
+    New catalogs SHOULD prefer ``instance_url`` + inline Jinja string
+    ops (e.g. ``{{ instance_url.split('://')[1] }}``); the parsed
+    pieces are kept exposed because they're a public API on main
+    (added in greffer commit 0a1c8aa) that external catalogs may
+    depend on."""
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
-    def test_fallback_url_built_from_public_host_and_port_host(self):
-        """No manager URL ⇒ instance_url is built from GREFFER_PUBLIC_HOST
+    def test_fallback_built_from_public_host_and_port_host(self):
+        """No manager URL ⇒ host/port/url all built from GREFFER_PUBLIC_HOST
         + port_host. Used in greffer-direct test / dev paths where no
         public proxy fronts the greffer."""
         from apps.utils.docker.compose import _compute_instance_context
@@ -30,22 +34,26 @@ class ComputeInstanceContextTests(TestCase):
         info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 4242}]})
 
         self.assertEqual(info['instance_id'], 'abc')
+        self.assertEqual(info['instance_host'], 'worker.example.com')
+        self.assertEqual(info['instance_port'], 4242)
         self.assertEqual(info['instance_url'], 'https://worker.example.com:4242')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com', 'GREFFER_PUBLIC_SCHEME': 'http'})
-    def test_honors_public_scheme_env(self):
+    def test_honors_public_host_and_scheme_env(self):
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 8080}]})
 
+        self.assertEqual(info['instance_host'], 'worker.example.com')
         self.assertEqual(info['instance_url'], 'http://worker.example.com:8080')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
-    def test_no_ports_yields_portless_fallback_url(self):
+    def test_no_ports_yields_empty_port_and_portless_url(self):
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'abc', 'ports': []})
 
+        self.assertEqual(info['instance_port'], '')
         self.assertEqual(info['instance_url'], 'https://worker.example.com')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
@@ -101,6 +109,19 @@ class ComputeInstanceContextTests(TestCase):
             info['instance_url'],
             'https://1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
         )
+        # Back-compat: instance_host / instance_port stay parsed from
+        # the manager URL. instance_port is empty (NOT a fallback to
+        # the greffer-local port_host = 51019) because the user-facing
+        # URL has no explicit port. Catalogs that previously rendered
+        # ``{{ instance_host }}:{{ instance_port }}`` against the
+        # greffer-local form silently leaked the internal port into
+        # OVERWRITEHOST-style env values; the corrected semantics
+        # surface the actual user-facing port (empty for default 443).
+        self.assertEqual(
+            info['instance_host'],
+            '1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+        self.assertEqual(info['instance_port'], '')
 
     def test_manager_url_with_explicit_port_is_passed_through(self):
         """Non-default-port public deployments (operator-supplied custom
@@ -118,6 +139,9 @@ class ComputeInstanceContextTests(TestCase):
         })
 
         self.assertEqual(info['instance_url'], 'https://example.com:8443')
+        # Back-compat: parsed pieces also surface the explicit port.
+        self.assertEqual(info['instance_host'], 'example.com')
+        self.assertEqual(info['instance_port'], '8443')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
     def test_malformed_manager_url_falls_back(self):
