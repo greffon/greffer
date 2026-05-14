@@ -14,38 +14,53 @@ from tests.helpers import SAMPLE_COMPOSE, SAMPLE_START_PAYLOAD
 
 class ComputeInstanceContextTests(TestCase):
     """Tests for _compute_instance_context — the Jinja context helper that
-    exposes instance_url / host / port / id for catalog metadata templating."""
+    exposes ``instance_url`` (source of truth), plus the parsed-out
+    ``instance_host`` / ``instance_port`` back-compat companions for
+    catalogs that pre-date the manager-URL contract.
 
-    def test_defaults_for_host_and_scheme(self):
+    New catalogs SHOULD prefer ``instance_url`` + inline Jinja string
+    ops (e.g. ``{{ instance_url.split('://')[1] }}``); the parsed
+    pieces are kept exposed because they're a public API on main
+    (added in greffer commit 0a1c8aa) that external catalogs may
+    depend on."""
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
+    def test_fallback_built_from_public_host_and_port_host(self):
+        """No manager URL ⇒ host/port/url all built from GREFFER_PUBLIC_HOST
+        + port_host. Used in greffer-direct test / dev paths where no
+        public proxy fronts the greffer."""
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 4242}]})
 
         self.assertEqual(info['instance_id'], 'abc')
-        self.assertEqual(info['instance_host'], 'host.docker.internal')
+        self.assertEqual(info['instance_host'], 'worker.example.com')
         self.assertEqual(info['instance_port'], 4242)
-        self.assertEqual(info['instance_url'], 'https://host.docker.internal:4242')
+        self.assertEqual(info['instance_url'], 'https://worker.example.com:4242')
 
-    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker1.example.com', 'GREFFER_PUBLIC_SCHEME': 'http'})
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com', 'GREFFER_PUBLIC_SCHEME': 'http'})
     def test_honors_public_host_and_scheme_env(self):
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'abc', 'ports': [{'port_host': 8080}]})
 
-        self.assertEqual(info['instance_host'], 'worker1.example.com')
-        self.assertEqual(info['instance_url'], 'http://worker1.example.com:8080')
+        self.assertEqual(info['instance_host'], 'worker.example.com')
+        self.assertEqual(info['instance_url'], 'http://worker.example.com:8080')
 
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
     def test_no_ports_yields_empty_port_and_portless_url(self):
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'abc', 'ports': []})
 
         self.assertEqual(info['instance_port'], '')
-        self.assertEqual(info['instance_url'], 'https://host.docker.internal')
+        self.assertEqual(info['instance_url'], 'https://worker.example.com')
 
-    def test_jinja_render_substitutes_instance_vars_in_env(self):
-        """End-to-end: a compose env var containing {{ instance_host }} is
-        resolved when the compose is rendered via Template(yaml.dump(...))."""
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
+    def test_jinja_render_substitutes_instance_url_in_env(self):
+        """End-to-end: a compose env var containing ``{{ instance_url }}``
+        — and inline split for the host-portion case — is resolved
+        when the compose is rendered via Template(yaml.dump(...))."""
         from apps.utils.docker.compose import _compute_instance_context
 
         info = _compute_instance_context({'id': 'xyz', 'ports': [{'port_host': 5555}]})
@@ -53,7 +68,8 @@ class ComputeInstanceContextTests(TestCase):
             'services': {
                 'app': {
                     'environment': [
-                        'TRUSTED_DOMAINS={{ instance_host }} localhost',
+                        # Catalogs that need the host[:port] use inline split.
+                        "TRUSTED_DOMAINS={{ instance_url.split('://')[1] }} localhost",
                         'BASE_URL={{ instance_url }}',
                     ],
                 },
@@ -61,8 +77,8 @@ class ComputeInstanceContextTests(TestCase):
         }
         rendered = Template(yaml.dump(compose)).render(**info)
 
-        self.assertIn('TRUSTED_DOMAINS=host.docker.internal localhost', rendered)
-        self.assertIn('BASE_URL=https://host.docker.internal:5555', rendered)
+        self.assertIn('TRUSTED_DOMAINS=worker.example.com:5555 localhost', rendered)
+        self.assertIn('BASE_URL=https://worker.example.com:5555', rendered)
 
     def test_does_not_clobber_existing_instance_keys(self):
         from apps.utils.docker.compose import _compute_instance_context
@@ -71,6 +87,80 @@ class ComputeInstanceContextTests(TestCase):
         info = _compute_instance_context(pre)
 
         self.assertEqual(info['instance_url'], 'https://override')
+
+    def test_manager_supplied_url_wins_over_greffer_public_host(self):
+        """The manager sends ``ports[0].url = https://<field-id>.my.<domain>``
+        in the start payload. ``instance_url`` must surface THAT — the
+        user-facing wildcard subdomain — not the greffer-direct
+        ``GREFFER_PUBLIC_HOST:port_host`` form, otherwise greffons like
+        Plausible bake an internal port into emails/OAuth/share-links
+        and users get sent to a host that doesn't resolve from elsewhere."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'abc',
+            'ports': [{
+                'port_host': 51019,
+                'url': 'https://1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+            }],
+        })
+
+        self.assertEqual(
+            info['instance_url'],
+            'https://1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+        # Back-compat: instance_host / instance_port stay parsed from
+        # the manager URL. instance_port is empty (NOT a fallback to
+        # the greffer-local port_host = 51019) because the user-facing
+        # URL has no explicit port. Catalogs that previously rendered
+        # ``{{ instance_host }}:{{ instance_port }}`` against the
+        # greffer-local form silently leaked the internal port into
+        # OVERWRITEHOST-style env values; the corrected semantics
+        # surface the actual user-facing port (empty for default 443).
+        self.assertEqual(
+            info['instance_host'],
+            '1b1feba6-a4a5-443e-b5ce-e822e778bc99.my.greffon.local',
+        )
+        self.assertEqual(info['instance_port'], '')
+
+    def test_manager_url_with_explicit_port_is_passed_through(self):
+        """Non-default-port public deployments (operator-supplied custom
+        domain like ``https://example.com:8443``): ``instance_url``
+        carries it verbatim. Catalogs render whatever host:port form
+        they need via inline string ops on ``instance_url``."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'abc',
+            'ports': [{
+                'port_host': 51019,
+                'url': 'https://example.com:8443',
+            }],
+        })
+
+        self.assertEqual(info['instance_url'], 'https://example.com:8443')
+        # Back-compat: parsed pieces also surface the explicit port.
+        self.assertEqual(info['instance_host'], 'example.com')
+        self.assertEqual(info['instance_port'], '8443')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'worker.example.com'})
+    def test_malformed_manager_url_falls_back(self):
+        """Non-string, missing scheme, or otherwise malformed values in
+        ``ports[0].url`` should not leak into ``instance_url`` —
+        otherwise greffons render broken BASE_URL / share links /
+        OAuth callbacks. Fall back to the greffer-local URL."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        for bad in ['abc', '/foo', '', None, 12345, {'not': 'a-string'}]:
+            info = _compute_instance_context({
+                'id': 'abc',
+                'ports': [{'port_host': 51019, 'url': bad}],
+            })
+            self.assertEqual(
+                info['instance_url'],
+                'https://worker.example.com:51019',
+                f'malformed url {bad!r} should fall back',
+            )
 
 
 class GetNginxServiceTests(TestCase):
