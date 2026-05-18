@@ -23,39 +23,46 @@ class CheckResult:
 
 
 def run(manager_url: str | None, *, port: int = 8001) -> list[CheckResult]:
-    """Execute all five doctor checks and return their results."""
+    """Execute all five doctor checks and return their results.
+
+    Each check is independent — a failing daemon does NOT mask the
+    Docker-installed check, and vice versa. Operators get the right
+    remediation for the actual failure.
+    """
     results: list[CheckResult] = []
 
-    # 1. Docker installed
-    docker_v = compose.docker_version()
-    if not docker_v.ok:
+    # 1. Docker CLI installed (daemon-independent: `docker --version`)
+    cli_check = compose.docker_cli_installed()
+    if not cli_check.ok:
         results.append(CheckResult(
             name="docker_installed", passed=False,
             line=strings.DOCTOR_FAIL_DOCKER,
         ))
-        # Subsequent docker-dependent checks skip.
+        # CLI binary not on PATH — subsequent docker-dependent checks
+        # genuinely can't run.
         results.append(CheckResult(
             name="compose_plugin", passed=False, skipped=True,
             line=strings.DOCTOR_SKIP.format(
-                what="Compose plugin available", reason="Docker not installed",
+                what="Compose plugin available", reason="Docker CLI not installed",
             ),
         ))
         results.append(CheckResult(
             name="docker_daemon", passed=False, skipped=True,
             line=strings.DOCTOR_SKIP.format(
-                what="Docker daemon reachable", reason="Docker not installed",
+                what="Docker daemon reachable", reason="Docker CLI not installed",
             ),
         ))
     else:
-        # Parse version (best-effort — `docker version --format json` is
-        # verbose; just show "Docker Engine" if we can't pick a clean line).
-        version_line = _extract_docker_version(docker_v.stdout)
+        # CLI is installed. Show its version; the daemon check runs
+        # independently below — a running CLI with a stopped daemon
+        # reports as "daemon not reachable," NOT "Docker not installed."
+        version_line = _extract_docker_version(cli_check.stdout)
         results.append(CheckResult(
             name="docker_installed", passed=True,
             line=strings.DOCTOR_PASS_DOCKER.format(version=version_line),
         ))
 
-        # 2. Compose plugin available
+        # 2. Compose plugin available (daemon-independent: ``compose version --short``)
         compose_v = compose.docker_compose_version()
         if compose_v.ok:
             results.append(CheckResult(
@@ -68,7 +75,7 @@ def run(manager_url: str | None, *, port: int = 8001) -> list[CheckResult]:
                 line=strings.DOCTOR_FAIL_COMPOSE,
             ))
 
-        # 3. Docker daemon reachable
+        # 3. Docker daemon reachable (needs daemon — `docker info`)
         info = compose.docker_info()
         if info.ok:
             results.append(CheckResult(

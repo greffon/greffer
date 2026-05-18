@@ -49,8 +49,26 @@ def _run(args: list[str], *, timeout: float | None = None) -> CommandResult:
 
 # --- Docker daemon / installation -----------------------------------
 
+def docker_cli_installed() -> CommandResult:
+    """``docker --version`` — daemon-independent. Tests "Docker CLI binary
+    is on PATH"; does NOT contact the daemon. The dedicated daemon check
+    uses ``docker info``.
+
+    Note: ``docker version`` (no double-dash) contacts the daemon and
+    fails when the daemon is down — we deliberately use the static
+    ``docker --version`` here so a "daemon down" condition reports as
+    "daemon not reachable" not "Docker not installed."
+    """
+    return _run(["docker", "--version"], timeout=10)
+
+
 def docker_version() -> CommandResult:
-    """``docker version --format json`` — used by doctor to detect Docker."""
+    """``docker version --format json`` — full client + server info.
+
+    Hits the daemon; will fail if the daemon is down. Use
+    ``docker_cli_installed()`` for daemon-independent installation
+    detection.
+    """
     return _run(["docker", "version", "--format", "json"], timeout=10)
 
 
@@ -60,6 +78,12 @@ def docker_info() -> CommandResult:
 
 
 def docker_compose_version() -> CommandResult:
+    """``docker compose version --short`` — daemon-independent.
+
+    The compose plugin is invoked as a docker subcommand but doesn't
+    contact the daemon for ``version --short``; this works on a host
+    where the daemon is down.
+    """
     return _run(["docker", "compose", "version", "--short"], timeout=10)
 
 

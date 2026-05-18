@@ -7,7 +7,7 @@ import pytest
 from greffer_cli import compose, doctor, manager_client
 
 
-# We mock the subprocess + httpx calls (compose.docker_version, etc.)
+# We mock the subprocess + httpx calls (compose.docker_cli_installed, etc.)
 # rather than invoking real Docker — the doctor logic is what we're
 # testing, not the underlying tools.
 
@@ -20,8 +20,20 @@ def _fail(returncode: int = 1, stderr: str = "") -> compose.CommandResult:
     return compose.CommandResult(returncode=returncode, stdout="", stderr=stderr)
 
 
+def _cli_ok(version: str = "25.0.3") -> compose.CommandResult:
+    """Mock of ``docker --version`` (daemon-independent installation check).
+
+    The real command returns a plain string like ``Docker version 25.0.3, build abc``;
+    doctor parses ``Client.Version`` from JSON only when reading the rich
+    ``docker version --format json`` output. Here we return JSON because
+    ``_extract_docker_version`` consumes it — keeps test reality close to
+    production while still mocking out subprocess.
+    """
+    return _ok(f'{{"Client":{{"Version":"{version}"}}}}')
+
+
 def test_doctor_all_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(compose, "docker_version", lambda: _ok('{"Client":{"Version":"25.0.3"}}'))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _cli_ok())
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2.24.5"))
     monkeypatch.setattr(compose, "docker_info", lambda: _ok("server"))
     monkeypatch.setattr(compose, "host_port_free", lambda port: True)
@@ -36,7 +48,7 @@ def test_doctor_all_pass(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_doctor_docker_missing_skips_dependent_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     """When docker isn't installed, the compose-plugin and daemon checks skip."""
-    monkeypatch.setattr(compose, "docker_version", lambda: _fail(returncode=127))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _fail(returncode=127))
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2"))
     monkeypatch.setattr(compose, "docker_info", lambda: _ok("server"))
     monkeypatch.setattr(compose, "host_port_free", lambda port: True)
@@ -55,7 +67,7 @@ def test_doctor_docker_missing_skips_dependent_checks(monkeypatch: pytest.Monkey
 
 def test_doctor_daemon_down_does_not_skip_port_check(monkeypatch: pytest.MonkeyPatch) -> None:
     """Docker installed but daemon down — port check still runs."""
-    monkeypatch.setattr(compose, "docker_version", lambda: _ok('{"Client":{"Version":"25"}}'))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _cli_ok("25"))
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2"))
     monkeypatch.setattr(compose, "docker_info", lambda: _fail())
     monkeypatch.setattr(compose, "host_port_free", lambda port: True)
@@ -63,6 +75,12 @@ def test_doctor_daemon_down_does_not_skip_port_check(monkeypatch: pytest.MonkeyP
 
     results = doctor.run(manager_url="https://api.example.com")
     by_name = {r.name: r for r in results}
+    # The Codex finding: a stopped daemon must NOT be reported as
+    # "Docker not installed" — those are independent checks with
+    # different remediations ("start the daemon" vs "install Docker").
+    assert by_name["docker_installed"].passed is True
+    assert by_name["docker_installed"].skipped is False
+    assert by_name["compose_plugin"].passed is True  # daemon-independent too
     assert by_name["docker_daemon"].passed is False
     assert by_name["docker_daemon"].skipped is False  # ran, failed
     assert by_name["port_free"].passed is True
@@ -70,7 +88,7 @@ def test_doctor_daemon_down_does_not_skip_port_check(monkeypatch: pytest.MonkeyP
 
 
 def test_doctor_port_taken_is_a_blocking_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(compose, "docker_version", lambda: _ok('{"Client":{"Version":"25"}}'))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _cli_ok("25"))
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2"))
     monkeypatch.setattr(compose, "docker_info", lambda: _ok("server"))
     monkeypatch.setattr(compose, "host_port_free", lambda port: False)
@@ -86,7 +104,7 @@ def test_doctor_no_manager_url_skips_manager_check(monkeypatch: pytest.MonkeyPat
     """Pre-init invocation: no env.env exists → manager URL unknown →
     the manager-reachability check skips with an informational note
     rather than failing."""
-    monkeypatch.setattr(compose, "docker_version", lambda: _ok('{"Client":{"Version":"25"}}'))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _cli_ok("25"))
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2"))
     monkeypatch.setattr(compose, "docker_info", lambda: _ok("server"))
     monkeypatch.setattr(compose, "host_port_free", lambda port: True)
@@ -99,7 +117,7 @@ def test_doctor_no_manager_url_skips_manager_check(monkeypatch: pytest.MonkeyPat
 
 
 def test_doctor_format_report_lists_all_checks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(compose, "docker_version", lambda: _ok('{"Client":{"Version":"25"}}'))
+    monkeypatch.setattr(compose, "docker_cli_installed", lambda: _cli_ok("25"))
     monkeypatch.setattr(compose, "docker_compose_version", lambda: _ok("v2"))
     monkeypatch.setattr(compose, "docker_info", lambda: _ok("server"))
     monkeypatch.setattr(compose, "host_port_free", lambda port: True)
