@@ -175,7 +175,14 @@ def up(
     # state machine to actual `docker compose up -d` + polling is
     # gated on the release-infrastructure PR landing.
     compose_path = paths.docker_compose_yml_path(cfg)
-    if mode == "tunnel":
+    # On the idempotent fast-path the persisted mode is the source of
+    # truth — the operator may have invoked `greffer up` with the default
+    # --mode tunnel on a host that was originally initialized as proxy.
+    # Print the hint that matches what's on disk.
+    from . import env_file as env_mod
+    persisted_mode = env_mod.EnvFile.read(paths.env_env_path(cfg)).get("GREFFER_MODE")
+    effective_mode = persisted_mode or mode
+    if effective_mode == "tunnel":
         manual_hint = f"docker compose -f {compose_path} --profile tunnel up -d"
     else:
         manual_hint = f"docker compose -f {compose_path} up -d"

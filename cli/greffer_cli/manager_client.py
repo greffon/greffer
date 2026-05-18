@@ -50,8 +50,19 @@ def fetch_state(manager_url: str, greffer_id: str, *, timeout: float = 5.0) -> S
         # back-off loop handles re-spacing.
         raise _RateLimited(retry_after=_retry_after_seconds(r))
 
-    r.raise_for_status()
-    body = r.json()
+    # Normalize any other non-2xx into the typed exceptions the caller
+    # already handles. Without this, a transient 502/503/504 from the
+    # manager would leak through poll_state (which only catches
+    # _RateLimited) as a raw httpx.HTTPStatusError and abort polling
+    # mid-flight. Map them all to ManagerUnreachable so the caller
+    # gets retry semantics consistent with a transport-level failure.
+    if r.status_code >= 400:
+        raise ManagerUnreachable(f"manager returned HTTP {r.status_code}")
+
+    try:
+        body = r.json()
+    except ValueError as exc:
+        raise ManagerUnreachable(f"manager returned non-JSON body: {exc}") from exc
     state = body.get("state", "UNKNOWN")
     return StatePublic(state=state)
 
@@ -99,6 +110,18 @@ def poll_state(
             interval = initial_interval  # back to fast cadence on success
         except _RateLimited as rl:
             time.sleep(max(rl.retry_after, interval))
+            interval = min(
+                interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
+                rate_limited_interval_max,
+            )
+            continue
+        except ManagerUnreachable:
+            # Transient transport / 5xx — back off on the same schedule
+            # as a rate-limit and keep polling. The caller's own
+            # deadline (e.g. `wait_for_state`'s timeout) decides when
+            # to give up. GrefferNotFound (a terminal verdict) still
+            # propagates because it's NOT a ManagerUnreachable.
+            time.sleep(interval)
             interval = min(
                 interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
                 rate_limited_interval_max,
