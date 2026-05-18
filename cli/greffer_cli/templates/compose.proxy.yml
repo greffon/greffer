@@ -1,0 +1,48 @@
+# greffer-cli proxy-mode compose template.
+#
+# Rendered by `greffer up` into ~/.greffer/docker-compose.yml. The
+# image-tag placeholder is interpolated at PyInstaller bundle time
+# from cli/IMAGE_TAG (see HLD section "Image-tag bundling contract");
+# in dev, main.py resolves it at runtime from the same file.
+#
+# This file ships the operator-facing compose: it pulls the published
+# `ghcr.io/greffon/greffer:<TAG>` image rather than `build:` from a
+# local source tree (operators don't have the source).
+version: "3.8"
+
+services:
+  greffer:
+    image: ghcr.io/greffon/greffer:<TAG>
+    restart: unless-stopped
+    networks:
+      - internal
+    env_file:
+      - env.env
+    environment:
+      # Critical: without this the greffer boots but never registers.
+      # See HLD § Current State for why this is in the rendered compose
+      # rather than relying on the service's default.
+      - GREFFER_WORKERS_ENABLED=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Docker socket for cert install into the nginx sidecar.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Data dir aligns with GREFFON_PATH=/data in env.env.
+      - greffon-data:/data
+
+  nginx:
+    image: ghcr.io/greffon/greffer-nginx:<TAG>
+    restart: unless-stopped
+    networks:
+      - internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:443"
+
+networks:
+  internal: {}
+
+volumes:
+  greffon-data:
