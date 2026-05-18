@@ -61,7 +61,9 @@ def collect(config_dir: Path) -> StatusReport:
     public_host = env.get("GREFFER_PUBLIC_HOST")
 
     compose_file = paths.docker_compose_yml_path(config_dir)
-    container_states = compose.compose_services_running(compose_file)
+    # Surface the tunnel-sidecar in tunnel mode (it's profile-gated).
+    profile = "tunnel" if mode == "tunnel" else None
+    container_states = compose.compose_services_running(compose_file, profile=profile)
 
     manager_state, manager_unreachable = _manager_state_safe(manager_url, greffer_id)
     healthz_ok, healthz_unreachable = _healthz_safe(compose_file)

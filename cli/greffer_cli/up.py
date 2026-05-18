@@ -104,13 +104,27 @@ def _now() -> str:
     return dt.datetime.now().strftime("%H:%M:%S")
 
 
+def profile_for_mode(mode: Mode) -> str | None:
+    """Map operator-facing mode to the docker compose profile name."""
+    return "tunnel" if mode == "tunnel" else None
+
+
 def wait_for_compose_running(
-    compose_file: Path, *, timeout: float = 600.0, poll_interval: float = 2.0,
+    compose_file: Path,
+    *,
+    profile: str | None = None,
+    timeout: float = 600.0,
+    poll_interval: float = 2.0,
 ) -> bool:
-    """Block until both greffer + sidecar services show 'running'."""
+    """Block until the relevant services show 'running'.
+
+    Pass ``profile="tunnel"`` so the tunnel-sidecar is included in the
+    "all running?" check. In proxy mode (no profile), only greffer +
+    nginx are visible to ``compose ps``.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        services = compose.compose_services_running(compose_file)
+        services = compose.compose_services_running(compose_file, profile=profile)
         if services and all(services.values()):
             return True
         time.sleep(poll_interval)

@@ -1,0 +1,91 @@
+# greffer-cli compose template — single file, two modes via profiles.
+#
+# Rendered by `greffer up` into ~/.greffer/docker-compose.yml. The
+# image-tag placeholder is interpolated at PyInstaller bundle time
+# from cli/IMAGE_TAG (see HLD section "Image-tag bundling contract");
+# in dev, main.py resolves it at runtime from the same file.
+#
+# Mode selection happens at `docker compose up` time, NOT at template-
+# render time:
+#   - Proxy mode:  docker compose up -d                 (no profile)
+#   - Tunnel mode: docker compose --profile tunnel up -d
+# The tunnel-sidecar service has `profiles: ["tunnel"]` so proxy
+# operators pay zero cost — the container is never created.
+#
+# Mirrors the shape of the in-repo greffer/docker-compose.yml, with
+# `build:` swapped for published `image:` references (operators have
+# no source tree).
+version: "3.8"
+
+services:
+  greffer:
+    image: ghcr.io/greffon/greffer:<TAG>
+    restart: unless-stopped
+    networks:
+      - internal
+    env_file:
+      - env.env
+    environment:
+      # Critical: without this the greffer boots but never registers.
+      # See HLD section "Current State" for why this is in the rendered
+      # compose rather than relying on the service's default.
+      - GREFFER_WORKERS_ENABLED=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Docker socket for cert install into the nginx sidecar.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Data dir aligns with GREFFON_PATH=/data in env.env.
+      - greffon-data:/data
+      # Shared client.toml between the greffer's FastAPI controller
+      # (writer) and tunnel-sidecar's rathole-client (reader). Always
+      # mounted so proxy-mode deployments don't need a separate compose
+      # layer; the sidecar only starts when --profile tunnel is passed.
+      - rathole-client-config:/config
+
+  nginx:
+    image: ghcr.io/greffon/greffer-nginx:<TAG>
+    restart: unless-stopped
+    networks:
+      - internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:443"
+
+  # Tunnel-mode sidecar — only started when `docker compose --profile
+  # tunnel up`. Proxy-mode operators never create this container. The
+  # CLI passes `--profile tunnel` to `compose up` when env.env's
+  # GREFFER_MODE=tunnel.
+  #
+  # rathole-client + dumb-init only. No agent.py, no python runtime,
+  # no manager polling, no shared-secret token on disk. The greffer's
+  # FastAPI controller writes client.toml on the shared volume in
+  # response to manager pushes; rathole-client picks up the change
+  # via its built-in file watcher.
+  tunnel-sidecar:
+    image: ghcr.io/greffon/greffer-tunnel-sidecar:<TAG>
+    profiles: ["tunnel"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - greffer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Read-only mount of the shared client.toml the greffer's
+      # controller writes. Sidecar never writes here.
+      - rathole-client-config:/config:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "rathole"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+networks:
+  internal: {}
+
+volumes:
+  greffon-data:
+  # Shared client.toml — see the greffer service's volumes block.
+  rathole-client-config:

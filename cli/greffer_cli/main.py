@@ -151,7 +151,7 @@ def up(
             address=address,
             public_host=public_host,
         )
-        template_path = _select_compose_template(mode)
+        template_path = _compose_template_path()
         template_text = template_path.read_text(encoding="utf-8")
         image_tag = _read_image_tag()
         up_mod.write_config(
@@ -174,10 +174,15 @@ def up(
     # status.py, and unit tests. The integration that wires the
     # state machine to actual `docker compose up -d` + polling is
     # gated on the release-infrastructure PR landing.
+    compose_path = paths.docker_compose_yml_path(cfg)
+    if mode == "tunnel":
+        manual_hint = f"docker compose -f {compose_path} --profile tunnel up -d"
+    else:
+        manual_hint = f"docker compose -f {compose_path} up -d"
     typer.echo(
         "(state-machine driver lands in a follow-up PR — this PR ships\n"
         "the package + config write + doctor + status. To bring up the\n"
-        f"container manually now: docker compose -f {paths.docker_compose_yml_path(cfg)} up -d)"
+        f"container manually now: {manual_hint})"
     )
 
 
@@ -193,18 +198,20 @@ def status(
     print(status_mod.format_report(report))
 
 
-def _select_compose_template(mode: str) -> Path:
-    """Resolve the bundled compose template for the chosen mode."""
-    # Use importlib.resources so the lookup works both in dev (Poetry
-    # editable install) and (eventually) in PyInstaller bundles.
-    template_name = f"compose.{mode}.yml"
+def _compose_template_path() -> Path:
+    """Resolve the bundled compose template (single file, both modes via profiles).
+
+    Mode selection happens at ``docker compose up`` time via the
+    ``--profile tunnel`` flag, NOT at template-render time. This mirrors
+    the existing in-repo greffer/docker-compose.yml shape — one source
+    of truth, two run paths.
+    """
+    # importlib.resources so the lookup works in both Poetry editable
+    # install and (eventually) PyInstaller bundle.
     files = resources.files("greffer_cli").joinpath("templates")
-    target = files.joinpath(template_name)
+    target = files.joinpath("compose.yml")
     if not target.is_file():
-        raise RuntimeError(
-            f"compose template '{template_name}' not bundled — "
-            "tunnel-mode template is in scope for the Stem-coordinated release."
-        )
+        raise RuntimeError("compose.yml template not bundled (package layout bug)")
     return Path(str(target))
 
 

@@ -65,27 +65,44 @@ def docker_compose_version() -> CommandResult:
 
 # --- Compose lifecycle ----------------------------------------------
 
-def compose_up(compose_file: Path) -> CommandResult:
-    return _run(
-        ["docker", "compose", "-f", str(compose_file), "up", "-d"],
-        timeout=300,  # image pull can be slow
-    )
+def compose_up(compose_file: Path, *, profile: str | None = None) -> CommandResult:
+    """Bring the compose stack up. In tunnel mode, pass profile="tunnel"
+    so the tunnel-sidecar service starts; in proxy mode (default) only
+    the greffer + nginx services start.
+
+    Profiles are how the single bundled compose.yml supports both modes:
+    services with ``profiles: ["tunnel"]`` are skipped unless that
+    profile is enabled.
+    """
+    args = ["docker", "compose", "-f", str(compose_file)]
+    if profile:
+        args.extend(["--profile", profile])
+    args.extend(["up", "-d"])
+    return _run(args, timeout=300)  # image pull can be slow
 
 
-def compose_ps(compose_file: Path) -> CommandResult:
-    return _run(
-        ["docker", "compose", "-f", str(compose_file), "ps", "--format", "json"],
-        timeout=15,
-    )
+def compose_ps(compose_file: Path, *, profile: str | None = None) -> CommandResult:
+    """List running compose services. Mode-aware via profile: without
+    the profile, ``ps`` only lists default services even if a profiled
+    service is also running. We pass the profile so tunnel-mode
+    operators see all four containers (greffer + nginx + tunnel-sidecar)."""
+    args = ["docker", "compose", "-f", str(compose_file)]
+    if profile:
+        args.extend(["--profile", profile])
+    args.extend(["ps", "--format", "json"])
+    return _run(args, timeout=15)
 
 
-def compose_services_running(compose_file: Path) -> dict[str, bool]:
+def compose_services_running(
+    compose_file: Path, *, profile: str | None = None,
+) -> dict[str, bool]:
     """Parse ``compose ps --format json`` and return a dict of service → running.
 
     Compose v2 emits one JSON object per line (NDJSON-style). v1 emitted
-    a single JSON array. We accept either.
+    a single JSON array. We accept either. Pass ``profile`` to surface
+    profiled services (e.g., the tunnel-sidecar in tunnel mode).
     """
-    result = compose_ps(compose_file)
+    result = compose_ps(compose_file, profile=profile)
     if not result.ok:
         return {}
     text = result.stdout.strip()
