@@ -150,17 +150,27 @@ def compose_services_running(
 def exec_in_greffer_healthz(compose_file: Path) -> CommandResult:
     """Probe the FastAPI app's ``/healthz`` from inside the greffer container.
 
-    We hit the app's internal port (8000) via curl-from-inside rather
-    than the host's exposed nginx port — the host probe is the
+    We hit the app's internal port (8000) from inside the container
+    rather than the host's exposed nginx port — the host probe is the
     reachability self-test (proxy mode only) and depends on operator
     DNS / public-host setup; the in-container probe just verifies the
     app is up.
+
+    We use ``python -c urllib.request`` rather than ``curl``: the
+    greffer image is ``python:3.11-alpine`` and does NOT install curl
+    (see greffer/Dockerfile). Python is guaranteed present — it's
+    what runs uvicorn. Exit 0 iff the response status is 200.
     """
+    probe = (
+        "import sys, urllib.request;"
+        "r = urllib.request.urlopen('http://localhost:8000/healthz', timeout=3);"
+        "sys.exit(0 if r.status == 200 else 1)"
+    )
     return _run(
         [
             "docker", "compose", "-f", str(compose_file),
             "exec", "-T", "greffer",
-            "curl", "-fsS", "http://localhost:8000/healthz",
+            "python", "-c", probe,
         ],
         timeout=10,
     )
