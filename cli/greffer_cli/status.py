@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import compose, env_file, manager_client, paths
+from . import compose, env_file, manager_client, paths, up
 
 
 @dataclass
@@ -62,7 +62,9 @@ def collect(config_dir: Path) -> StatusReport:
 
     compose_file = paths.docker_compose_yml_path(config_dir)
     # Surface the tunnel-sidecar in tunnel mode (it's profile-gated).
-    profile = "tunnel" if mode == "tunnel" else None
+    # Delegate the mode→profile mapping to up.profile_for_mode so the
+    # two call sites can't drift if a third mode is ever added.
+    profile = up.profile_for_mode(mode)  # type: ignore[arg-type]
     container_states = compose.compose_services_running(compose_file, profile=profile)
 
     manager_state, manager_unreachable = _manager_state_safe(manager_url, greffer_id)
@@ -168,7 +170,13 @@ def format_report(report: StatusReport) -> str:
         lines.append("  ✓ cert installed in nginx sidecar")
     elif report.cert_installed is False:
         lines.append("  ✗ cert NOT installed in nginx sidecar")
-    elif report.mode != "proxy":
+    elif report.mode == "proxy":
+        # Proxy mode + cert_installed is None → the check itself couldn't
+        # run (e.g. Docker missing). Surface that explicitly; silently
+        # dropping the line would leave operators unsure whether the
+        # check was skipped or forgotten.
+        lines.append("  ⊘ cert check: unavailable (docker not reachable)")
+    else:
         lines.append(f"  ⊘ cert check: skipped in {report.mode} mode (TBD per Stem HLD)")
 
     return "\n".join(lines)

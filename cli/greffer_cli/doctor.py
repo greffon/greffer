@@ -124,20 +124,17 @@ def run(manager_url: str | None, *, port: int = 8001) -> list[CheckResult]:
     return results
 
 
-def _extract_docker_version(json_stdout: str) -> str:
-    """Pull a short version string out of ``docker version --format json``.
+def _extract_docker_version(stdout: str) -> str:
+    """Pull a short version string out of ``docker --version`` output.
 
+    The plain-text format is ``Docker version 25.0.3, build abc123``.
     Best-effort — if parsing fails we fall back to "Docker Engine" so
     the doctor output stays clean.
     """
-    import json
-    try:
-        data = json.loads(json_stdout)
-        client = data.get("Client", {})
-        version = client.get("Version") or "?"
-        return f"Docker Engine {version}"
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        return "Docker Engine"
+    parts = stdout.strip().split()
+    if len(parts) >= 3 and parts[0] == "Docker" and parts[1] == "version":
+        return f"Docker Engine {parts[2].rstrip(',')}"
+    return "Docker Engine"
 
 
 def is_blocking_failure(results: list[CheckResult]) -> bool:

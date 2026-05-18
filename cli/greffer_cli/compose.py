@@ -132,11 +132,25 @@ def compose_services_running(
     text = result.stdout.strip()
     if not text:
         return {}
+    # Be defensive: a compose-plugin warning printed to stdout (rare but
+    # observed in the wild) would crash status with a JSONDecodeError.
+    # Skip unparseable lines instead — better to under-report a service
+    # than to abort the whole status command.
     services: dict[str, bool] = {}
-    if text.startswith("["):
-        items = json.loads(text)
-    else:
-        items = [json.loads(line) for line in text.splitlines() if line.strip()]
+    try:
+        if text.startswith("["):
+            items = json.loads(text)
+        else:
+            items = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except json.JSONDecodeError:
+        return {}
     for item in items:
         name = item.get("Service") or item.get("Name")
         state = item.get("State") or item.get("status", "")
@@ -161,10 +175,19 @@ def exec_in_greffer_healthz(compose_file: Path) -> CommandResult:
     (see greffer/Dockerfile). Python is guaranteed present — it's
     what runs uvicorn. Exit 0 iff the response status is 200.
     """
+    # Catch HTTPError / URLError explicitly: ``urlopen`` raises
+    # ``HTTPError`` for 4xx/5xx (so a 503 would never reach ``r.status``)
+    # and ``URLError`` for connection refused. Without the try/except,
+    # those manifest as a traceback piped through ``docker exec`` —
+    # functionally non-zero exit, but noisy in logs. Clean exit 1 in
+    # both error cases.
     probe = (
-        "import sys, urllib.request;"
-        "r = urllib.request.urlopen('http://localhost:8000/healthz', timeout=3);"
-        "sys.exit(0 if r.status == 200 else 1)"
+        "import sys, urllib.request, urllib.error;"
+        "\ntry:"
+        "\n    r = urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"
+        "\n    sys.exit(0 if r.status == 200 else 1)"
+        "\nexcept (urllib.error.HTTPError, urllib.error.URLError):"
+        "\n    sys.exit(1)"
     )
     return _run(
         [

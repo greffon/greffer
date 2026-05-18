@@ -23,13 +23,12 @@ def _fail(returncode: int = 1, stderr: str = "") -> compose.CommandResult:
 def _cli_ok(version: str = "25.0.3") -> compose.CommandResult:
     """Mock of ``docker --version`` (daemon-independent installation check).
 
-    The real command returns a plain string like ``Docker version 25.0.3, build abc``;
-    doctor parses ``Client.Version`` from JSON only when reading the rich
-    ``docker version --format json`` output. Here we return JSON because
-    ``_extract_docker_version`` consumes it — keeps test reality close to
-    production while still mocking out subprocess.
+    The real command emits plain text — ``Docker version 25.0.3, build abc123`` —
+    NOT JSON. Earlier mocks used JSON, which silently exercised the
+    ``_extract_docker_version`` error-fallback path instead of the real
+    parser. Fixed here so tests assert the actual production code path.
     """
-    return _ok(f'{{"Client":{{"Version":"{version}"}}}}')
+    return _ok(f"Docker version {version}, build abc123")
 
 
 def test_doctor_all_pass(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,3 +129,7 @@ def test_doctor_format_report_lists_all_checks(monkeypatch: pytest.MonkeyPatch) 
     assert "Docker daemon" in report
     assert "Host port" in report
     assert "Manager URL" in report
+    # The version actually surfaces in the pass line — regression guard
+    # against the Codex finding that `_extract_docker_version` was being
+    # fed plain text but parsing JSON, silently dropping the version.
+    assert "25" in report
