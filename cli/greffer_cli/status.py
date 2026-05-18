@@ -106,10 +106,31 @@ def _manager_state_safe(
 
 
 def _healthz_safe(compose_file: Path) -> tuple[bool, bool]:
-    """In-container healthz probe; degrades gracefully if Docker is missing."""
+    """In-container healthz probe; degrades gracefully if Docker is missing.
+
+    Returns ``(ok, unavailable)``. ``unavailable`` covers ALL the
+    "couldn't run the probe" cases — not just exit 127 (binary missing)
+    but also a stopped daemon and a stopped/absent container. Without
+    this distinction, a daemon-down host reports "/healthz: not
+    responding" (an app problem), sending operators to the wrong
+    remediation. Stderr matching is heuristic but matches Docker's
+    error strings as of the 20.10+ CLI.
+    """
     result = compose.exec_in_greffer_healthz(compose_file)
-    if result.returncode == 127:  # docker not found
+    if result.returncode == 127:  # docker binary not on PATH
         return False, True
+    if not result.ok:
+        stderr = (result.stderr or "").lower()
+        # Daemon down / DOCKER_HOST broken / not in docker group:
+        if "cannot connect to the docker daemon" in stderr:
+            return False, True
+        # Container absent (stack not started, or wrong compose file):
+        if (
+            "no such container" in stderr
+            or "no such service" in stderr
+            or "is not running" in stderr
+        ):
+            return False, True
     return result.ok, False
 
 

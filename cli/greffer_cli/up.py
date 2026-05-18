@@ -146,24 +146,37 @@ def wait_for_state(
     deadline = time.monotonic() + timeout
     last_heartbeat = time.monotonic()
     seen_unknown: set[str] = set()
-    for state in manager_client.poll_state(manager_url, greffer_id):
-        if state.state == target:
-            return True
-        # Forward-compat: log unrecognized states once and continue
-        # polling. Lets future manager states coexist with older CLIs.
-        if state.state not in (
-            "GREFFER_CREATED", "GREFFER_REGISTERING", "GREFFER_REGISTERED",
-        ) and state.state not in seen_unknown:
-            seen_unknown.add(state.state)
-            print(f"(unknown manager state '{state.state}' — continuing)")
-        if time.monotonic() >= deadline:
-            return False
-        if (
-            on_heartbeat
-            and time.monotonic() - last_heartbeat >= heartbeat_interval
+    # Pass the deadline INTO poll_state — its transient-error retry loop
+    # would otherwise spin forever without yielding, never letting the
+    # for-body run the deadline check below. (Codex regression on a
+    # prior fix that added ManagerUnreachable retries.)
+    try:
+        for state in manager_client.poll_state(
+            manager_url, greffer_id, deadline=deadline,
         ):
-            on_heartbeat()
-            last_heartbeat = time.monotonic()
+            if state.state == target:
+                return True
+            # Forward-compat: log unrecognized states once and continue
+            # polling. Lets future manager states coexist with older CLIs.
+            if state.state not in (
+                "GREFFER_CREATED", "GREFFER_REGISTERING", "GREFFER_REGISTERED",
+            ) and state.state not in seen_unknown:
+                seen_unknown.add(state.state)
+                print(f"(unknown manager state '{state.state}' — continuing)")
+            if time.monotonic() >= deadline:
+                return False
+            if (
+                on_heartbeat
+                and time.monotonic() - last_heartbeat >= heartbeat_interval
+            ):
+                on_heartbeat()
+                last_heartbeat = time.monotonic()
+    except manager_client.ManagerUnreachable:
+        # poll_state hit the deadline during a sustained outage and
+        # propagated. Surface as a normal "timed out" return so the
+        # state-machine driver shows the right stuck-state hint.
+        return False
+    return False
 
 
 def reachability_self_test(

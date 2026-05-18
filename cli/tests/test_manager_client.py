@@ -106,6 +106,32 @@ def test_poll_state_recovers_from_transient_5xx(monkeypatch: pytest.MonkeyPatch)
     assert calls["n"] == 3  # two failures then a success
 
 
+def test_poll_state_propagates_unreachable_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a prolonged outage must NOT hang the caller. When
+    ``deadline`` is set and we've passed it, poll_state re-raises the
+    last ManagerUnreachable so the caller (wait_for_state) can return
+    False on timeout instead of looping forever without yielding."""
+    monkeypatch.setattr(manager_client.time, "sleep", lambda _: None)
+
+    # Move the monotonic clock forward fast so the deadline trips.
+    fake_now = {"t": 1000.0}
+    monkeypatch.setattr(manager_client.time, "monotonic", lambda: fake_now["t"])
+
+    def fake_fetch(*_args, **_kwargs):
+        fake_now["t"] += 10  # advance past the deadline below
+        raise manager_client.ManagerUnreachable("sustained 503")
+
+    monkeypatch.setattr(manager_client, "fetch_state", fake_fetch)
+
+    gen = manager_client.poll_state(
+        "https://m", "abc", deadline=1005.0,  # 5s window, fake clock advances 10s/attempt
+    )
+    with pytest.raises(manager_client.ManagerUnreachable):
+        next(gen)
+
+
 def test_poll_state_propagates_greffer_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     """A terminal verdict (greffer ID unknown) must NOT be swallowed by the
     transient-error retry path."""

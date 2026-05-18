@@ -94,6 +94,7 @@ def poll_state(
     rate_limited_interval: float = 5.0,
     rate_limited_interval_max: float = 30.0,
     timeout: float = 5.0,
+    deadline: float | None = None,
 ) -> Iterator[StatePublic]:
     """Generator that yields successive ``StatePublic`` snapshots.
 
@@ -102,6 +103,13 @@ def poll_state(
     ``Retry-After`` when the manager sends it). Raises ``GrefferNotFound``
     or ``ManagerUnreachable`` to the caller — the caller decides what
     a stuck greffer means.
+
+    ``deadline`` (optional, ``time.monotonic()`` seconds) bounds the
+    transient-retry loop: if set, a sustained ``ManagerUnreachable``
+    re-raises once the deadline is past instead of looping forever.
+    Without it, a prolonged manager outage would hang the caller
+    silently — ``wait_for_state``'s outer timeout can't fire while
+    we're inside this generator if we never yield.
     """
     interval = initial_interval
     while True:
@@ -121,6 +129,8 @@ def poll_state(
             # deadline (e.g. `wait_for_state`'s timeout) decides when
             # to give up. GrefferNotFound (a terminal verdict) still
             # propagates because it's NOT a ManagerUnreachable.
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
             time.sleep(interval)
             interval = min(
                 interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
