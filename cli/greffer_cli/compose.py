@@ -106,14 +106,24 @@ def compose_up(compose_file: Path, *, profile: str | None = None) -> CommandResu
 
 
 def compose_ps(compose_file: Path, *, profile: str | None = None) -> CommandResult:
-    """List running compose services. Mode-aware via profile: without
-    the profile, ``ps`` only lists default services even if a profiled
-    service is also running. We pass the profile so tunnel-mode
-    operators see all four containers (greffer + nginx + tunnel-sidecar)."""
+    """List compose services, including stopped ones.
+
+    Mode-aware via profile: without the profile, ``ps`` only lists
+    default services even if a profiled service is also running. We
+    pass the profile so tunnel-mode operators see all containers
+    (greffer + nginx + tunnel-sidecar).
+
+    We also pass ``--all``: by default ``docker compose ps`` only shows
+    RUNNING services (per Docker's CLI docs), so a crashed/exited
+    service would disappear entirely — making ``wait_for_compose_running``
+    falsely report success because the failed service isn't in the
+    dict to check. With ``--all`` it shows up with state != "running",
+    which the caller correctly flags as not-yet-up.
+    """
     args = ["docker", "compose", "-f", str(compose_file)]
     if profile:
         args.extend(["--profile", profile])
-    args.extend(["ps", "--format", "json"])
+    args.extend(["ps", "--all", "--format", "json"])
     return _run(args, timeout=15)
 
 
