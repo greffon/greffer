@@ -28,7 +28,13 @@ name: greffer
 
 services:
   greffer:
-    image: ghcr.io/greffon/greffer:<TAG>
+    # Image refs match what .github/workflows/docker-publish.yml pushes:
+    # Docker Hub (no registry prefix), repository names without the
+    # "greffer-" prefix for tunnel-sidecar. IMAGE_TAG defaults to
+    # "latest" because that's the only tag the publish workflow emits
+    # today; release-infrastructure work will introduce per-version
+    # tags and bump cli/IMAGE_TAG in lockstep with each cut.
+    image: greffon/greffer:<TAG>
     restart: unless-stopped
     networks:
       - internal
@@ -53,7 +59,7 @@ services:
       - rathole-client-config:/config
 
   nginx:
-    image: ghcr.io/greffon/greffer-nginx:<TAG>
+    image: greffon/greffer-nginx:<TAG>
     restart: unless-stopped
     networks:
       - internal
@@ -73,7 +79,10 @@ services:
   # response to manager pushes; rathole-client picks up the change
   # via its built-in file watcher.
   tunnel-sidecar:
-    image: ghcr.io/greffon/greffer-tunnel-sidecar:<TAG>
+    # NB: published as `greffon/tunnel-sidecar` (no `greffer-` prefix) —
+    # matches the docker-publish.yml workflow's tag, not the sibling
+    # services' naming. Don't rename without bumping the workflow.
+    image: greffon/tunnel-sidecar:<TAG>
     profiles: ["tunnel"]
     network_mode: host
     restart: unless-stopped
