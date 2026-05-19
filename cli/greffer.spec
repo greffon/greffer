@@ -16,8 +16,12 @@
 
 # noqa: F821 — PyInstaller injects `Analysis`, `PYZ`, `EXE`, etc.
 # into the spec namespace; pyflakes flags them as undefined.
-
-block_cipher = None
+#
+# Matches the PyInstaller 6.x spec layout (drops the 5.x-era
+# `block_cipher` / `cipher=` / `a.zipfiles` / `win_no_prefer_redirects`
+# / `win_private_assemblies` args, all removed or no-ops in 6.x). The
+# current pyinstaller pin in pyproject.toml is ^6.5 so we don't need
+# the 5-compat surface.
 
 
 a = Analysis(
@@ -44,19 +48,15 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='greffer',
