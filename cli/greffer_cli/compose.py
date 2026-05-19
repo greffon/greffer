@@ -142,26 +142,41 @@ def compose_services_running(
     text = result.stdout.strip()
     if not text:
         return {}
-    # Be defensive: a compose-plugin warning printed to stdout (rare but
-    # observed in the wild) would crash status with a JSONDecodeError.
-    # Skip unparseable lines instead — better to under-report a service
-    # than to abort the whole status command.
+    # Be defensive about two known stdout shapes:
+    #   1. Compose v2 NDJSON: one JSON object per line.
+    #   2. Compose v1 (and v2 with `--format json` per Docker docs): a
+    #      single JSON array.
+    # AND about a compose-plugin warning printed before the payload —
+    # which would push the array onto a non-first line and was
+    # previously appended as a single nested list, crashing item.get()
+    # below. Extend on lists, append on dicts.
     services: dict[str, bool] = {}
+    items: list[dict] = []
     try:
         if text.startswith("["):
-            items = json.loads(text)
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                items.extend(parsed)
         else:
-            items = []
             for line in text.splitlines():
                 if not line.strip():
                     continue
                 try:
-                    items.append(json.loads(line))
+                    parsed = json.loads(line)
                 except json.JSONDecodeError:
-                    continue
+                    continue  # warning / banner line; skip
+                if isinstance(parsed, list):
+                    items.extend(parsed)
+                elif isinstance(parsed, dict):
+                    items.append(parsed)
+                # Any other JSON scalar is ignored — compose has never
+                # emitted one in practice but we don't want to crash if
+                # the format ever drifts.
     except json.JSONDecodeError:
         return {}
     for item in items:
+        if not isinstance(item, dict):
+            continue
         name = item.get("Service") or item.get("Name")
         state = item.get("State") or item.get("status", "")
         if name:

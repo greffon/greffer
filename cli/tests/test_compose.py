@@ -62,6 +62,30 @@ def test_compose_services_running_surfaces_exited_as_not_running(
     assert services == {"greffer": True, "nginx": False}
 
 
+def test_compose_services_running_warning_then_json_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a warning line followed by the documented JSON-array
+    format (Compose v1 / `--format json`) used to append the array as
+    a single list item and crash on item.get(). Now the array is
+    flattened correctly."""
+    text = (
+        "WARN[0000] some compose deprecation notice\n"
+        + json.dumps([
+            {"Service": "greffer", "State": "running"},
+            {"Service": "nginx", "State": "exited"},
+        ])
+    )
+    monkeypatch.setattr(
+        compose, "compose_ps",
+        lambda f, profile=None: compose.CommandResult(
+            returncode=0, stdout=text, stderr="",
+        ),
+    )
+    services = compose.compose_services_running(Path("/tmp/compose.yml"))
+    assert services == {"greffer": True, "nginx": False}
+
+
 def test_compose_services_running_tolerates_warning_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
