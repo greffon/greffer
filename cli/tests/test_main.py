@@ -126,6 +126,38 @@ def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(
     assert captured["mode"] == "tunnel"
 
 
+def test_up_idempotent_fast_path_uses_persisted_manager_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: an operator with a self-hosted manager who re-runs
+    `greffer up --id …` (no --manager flag → CLI default
+    https://api.greffon.io) must NOT have the driver point at Greffon
+    Hosted. The persisted GREFFON_BASE_SERVER wins."""
+    cfg = tmp_path / ".greffer"
+    cfg.mkdir(parents=True)
+    env = env_file.EnvFile(values={
+        "GREFFER_ID": "abc",
+        "GREFFON_BASE_SERVER": "https://manager.self-hosted.example.com",
+        "GREFFER_MODE": "tunnel",
+        "GREFFER_PORT": "8001",
+    })
+    env.write_atomic(paths.env_env_path(cfg))
+    paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
+
+    from greffer_cli import up as up_mod
+    captured: dict = {}
+    monkeypatch.setattr(up_mod, "run_state_machine", _stub_run_state_machine(captured))
+
+    result = runner.invoke(
+        main.app,
+        ["up", "--id", "abc", "--config-dir", str(cfg)],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["manager_url"] == "https://manager.self-hosted.example.com"
+    # Specifically NOT the CLI default:
+    assert "greffon.io" not in captured["manager_url"]
+
+
 def test_up_propagates_driver_failure_as_typer_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

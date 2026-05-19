@@ -133,6 +133,47 @@ def test_run_state_machine_fast_paths_when_already_running(
 
 # --- failure modes --------------------------------------------------
 
+def test_run_state_machine_cold_start_calls_compose_up_with_kw_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: ``compose.compose_up`` declares ``profile`` as
+    keyword-only, so the driver must call ``starter(..., profile=profile)``
+    — a positional call would raise TypeError on every cold start
+    (when services are not already running) and bypass the intended
+    EXIT_COMPOSE_UP_FAILED handling entirely.
+
+    We use the real ``compose.compose_up`` signature (no override) and
+    just spy on the call to confirm it works without TypeError."""
+    cfg = tmp_path / ".greffer"
+    _setup_compose_file(cfg)
+
+    # Containers not running → driver takes the cold-start path.
+    monkeypatch.setattr(compose, "compose_services_running", lambda f, profile=None: {})
+    # Use compose.compose_up's REAL signature: positional `compose_file`,
+    # keyword-only `profile`. A positional call from the driver would
+    # TypeError here.
+    captured: dict = {"calls": []}
+
+    def real_signature_compose_up(compose_file, *, profile=None):
+        captured["calls"].append({"compose_file": compose_file, "profile": profile})
+        return _ok()
+
+    # Then immediately fail wait_for_compose_running so the test exits
+    # without invoking the rest of the state machine.
+    monkeypatch.setattr(up.time, "sleep", lambda _: None)
+
+    rc = up.run_state_machine(
+        cfg, manager_url="https://m", greffer_id="abc",
+        mode="tunnel", timeout=0.1,
+        starter=real_signature_compose_up,
+    )
+    # We expect Starting-timeout (because wait_for_compose_running
+    # never sees a running container), NOT a TypeError.
+    assert rc == up.EXIT_TIMEOUT_STARTING
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["profile"] == "tunnel"
+
+
 def test_run_state_machine_compose_up_failure_returns_distinct_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

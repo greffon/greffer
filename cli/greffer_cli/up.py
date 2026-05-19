@@ -298,7 +298,7 @@ def run_state_machine(
     public_host: str | None = None,
     port: int = 8001,
     timeout: float = 600.0,
-    starter: Callable[[Path, str | None], compose.CommandResult] | None = None,
+    starter: Callable[..., compose.CommandResult] | None = None,
 ) -> int:
     """Walk Starting → Registering → Awaiting cert → Connected.
 
@@ -330,7 +330,10 @@ def run_state_machine(
     services = compose.compose_services_running(compose_file, profile=profile)
     already_up = bool(services) and all(services.values())
     if not already_up:
-        up_result = starter(compose_file, profile)
+        # ``compose.compose_up`` declares ``profile`` as keyword-only,
+        # so we pass it as a kwarg here — a positional call would
+        # raise TypeError on every cold start (Codex P1).
+        up_result = starter(compose_file, profile=profile)
         if not up_result.ok:
             print(
                 f"  ✗ docker compose up failed (exit {up_result.returncode}):\n"

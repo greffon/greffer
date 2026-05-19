@@ -168,20 +168,23 @@ def up(
                 address=address, public_host=public_host,
             ))
 
-    # Wire the state-machine driver. The persisted mode is the source
-    # of truth — the operator may have invoked `greffer up` with the
-    # default --mode tunnel on a host that was originally initialized
-    # as proxy.
+    # Wire the state-machine driver. On idempotent reruns the persisted
+    # env.env is the source of truth for mode, address, public-host,
+    # AND the manager URL — operators with a self-hosted manager who
+    # re-run `greffer up --id …` without `--manager` would otherwise
+    # poll Greffon Hosted (the CLI flag default) and time out in
+    # Registering even though their actual deployment is fine.
     from . import env_file as env_mod
     env_persisted = env_mod.EnvFile.read(paths.env_env_path(cfg))
     persisted_mode = env_persisted.get("GREFFER_MODE")
     effective_mode = persisted_mode or mode
     persisted_address = env_persisted.get("GREFFER_ADDRESS") or address
     persisted_public_host = env_persisted.get("GREFFER_PUBLIC_HOST") or public_host
+    persisted_manager = env_persisted.get("GREFFON_BASE_SERVER") or manager
 
     rc = up_mod.run_state_machine(
         cfg,
-        manager_url=manager,
+        manager_url=persisted_manager,
         greffer_id=id,
         mode=effective_mode,  # type: ignore[arg-type]
         address=persisted_address,
