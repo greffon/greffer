@@ -29,7 +29,12 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write  # required to upload Release assets
+  # Default scope is read-only so the build jobs — which execute
+  # third-party code via `poetry install` and `pytest` — can't
+  # mutate the repo or cut releases. The publish job overrides
+  # this with `contents: write` for its single use case (uploading
+  # Release assets). Least-privilege.
+  contents: read
 
 jobs:
   build:
