@@ -126,7 +126,12 @@ def poll_state(
                 raise ManagerUnreachable(
                     f"rate-limited past deadline; last retry-after={rl.retry_after}s"
                 ) from rl
-            time.sleep(max(rl.retry_after, interval))
+            sleep_for = max(rl.retry_after, interval)
+            # Cap sleep to remaining budget: a 3600s Retry-After must
+            # not extend a --timeout=600 invocation to an hour.
+            if deadline is not None:
+                sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
+            time.sleep(sleep_for)
             interval = min(
                 interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
                 rate_limited_interval_max,
@@ -140,7 +145,10 @@ def poll_state(
             # propagates because it's NOT a ManagerUnreachable.
             if deadline is not None and time.monotonic() >= deadline:
                 raise
-            time.sleep(interval)
+            sleep_for = interval
+            if deadline is not None:
+                sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
+            time.sleep(sleep_for)
             interval = min(
                 interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
                 rate_limited_interval_max,
