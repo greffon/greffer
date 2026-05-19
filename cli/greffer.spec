@@ -21,7 +21,11 @@ block_cipher = None
 
 
 a = Analysis(
-    ['greffer_cli/main.py'],
+    # Launcher script — NOT greffer_cli/main.py. PyInstaller runs the
+    # analyzed script as `__main__`, which would break the relative
+    # imports at the top of main.py. The launcher imports the package
+    # properly, then calls the Typer app. See greffer_launcher.py.
+    ['greffer_launcher.py'],
     pathex=[],
     binaries=[],
     datas=[
