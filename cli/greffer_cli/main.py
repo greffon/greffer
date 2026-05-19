@@ -75,8 +75,14 @@ def install_deps_cmd(
 @app.command()
 def up(
     id: str = typer.Option(..., "--id", help="Manager-issued greffer UUID"),
-    manager: str = typer.Option(
-        DEFAULT_MANAGER, "--manager", help="Manager URL (defaults to Greffon Hosted)",
+    manager: Optional[str] = typer.Option(
+        None, "--manager",
+        help=(
+            "Manager URL. Resolution order on re-runs: "
+            "explicit --manager flag wins (allows manager migration / "
+            "typo recovery); else persisted env.env value; else default "
+            f"{DEFAULT_MANAGER}."
+        ),
     ),
     mode: str = typer.Option(
         "tunnel", "--mode", help="Deployment mode: tunnel (default) or proxy",
@@ -126,6 +132,24 @@ def up(
     cfg = paths.resolve_config_dir(config_dir)
     cfg.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the effective manager URL once, here, so the rest of
+    # the function (and downstream config-write + state-machine call)
+    # uses a single consistent value. Precedence:
+    #   1. Explicit --manager flag (operator can migrate / fix a typo)
+    #   2. Persisted GREFFON_BASE_SERVER from env.env (preserves the
+    #      first-run choice on idempotent reruns)
+    #   3. Default Greffon Hosted URL (first-run fallback)
+    if manager is None:
+        from . import env_file as _env_for_manager
+        _env_for_manager_path = paths.env_env_path(cfg)
+        if _env_for_manager_path.exists():
+            _persisted_manager = _env_for_manager.EnvFile.read(
+                _env_for_manager_path,
+            ).get("GREFFON_BASE_SERVER")
+            manager = _persisted_manager or DEFAULT_MANAGER
+        else:
+            manager = DEFAULT_MANAGER
+
     # Idempotence: if env.env exists with matching id, fast-path.
     existing_id = up_mod.existing_greffer_id(cfg)
     if existing_id == id:
@@ -168,23 +192,21 @@ def up(
                 address=address, public_host=public_host,
             ))
 
-    # Wire the state-machine driver. On idempotent reruns the persisted
-    # env.env is the source of truth for mode, address, public-host,
-    # AND the manager URL — operators with a self-hosted manager who
-    # re-run `greffer up --id …` without `--manager` would otherwise
-    # poll Greffon Hosted (the CLI flag default) and time out in
-    # Registering even though their actual deployment is fine.
+    # Wire the state-machine driver. The persisted env.env is the
+    # source of truth for mode/address/public-host on idempotent
+    # reruns (with the same fallback-to-CLI semantics). The manager
+    # URL was already resolved above with explicit-flag-wins
+    # precedence, so we just pass it through.
     from . import env_file as env_mod
     env_persisted = env_mod.EnvFile.read(paths.env_env_path(cfg))
     persisted_mode = env_persisted.get("GREFFER_MODE")
     effective_mode = persisted_mode or mode
     persisted_address = env_persisted.get("GREFFER_ADDRESS") or address
     persisted_public_host = env_persisted.get("GREFFER_PUBLIC_HOST") or public_host
-    persisted_manager = env_persisted.get("GREFFON_BASE_SERVER") or manager
 
     rc = up_mod.run_state_machine(
         cfg,
-        manager_url=persisted_manager,
+        manager_url=manager,
         greffer_id=id,
         mode=effective_mode,  # type: ignore[arg-type]
         address=persisted_address,

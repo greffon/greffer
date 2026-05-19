@@ -158,6 +158,44 @@ def test_up_idempotent_fast_path_uses_persisted_manager_url(
     assert "greffon.io" not in captured["manager_url"]
 
 
+def test_up_explicit_manager_flag_overrides_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: an explicit --manager must win over the persisted
+    GREFFON_BASE_SERVER so operators can recover from a typo in the
+    initial install command or migrate to a new manager.
+
+    The previous fix made persisted always win, which blocked recovery."""
+    cfg = tmp_path / ".greffer"
+    cfg.mkdir(parents=True)
+    env = env_file.EnvFile(values={
+        "GREFFER_ID": "abc",
+        "GREFFON_BASE_SERVER": "https://typo.example.com",  # the bad URL
+        "GREFFER_MODE": "tunnel",
+        "GREFFER_PORT": "8001",
+    })
+    env.write_atomic(paths.env_env_path(cfg))
+    paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
+
+    from greffer_cli import up as up_mod
+    captured: dict = {}
+    monkeypatch.setattr(up_mod, "run_state_machine", _stub_run_state_machine(captured))
+
+    # Operator passes --manager explicitly to recover from the typo.
+    result = runner.invoke(
+        main.app,
+        [
+            "up", "--id", "abc", "--config-dir", str(cfg),
+            "--manager", "https://correct.example.com",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    # Explicit flag wins:
+    assert captured["manager_url"] == "https://correct.example.com"
+    # NOT the persisted typo:
+    assert "typo" not in captured["manager_url"]
+
+
 def test_up_propagates_driver_failure_as_typer_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
