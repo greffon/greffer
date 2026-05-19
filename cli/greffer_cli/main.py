@@ -223,18 +223,25 @@ def _compose_template_path() -> Path:
 
 
 def _read_image_tag() -> str:
-    """Read the CLI's pinned greffer image tag from cli/IMAGE_TAG.
+    """Read the CLI's pinned greffer image tag from the bundled IMAGE_TAG.
 
-    In a built PyInstaller binary, the tag is interpolated into the
-    template at bundle time by cli-release.yml (see HLD § "Image-tag
-    bundling contract"). In dev (`poetry run greffer up`), we read it
-    fresh from the file each time.
+    The file lives INSIDE the package (``greffer_cli/IMAGE_TAG``) so it
+    ships with the wheel / sdist / PyInstaller bundle alike. An earlier
+    layout had it at ``cli/IMAGE_TAG`` (one level up), which worked
+    from an editable Poetry install but was silently dropped from
+    built wheels — operators would render image refs like
+    ``greffon/greffer:main`` (the fallback) against a registry that
+    only publishes ``latest``, and ``docker compose up`` failed at
+    the image pull. Reading via ``importlib.resources`` mirrors how
+    ``_compose_template_path`` resolves the template.
     """
-    # cli/IMAGE_TAG is one level up from the greffer_cli/ package.
-    image_tag_path = Path(__file__).resolve().parent.parent / "IMAGE_TAG"
-    if image_tag_path.exists():
-        return image_tag_path.read_text(encoding="utf-8").strip()
-    return "main"  # dev fallback
+    try:
+        target = resources.files("greffer_cli").joinpath("IMAGE_TAG")
+        if target.is_file():
+            return target.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, ModuleNotFoundError):
+        pass
+    return "latest"  # dev fallback — matches what docker-publish.yml emits
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -13,6 +13,21 @@ from greffer_cli import env_file, main, paths
 runner = CliRunner()
 
 
+def test_read_image_tag_reads_from_package_resources() -> None:
+    """IMAGE_TAG lives INSIDE the greffer_cli package so importlib.resources
+    finds it in both editable installs and built wheels. An earlier
+    layout (cli/IMAGE_TAG, one level above the package) was silently
+    dropped from built wheels — fallback "main" rendered image refs
+    pointing at a non-existent registry tag."""
+    tag = main._read_image_tag()
+    # Must be non-empty, non-whitespace, and not the fallback default
+    # (the fallback should only fire if IMAGE_TAG is missing from the
+    # package, which would be a packaging regression we want to catch).
+    assert tag
+    assert tag.strip() == tag
+    assert tag != ""
+
+
 def _write_proxy_env(cfg: Path, greffer_id: str) -> None:
     """Simulate an already-initialized proxy host: env.env + compose.yml on disk."""
     cfg.mkdir(parents=True, exist_ok=True)
