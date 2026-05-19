@@ -33,6 +33,10 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# …except the hand-authored, version-controlled spec for the operator
+# CLI binary. It's the reproducible-build source of truth used by
+# .github/workflows/cli-release.yml.
+!cli/greffer.spec
 
 # Installer logs
 pip-log.txt

@@ -1,0 +1,174 @@
+name: cli-release
+
+# Builds per-arch greffer CLI binaries with PyInstaller and publishes
+# them to a GitHub Release, plus a `sha256sums.txt`. Triggered by
+# pushing a `cli-vX.Y.Z` tag — version comes from the tag, NOT from
+# cli/pyproject.toml (the pyproject version is for the Python package
+# distribution if we ever publish one; the operator-facing binary is
+# the tag).
+#
+# Operator install path:
+#   curl -sSL https://greffon.io/install.sh | sh
+# which downloads the matching `greffer-{os}-{arch}` asset, verifies
+# sha256, and execs the binary. See landing-page's install.sh route.
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+  # PR validation: build all four arches and smoke-test --help when
+  # any CLI file changes. The publish job's `if:` skips the actual
+  # Release creation, so PR runs are zero-risk. Catches "the tag
+  # build is broken" issues BEFORE we tag.
+  pull_request:
+    paths:
+      - 'cli/**'
+      - '.github/workflows/cli-release.yml'
+  # Allow manual dry-runs without publishing — useful before cutting
+  # a real tag to confirm the matrix builds clean.
+  workflow_dispatch: {}
+
+permissions:
+  # Default scope is read-only so the build jobs — which execute
+  # third-party code via `poetry install` and `pytest` — can't
+  # mutate the repo or cut releases. The publish job overrides
+  # this with `contents: write` for its single use case (uploading
+  # Release assets). Least-privilege.
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            # GitHub-hosted arm64 Linux runner. If unavailable in this
+            # org's plan, fall back to ubuntu-22.04 + QEMU — but that
+            # path is ~10x slower and produces emulated artifacts;
+            # prefer native.
+            runner: ubuntu-22.04-arm
+          - target: darwin-x86_64
+            # macos-13 was retired in late 2025 per GitHub's runner-images
+            # deprecation schedule; macos-15-intel is the current label
+            # for Intel macOS jobs. Apple Silicon jobs (darwin-arm64) use
+            # the unsuffixed macos-N label since those runners are
+            # arm64-native.
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-14
+
+    defaults:
+      run:
+        working-directory: cli
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        # Pin Poetry to match the docker-publish.yml workflow so the
+        # CI environments don't drift across the two release paths.
+        run: pip install --no-cache-dir "poetry==1.8.5"
+
+      - name: Install dependencies (incl. release group)
+        # `--with release` pulls pyinstaller; main + dev groups give
+        # us the runtime deps + tests we run in the smoke-check step.
+        run: poetry install --no-interaction --with release
+
+      - name: Run unit tests
+        # Don't ship a binary built off a broken commit. The unit
+        # suite runs in <1s; cheap insurance against tag-and-pray.
+        run: poetry run pytest -q
+
+      - name: Build binary with PyInstaller
+        run: poetry run pyinstaller --clean --noconfirm greffer.spec
+
+      - name: Smoke-test the built binary
+        # `--help` exercises Typer's command tree without needing
+        # docker. Catches missing-import bugs that only surface on
+        # the frozen bundle (e.g. a click submodule we forgot to
+        # add to hiddenimports in greffer.spec).
+        run: ./dist/greffer --help
+
+      - name: Rename binary with target suffix
+        # Each matrix job produces a generically-named `greffer`
+        # binary; renaming with the target makes the artifacts
+        # uniquely identifiable when downloaded together.
+        run: mv dist/greffer "dist/greffer-${{ matrix.target }}"
+
+      - name: Compute per-file sha256
+        # We aggregate per-target checksums into a single sums file
+        # in the publish job; this step just emits the local hash
+        # for debugging in the Actions log.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 "dist/greffer-${{ matrix.target }}"
+          else
+            sha256sum "dist/greffer-${{ matrix.target }}"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: greffer-${{ matrix.target }}
+          path: cli/dist/greffer-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    # Skip the publish step on workflow_dispatch dry-runs and on any
+    # invocation that didn't actually push a tag (defensive — the
+    # `on:` filter already excludes those, but workflow_dispatch can
+    # be fired from any ref).
+    if: |
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/cli-v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all per-target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          # All four jobs upload under names matching `greffer-*`.
+          pattern: greffer-*
+          merge-multiple: true
+
+      - name: Generate sha256sums.txt
+        # Format matches the convention used by curl|sh install
+        # scripts everywhere: `<sha256>  <filename>` (two spaces).
+        # The install.sh in landing-page parses this exact format.
+        working-directory: artifacts
+        run: |
+          sha256sum greffer-* > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag drives the release name + the install.sh `latest`
+          # lookup. Body is intentionally minimal — the changelog
+          # lives in cli/CHANGELOG.md (separate doc) once we have
+          # multiple releases to differentiate.
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/greffer-*
+            artifacts/sha256sums.txt
