@@ -17,6 +17,15 @@
 # no source tree).
 version: "3.8"
 
+# Explicit project name. Without this, ``docker compose`` derives the
+# project name from the compose file's parent directory — which is
+# ``~/.greffer/`` in the default path. Compose rejects project names
+# that don't start with a lowercase letter or digit, so the default
+# `up` command would fail before creating any container. Pin it here
+# so the file is runnable from the documented default location AND
+# any operator-chosen --config-dir.
+name: greffer
+
 services:
   greffer:
     image: ghcr.io/greffon/greffer:<TAG>
