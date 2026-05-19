@@ -105,43 +105,65 @@ def _manager_state_safe(
     return state.state, False
 
 
+def _docker_exec_unavailable(result: compose.CommandResult) -> bool:
+    """True when a ``docker compose exec`` result reflects a broken Docker
+    layer rather than the in-container probe itself failing.
+
+    Distinguishing matters because the two have different remediations:
+    "fix Docker / start the stack" vs. "check the app logs." We treat
+    these as unavailable:
+      - exit 127: docker binary not on PATH
+      - "Cannot connect to the Docker daemon": daemon down / DOCKER_HOST
+        broken / user not in the docker group
+      - "no such container/service" or "is not running": stack not
+        started, or wrong compose file
+
+    Stderr matching is heuristic but matches Docker's error strings as
+    of the 20.10+ CLI.
+    """
+    if result.returncode == 127:
+        return True
+    if result.ok:
+        return False
+    stderr = (result.stderr or "").lower()
+    if "cannot connect to the docker daemon" in stderr:
+        return True
+    if (
+        "no such container" in stderr
+        or "no such service" in stderr
+        or "is not running" in stderr
+    ):
+        return True
+    return False
+
+
 def _healthz_safe(compose_file: Path) -> tuple[bool, bool]:
     """In-container healthz probe; degrades gracefully if Docker is missing.
 
-    Returns ``(ok, unavailable)``. ``unavailable`` covers ALL the
-    "couldn't run the probe" cases — not just exit 127 (binary missing)
-    but also a stopped daemon and a stopped/absent container. Without
-    this distinction, a daemon-down host reports "/healthz: not
-    responding" (an app problem), sending operators to the wrong
-    remediation. Stderr matching is heuristic but matches Docker's
-    error strings as of the 20.10+ CLI.
+    Returns ``(ok, unavailable)``. A real app failure (probe exits
+    non-zero with no daemon/container signal) reports ``(False, False)``
+    so operators get steered to greffer logs, not Docker.
     """
     result = compose.exec_in_greffer_healthz(compose_file)
-    if result.returncode == 127:  # docker binary not on PATH
+    if _docker_exec_unavailable(result):
         return False, True
-    if not result.ok:
-        stderr = (result.stderr or "").lower()
-        # Daemon down / DOCKER_HOST broken / not in docker group:
-        if "cannot connect to the docker daemon" in stderr:
-            return False, True
-        # Container absent (stack not started, or wrong compose file):
-        if (
-            "no such container" in stderr
-            or "no such service" in stderr
-            or "is not running" in stderr
-        ):
-            return False, True
     return result.ok, False
 
 
 def _cert_installed_safe(
     compose_file: Path, mode: str,
 ) -> tuple[bool | None, bool]:
-    """Proxy-mode cert check. Tunnel mode returns (None, True) — TBD per Stem HLD."""
+    """Proxy-mode cert check. Tunnel mode returns (None, True) — TBD per Stem HLD.
+
+    Same Docker-layer-vs-probe-failure distinction as ``_healthz_safe``:
+    daemon down / nginx container absent must report unavailable, not
+    "cert NOT installed," otherwise operators get routed to cert
+    debugging when the real problem is Docker reachability.
+    """
     if mode != "proxy":
         return None, True
     result = compose.exec_nginx_cert_installed(compose_file)
-    if result.returncode == 127:
+    if _docker_exec_unavailable(result):
         return None, True
     return result.ok, False
 

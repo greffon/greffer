@@ -106,6 +106,26 @@ def test_poll_state_recovers_from_transient_5xx(monkeypatch: pytest.MonkeyPatch)
     assert calls["n"] == 3  # two failures then a success
 
 
+def test_poll_state_rate_limit_respects_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a manager pinning us at 429 (or a long Retry-After)
+    must NOT let us sleep past --timeout. The 429 retry path now also
+    bounds on deadline and re-raises as ManagerUnreachable so the
+    caller's outer timeout handler runs."""
+    monkeypatch.setattr(manager_client.time, "sleep", lambda _: None)
+    fake_now = {"t": 1000.0}
+    monkeypatch.setattr(manager_client.time, "monotonic", lambda: fake_now["t"])
+
+    def fake_fetch(*_args, **_kwargs):
+        fake_now["t"] += 10  # advance past the deadline below
+        raise manager_client._RateLimited(retry_after=60.0)
+
+    monkeypatch.setattr(manager_client, "fetch_state", fake_fetch)
+
+    gen = manager_client.poll_state("https://m", "abc", deadline=1005.0)
+    with pytest.raises(manager_client.ManagerUnreachable):
+        next(gen)
+
+
 def test_poll_state_propagates_unreachable_after_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

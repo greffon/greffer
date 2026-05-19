@@ -117,6 +117,15 @@ def poll_state(
             yield fetch_state(manager_url, greffer_id, timeout=timeout)
             interval = initial_interval  # back to fast cadence on success
         except _RateLimited as rl:
+            # Also bound on deadline here: a manager that hammers us with
+            # 429 (or a long Retry-After) would otherwise let us sleep
+            # well past the caller's --timeout. Re-raise as
+            # ManagerUnreachable so the caller's handler treats it the
+            # same as a sustained outage and returns False on timeout.
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ManagerUnreachable(
+                    f"rate-limited past deadline; last retry-after={rl.retry_after}s"
+                ) from rl
             time.sleep(max(rl.retry_after, interval))
             interval = min(
                 interval * 2 if interval >= rate_limited_interval else rate_limited_interval,
