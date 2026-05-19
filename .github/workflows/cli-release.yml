@@ -48,7 +48,12 @@ jobs:
             # prefer native.
             runner: ubuntu-22.04-arm
           - target: darwin-x86_64
-            runner: macos-13
+            # macos-13 was retired in late 2025 per GitHub's runner-images
+            # deprecation schedule; macos-15-intel is the current label
+            # for Intel macOS jobs. Apple Silicon jobs (darwin-arm64) use
+            # the unsuffixed macos-N label since those runners are
+            # arm64-native.
+            runner: macos-15-intel
           - target: darwin-arm64
             runner: macos-14
 
