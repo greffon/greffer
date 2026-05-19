@@ -45,14 +45,36 @@ def _write_proxy_env(cfg: Path, greffer_id: str) -> None:
     paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
 
 
-def test_up_idempotent_fast_path_uses_persisted_mode(tmp_path: Path) -> None:
+def _stub_run_state_machine(captured: dict) -> "callable":
+    """Build a stub for up.run_state_machine that records its args.
+
+    The CLI tests verify the persisted-mode value PROPAGATED into the
+    driver call — not what the driver itself prints. Stubbing here keeps
+    the test focused on the CLI-glue layer; driver-internal behavior
+    (state transitions, heartbeats, timeouts) is covered by test_up.py.
+    """
+    def _stub(cfg, **kwargs):
+        captured.update(kwargs)
+        captured["cfg"] = cfg
+        from greffer_cli import up as _up
+        return _up.EXIT_OK
+    return _stub
+
+
+def test_up_idempotent_fast_path_uses_persisted_mode_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regression: when env.env already exists for the same greffer_id, the
-    manual-compose hint must reflect the persisted mode (proxy), NOT the
-    CLI's default --mode tunnel. Otherwise re-running `greffer up --id …`
-    on a proxy host prints a tunnel-profile command that won't match
-    what's on disk."""
+    state-machine driver must be called with the PERSISTED mode (proxy),
+    not the CLI's default --mode tunnel. Otherwise re-running
+    `greffer up --id …` on a proxy host would call the driver in
+    tunnel mode and skip the proxy-specific cert + reachability paths."""
     cfg = tmp_path / ".greffer"
     _write_proxy_env(cfg, greffer_id="abc-123")
+
+    from greffer_cli import up as up_mod
+    captured: dict = {}
+    monkeypatch.setattr(up_mod, "run_state_machine", _stub_run_state_machine(captured))
 
     # Invoke `greffer up --id abc-123 --config-dir …` WITHOUT --mode.
     # The default --mode tunnel must NOT win over the persisted "proxy".
@@ -61,14 +83,18 @@ def test_up_idempotent_fast_path_uses_persisted_mode(tmp_path: Path) -> None:
         ["up", "--id", "abc-123", "--config-dir", str(cfg)],
     )
     assert result.exit_code == 0, result.stdout
-    # Tunnel-mode hint includes `--profile tunnel`; proxy hint does not.
-    assert "--profile tunnel" not in result.stdout
-    assert "docker compose -f" in result.stdout
+    assert captured["mode"] == "proxy"
+    # And the proxy-mode fields propagated too:
+    assert captured["address"] == "g.example.com"
+    assert captured["public_host"] == "203.0.113.5"
 
 
-def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(tmp_path: Path) -> None:
+def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Mirror of the above for a tunnel-mode host re-invoked with an
-    explicit --mode proxy flag — persisted wins, prints tunnel hint."""
+    explicit --mode proxy flag — persisted wins, driver gets called
+    in tunnel mode."""
     cfg = tmp_path / ".greffer"
     cfg.mkdir(parents=True)
     env = env_file.EnvFile(values={
@@ -80,9 +106,13 @@ def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(tmp_path: Path) -> N
     env.write_atomic(paths.env_env_path(cfg))
     paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
 
+    from greffer_cli import up as up_mod
+    captured: dict = {}
+    monkeypatch.setattr(up_mod, "run_state_machine", _stub_run_state_machine(captured))
+
     # Operator typo'd --mode proxy on a host previously initialized as
     # tunnel. Need --address/--public-host to pass arg validation;
-    # the fast-path then uses the persisted (tunnel) mode for the hint.
+    # the persisted (tunnel) mode wins.
     result = runner.invoke(
         main.app,
         [
@@ -93,4 +123,26 @@ def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(tmp_path: Path) -> N
         ],
     )
     assert result.exit_code == 0, result.stdout
-    assert "--profile tunnel" in result.stdout
+    assert captured["mode"] == "tunnel"
+
+
+def test_up_propagates_driver_failure_as_typer_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI must surface the driver's exit code (timeout, compose-up
+    failure, etc.) so operators and CI can detect failure. Returning 0
+    when the driver returned a timeout would mask real problems."""
+    cfg = tmp_path / ".greffer"
+    _write_proxy_env(cfg, greffer_id="abc-123")
+
+    from greffer_cli import up as up_mod
+    monkeypatch.setattr(
+        up_mod, "run_state_machine",
+        lambda cfg, **kw: up_mod.EXIT_TIMEOUT_REGISTERING,
+    )
+
+    result = runner.invoke(
+        main.app,
+        ["up", "--id", "abc-123", "--config-dir", str(cfg)],
+    )
+    assert result.exit_code == up_mod.EXIT_TIMEOUT_REGISTERING

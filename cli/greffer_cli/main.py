@@ -168,29 +168,28 @@ def up(
                 address=address, public_host=public_host,
             ))
 
-    # The state-machine driver is documented in HLD § Flow. v1
-    # implementation lands in a follow-up PR — this PR ships the
-    # config-write + idempotence path, the library code in up.py /
-    # status.py, and unit tests. The integration that wires the
-    # state machine to actual `docker compose up -d` + polling is
-    # gated on the release-infrastructure PR landing.
-    compose_path = paths.docker_compose_yml_path(cfg)
-    # On the idempotent fast-path the persisted mode is the source of
-    # truth — the operator may have invoked `greffer up` with the default
-    # --mode tunnel on a host that was originally initialized as proxy.
-    # Print the hint that matches what's on disk.
+    # Wire the state-machine driver. The persisted mode is the source
+    # of truth — the operator may have invoked `greffer up` with the
+    # default --mode tunnel on a host that was originally initialized
+    # as proxy.
     from . import env_file as env_mod
-    persisted_mode = env_mod.EnvFile.read(paths.env_env_path(cfg)).get("GREFFER_MODE")
+    env_persisted = env_mod.EnvFile.read(paths.env_env_path(cfg))
+    persisted_mode = env_persisted.get("GREFFER_MODE")
     effective_mode = persisted_mode or mode
-    if effective_mode == "tunnel":
-        manual_hint = f"docker compose -f {compose_path} --profile tunnel up -d"
-    else:
-        manual_hint = f"docker compose -f {compose_path} up -d"
-    typer.echo(
-        "(state-machine driver lands in a follow-up PR — this PR ships\n"
-        "the package + config write + doctor + status. To bring up the\n"
-        f"container manually now: {manual_hint})"
+    persisted_address = env_persisted.get("GREFFER_ADDRESS") or address
+    persisted_public_host = env_persisted.get("GREFFER_PUBLIC_HOST") or public_host
+
+    rc = up_mod.run_state_machine(
+        cfg,
+        manager_url=manager,
+        greffer_id=id,
+        mode=effective_mode,  # type: ignore[arg-type]
+        address=persisted_address,
+        public_host=persisted_public_host,
+        timeout=float(timeout),
     )
+    if rc != up_mod.EXIT_OK:
+        raise typer.Exit(code=rc)
 
 
 @app.command()
