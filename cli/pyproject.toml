@@ -34,6 +34,14 @@ rich = "^13"
 pytest = "^8"
 pytest-mock = "^3"
 
+[tool.poetry.group.release.dependencies]
+# Optional group — installed only on the CI release runner, not in dev
+# or test environments. Keeps `poetry install` lean for contributors.
+# pyinstaller 6.x only supports python <3.14; we scope the marker so
+# `poetry lock` doesn't reject the whole solver tree on Python 3.14+.
+# Lift the upper bound when pyinstaller publishes 3.14 support.
+pyinstaller = { version = "^6.5", python = ">=3.11,<3.14" }
+
 [tool.poetry.scripts]
 greffer = "greffer_cli.main:app"
 
