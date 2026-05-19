@@ -266,6 +266,7 @@ EXIT_TIMEOUT_STARTING = 10
 EXIT_TIMEOUT_REGISTERING = 11
 EXIT_TIMEOUT_AWAITING_CERT = 12
 EXIT_TIMEOUT_HEALTHZ = 13
+EXIT_GREFFER_NOT_FOUND = 14  # state-public/ 404 — wrong manager URL or unknown UUID
 EXIT_COMPOSE_UP_FAILED = 20
 
 
@@ -368,12 +369,29 @@ def run_state_machine(
     # gate on seeing GREFFER_REGISTERING first — the greffer's
     # register-worker may transition through it in under a poll
     # interval, in which case we'd never see it. Land on REGISTERED.
-    if not wait_for_state(
-        manager_url, greffer_id, target="GREFFER_REGISTERED",
-        timeout=timeout,
-        heartbeat_interval=30.0,
-        on_heartbeat=_heartbeat,
-    ):
+    #
+    # GrefferNotFound (state-public 404) gets a distinct exit code +
+    # hint — the operator usually has the wrong --manager URL OR was
+    # given a UUID that doesn't exist on this manager. Without this
+    # catch, the wired-up `main.up` path would propagate the exception
+    # to Typer and dump a traceback instead of a clean failure.
+    try:
+        reached = wait_for_state(
+            manager_url, greffer_id, target="GREFFER_REGISTERED",
+            timeout=timeout,
+            heartbeat_interval=30.0,
+            on_heartbeat=_heartbeat,
+        )
+    except manager_client.GrefferNotFound:
+        print(
+            f"  ✗ Manager at {manager_url} doesn't know greffer ID {greffer_id}.\n"
+            f"    → check the --manager URL (typo? wrong environment?)\n"
+            f"    → confirm the UUID with your admin (they create the row first\n"
+            f"      via the manager admin UI; the install command then references it).",
+            file=sys.stderr,
+        )
+        return EXIT_GREFFER_NOT_FOUND
+    if not reached:
         print(strings.TIMEOUT_REGISTERING.format(
             minutes=int(timeout // 60),
             accept_url=accept_url,
@@ -397,9 +415,10 @@ def run_state_machine(
 
     # ---- 4. Connected ---------------------------------------------------
     # Final gate: healthz returns 200 from inside the greffer container.
-    # Short timeout — by this point everything else is up; we're guarding
-    # against a momentary nginx reload after cert install.
-    if not _wait_for_healthz(compose_file, timeout=30.0):
+    # Honor --timeout so slow hosts (or post-cert-install reload latency)
+    # don't false-negative. The default 600s is plenty; operators with
+    # a short --timeout get what they asked for.
+    if not _wait_for_healthz(compose_file, timeout=timeout):
         print(
             "  ✗ container is running and cert is installed, but /healthz "
             "isn't responding. Try `docker compose -f "

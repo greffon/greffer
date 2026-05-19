@@ -300,6 +300,79 @@ def test_run_state_machine_tunnel_skips_cert_check(
     assert cert_calls["n"] == 0  # never called in tunnel mode
 
 
+# --- GrefferNotFound + timeout honoring ------------------------------
+
+def test_run_state_machine_greffer_not_found_returns_distinct_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: when state-public/ returns 404 (wrong --manager URL
+    or unknown UUID), wait_for_state's poll_state propagates
+    GrefferNotFound. Without an explicit catch in run_state_machine,
+    the wired `main.up` path dumps a traceback instead of returning a
+    controlled exit code with an operator hint."""
+    cfg = tmp_path / ".greffer"
+    _setup_compose_file(cfg)
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda f, profile=None: {"greffer": True, "nginx": True, "tunnel-sidecar": True},
+    )
+
+    def fake_poll(*_args, **_kwargs):
+        raise manager_client.GrefferNotFound("abc")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(manager_client, "poll_state", fake_poll)
+
+    rc = up.run_state_machine(
+        cfg, manager_url="https://wrong.example.com", greffer_id="abc",
+        mode="tunnel", timeout=10.0,
+    )
+    assert rc == up.EXIT_GREFFER_NOT_FOUND
+    err = capsys.readouterr().err
+    # The hint must point at the two real causes: bad URL or unknown UUID.
+    assert "wrong.example.com" in err
+    assert "abc" in err
+
+
+def test_run_state_machine_healthz_honors_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the final healthz gate used to hardcode 30s, ignoring
+    --timeout. Operators on slow hosts (or post-cert reload latency)
+    got EXIT_TIMEOUT_HEALTHZ false-negatives even with --timeout 1200.
+    Now the operator's timeout flows through."""
+    cfg = tmp_path / ".greffer"
+    _setup_compose_file(cfg)
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda f, profile=None: {"greffer": True, "nginx": True, "tunnel-sidecar": True},
+    )
+    monkeypatch.setattr(
+        manager_client, "poll_state",
+        lambda *a, **k: iter([manager_client.StatePublic(state="GREFFER_REGISTERED")]),
+    )
+    # Healthz never succeeds — verifying we honor the timeout we got.
+    monkeypatch.setattr(compose, "exec_in_greffer_healthz", lambda f: _fail(1))
+
+    captured: dict = {"healthz_timeout": None}
+    real_wait = up._wait_for_healthz
+
+    def spy_wait(compose_file, *, timeout, poll_interval=2.0):
+        captured["healthz_timeout"] = timeout
+        # Don't actually wait — just record the timeout and return False.
+        return False
+
+    monkeypatch.setattr(up, "_wait_for_healthz", spy_wait)
+
+    up.run_state_machine(
+        cfg, manager_url="https://m", greffer_id="abc",
+        mode="tunnel", timeout=0.1,
+    )
+    # The driver passes the operator's --timeout straight through, no
+    # silent 30s cap.
+    assert captured["healthz_timeout"] == 0.1
+
+
 # --- accept-URL formatting ------------------------------------------
 
 def test_run_state_machine_accept_url_format(
