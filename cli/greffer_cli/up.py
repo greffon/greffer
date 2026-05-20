@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
+import sys
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from . import compose, doctor, env_file, install_deps, manager_client, paths, strings
 
@@ -213,3 +214,242 @@ def reachability_self_test(
         return ("wrong_id", {"seen": seen_id, "expected": expected_id})
 
     return ("ok", {})
+
+
+# --- Cert-installed waiter -------------------------------------------
+
+def wait_for_cert_installed(
+    compose_file: Path, *, timeout: float = 600.0, poll_interval: float = 2.0,
+) -> bool:
+    """Proxy-mode: poll the nginx sidecar until /root/pem.crt exists + non-empty.
+
+    Returns True on success, False on timeout. Tunnel mode does NOT
+    call this — the Stem-client sidecar's cert-install signal is TBD
+    per the Stem HLD, so tunnel-mode Awaiting-cert is gated only on
+    the manager state transition + the healthz probe (see
+    ``run_state_machine``).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = compose.exec_nginx_cert_installed(compose_file)
+        if result.ok:
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+def _wait_for_healthz(
+    compose_file: Path, *, timeout: float = 30.0, poll_interval: float = 2.0,
+) -> bool:
+    """Brief wait for the in-container healthz probe to return 200.
+
+    Used as the final "Connected" gate. The longer per-state timeouts
+    already cover the slow paths; this is a short final-confirmation
+    poll because the cert install can cause a momentary nginx reload
+    even after the file appears.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = compose.exec_in_greffer_healthz(compose_file)
+        if result.ok:
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+# --- The state-machine driver ----------------------------------------
+
+# Outcome codes the driver returns. Anything non-zero means the
+# operator should look at the printed hint and re-run after fixing.
+EXIT_OK = 0
+EXIT_TIMEOUT_STARTING = 10
+EXIT_TIMEOUT_REGISTERING = 11
+EXIT_TIMEOUT_AWAITING_CERT = 12
+EXIT_TIMEOUT_HEALTHZ = 13
+EXIT_GREFFER_NOT_FOUND = 14  # state-public/ 404 — wrong manager URL or unknown UUID
+EXIT_COMPOSE_UP_FAILED = 20
+
+
+def _build_reachability_line(
+    outcome: str, ctx: dict, *, public_host: str, port: int,
+) -> str:
+    """Map the reachability_self_test outcome to the right string from strings.py."""
+    if outcome == "ok":
+        return strings.REACHABILITY_OK
+    if outcome == "wrong_id":
+        return strings.REACHABILITY_WRONG_ID.format(
+            public_host=public_host, port=port,
+            seen=ctx.get("seen", "?"), expected=ctx.get("expected", "?"),
+        )
+    if outcome == "transport_error":
+        return strings.REACHABILITY_TRANSPORT_ERROR.format(
+            public_host=public_host, port=port,
+        )
+    # bad_status or anything else
+    return strings.REACHABILITY_BAD_STATUS
+
+
+def run_state_machine(
+    cfg: Path,
+    *,
+    manager_url: str,
+    greffer_id: str,
+    mode: Mode,
+    address: str | None = None,
+    public_host: str | None = None,
+    port: int = 8001,
+    timeout: float = 600.0,
+    starter: Callable[..., compose.CommandResult] | None = None,
+) -> int:
+    """Walk Starting → Registering → Awaiting cert → Connected.
+
+    Returns ``EXIT_OK`` on success, a non-zero code on timeout/failure.
+    Prints a timestamped one-liner per state transition and a
+    heartbeat every 30s while stuck in Registering.
+
+    Per-state timeout is ``timeout`` seconds (10 min default). The
+    total wall-clock for a full happy-path run is dominated by the
+    Registering wait (admin acceptance latency); fast-pathing an
+    already-Connected greffer is sub-second because all three checks
+    pass on the first probe.
+
+    ``starter`` is the injection point for the ``docker compose up``
+    call — tests pass a mock; production passes ``None`` and we use
+    ``compose.compose_up`` directly. Keeps the orchestration unit-testable
+    without standing up Docker.
+    """
+    compose_file = paths.docker_compose_yml_path(cfg)
+    profile = profile_for_mode(mode)
+    starter = starter or compose.compose_up
+
+    # ---- 1. Starting ----------------------------------------------------
+    print(strings.STATE_STARTING.format(ts=_now()))
+
+    # Fast-path: if every relevant service is already running, skip
+    # `compose up` (it's idempotent but adds 1-2s and prints noise).
+    # This is what makes a second `greffer up` invocation sub-second.
+    services = compose.compose_services_running(compose_file, profile=profile)
+    already_up = bool(services) and all(services.values())
+    if not already_up:
+        # ``compose.compose_up`` declares ``profile`` as keyword-only,
+        # so we pass it as a kwarg here — a positional call would
+        # raise TypeError on every cold start (Codex P1).
+        up_result = starter(compose_file, profile=profile)
+        if not up_result.ok:
+            print(
+                f"  ✗ docker compose up failed (exit {up_result.returncode}):\n"
+                f"{up_result.stderr}",
+                file=sys.stderr,
+            )
+            return EXIT_COMPOSE_UP_FAILED
+
+    if not wait_for_compose_running(
+        compose_file, profile=profile, timeout=timeout,
+    ):
+        print(strings.TIMEOUT_STARTING.format(
+            minutes=int(timeout // 60),
+            compose_path=compose_file,
+        ), file=sys.stderr)
+        return EXIT_TIMEOUT_STARTING
+
+    # ---- 2. Registering -------------------------------------------------
+    accept_url = (
+        f"{manager_url.rstrip('/')}/api/greffer/register/accept/{greffer_id}/"
+    )
+    print(strings.STATE_REGISTERING.format(
+        ts=_now(), greffer_id=greffer_id, accept_url=accept_url,
+    ))
+
+    def _heartbeat() -> None:
+        print(strings.STATE_REGISTERING_HEARTBEAT.format(
+            ts=_now(), greffer_id=greffer_id,
+        ))
+
+    # Manager state GREFFER_REGISTERED == admin has accepted. We don't
+    # gate on seeing GREFFER_REGISTERING first — the greffer's
+    # register-worker may transition through it in under a poll
+    # interval, in which case we'd never see it. Land on REGISTERED.
+    #
+    # GrefferNotFound (state-public 404) gets a distinct exit code +
+    # hint — the operator usually has the wrong --manager URL OR was
+    # given a UUID that doesn't exist on this manager. Without this
+    # catch, the wired-up `main.up` path would propagate the exception
+    # to Typer and dump a traceback instead of a clean failure.
+    try:
+        reached = wait_for_state(
+            manager_url, greffer_id, target="GREFFER_REGISTERED",
+            timeout=timeout,
+            heartbeat_interval=30.0,
+            on_heartbeat=_heartbeat,
+        )
+    except manager_client.GrefferNotFound:
+        print(
+            f"  ✗ Manager at {manager_url} doesn't know greffer ID {greffer_id}.\n"
+            f"    → check the --manager URL (typo? wrong environment?)\n"
+            f"    → confirm the UUID with your admin (they create the row first\n"
+            f"      via the manager admin UI; the install command then references it).",
+            file=sys.stderr,
+        )
+        return EXIT_GREFFER_NOT_FOUND
+    if not reached:
+        print(strings.TIMEOUT_REGISTERING.format(
+            minutes=int(timeout // 60),
+            accept_url=accept_url,
+            compose_path=compose_file,
+        ), file=sys.stderr)
+        return EXIT_TIMEOUT_REGISTERING
+
+    # ---- 3. Awaiting cert -----------------------------------------------
+    print(strings.STATE_AWAITING_CERT.format(ts=_now()))
+
+    # Proxy mode: cert lands in the nginx sidecar at /root/pem.crt.
+    # Tunnel mode: no equivalent local probe yet (Stem HLD TBD); the
+    # state transition + healthz check below cover us.
+    if mode == "proxy":
+        if not wait_for_cert_installed(compose_file, timeout=timeout):
+            print(strings.TIMEOUT_AWAITING_CERT.format(
+                minutes=int(timeout // 60),
+                compose_path=compose_file,
+            ), file=sys.stderr)
+            return EXIT_TIMEOUT_AWAITING_CERT
+
+    # ---- 4. Connected ---------------------------------------------------
+    # Final gate: healthz returns 200 from inside the greffer container.
+    # Honor --timeout so slow hosts (or post-cert-install reload latency)
+    # don't false-negative. The default 600s is plenty; operators with
+    # a short --timeout get what they asked for.
+    if not _wait_for_healthz(compose_file, timeout=timeout):
+        print(
+            "  ✗ container is running and cert is installed, but /healthz "
+            "isn't responding. Try `docker compose -f "
+            f"{compose_file} logs greffer`.",
+            file=sys.stderr,
+        )
+        return EXIT_TIMEOUT_HEALTHZ
+
+    # Success — print the mode-appropriate Connected message.
+    if mode == "tunnel":
+        print(strings.CONNECTED_TUNNEL.format(
+            greffer_id=greffer_id,
+            manager_url=manager_url,
+        ))
+    else:
+        # Proxy: run the reachability self-test (informative, NOT gating)
+        # before printing success. Surfaces the most common operator
+        # misconfiguration: a --public-host that doesn't resolve to here.
+        assert public_host is not None, "proxy mode requires public_host"
+        outcome, ctx = reachability_self_test(
+            public_host=public_host, port=port, expected_id=greffer_id,
+        )
+        reachability_line = _build_reachability_line(
+            outcome, ctx, public_host=public_host, port=port,
+        )
+        print(strings.CONNECTED_PROXY.format(
+            greffer_id=greffer_id,
+            address=address or "?",
+            public_host=public_host,
+            manager_url=manager_url,
+            reachability_line=reachability_line,
+        ))
+
+    return EXIT_OK
