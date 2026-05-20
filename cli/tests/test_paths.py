@@ -16,8 +16,16 @@ def test_resolve_with_override(tmp_path: Path) -> None:
 
 
 def test_resolve_override_expands_user(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """``~`` in ``--config-dir`` expands to $HOME."""
+    """``~`` in ``--config-dir`` expands to the user's home dir.
+
+    Cross-platform note: pathlib's ``expanduser`` reads ``$HOME`` on
+    POSIX but ``%USERPROFILE%`` (with ``%HOMEDRIVE%``+``%HOMEPATH%``
+    as fallback) on Windows. Setting only ``HOME`` was a silent bug
+    that only surfaced when we added the windows-x86_64 build matrix.
+    Set both so the test passes on every supported platform.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     result = paths.resolve_config_dir("~/custom")
     assert result == (tmp_path / "custom").resolve()
 
