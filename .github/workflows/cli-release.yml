@@ -8,9 +8,12 @@ name: cli-release
 # the tag).
 #
 # Operator install path:
-#   curl -sSL https://greffon.io/install.sh | sh
-# which downloads the matching `greffer-{os}-{arch}` asset, verifies
-# sha256, and execs the binary. See landing-page's install.sh route.
+#   curl -sSL https://greffon.io/install.sh | sh                 (linux + macOS)
+#   iwr -useb https://greffon.io/install.ps1 | iex               (Windows; see
+#                                                                 greffer-windows-support epic)
+# which downloads the matching `greffer-{os}-{arch}{.exe?}` asset, verifies
+# sha256, and execs the binary. See landing-page's install.sh route
+# and the install.ps1 route (added by the Windows epic).
 
 on:
   push:
@@ -61,10 +64,22 @@ jobs:
             runner: macos-15-intel
           - target: darwin-arm64
             runner: macos-14
+          - target: windows-x86_64
+            # windows-latest runners include Python 3.11 via setup-python,
+            # PyInstaller works the same as on Linux/macOS, and they ship
+            # Git Bash by default — which is why every shell step below
+            # uses `shell: bash` so the same command works across all
+            # three OS families. Binary suffix differs: only Windows
+            # gets `.exe`. See cli/.github/workflows/cli-release.yml docs.
+            runner: windows-latest
 
     defaults:
       run:
         working-directory: cli
+        # All steps below run under Git Bash (windows-latest) or bash
+        # (linux/macOS). Without this, windows-latest defaults to
+        # PowerShell and the if/elif/else shell logic breaks.
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -96,31 +111,59 @@ jobs:
         # `--help` exercises Typer's command tree without needing
         # docker. Catches missing-import bugs that only surface on
         # the frozen bundle (e.g. a click submodule we forgot to
-        # add to hiddenimports in greffer.spec).
-        run: ./dist/greffer --help
+        # add to hiddenimports in greffer.spec). The `.exe` suffix
+        # only exists on Windows; the conditional keeps one step for
+        # all platforms instead of two with matrix-conditional `if:`.
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./dist/greffer.exe --help
+          else
+            ./dist/greffer --help
+          fi
 
       - name: Rename binary with target suffix
         # Each matrix job produces a generically-named `greffer`
-        # binary; renaming with the target makes the artifacts
-        # uniquely identifiable when downloaded together.
-        run: mv dist/greffer "dist/greffer-${{ matrix.target }}"
+        # binary (`greffer.exe` on Windows); renaming with the target
+        # makes the artifacts uniquely identifiable when downloaded
+        # together. The Windows binary keeps `.exe` after rename so
+        # operators get a runnable file (Defender + Explorer rely on
+        # the extension).
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/greffer.exe "dist/greffer-${{ matrix.target }}.exe"
+          else
+            mv dist/greffer "dist/greffer-${{ matrix.target }}"
+          fi
 
       - name: Compute per-file sha256
         # We aggregate per-target checksums into a single sums file
         # in the publish job; this step just emits the local hash
-        # for debugging in the Actions log.
+        # for debugging in the Actions log. macOS ships shasum (Perl)
+        # only; Linux + Git-Bash-on-Windows ship sha256sum.
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            sha256sum "dist/greffer-${{ matrix.target }}.exe"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
             shasum -a 256 "dist/greffer-${{ matrix.target }}"
           else
             sha256sum "dist/greffer-${{ matrix.target }}"
           fi
 
-      - name: Upload binary artifact
+      - name: Upload binary artifact (non-Windows)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: greffer-${{ matrix.target }}
           path: cli/dist/greffer-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload binary artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: greffer-${{ matrix.target }}
+          path: cli/dist/greffer-${{ matrix.target }}.exe
           if-no-files-found: error
           retention-days: 14
 
