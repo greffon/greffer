@@ -28,7 +28,6 @@ app = typer.Typer(
 
 DEFAULT_MANAGER = "https://api.greffon.io"
 _ADDRESS_PLACEHOLDER = "<YOUR-ADDRESS>"
-_PUBLIC_HOST_PLACEHOLDER = "<YOUR-PUBLIC-HOST>"
 # RFC 1123 hostname OR IPv4 (we accept IPv6 brackets too; the regex
 # is lenient — operator typos will fail loudly when curl tries to reach.
 _HOSTNAME_OR_IP_RE = re.compile(
@@ -90,10 +89,6 @@ def up(
     address: Optional[str] = typer.Option(
         None, "--address", help="Manager-callback hostname (required in proxy mode)",
     ),
-    public_host: Optional[str] = typer.Option(
-        None, "--public-host",
-        help="End-user-facing public IP/hostname (required in proxy mode)",
-    ),
     config_dir: Optional[str] = typer.Option(
         None, "--config-dir", help="Override the default ~/.greffer/ location",
     ),
@@ -106,27 +101,22 @@ def up(
         typer.echo(f"--mode must be 'tunnel' or 'proxy' (got: {mode})", err=True)
         raise typer.Exit(code=2)
 
-    # Placeholder detection: refuse to run with literal <YOUR-*> values.
-    if address == _ADDRESS_PLACEHOLDER or public_host == _PUBLIC_HOST_PLACEHOLDER:
+    # Placeholder detection: refuse to run with the literal <YOUR-*> value.
+    if address == _ADDRESS_PLACEHOLDER:
         typer.echo(strings_mod.ERR_PLACEHOLDER_NOT_SUBSTITUTED, err=True)
         raise typer.Exit(code=2)
 
     if mode == "proxy":
-        if not address or not public_host:
+        if not address:
             typer.echo(
-                "--mode proxy requires --address and --public-host.\n"
-                "(In tunnel mode — the default — they're not needed.)",
+                "--mode proxy requires --address (manager-callback hostname).\n"
+                "(In tunnel mode — the default — it's not needed.)",
                 err=True,
             )
             raise typer.Exit(code=2)
         # RFC 1123 / IP validation.
         if not _HOSTNAME_OR_IP_RE.match(address):
             typer.echo(f"--address is not a valid hostname or IP: {address}", err=True)
-            raise typer.Exit(code=2)
-        if not _HOSTNAME_OR_IP_RE.match(public_host):
-            typer.echo(
-                f"--public-host is not a valid hostname or IP: {public_host}", err=True,
-            )
             raise typer.Exit(code=2)
 
     cfg = paths.resolve_config_dir(config_dir)
@@ -173,7 +163,6 @@ def up(
             greffer_id=id,
             mode=mode,  # type: ignore[arg-type]
             address=address,
-            public_host=public_host,
         )
         template_path = _compose_template_path()
         template_text = template_path.read_text(encoding="utf-8")
@@ -189,20 +178,18 @@ def up(
         ))
         if mode == "proxy":
             typer.echo(strings_mod.INIT_WROTE_FILES_PROXY_EXTRA.format(
-                address=address, public_host=public_host,
+                address=address,
             ))
 
     # Wire the state-machine driver. The persisted env.env is the
-    # source of truth for mode/address/public-host on idempotent
-    # reruns (with the same fallback-to-CLI semantics). The manager
-    # URL was already resolved above with explicit-flag-wins
+    # source of truth for mode/address on idempotent reruns. The
+    # manager URL was already resolved above with explicit-flag-wins
     # precedence, so we just pass it through.
     from . import env_file as env_mod
     env_persisted = env_mod.EnvFile.read(paths.env_env_path(cfg))
     persisted_mode = env_persisted.get("GREFFER_MODE")
     effective_mode = persisted_mode or mode
     persisted_address = env_persisted.get("GREFFER_ADDRESS") or address
-    persisted_public_host = env_persisted.get("GREFFER_PUBLIC_HOST") or public_host
 
     rc = up_mod.run_state_machine(
         cfg,
@@ -210,7 +197,6 @@ def up(
         greffer_id=id,
         mode=effective_mode,  # type: ignore[arg-type]
         address=persisted_address,
-        public_host=persisted_public_host,
         timeout=float(timeout),
     )
     if rc != up_mod.EXIT_OK:

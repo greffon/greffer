@@ -38,13 +38,19 @@ def _build_env_values(
     greffer_id: str,
     mode: Mode,
     address: str | None,
-    public_host: str | None,
 ) -> dict[str, str]:
     """Build the env.env values to write for the chosen mode.
 
-    See HLD § Current State for the eight env vars and what defaults
-    each one has. Proxy mode requires --address and --public-host;
-    tunnel mode does not.
+    Proxy mode requires --address (the manager-callback hostname/IP).
+    Tunnel mode does not require it.
+
+    GREFFER_PUBLIC_HOST is intentionally NOT written: the greffer's
+    end-user URLs are constructed by the manager (wildcard subdomain,
+    ``ports[].url``) and shipped to the greffer at start_greffon time;
+    the greffer's compose-rendering code uses GREFFER_PUBLIC_HOST only
+    as a dev/test fallback when the manager-supplied URL is missing.
+    Asking the operator to type a value that production never uses was
+    legacy redundancy.
     """
     values: dict[str, str] = {
         "GREFFER_ID": greffer_id,
@@ -59,12 +65,9 @@ def _build_env_values(
         "GREFFON_PATH": "/data",
     }
     if mode == "proxy":
-        if not address or not public_host:
-            raise ValueError(
-                "proxy mode requires --address and --public-host"
-            )
+        if not address:
+            raise ValueError("proxy mode requires --address")
         values["GREFFER_ADDRESS"] = address
-        values["GREFFER_PUBLIC_HOST"] = public_host
     return values
 
 
@@ -296,7 +299,6 @@ def run_state_machine(
     greffer_id: str,
     mode: Mode,
     address: str | None = None,
-    public_host: str | None = None,
     port: int = 8001,
     timeout: float = 600.0,
     starter: Callable[..., compose.CommandResult] | None = None,
@@ -428,28 +430,22 @@ def run_state_machine(
         return EXIT_TIMEOUT_HEALTHZ
 
     # Success — print the mode-appropriate Connected message.
+    # The reachability self-test that used to live here was diagnosing
+    # --public-host misconfiguration. Since --public-host is gone (the
+    # manager constructs end-user URLs, not the operator), the test's
+    # main use case is too. The address-based connectivity check is
+    # already implicit: if registration completed, the manager could
+    # reach the greffer at --address.
     if mode == "tunnel":
         print(strings.CONNECTED_TUNNEL.format(
             greffer_id=greffer_id,
             manager_url=manager_url,
         ))
     else:
-        # Proxy: run the reachability self-test (informative, NOT gating)
-        # before printing success. Surfaces the most common operator
-        # misconfiguration: a --public-host that doesn't resolve to here.
-        assert public_host is not None, "proxy mode requires public_host"
-        outcome, ctx = reachability_self_test(
-            public_host=public_host, port=port, expected_id=greffer_id,
-        )
-        reachability_line = _build_reachability_line(
-            outcome, ctx, public_host=public_host, port=port,
-        )
         print(strings.CONNECTED_PROXY.format(
             greffer_id=greffer_id,
             address=address or "?",
-            public_host=public_host,
             manager_url=manager_url,
-            reachability_line=reachability_line,
         ))
 
     return EXIT_OK

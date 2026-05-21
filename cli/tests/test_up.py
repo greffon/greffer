@@ -12,42 +12,43 @@ from greffer_cli import env_file, paths, up
 # --- env-value building ---------------------------------------------
 
 def test_build_env_values_tunnel_minimal() -> None:
-    """Tunnel mode: --address and --public-host are NOT in the values."""
+    """Tunnel mode: --address is NOT required and not in the values."""
     values = up._build_env_values(
         manager_url="https://api.example.com",
         greffer_id="3d4f7760",
         mode="tunnel",
         address=None,
-        public_host=None,
     )
     assert values["GREFFER_ID"] == "3d4f7760"
     assert values["GREFFON_BASE_SERVER"] == "https://api.example.com"
     assert values["GREFFER_MODE"] == "tunnel"
     assert "GREFFER_ADDRESS" not in values
+    # GREFFER_PUBLIC_HOST is intentionally never written to env.env —
+    # the greffer uses the manager-supplied URL (ports[].url) for
+    # end-user-facing URLs, with PUBLIC_HOST only as a dev fallback.
     assert "GREFFER_PUBLIC_HOST" not in values
 
 
-def test_build_env_values_proxy_includes_address_and_public_host() -> None:
+def test_build_env_values_proxy_includes_only_address() -> None:
     values = up._build_env_values(
         manager_url="https://api.example.com",
         greffer_id="3d4f7760",
         mode="proxy",
         address="mygreffer.example.com",
-        public_host="203.0.113.10",
     )
     assert values["GREFFER_ADDRESS"] == "mygreffer.example.com"
-    assert values["GREFFER_PUBLIC_HOST"] == "203.0.113.10"
     assert values["GREFFER_MODE"] == "proxy"
+    # PUBLIC_HOST is never written — manager constructs end-user URLs.
+    assert "GREFFER_PUBLIC_HOST" not in values
 
 
-def test_build_env_values_proxy_requires_both_address_flags() -> None:
+def test_build_env_values_proxy_requires_address() -> None:
     with pytest.raises(ValueError, match="proxy mode requires"):
         up._build_env_values(
             manager_url="https://api.example.com",
             greffer_id="3d4f7760",
             mode="proxy",
-            address="mygreffer.example.com",
-            public_host=None,
+            address=None,
         )
 
 
@@ -59,7 +60,6 @@ def test_build_env_values_always_sets_critical_defaults() -> None:
         greffer_id="abc",
         mode="tunnel",
         address=None,
-        public_host=None,
     )
     assert values["GREFFER_WORKERS_ENABLED"] == "true"
     assert values["GREFFER_PORT"] == "8001"

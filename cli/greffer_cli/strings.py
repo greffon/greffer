@@ -26,12 +26,10 @@ Run `greffer status` anytime to check.
 
 CONNECTED_PROXY = """\
 ✓ Connected — your greffer is ready.
-  ID:          {greffer_id}
-  Mode:        proxy
-  Address:     {address}   (manager-callback)
-  Public host: {public_host}            (end-user-facing)
-  Manager:     {manager_url}
-{reachability_line}
+  ID:      {greffer_id}
+  Mode:    proxy
+  Address: {address}   (manager-callback)
+  Manager: {manager_url}
 Run `greffer status` anytime to check.
 """
 
@@ -49,7 +47,6 @@ wrote {env_path}
 
 INIT_WROTE_FILES_PROXY_EXTRA = """\
   GREFFER_ADDRESS={address}      (manager-callback)
-  GREFFER_PUBLIC_HOST={public_host}           (end-user-facing)
 """
 
 

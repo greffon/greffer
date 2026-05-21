@@ -105,13 +105,14 @@ def test_run_state_machine_proxy_happy_path_includes_reachability(
 
     rc = up.run_state_machine(
         cfg, manager_url="https://m.example.com", greffer_id="abc-123",
-        mode="proxy", address="g.example.com", public_host="203.0.113.5",
+        mode="proxy", address="g.example.com",
         timeout=10.0,
     )
     assert rc == up.EXIT_OK
     out = capsys.readouterr().out
-    assert "network reachable" in out  # REACHABILITY_OK
-    assert "203.0.113.5" in out
+    # Connected message shows the address; no public-host line.
+    assert "g.example.com" in out
+    assert "proxy" in out.lower()
 
 
 def test_run_state_machine_fast_paths_when_already_running(
@@ -268,7 +269,7 @@ def test_run_state_machine_proxy_cert_timeout(
 
     rc = up.run_state_machine(
         cfg, manager_url="https://m", greffer_id="abc",
-        mode="proxy", address="g.example.com", public_host="203.0.113.5",
+        mode="proxy", address="g.example.com",
         timeout=0.1,
     )
     assert rc == up.EXIT_TIMEOUT_AWAITING_CERT

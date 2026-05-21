@@ -84,9 +84,8 @@ def test_up_idempotent_fast_path_uses_persisted_mode_proxy(
     )
     assert result.exit_code == 0, result.stdout
     assert captured["mode"] == "proxy"
-    # And the proxy-mode fields propagated too:
+    # And the proxy-mode address propagated too:
     assert captured["address"] == "g.example.com"
-    assert captured["public_host"] == "203.0.113.5"
 
 
 def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(
@@ -111,15 +110,14 @@ def test_up_idempotent_fast_path_uses_persisted_mode_tunnel(
     monkeypatch.setattr(up_mod, "run_state_machine", _stub_run_state_machine(captured))
 
     # Operator typo'd --mode proxy on a host previously initialized as
-    # tunnel. Need --address/--public-host to pass arg validation;
-    # the persisted (tunnel) mode wins.
+    # tunnel. Need --address to pass arg validation; the persisted
+    # (tunnel) mode wins.
     result = runner.invoke(
         main.app,
         [
             "up", "--id", "xyz", "--config-dir", str(cfg),
             "--mode", "proxy",
             "--address", "g.example.com",
-            "--public-host", "203.0.113.5",
         ],
     )
     assert result.exit_code == 0, result.stdout
