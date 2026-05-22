@@ -221,9 +221,10 @@ def test_run_state_machine_starting_timeout(
 def test_run_state_machine_registering_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """If the manager never reaches GREFFER_REGISTERED (admin hasn't
-    accepted), return EXIT_TIMEOUT_REGISTERING and print the
-    accept-URL hint."""
+    """If the manager never reaches GREFFER_REGISTERED (no one accepted
+    the greffer in the manager UI), return EXIT_TIMEOUT_REGISTERING and
+    print a hint that points at the manager UI with the greffer ID for
+    the admin to find the right card."""
     cfg = tmp_path / ".greffer"
     _setup_compose_file(cfg)
     monkeypatch.setattr(
@@ -245,8 +246,11 @@ def test_run_state_machine_registering_timeout(
     )
     assert rc == up.EXIT_TIMEOUT_REGISTERING
     out = capsys.readouterr().out + capsys.readouterr().err
-    # The hint must include the accept URL operators need to send to admin.
-    assert "register/accept/abc-123" in out
+    # The hint identifies the greffer by ID so the admin can find its
+    # card on the Greffers page.
+    assert "abc-123" in out
+    # No raw API URL leaks into operator output.
+    assert "register/accept/" not in out
 
 
 def test_run_state_machine_proxy_cert_timeout(
@@ -374,15 +378,19 @@ def test_run_state_machine_healthz_honors_timeout(
     assert captured["healthz_timeout"] == 0.1
 
 
-# --- accept-URL formatting ------------------------------------------
+# --- Registering message content ------------------------------------
 
-def test_run_state_machine_accept_url_format(
+def test_run_state_machine_registering_points_at_manager_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The Registering message must include the exact accept-URL operators
-    will paste to their admin. Manager URLs with trailing slashes must
-    not produce double slashes; the URL path is
-    /api/greffer/register/accept/<id>/."""
+    """The Registering message must direct the operator at the manager
+    UI (Accept button on the Greffers page), NOT at a raw POST URL.
+    The --manager value is the API URL — often on a different host
+    than the frontend — so synthesizing a clickable UI link from it
+    would be wrong in the configs where it matters. Pin both halves:
+    (a) the greffer ID is printed so the admin can find the card,
+    (b) the API accept URL is NOT printed (no curl-flavored output).
+    """
     cfg = tmp_path / ".greffer"
     _setup_compose_file(cfg)
     _patch_happy_path(monkeypatch, mode="tunnel")
@@ -392,6 +400,10 @@ def test_run_state_machine_accept_url_format(
         mode="tunnel", timeout=10.0,
     )
     out = capsys.readouterr().out
-    assert "https://api.example.com/api/greffer/register/accept/uuid-here/" in out
-    # No double slashes from the manager_url stripping.
-    assert "api.example.com//api" not in out
+    # Operator-actionable: the greffer ID lets the admin find the card.
+    assert "uuid-here" in out
+    # The instruction points at the manager UI's Greffers page.
+    assert "Greffers" in out
+    assert "Accept" in out
+    # No raw API URL leaks into operator output.
+    assert "/api/greffer/register/accept/" not in out
