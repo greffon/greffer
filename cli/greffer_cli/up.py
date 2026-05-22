@@ -355,11 +355,14 @@ def run_state_machine(
         return EXIT_TIMEOUT_STARTING
 
     # ---- 2. Registering -------------------------------------------------
-    accept_url = (
-        f"{manager_url.rstrip('/')}/api/greffer/register/accept/{greffer_id}/"
-    )
+    # We deliberately do NOT print a clickable accept URL. The --manager
+    # value is the API URL (REACT_APP_API in manager-front), which is
+    # often on a different host than the frontend (e.g. api.example.com
+    # vs app.example.com) — synthesizing a UI URL from it is wrong in
+    # the configs where it matters. Print the greffer ID instead and
+    # let the admin find the matching card on the Greffers page.
     print(strings.STATE_REGISTERING.format(
-        ts=_now(), greffer_id=greffer_id, accept_url=accept_url,
+        ts=_now(), greffer_id=greffer_id,
     ))
 
     def _heartbeat() -> None:
@@ -396,7 +399,7 @@ def run_state_machine(
     if not reached:
         print(strings.TIMEOUT_REGISTERING.format(
             minutes=int(timeout // 60),
-            accept_url=accept_url,
+            greffer_id=greffer_id,
             compose_path=compose_file,
         ), file=sys.stderr)
         return EXIT_TIMEOUT_REGISTERING

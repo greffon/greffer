@@ -55,15 +55,15 @@ INIT_WROTE_FILES_PROXY_EXTRA = """\
 STATE_STARTING = "[{ts}] Starting — bringing up the greffer container..."
 STATE_REGISTERING = (
     "[{ts}] Registering — greffer is talking to the manager.\n"
-    "[{ts}] Now: ask your admin to accept this greffer at the manager.\n"
+    "[{ts}] Next step: accept this greffer on the manager.\n"
     "           greffer ID: {greffer_id}\n"
-    "           accept URL: POST {accept_url}\n"
-    "           (If you ARE the admin — that's normal for solo setups —\n"
-    "           accept it yourself: see your manager UI or curl the URL above.)"
+    "           Open the manager UI, go to Greffers, and click Accept on the\n"
+    "           card showing this ID.\n"
+    "           (Solo setup? That's you — go accept it now in your manager UI.)"
 )
 STATE_REGISTERING_HEARTBEAT = (
-    "[{ts}] still waiting for admin to accept (greffer ID: {greffer_id}). "
-    "I'll keep checking."
+    "[{ts}] still waiting for this greffer to be accepted on the manager "
+    "(greffer ID: {greffer_id}). I'll keep checking."
 )
 STATE_AWAITING_CERT = (
     "[{ts}] Awaiting cert — admin accepted, manager is issuing your TLS cert."
@@ -86,8 +86,8 @@ TIMEOUT_REGISTERING = """\
 ✗ Stuck at Registering for {minutes} minutes. The manager has not yet
 acknowledged your greffer.
   - The manager URL might be wrong: re-run `greffer doctor`.
-  - Your admin might not have seen the accept request — re-send them:
-      POST {accept_url}
+  - The greffer may still be waiting to be accepted — open the manager
+    UI, go to Greffers, and accept the card with greffer ID {greffer_id}.
   - Check what the greffer is doing:
       docker compose -f {compose_path} logs greffer
 """
