@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discord community
+    url: https://discord.gg/vBmhUGPY
+    about: Real-time help from other Greffon users and maintainers.
+  - name: GitHub Discussions (main repo)
+    url: https://github.com/greffon/greffon/discussions
+    about: General questions and longer discussion.
+  - name: Security vulnerabilities
+    url: https://github.com/greffon/greffer/security/advisories/new
+    about: Privately report a security issue. Do not file as a public issue.
