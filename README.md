@@ -3,7 +3,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2.svg)](https://discord.gg/vBmhUGPY)
 
-The worker node for [Greffon](https://greffon.io), a self-hosted app deployment platform. A greffer runs on a machine you own (VPS, mini-PC, Raspberry Pi, old laptop — anything with Docker), receives commands from the [manager](https://github.com/greffon/manager) control plane, and deploys/manages greffon instances via docker-compose behind a TLS reverse proxy.
+The worker node for [Greffon](https://greffon.io), a self-hosted app deployment platform. A greffer runs on a machine you own (VPS, mini-PC, Raspberry Pi, old laptop — anything with Docker), receives commands from the manager control plane, and deploys/manages greffon instances via docker-compose behind a TLS reverse proxy.
 
 **Tech stack:** FastAPI 0.110, uvicorn (`--workers 1` by design), Pydantic v2, asyncio, the Docker SDK, and Nginx for per-instance TLS.
 
@@ -34,16 +34,18 @@ The greffer runs as a single uvicorn worker (`--workers 1`) on purpose: three ba
 
 ## Local development
 
-The greffer needs a reachable [manager](https://github.com/greffon/manager) and a Docker daemon.
+The greffer needs a reachable manager (the Greffon control plane) and a Docker daemon.
 
 ```bash
 poetry install
-poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
+# Run on-disk state migrations before the server binds (they must not race request handlers)
+poetry run python -m app.cli apply_ops_migrations
+# GREFFER_WORKERS_ENABLED=true turns on the register / monitor / CRL background tasks —
+# without it the greffer starts but never registers with the manager or sends callbacks
+GREFFER_WORKERS_ENABLED=true poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-Greffer runs on `localhost:8001`. Boot runs ops-migrations (`python -m app.cli apply_ops_migrations`) before uvicorn binds, so on-disk state migrations can't race request handlers.
-
-Configuration is via environment variables (`GREFFON_BASE_SERVER`, `GREFFER_ID`, `GREFFER_PROTOCOL`, etc.) — see `env.env` for the full set.
+Greffer runs on `localhost:8001`. Configuration is via environment variables (`GREFFON_BASE_SERVER`, `GREFFER_ID`, `GREFFER_PROTOCOL`, `GREFFER_WORKERS_ENABLED`, etc.) — see `env.env` for the full set.
 
 ## API
 

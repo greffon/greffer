@@ -1,6 +1,6 @@
 # Contributing to Greffon Greffer
 
-Thanks for considering a contribution. This repo is the worker node for [Greffon](https://greffon.io) — it runs on user hardware, talks to the [manager](https://github.com/greffon/manager), and drives Docker.
+Thanks for considering a contribution. This repo is the worker node for [Greffon](https://greffon.io) — it runs on user hardware, talks to the manager (the control plane), and drives Docker.
 
 ## Quick checklist
 
@@ -28,10 +28,11 @@ PRs without DCO sign-off cannot be merged.
 
 ```bash
 poetry install
-poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
+poetry run python -m app.cli apply_ops_migrations
+GREFFER_WORKERS_ENABLED=true poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-The greffer expects a reachable [manager](https://github.com/greffon/manager) and a Docker daemon. See [README.md](./README.md) for the env vars and run command.
+`GREFFER_WORKERS_ENABLED=true` is required for the greffer to register with the manager and run its background tasks. The greffer expects a reachable manager and a Docker daemon. See [README.md](./README.md) for the full env var set.
 
 ## Code style
 
@@ -55,7 +56,7 @@ Add tests for new behavior. Bug fixes should include a regression test where pra
 
 - One maintainer review required before merge
 - CI must pass (lint + tests)
-- Changes that touch the manager contract: link the corresponding [manager](https://github.com/greffon/manager) PR
+- Changes that touch the manager contract: link the corresponding manager PR
 
 ## Reporting bugs
 

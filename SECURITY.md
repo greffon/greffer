@@ -34,7 +34,7 @@ Include as much as you can:
 - Tunnel mode / rathole sidecar (when enabled)
 - Auth on manager callbacks and the cert-poll endpoint
 
-Related repos each have their own SECURITY.md: [manager](https://github.com/greffon/manager), [manager-front](https://github.com/greffon/manager-front), [greffon-catalog](https://github.com/greffon/greffon-catalog). Anything sent to `security@greffon.io` will be routed.
+Related repos (manager, manager-front, greffon-catalog) each have their own SECURITY.md. The fastest always-reachable route for any Greffon security report is `security@greffon.io` — we'll route it.
 
 ## Out of scope
 
