@@ -3,7 +3,7 @@ name = "greffer"
 version = "0.1.0"
 description = ""
 authors = ["Greffon <admin@greffon.io>"]
-license = "MIT"
+license = "AGPL-3.0-only"
 # This repo is an application (FastAPI service), not a distributable
 # library. Prior to cutover, the ``greffer`` Django project module was
 # the implicit "package" poetry looked for; now that Django is gone,
