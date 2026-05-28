@@ -1,6 +1,6 @@
 # Contributing to Greffon Greffer
 
-Thanks for considering a contribution. This repo is the worker node for the [Greffon](https://github.com/greffon/greffon) platform — it runs on user hardware, talks to the [manager](https://github.com/greffon/manager), and drives Docker.
+Thanks for considering a contribution. This repo is the worker node for [Greffon](https://greffon.io) — it runs on user hardware, talks to the [manager](https://github.com/greffon/manager), and drives Docker.
 
 ## Quick checklist
 
@@ -31,7 +31,7 @@ poetry install
 poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-The greffer expects a reachable manager and a Docker daemon. The monorepo's `setup-dev.sh` wires up a full local environment (CA, admin, a registered greffer). See [README.md](./README.md).
+The greffer expects a reachable [manager](https://github.com/greffon/manager) and a Docker daemon. See [README.md](./README.md) for the env vars and run command.
 
 ## Code style
 
@@ -67,5 +67,5 @@ Add tests for new behavior. Bug fixes should include a regression test where pra
 
 ## Questions
 
-- General: [GitHub Discussions](https://github.com/greffon/greffon/discussions)
-- Real-time: [Discord](https://discord.gg/vBmhUGPY)
+- Bugs and feature requests: this repo's [Issues](https://github.com/greffon/greffer/issues)
+- Real-time / general: [Discord](https://discord.gg/vBmhUGPY)

@@ -3,7 +3,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2.svg)](https://discord.gg/vBmhUGPY)
 
-The worker node for the [Greffon](https://github.com/greffon/greffon) self-hosted app deployment platform. A greffer runs on a machine you own (VPS, mini-PC, Raspberry Pi, old laptop — anything with Docker), receives commands from the [manager](https://github.com/greffon/manager) control plane, and deploys/manages greffon instances via docker-compose behind a TLS reverse proxy.
+The worker node for [Greffon](https://greffon.io), a self-hosted app deployment platform. A greffer runs on a machine you own (VPS, mini-PC, Raspberry Pi, old laptop — anything with Docker), receives commands from the [manager](https://github.com/greffon/manager) control plane, and deploys/manages greffon instances via docker-compose behind a TLS reverse proxy.
 
 **Tech stack:** FastAPI 0.110, uvicorn (`--workers 1` by design), Pydantic v2, asyncio, the Docker SDK, and Nginx for per-instance TLS.
 
@@ -30,26 +30,20 @@ Docker Engine (docker-compose) ──► greffon instances
 Nginx (per-instance TLS reverse proxy)
 ```
 
-The greffer runs as a single uvicorn worker (`--workers 1`) on purpose: three background tasks (register / monitor / CRL sync) live in one process, and multi-worker would spawn duplicate copies that fight over cert state. See [docs](https://github.com/greffon/greffon/blob/main/docs/greffer.md).
+The greffer runs as a single uvicorn worker (`--workers 1`) on purpose: three background tasks (register / monitor / CRL sync) live in one process, and multi-worker would spawn duplicate copies that fight over cert state.
 
 ## Local development
 
-Fastest path is the monorepo's `setup-dev.sh`:
-
-```bash
-git clone --recurse-submodules https://github.com/greffon/greffon
-cd greffon && ./scripts/setup-dev.sh
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up
-```
-
-Greffer runs on `localhost:8001`. For standalone dev:
+The greffer needs a reachable [manager](https://github.com/greffon/manager) and a Docker daemon.
 
 ```bash
 poetry install
 poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-Boot runs ops-migrations (`python -m app.cli apply_ops_migrations`) before uvicorn binds — see [the boot flow](https://github.com/greffon/greffon/blob/main/docs/greffer.md).
+Greffer runs on `localhost:8001`. Boot runs ops-migrations (`python -m app.cli apply_ops_migrations`) before uvicorn binds, so on-disk state migrations can't race request handlers.
+
+Configuration is via environment variables (`GREFFON_BASE_SERVER`, `GREFFER_ID`, `GREFFER_PROTOCOL`, etc.) — see `env.env` for the full set.
 
 ## API
 
@@ -57,7 +51,7 @@ FastAPI auto-generates OpenAPI docs. With the greffer running locally, see `http
 
 ## License
 
-[AGPL v3](LICENSE) — same as the rest of the Greffon product. Network copyleft protects against commercial clones running a greffer fleet as a hosted service. For internal/self-hosted use there's no disclosure trigger. [Licensing rationale](https://github.com/greffon/greffon/blob/main/docs/marketing/licensing.md).
+[AGPL v3](LICENSE). Network copyleft protects against commercial clones running a greffer fleet as a hosted service. For internal/self-hosted use there's no disclosure trigger — you can run, modify, and deploy your own greffer freely. Greffon's policy in six words: *free to self-host, pay to resell.*
 
 ## Contributing
 
@@ -65,7 +59,7 @@ FastAPI auto-generates OpenAPI docs. With the greffer running locally, see `http
 
 ## Community
 
-[Discord](https://discord.gg/vBmhUGPY) · [GitHub Discussions](https://github.com/greffon/greffon/discussions) · [Code of Conduct](CODE_OF_CONDUCT.md)
+[Discord](https://discord.gg/vBmhUGPY) · file bugs and feature requests in this repo's [Issues](https://github.com/greffon/greffer/issues) · [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## Security
 
