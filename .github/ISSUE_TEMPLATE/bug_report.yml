@@ -1,0 +1,47 @@
+name: Bug report
+description: The greffer worker isn't behaving as expected.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What went wrong?
+      description: Clear description of the unexpected behavior. Include greffer logs and any docker-compose errors.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Register greffer with manager
+        2. Graft <greffon> from the catalog
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: greffer-version
+    attributes:
+      label: Greffer version / commit
+      description: Git SHA, tag, or Docker image tag.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Host OS, Docker version, how the greffer is run (compose / standalone), proxy vs tunnel mode.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant greffer / uvicorn / docker-compose logs. Redact certs, keys, and tokens first.
+      render: shell
+  - type: checkboxes
+    id: code-of-conduct
+    attributes:
+      label: Code of Conduct
+      description: By submitting, you agree to follow our [Code of Conduct](https://github.com/greffon/greffer/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow the Code of Conduct
+          required: true

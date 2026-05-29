@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an improvement to the greffer.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the operator- or user-facing problem first; the feature is the proposed solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This changes the manager↔greffer contract (separate manager PR needed)
+        - label: This touches cert/mTLS or CRL handling
+        - label: This touches tunnel mode / the rathole sidecar
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to open a PR for this myself
+  - type: checkboxes
+    id: code-of-conduct
+    attributes:
+      label: Code of Conduct
+      description: By submitting, you agree to follow our [Code of Conduct](https://github.com/greffon/greffer/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow the Code of Conduct
+          required: true
