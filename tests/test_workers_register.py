@@ -79,7 +79,7 @@ def test_fetch_cert_returns_data_on_200(settings: Settings) -> None:
         mock_response.status_code = 200
         mock_response.json.return_value = {"certificate": "c", "private_key": "k"}
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings) == {"certificate": "c", "private_key": "k"}
+        assert _fetch_cert(settings, "tok") == {"certificate": "c", "private_key": "k"}
 
 
 def test_fetch_cert_returns_none_on_non_200(settings: Settings) -> None:
@@ -87,7 +87,21 @@ def test_fetch_cert_returns_none_on_non_200(settings: Settings) -> None:
         mock_response = MagicMock()
         mock_response.status_code = 401
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings) is None
+        assert _fetch_cert(settings, "tok") is None
+
+
+def test_fetch_cert_sends_greffon_token_header(settings: Settings) -> None:
+    """The manager's get_greffer_cert endpoint requires X-GREFFON-TOKEN.
+    Without this header the post-accept cert poll would 403 against a
+    mTLS-hardened manager."""
+    with patch("app.workers.register.requests") as mock_requests:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"certificate": "c", "private_key": "k"}
+        mock_requests.get.return_value = mock_response
+        _fetch_cert(settings, "my-token")
+    kwargs = mock_requests.get.call_args.kwargs
+    assert kwargs["headers"] == {"X-GREFFON-TOKEN": "my-token"}
 
 
 def test_install_cert_copies_files(settings: Settings) -> None:
@@ -286,7 +300,7 @@ def test_fetch_cert_carries_timeout(settings: Settings) -> None:
         mock_response.status_code = 200
         mock_response.json.return_value = {}
         mock_requests.get.return_value = mock_response
-        _fetch_cert(settings)
+        _fetch_cert(settings, "tok")
     assert "timeout" in mock_requests.get.call_args.kwargs
     assert mock_requests.get.call_args.kwargs["timeout"] == 10.0
 

@@ -74,7 +74,7 @@ async def register_worker(app: FastAPI) -> None:
     while True:
         try:
             data = await anyio.to_thread.run_sync(
-                _fetch_cert, settings, abandon_on_cancel=True
+                _fetch_cert, settings, token, abandon_on_cancel=True
             )
         except (requests.ConnectionError, requests.Timeout):
             logger.info(
@@ -153,9 +153,15 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
     )
 
 
-def _fetch_cert(settings: Settings) -> dict[str, Any] | None:
+def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
+    # The manager's get_greffer_cert endpoint requires the X-GREFFON-TOKEN
+    # header (matched against Greffer.token or Greffer.new_token). The
+    # greffer sends the same token it posted to /register/ — accept_register
+    # copies new_token → token, so the value the greffer holds matches
+    # whichever field the manager looks up.
     res = requests.get(
         f"{settings.greffon_base_server}/api/greffer/certificate/{settings.greffer_id}/",
+        headers={"X-GREFFON-TOKEN": token},
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )

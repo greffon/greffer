@@ -41,9 +41,9 @@ def test_one_tick_calls_report_status_change_on_first_seen(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, "tok", prev)
 
-    mock_report.assert_called_once_with(settings, "inst-a", "running")
+    mock_report.assert_called_once_with(settings, "tok", "inst-a", "running")
     assert prev == {"inst-a": "running"}
 
 
@@ -58,7 +58,7 @@ def test_one_tick_skips_report_status_change_when_unchanged(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, "tok", prev)
 
     mock_report.assert_not_called()
 
@@ -74,9 +74,9 @@ def test_one_tick_fires_report_status_change_on_transition(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "stopped"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, "tok", prev)
 
-    mock_report.assert_called_once_with(settings, "inst-a", "stopped")
+    mock_report.assert_called_once_with(settings, "tok", "inst-a", "stopped")
     assert prev == {"inst-a": "stopped"}
 
 
@@ -89,7 +89,7 @@ def test_report_status_change_posts_correct_payload(settings: Settings) -> None:
     from app.workers.monitor import _report_status_change
 
     with patch("app.workers.monitor.requests") as mock_requests:
-        _report_status_change(settings, "inst-42", "running")
+        _report_status_change(settings, "tok", "inst-42", "running")
 
     mock_requests.post.assert_called_once()
     url, = mock_requests.post.call_args.args
@@ -98,6 +98,19 @@ def test_report_status_change_posts_correct_payload(settings: Settings) -> None:
     assert kwargs["json"] == {"status": "running"}
     assert kwargs["verify"] == settings.greffer_ssl_verify
     assert kwargs["timeout"] == 10.0
+
+
+def test_report_status_change_sends_greffon_token_header(settings: Settings) -> None:
+    """Manager-side greffon_status_changed requires X-GREFFON-TOKEN. Without
+    this header the status callback 403s, and the dashboard silently shows
+    stale state."""
+    from app.workers.monitor import _report_status_change
+
+    with patch("app.workers.monitor.requests") as mock_requests:
+        _report_status_change(settings, "my-token", "inst-42", "running")
+
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["headers"] == {"X-GREFFON-TOKEN": "my-token"}
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +127,7 @@ async def test_monitor_worker_continues_after_tick_exception(
 
     call_count = 0
 
-    def _fake_tick(_settings, _prev):
+    def _fake_tick(_settings, _token, _prev):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -141,7 +154,7 @@ async def test_monitor_worker_cancellable_during_sleep(
     """Cancellation during asyncio.sleep propagates cleanly."""
     app = create_app(token="t", settings=settings)
 
-    def _noop_tick(_settings, _prev):
+    def _noop_tick(_settings, _token, _prev):
         return
 
     monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _noop_tick)
@@ -168,7 +181,7 @@ async def test_monitor_worker_cancel_is_snappy_during_blocking_tick(
     tick_started = threading.Event()
     never_complete = threading.Event()
 
-    def _blocking_tick(_settings, _prev):
+    def _blocking_tick(_settings, _token, _prev):
         tick_started.set()
         never_complete.wait(timeout=10)
 

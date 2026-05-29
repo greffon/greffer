@@ -28,6 +28,7 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 
 async def monitor_worker(app: FastAPI) -> None:
     settings: Settings = app.state.settings
+    token: str = app.state.greffer_token
     prev_status: dict[str, str] = {}
     try:
         while True:
@@ -40,6 +41,7 @@ async def monitor_worker(app: FastAPI) -> None:
                 await anyio.to_thread.run_sync(
                     _one_monitor_tick,
                     settings,
+                    token,
                     prev_status,
                     abandon_on_cancel=True,
                 )
@@ -55,7 +57,9 @@ async def monitor_worker(app: FastAPI) -> None:
         raise
 
 
-def _one_monitor_tick(settings: Settings, prev_status: dict[str, str]) -> None:
+def _one_monitor_tick(
+    settings: Settings, token: str, prev_status: dict[str, str]
+) -> None:
     """Run one monitoring pass. Mutates ``prev_status`` in place."""
     # Imported lazily so unit tests can mock before the docker SDK
     # initializes its from_env() client at import.
@@ -65,22 +69,22 @@ def _one_monitor_tick(settings: Settings, prev_status: dict[str, str]) -> None:
     for greffon_id in os.listdir(greffon_dir):
         status = compose.get_status(greffon_id)["status"]
         if prev_status.get(greffon_id) != status:
-            _report_status_change(settings, greffon_id, status)
+            _report_status_change(settings, token, greffon_id, status)
         prev_status[greffon_id] = status
 
 
 def _report_status_change(
-    settings: Settings, greffon_id: str, status: str
+    settings: Settings, token: str, greffon_id: str, status: str
 ) -> None:
-    """POST a status change to the manager.
-
-    Inlined from the now-deleted ``apps/utils/greffon/base_server.py``'s
-    ``change_status``. Six lines, exactly one caller — no reason for a
-    shared module anymore post-cutover.
+    """POST a status change to the manager. Carries ``X-GREFFON-TOKEN``
+    because the manager's greffon_status_changed endpoint authenticates
+    the greffer by that header and cross-checks ownership of the
+    instance id against the authenticated Greffer.
     """
     requests.post(
         f"{settings.greffon_base_server}/api/greffer/instances/{greffon_id}/",
         json={"status": status},
+        headers={"X-GREFFON-TOKEN": token},
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
