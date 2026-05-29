@@ -47,11 +47,15 @@ set -a && source env.env && set +a
 poetry run python -m app.cli apply_ops_migrations
 
 # GREFFER_WORKERS_ENABLED=true turns on the register / monitor / CRL background tasks —
-# without it the greffer starts but never registers with the manager or sends callbacks
-GREFFER_WORKERS_ENABLED=true poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
+# without it the greffer starts but never registers with the manager or sends callbacks.
+# GREFFER_PROTOCOL=http: bare uvicorn serves plain HTTP. env.env defaults to https because
+# the full compose stack puts an nginx TLS proxy in front; running uvicorn directly has no
+# proxy, so override to http or the greffer registers an https callback URL that 404s.
+GREFFER_WORKERS_ENABLED=true GREFFER_PROTOCOL=http \
+  poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-`env.env` ships with working dev defaults. `apply_ops_migrations` hydrates `Settings` and exits early if required vars (e.g. `GREFFER_ID`) aren't set, so the `source env.env` step is required, not optional.
+`env.env` ships with working dev defaults. `apply_ops_migrations` hydrates `Settings` and exits early if required vars (e.g. `GREFFER_ID`) aren't set, so the `source env.env` step is required, not optional. For a setup that mirrors production TLS (nginx in front of uvicorn), run the full compose stack instead of bare uvicorn.
 
 Greffer runs on `localhost:8001`. Configuration is via environment variables (`GREFFON_BASE_SERVER`, `GREFFER_ID`, `GREFFER_PROTOCOL`, `GREFFER_WORKERS_ENABLED`, etc.) — see `env.env` for the full set.
 

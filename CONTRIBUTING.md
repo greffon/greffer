@@ -30,10 +30,11 @@ PRs without DCO sign-off cannot be merged.
 poetry install
 set -a && source env.env && set +a        # load dev settings (GREFFER_ID, etc.) — required
 poetry run python -m app.cli apply_ops_migrations
-GREFFER_WORKERS_ENABLED=true poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
+GREFFER_WORKERS_ENABLED=true GREFFER_PROTOCOL=http \
+  poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-`source env.env` is required — `Settings` has no auto-loaded env file and `apply_ops_migrations` exits early without `GREFFER_ID`. `GREFFER_WORKERS_ENABLED=true` is required for the greffer to register with the manager and run its background tasks. The greffer also needs a reachable manager and a Docker daemon. See [README.md](./README.md) for the full env var set.
+`source env.env` is required — `Settings` has no auto-loaded env file and `apply_ops_migrations` exits early without `GREFFER_ID`. `GREFFER_WORKERS_ENABLED=true` turns on the register/monitor/CRL tasks. `GREFFER_PROTOCOL=http` overrides env.env's `https` default: bare uvicorn has no TLS, so without the override the greffer registers an `https` callback URL that the manager can't reach. (Run the full compose stack if you want production-like nginx TLS.) The greffer also needs a reachable manager and a Docker daemon. See [README.md](./README.md) for the env var set.
 
 ## Code style
 
