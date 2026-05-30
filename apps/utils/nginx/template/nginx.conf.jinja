@@ -89,6 +89,18 @@ http {
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # The greffon_nginx terminates TLS on every instance and proxies plain
+    # HTTP to the upstream container. Apps that compare the request
+    # protocol against their configured public URL (Ghost is the canonical
+    # case — there are many: Discourse, GitLab, Mastodon, Vaultwarden,
+    # anything Express- or Rails-based that auto-301s on protocol
+    # mismatch) will see HTTP, see their configured https:// url, and
+    # 301-loop indefinitely. Setting X-Forwarded-Proto here lets those
+    # apps detect they're already behind TLS termination and skip the
+    # redirect. Hardcoded `https` because greffon_nginx is *only* ever
+    # reached over TLS (the `listen 2368 ssl` directive above is the
+    # single entry point for upstream traffic).
+    proxy_set_header X-Forwarded-Proto https;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
     proxy_set_header Accept-Encoding $http_accept_encoding;
