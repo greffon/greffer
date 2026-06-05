@@ -53,23 +53,43 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# ONEDIR build (EXE with exclude_binaries=True + a COLLECT step), NOT
+# onefile. Onefile re-extracts the entire ~20MB bundle to a fresh
+# /tmp/_MEIxxxx directory on EVERY invocation; on macOS the adhoc-signed,
+# un-notarized payload then fails Gatekeeper's per-path assessment, and
+# because the extraction path is random each run the verdict is never
+# cached — measured ~7s startup on Apple Silicon for even `greffer
+# --help`. Onedir ships the interpreter + libs unpacked alongside the
+# launcher at a STABLE install path, so there is no per-run extraction
+# and macOS caches the assessment after first run: startup drops to a
+# few hundred ms. Distribution becomes a tarball (greffer/ dir) instead
+# of a single file — see cli-release.yml packaging + landing-page
+# install.sh/install.ps1 extraction.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,  # onedir — binaries/datas go in COLLECT below
     name='greffer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,  # UPX shaves ~5MB but trips macOS Gatekeeper / Apple Silicon
     upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,  # CLI tool — needs stdout/stderr; the bootloader unpacks here
+    console=True,  # CLI tool — needs stdout/stderr
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,  # Architecture is whatever the runner builds for
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='greffer',  # output dir: dist/greffer/ (greffer launcher + _internal/)
 )

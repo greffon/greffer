@@ -114,56 +114,46 @@ jobs:
         # add to hiddenimports in greffer.spec). The `.exe` suffix
         # only exists on Windows; the conditional keeps one step for
         # all platforms instead of two with matrix-conditional `if:`.
+        # Onedir output is a directory; the launcher lives one level
+        # down at dist/greffer/greffer (greffer.exe on Windows).
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./dist/greffer.exe --help
+            ./dist/greffer/greffer.exe --help
           else
-            ./dist/greffer --help
+            ./dist/greffer/greffer --help
           fi
 
-      - name: Rename binary with target suffix
-        # Each matrix job produces a generically-named `greffer`
-        # binary (`greffer.exe` on Windows); renaming with the target
-        # makes the artifacts uniquely identifiable when downloaded
-        # together. The Windows binary keeps `.exe` after rename so
-        # operators get a runnable file (Defender + Explorer rely on
-        # the extension).
+      - name: Package onedir bundle as a tarball
+        # Onedir ships a directory (launcher + _internal/), so the
+        # release asset is a tarball, not a bare binary. tar -czf is
+        # uniform across all three OS families — Git Bash on
+        # windows-latest provides GNU/bsdtar, and `-C dist greffer`
+        # archives the bundle dir with a stable top-level `greffer/`
+        # entry the installers extract. The Windows launcher
+        # (greffer.exe) is preserved inside the tarball with its
+        # extension intact.
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            mv dist/greffer.exe "dist/greffer-${{ matrix.target }}.exe"
-          else
-            mv dist/greffer "dist/greffer-${{ matrix.target }}"
-          fi
+          tar -czf "dist/greffer-${{ matrix.target }}.tar.gz" -C dist greffer
 
       - name: Compute per-file sha256
-        # We aggregate per-target checksums into a single sums file
-        # in the publish job; this step just emits the local hash
-        # for debugging in the Actions log. macOS ships shasum (Perl)
-        # only; Linux + Git-Bash-on-Windows ship sha256sum.
+        # Emits the local hash for debugging in the Actions log; the
+        # publish job aggregates all targets into sha256sums.txt.
+        # macOS ships shasum (Perl) only; Linux + Git-Bash-on-Windows
+        # ship sha256sum.
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            sha256sum "dist/greffer-${{ matrix.target }}.exe"
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            shasum -a 256 "dist/greffer-${{ matrix.target }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/greffer-${{ matrix.target }}.tar.gz"
           else
-            sha256sum "dist/greffer-${{ matrix.target }}"
+            shasum -a 256 "dist/greffer-${{ matrix.target }}.tar.gz"
           fi
 
-      - name: Upload binary artifact (non-Windows)
-        if: runner.os != 'Windows'
+      - name: Upload bundle artifact
+        # Uniform asset name across all OSes now that everything ships
+        # as a .tar.gz — no Windows/.exe special-case.
         uses: actions/upload-artifact@v4
         with:
           name: greffer-${{ matrix.target }}
-          path: cli/dist/greffer-${{ matrix.target }}
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload binary artifact (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: greffer-${{ matrix.target }}
-          path: cli/dist/greffer-${{ matrix.target }}.exe
+          path: cli/dist/greffer-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 14
 
