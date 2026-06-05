@@ -53,17 +53,47 @@ INIT_WROTE_FILES_PROXY_EXTRA = """\
 # --- State transitions -----------------------------------------------
 
 STATE_STARTING = "[{ts}] Starting — bringing up the greffer container..."
+# Printed on ENTERING the Registering state, before the manager has
+# confirmed anything. Deliberately neutral: the container is up and
+# contacting the manager, but we do NOT yet know the manager received
+# the registration — so we must not tell the operator to accept a
+# greffer that may never have registered (the silent-stall failure when
+# the tunnel is down). The accept guidance (STATE_REGISTERING) prints
+# only once the manager actually reports GREFFER_REGISTERING.
+STATE_REGISTERING_CONTACTING = (
+    "[{ts}] Registering — container is up, contacting the manager..."
+)
 STATE_REGISTERING = (
-    "[{ts}] Registering — greffer is talking to the manager.\n"
-    "[{ts}] Next step: accept this greffer on the manager.\n"
+    "[{ts}] The manager has received your greffer. Next step: accept it.\n"
     "           greffer ID: {greffer_id}\n"
     "           Open the manager UI, go to Greffers, and click Accept on the\n"
     "           card showing this ID.\n"
     "           (Solo setup? That's you — go accept it now in your manager UI.)"
 )
+# Heartbeat once the manager has the registration but no one has accepted
+# it yet — a genuine "waiting on a human" wait.
 STATE_REGISTERING_HEARTBEAT = (
     "[{ts}] still waiting for this greffer to be accepted on the manager "
     "(greffer ID: {greffer_id}). I'll keep checking."
+)
+# Heartbeat while the manager is STILL at GREFFER_CREATED — it has NOT
+# received a registration. This is a connectivity problem on the greffer
+# side (tunnel down, egress blocked, workers disabled), not an admin
+# action. Keeping it distinct from the "accepted yet?" beat is the whole
+# point: the operator can't fix this by clicking Accept.
+STATE_REGISTERING_PENDING_HEARTBEAT = (
+    "[{ts}] container is up, but the manager hasn't received your "
+    "registration yet (greffer ID: {greffer_id}). Still trying."
+)
+# Printed once, in tunnel mode only, while stuck at GREFFER_CREATED. In
+# tunnel mode the registration reaches the manager through the tunnel,
+# so a tunnel sidecar that isn't running/connected means the manager
+# never sees the greffer — the most common first-run failure.
+STATE_REGISTERING_TUNNEL_HINT = (
+    "[{ts}] tunnel mode: registration reaches the manager through the tunnel.\n"
+    "           If this persists, confirm the tunnel sidecar is running\n"
+    "           and connected:\n"
+    "           docker compose -f {compose_path} logs"
 )
 STATE_AWAITING_CERT = (
     "[{ts}] Awaiting cert — admin accepted, manager is issuing your TLS cert."
@@ -83,11 +113,17 @@ TIMEOUT_STARTING = """\
 """
 
 TIMEOUT_REGISTERING = """\
-✗ Stuck at Registering for {minutes} minutes. The manager has not yet
-acknowledged your greffer.
-  - The manager URL might be wrong: re-run `greffer doctor`.
-  - The greffer may still be waiting to be accepted — open the manager
-    UI, go to Greffers, and accept the card with greffer ID {greffer_id}.
+✗ Stuck at Registering for {minutes} minutes. The manager never reached
+the accepted state for this greffer. Two different causes:
+  - The manager never received the registration (it stayed at
+    GREFFER_CREATED). The greffer couldn't reach the manager:
+      * tunnel mode: the tunnel sidecar may not be running or connected —
+        check `docker compose -f {compose_path} logs`.
+      * the manager URL might be wrong: re-run `greffer doctor`.
+      * the greffer's network egress to the manager may be blocked.
+  - The manager received it (GREFFER_REGISTERING) but no one accepted —
+    open the manager UI, go to Greffers, and accept the card with greffer
+    ID {greffer_id}.
   - Check what the greffer is doing:
       docker compose -f {compose_path} logs greffer
 """

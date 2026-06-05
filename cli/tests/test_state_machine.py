@@ -407,3 +407,101 @@ def test_run_state_machine_registering_points_at_manager_ui(
     assert "Accept" in out
     # No raw API URL leaks into operator output.
     assert "/api/greffer/register/accept/" not in out
+
+
+# --- silent-stall regression (manager stuck at GREFFER_CREATED) ------
+
+def test_wait_for_state_heartbeat_receives_observed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat callback must receive the most recently observed
+    manager state. Without it, a never-registered greffer (manager pegged
+    at GREFFER_CREATED) is indistinguishable from one merely waiting for
+    an admin to accept — the silent-stall bug."""
+    monkeypatch.setattr(
+        manager_client, "poll_state",
+        lambda *a, **k: iter(
+            [manager_client.StatePublic(state="GREFFER_CREATED")] * 1000
+        ),
+    )
+    monkeypatch.setattr(up.time, "sleep", lambda _: None)
+    seen: list[str] = []
+    rc = up.wait_for_state(
+        "https://m.example.com", "abc", target="GREFFER_REGISTERED",
+        timeout=0.05,
+        heartbeat_interval=0.0,  # fire on every poll
+        on_heartbeat=seen.append,
+    )
+    assert rc is False
+    assert seen, "heartbeat never fired"
+    assert all(s == "GREFFER_CREATED" for s in seen)
+
+
+def test_wait_for_state_on_state_change_fires_on_each_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_state_change fires once per observed state change — including
+    the first observation and the transition into the target — so the
+    driver can defer the 'go accept it' guidance until the manager has
+    actually acknowledged the registration."""
+    states = [
+        manager_client.StatePublic(state="GREFFER_CREATED"),
+        manager_client.StatePublic(state="GREFFER_CREATED"),
+        manager_client.StatePublic(state="GREFFER_REGISTERING"),
+        manager_client.StatePublic(state="GREFFER_REGISTERED"),
+    ]
+    monkeypatch.setattr(
+        manager_client, "poll_state", lambda *a, **k: iter(states),
+    )
+    monkeypatch.setattr(up.time, "sleep", lambda _: None)
+    changes: list[str] = []
+    rc = up.wait_for_state(
+        "https://m.example.com", "abc", target="GREFFER_REGISTERED",
+        timeout=5.0,
+        heartbeat_interval=999.0,
+        on_state_change=changes.append,
+    )
+    assert rc is True
+    assert changes == [
+        "GREFFER_CREATED", "GREFFER_REGISTERING", "GREFFER_REGISTERED",
+    ]
+
+
+def test_run_state_machine_created_does_not_tell_operator_to_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When the manager never leaves GREFFER_CREATED (the greffer never
+    registered — e.g. the tunnel sidecar is down), the driver must NOT
+    print the 'go accept it' guidance, which would point the operator at
+    a card that never appears. It times out at Registering and the hint
+    surfaces the connectivity cause instead. Regression for the silent
+    tunnel-stall bug."""
+    cfg = tmp_path / ".greffer"
+    _setup_compose_file(cfg)
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda f, profile=None: {"greffer": True, "nginx": True, "tunnel-sidecar": True},
+    )
+    # Manager pegs on GREFFER_CREATED forever — registration never lands.
+    monkeypatch.setattr(
+        manager_client, "poll_state",
+        lambda *a, **k: iter(
+            [manager_client.StatePublic(state="GREFFER_CREATED")] * 100
+        ),
+    )
+    monkeypatch.setattr(up.time, "sleep", lambda _: None)
+
+    rc = up.run_state_machine(
+        cfg, manager_url="https://m.example.com", greffer_id="abc-123",
+        mode="tunnel", timeout=0.1,
+    )
+    assert rc == up.EXIT_TIMEOUT_REGISTERING
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    # We did enter Registering...
+    assert "Registering" in out
+    # ...but never told the operator to accept a greffer the manager
+    # never received (the deferred guidance line stays unprinted).
+    assert "click Accept on the" not in out
+    # The timeout hint surfaces the real (connectivity) cause.
+    assert "GREFFER_CREATED" in out
