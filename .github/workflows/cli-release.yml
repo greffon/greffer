@@ -158,6 +158,89 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # ---- Windows code signing (greffer-windows-support epic, workstream 2) ----
+      #
+      # Signs the Windows binary via SignPath.io's free OSS community
+      # plan before final upload. The HLD picks SignPath because it's
+      # API-driven (no HSM management), issues an OV cert under our org
+      # name, and is free for AGPL projects.
+      #
+      # Conditional-on-secret pattern: the whole signing path is gated
+      # on the SignPath secrets existing. Reasoning:
+      #
+      # - During the period between this PR landing and the SignPath
+      #   account being set up, every step here skips cleanly. The
+      #   pre-existing unsigned-binary upload below still runs, so the
+      #   workflow output is unchanged from today.
+      #
+      # - The moment SIGNPATH_API_TOKEN + SIGNPATH_ORG_ID are added to
+      #   repo secrets, the next ``cli-v*`` tag automatically produces
+      #   a signed binary — no code change needed at signing-go-live.
+      #
+      # GitHub Actions does not allow ``secrets.X`` references in
+      # ``if:`` expressions (security), so we go through an env-var
+      # indirection: copy the secret to env, then check ``env.X != ''``.
+
+      - name: Upload pre-signing input artifact (Windows, if SignPath configured)
+        # SignPath downloads the artifact-id to sign; this step makes
+        # the unsigned binary visible to the SignPath action by upload-
+        # ing it as a separate, short-lived artifact.
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        id: pre_sign_upload
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: greffer-${{ matrix.target }}-unsigned-input
+          path: cli/dist/greffer-${{ matrix.target }}.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Submit signing request to SignPath
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        # SignPath's published action; downloads the artifact-id from
+        # the previous step, signs it, and writes the signed file back
+        # to ``output-artifact-directory``. ``wait-for-completion``
+        # blocks the job until the signing policy completes (default
+        # SignPath OSS policies auto-approve; review-required policies
+        # are also supported).
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: greffer-cli
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: greffer-exe
+          github-artifact-id: ${{ steps.pre_sign_upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: cli/dist/
+
+      - name: Verify signed binary
+        # Fail loudly if the signed file isn't present or doesn't have
+        # a valid Authenticode signature. Without this, a silent
+        # SignPath failure would produce an unsigned binary that gets
+        # uploaded below as if it were signed.
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        shell: powershell
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          $exe = "cli/dist/greffer-${{ matrix.target }}.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Signed binary missing at $exe — SignPath step likely failed."
+            exit 1
+          }
+          $sig = Get-AuthenticodeSignature $exe
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "Authenticode signature status is '$($sig.Status)' on $exe (expected 'Valid')."
+            exit 1
+          }
+          Write-Host "Verified: $($sig.SignerCertificate.Subject)"
+
+      # ---- End signing block ---------------------------------------------------
+
       - name: Upload binary artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
