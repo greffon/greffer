@@ -53,17 +53,51 @@ INIT_WROTE_FILES_PROXY_EXTRA = """\
 # --- State transitions -----------------------------------------------
 
 STATE_STARTING = "[{ts}] Starting — bringing up the greffer container..."
+# Printed on ENTERING the Registering state, before the manager has
+# confirmed anything. Deliberately neutral: the container is up and
+# contacting the manager, but we do NOT yet know the manager received
+# the registration — so we must not tell the operator to accept a
+# greffer that may never have registered (the silent-stall failure when
+# the tunnel is down). The accept guidance (STATE_REGISTERING) prints
+# only once the manager actually reports GREFFER_REGISTERING.
+STATE_REGISTERING_CONTACTING = (
+    "[{ts}] Registering — container is up, contacting the manager..."
+)
 STATE_REGISTERING = (
-    "[{ts}] Registering — greffer is talking to the manager.\n"
-    "[{ts}] Next step: accept this greffer on the manager.\n"
+    "[{ts}] The manager has received your greffer. Next step: accept it.\n"
     "           greffer ID: {greffer_id}\n"
     "           Open the manager UI, go to Greffers, and click Accept on the\n"
     "           card showing this ID.\n"
     "           (Solo setup? That's you — go accept it now in your manager UI.)"
 )
+# Heartbeat once the manager has the registration but no one has accepted
+# it yet — a genuine "waiting on a human" wait.
 STATE_REGISTERING_HEARTBEAT = (
     "[{ts}] still waiting for this greffer to be accepted on the manager "
     "(greffer ID: {greffer_id}). I'll keep checking."
+)
+# Heartbeat while the manager is STILL at GREFFER_CREATED — it has NOT
+# received a registration. This is a connectivity problem on the greffer
+# side (tunnel down, egress blocked, workers disabled), not an admin
+# action. Keeping it distinct from the "accepted yet?" beat is the whole
+# point: the operator can't fix this by clicking Accept.
+STATE_REGISTERING_PENDING_HEARTBEAT = (
+    "[{ts}] container is up, but the manager hasn't received your "
+    "registration yet (greffer ID: {greffer_id}). Still trying."
+)
+# Printed once while stuck at GREFFER_CREATED, in BOTH modes. The register
+# worker POSTs directly to the manager (settings.greffon_base_server) — it
+# does NOT go through the tunnel sidecar, which only consumes a client.toml
+# the manager pushes AFTER accept. So a stalled registration is a
+# greffer→manager reachability problem; the truth is in the register
+# worker's own log, not the sidecar's. Point there, and name the real
+# causes (manager URL, egress, workers disabled).
+STATE_REGISTERING_PENDING_HINT = (
+    "[{ts}] the greffer hasn't reached the manager yet. The register worker\n"
+    "           POSTs to the manager directly — check its log for the reason:\n"
+    "           docker compose -f {compose_path} logs greffer | grep -i regist\n"
+    "           Common causes: wrong manager URL, blocked egress to the\n"
+    "           manager, or GREFFER_WORKERS_ENABLED not set."
 )
 STATE_AWAITING_CERT = (
     "[{ts}] Awaiting cert — admin accepted, manager is issuing your TLS cert."
@@ -83,11 +117,19 @@ TIMEOUT_STARTING = """\
 """
 
 TIMEOUT_REGISTERING = """\
-✗ Stuck at Registering for {minutes} minutes. The manager has not yet
-acknowledged your greffer.
-  - The manager URL might be wrong: re-run `greffer doctor`.
-  - The greffer may still be waiting to be accepted — open the manager
-    UI, go to Greffers, and accept the card with greffer ID {greffer_id}.
+✗ Stuck at Registering for {minutes} minutes. The manager never reached
+the accepted state for this greffer. Two different causes:
+  - The manager never received the registration (it stayed at
+    GREFFER_CREATED). The greffer's register worker couldn't reach the
+    manager — it POSTs directly, so check its log for the reason:
+      * `docker compose -f {compose_path} logs greffer | grep -i regist`
+        (look for "manager not reachable at <url>, retrying").
+      * the manager URL might be wrong: re-run `greffer doctor`.
+      * the greffer's network egress to the manager may be blocked, or
+        GREFFER_WORKERS_ENABLED may be unset (register worker never ran).
+  - The manager received it (GREFFER_REGISTERING) but no one accepted —
+    open the manager UI, go to Greffers, and accept the card with greffer
+    ID {greffer_id}.
   - Check what the greffer is doing:
       docker compose -f {compose_path} logs greffer
 """

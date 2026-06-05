@@ -140,16 +140,30 @@ def wait_for_state(
     *, timeout: float = 600.0,
     heartbeat_interval: float = 30.0,
     on_heartbeat=None,
+    on_state_change=None,
 ) -> bool:
     """Poll the manager's state-public/ until ``state == target``.
 
-    Returns True on match, False on timeout. Calls ``on_heartbeat()``
-    every ``heartbeat_interval`` while still waiting — used by the
-    state-machine driver to print "still waiting for admin" messages.
+    Returns True on match, False on timeout.
+
+    ``on_heartbeat(observed_state)`` is called every ``heartbeat_interval``
+    while still waiting, receiving the most recently observed manager
+    state. The driver uses it to tailor the heartbeat — "the manager
+    hasn't received your registration" while still ``GREFFER_CREATED`` vs
+    "waiting to be accepted" once ``GREFFER_REGISTERING``. Without the
+    observed state the two are indistinguishable and a never-registered
+    greffer looks exactly like one merely waiting for an admin.
+
+    ``on_state_change(observed_state)`` is called once each time the
+    observed state changes (including the first observation) — the driver
+    uses it to print the "go accept it" guidance only after the manager
+    has actually acknowledged the registration, not on entry when the
+    manager may never have seen the greffer at all.
     """
     deadline = time.monotonic() + timeout
     last_heartbeat = time.monotonic()
     seen_unknown: set[str] = set()
+    last_state: str | None = None
     # Pass the deadline INTO poll_state — its transient-error retry loop
     # would otherwise spin forever without yielding, never letting the
     # for-body run the deadline check below. (Codex regression on a
@@ -158,6 +172,13 @@ def wait_for_state(
         for state in manager_client.poll_state(
             manager_url, greffer_id, deadline=deadline,
         ):
+            # Fire the state-change callback BEFORE the target check so a
+            # fast register-worker landing straight on REGISTERED still
+            # triggers the "manager has your greffer" guidance.
+            if state.state != last_state:
+                last_state = state.state
+                if on_state_change is not None:
+                    on_state_change(state.state)
             if state.state == target:
                 return True
             # Forward-compat: log unrecognized states once and continue
@@ -173,7 +194,7 @@ def wait_for_state(
                 on_heartbeat
                 and time.monotonic() - last_heartbeat >= heartbeat_interval
             ):
-                on_heartbeat()
+                on_heartbeat(state.state)
                 last_heartbeat = time.monotonic()
     except manager_client.ManagerUnreachable:
         # poll_state hit the deadline during a sustained outage and
@@ -355,20 +376,63 @@ def run_state_machine(
         return EXIT_TIMEOUT_STARTING
 
     # ---- 2. Registering -------------------------------------------------
+    # On ENTRY we only know the container is up and about to contact the
+    # manager — NOT that the manager received anything. Print a neutral
+    # "contacting the manager" line; the "go accept it" guidance is
+    # deferred to _on_state_change, fired only once the manager actually
+    # reports GREFFER_REGISTERING/REGISTERED. Printing accept guidance on
+    # entry (as we used to) told operators to accept a greffer the manager
+    # never saw — the silent-stall failure mode when the tunnel sidecar is
+    # down and registration never lands.
+    #
     # We deliberately do NOT print a clickable accept URL. The --manager
     # value is the API URL (REACT_APP_API in manager-front), which is
     # often on a different host than the frontend (e.g. api.example.com
     # vs app.example.com) — synthesizing a UI URL from it is wrong in
     # the configs where it matters. Print the greffer ID instead and
     # let the admin find the matching card on the Greffers page.
-    print(strings.STATE_REGISTERING.format(
-        ts=_now(), greffer_id=greffer_id,
-    ))
+    print(strings.STATE_REGISTERING_CONTACTING.format(ts=_now()))
 
-    def _heartbeat() -> None:
-        print(strings.STATE_REGISTERING_HEARTBEAT.format(
-            ts=_now(), greffer_id=greffer_id,
-        ))
+    accept_guidance_shown = False
+
+    def _on_state_change(observed_state: str) -> None:
+        nonlocal accept_guidance_shown
+        # The manager now has the registration. Once (and only once),
+        # tell the operator to accept it. REGISTERED can appear here too
+        # if register + accept happen between polls — harmless to show,
+        # we connect immediately after.
+        if (
+            observed_state in ("GREFFER_REGISTERING", "GREFFER_REGISTERED")
+            and not accept_guidance_shown
+        ):
+            accept_guidance_shown = True
+            print(strings.STATE_REGISTERING.format(
+                ts=_now(), greffer_id=greffer_id,
+            ))
+
+    pending_hint_shown = False
+
+    def _heartbeat(observed_state: str) -> None:
+        nonlocal pending_hint_shown
+        if observed_state == "GREFFER_CREATED":
+            # The manager has NOT received the registration. This is a
+            # greffer→manager reachability problem, not an admin-action
+            # wait. The register worker POSTs directly to the manager (it
+            # does NOT go through the tunnel sidecar — that only consumes
+            # the manager-pushed client.toml after accept), so the hint
+            # points at the register worker's log, mode-agnostic.
+            print(strings.STATE_REGISTERING_PENDING_HEARTBEAT.format(
+                ts=_now(), greffer_id=greffer_id,
+            ))
+            if not pending_hint_shown:
+                pending_hint_shown = True
+                print(strings.STATE_REGISTERING_PENDING_HINT.format(
+                    ts=_now(), compose_path=compose_file,
+                ))
+        else:
+            print(strings.STATE_REGISTERING_HEARTBEAT.format(
+                ts=_now(), greffer_id=greffer_id,
+            ))
 
     # Manager state GREFFER_REGISTERED == admin has accepted. We don't
     # gate on seeing GREFFER_REGISTERING first — the greffer's
@@ -386,6 +450,7 @@ def run_state_machine(
             timeout=timeout,
             heartbeat_interval=30.0,
             on_heartbeat=_heartbeat,
+            on_state_change=_on_state_change,
         )
     except manager_client.GrefferNotFound:
         print(
