@@ -503,5 +503,9 @@ def test_run_state_machine_created_does_not_tell_operator_to_accept(
     # ...but never told the operator to accept a greffer the manager
     # never received (the deferred guidance line stays unprinted).
     assert "click Accept on the" not in out
+    # ...and must NOT blame the tunnel sidecar: registration is a direct
+    # greffer→manager POST, not routed through the sidecar, so pointing
+    # there masks the real cause (manager URL / egress / workers).
+    assert "tunnel sidecar" not in out
     # The timeout hint surfaces the real (connectivity) cause.
     assert "GREFFER_CREATED" in out

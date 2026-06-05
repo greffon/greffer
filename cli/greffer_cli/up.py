@@ -410,21 +410,23 @@ def run_state_machine(
                 ts=_now(), greffer_id=greffer_id,
             ))
 
-    tunnel_hint_shown = False
+    pending_hint_shown = False
 
     def _heartbeat(observed_state: str) -> None:
-        nonlocal tunnel_hint_shown
+        nonlocal pending_hint_shown
         if observed_state == "GREFFER_CREATED":
             # The manager has NOT received the registration. This is a
-            # greffer-side connectivity problem, not an admin-action wait
-            # — say so, and in tunnel mode point at the likely culprit (a
-            # tunnel sidecar that isn't up/connected).
+            # greffer→manager reachability problem, not an admin-action
+            # wait. The register worker POSTs directly to the manager (it
+            # does NOT go through the tunnel sidecar — that only consumes
+            # the manager-pushed client.toml after accept), so the hint
+            # points at the register worker's log, mode-agnostic.
             print(strings.STATE_REGISTERING_PENDING_HEARTBEAT.format(
                 ts=_now(), greffer_id=greffer_id,
             ))
-            if mode == "tunnel" and not tunnel_hint_shown:
-                tunnel_hint_shown = True
-                print(strings.STATE_REGISTERING_TUNNEL_HINT.format(
+            if not pending_hint_shown:
+                pending_hint_shown = True
+                print(strings.STATE_REGISTERING_PENDING_HINT.format(
                     ts=_now(), compose_path=compose_file,
                 ))
         else:

@@ -85,15 +85,19 @@ STATE_REGISTERING_PENDING_HEARTBEAT = (
     "[{ts}] container is up, but the manager hasn't received your "
     "registration yet (greffer ID: {greffer_id}). Still trying."
 )
-# Printed once, in tunnel mode only, while stuck at GREFFER_CREATED. In
-# tunnel mode the registration reaches the manager through the tunnel,
-# so a tunnel sidecar that isn't running/connected means the manager
-# never sees the greffer — the most common first-run failure.
-STATE_REGISTERING_TUNNEL_HINT = (
-    "[{ts}] tunnel mode: registration reaches the manager through the tunnel.\n"
-    "           If this persists, confirm the tunnel sidecar is running\n"
-    "           and connected:\n"
-    "           docker compose -f {compose_path} logs"
+# Printed once while stuck at GREFFER_CREATED, in BOTH modes. The register
+# worker POSTs directly to the manager (settings.greffon_base_server) — it
+# does NOT go through the tunnel sidecar, which only consumes a client.toml
+# the manager pushes AFTER accept. So a stalled registration is a
+# greffer→manager reachability problem; the truth is in the register
+# worker's own log, not the sidecar's. Point there, and name the real
+# causes (manager URL, egress, workers disabled).
+STATE_REGISTERING_PENDING_HINT = (
+    "[{ts}] the greffer hasn't reached the manager yet. The register worker\n"
+    "           POSTs to the manager directly — check its log for the reason:\n"
+    "           docker compose -f {compose_path} logs greffer | grep -i regist\n"
+    "           Common causes: wrong manager URL, blocked egress to the\n"
+    "           manager, or GREFFER_WORKERS_ENABLED not set."
 )
 STATE_AWAITING_CERT = (
     "[{ts}] Awaiting cert — admin accepted, manager is issuing your TLS cert."
@@ -116,11 +120,13 @@ TIMEOUT_REGISTERING = """\
 ✗ Stuck at Registering for {minutes} minutes. The manager never reached
 the accepted state for this greffer. Two different causes:
   - The manager never received the registration (it stayed at
-    GREFFER_CREATED). The greffer couldn't reach the manager:
-      * tunnel mode: the tunnel sidecar may not be running or connected —
-        check `docker compose -f {compose_path} logs`.
+    GREFFER_CREATED). The greffer's register worker couldn't reach the
+    manager — it POSTs directly, so check its log for the reason:
+      * `docker compose -f {compose_path} logs greffer | grep -i regist`
+        (look for "manager not reachable at <url>, retrying").
       * the manager URL might be wrong: re-run `greffer doctor`.
-      * the greffer's network egress to the manager may be blocked.
+      * the greffer's network egress to the manager may be blocked, or
+        GREFFER_WORKERS_ENABLED may be unset (register worker never ran).
   - The manager received it (GREFFER_REGISTERING) but no one accepted —
     open the manager UI, go to Greffers, and accept the card with greffer
     ID {greffer_id}.
