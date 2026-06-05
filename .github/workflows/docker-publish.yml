@@ -28,12 +28,25 @@ jobs:
           context: "{{defaultContext}}:nginx"
           push: true
           tags: greffon/greffer-nginx:latest
+          # Multi-arch: amd64 + arm64. Base is nginx:1.20.2-alpine-perl
+          # (multi-arch manifest, no per-arch downloads), so arm64 is a
+          # pure rebuild. Without this the image is amd64-only and the
+          # rendered ~/.greffer/docker-compose.yml fails to pull on ARM
+          # hosts (Apple Silicon, Graviton, Pi, Windows-on-ARM/WSL2)
+          # with "no matching manifest for linux/arm64/v8".
+          platforms: linux/amd64,linux/arm64
       -
         name: Build and push Greffer
         uses: docker/build-push-action@v3
         with:
           push: true
           tags: greffon/greffer:latest
+          # Multi-arch: amd64 + arm64. Base is python:3.11-alpine
+          # (multi-arch manifest, no per-arch downloads), so arm64 is a
+          # pure rebuild. Pairs with the greffer-nginx step above — both
+          # services in the proxy-mode compose must ship arm64 or the
+          # pull aborts on ARM hosts.
+          platforms: linux/amd64,linux/arm64
       -
         name: Build and push Tunnel Sidecar
         uses: docker/build-push-action@v3
