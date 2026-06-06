@@ -19,7 +19,7 @@ on:
   push:
     tags:
       - 'cli-v*'
-  # PR validation: build all four arches and smoke-test --help when
+  # PR validation: build all five targets and smoke-test --help when
   # any CLI file changes. The publish job's `if:` skips the actual
   # Release creation, so PR runs are zero-risk. Catches "the tag
   # build is broken" issues BEFORE we tag.
@@ -38,6 +38,14 @@ permissions:
   # this with `contents: write` for its single use case (uploading
   # Release assets). Least-privilege.
   contents: read
+
+# Serialize per ref so two quick pushes (or a tag delete/re-push) can't
+# run two publish jobs racing the same GitHub Release. Don't cancel a run
+# in progress: a half-finished release upload should complete, not be
+# killed mid-way.
+concurrency:
+  group: cli-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -241,8 +249,9 @@ jobs:
         # it at runtime on the OLDEST supported glibc. We reuse the
         # manylinux2014 image (glibc 2.17) rather than Docker Hub's
         # centos:7: it is already pulled, lives on quay (no anonymous
-        # pull-rate-limit that could flake a release), is multi-arch, and
-        # is digest-pinned. A clean `docker run` with no build PATH/env
+        # pull-rate-limit that could flake a release), and is digest-
+        # pinned per-arch (the matrix pins the matching aarch64/x86_64
+        # digest). A clean `docker run` with no build PATH/env
         # exercises only the self-contained bundle — if greffer starts
         # here it starts on everything above (Amazon Linux 2, RHEL/Rocky/
         # Alma 8 & 9, Ubuntu 18.04+, ...).
@@ -304,7 +313,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          # All four jobs upload under names matching `greffer-*`.
+          # All five build legs upload under names matching `greffer-*`.
           pattern: greffer-*
           merge-multiple: true
 
