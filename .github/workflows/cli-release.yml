@@ -72,7 +72,12 @@ jobs:
           #      bump the tag/version periodically.
           - target: linux-x86_64
             runner: ubuntu-22.04
-            image: quay.io/pypa/manylinux2014_x86_64
+            # Pinned by DIGEST, not tag — this image builds the shipped
+            # binary, so it's part of the artifact's supply chain (the PBS
+            # interpreter below is sha256-pinned for the same reason).
+            # Tag at pin time: manylinux2014_x86_64 (glibc 2.17). Bump
+            # deliberately alongside pbs_url/pbs_sha256.
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:298eccaea20b9e9223dcfbd6af48743dce2dd3dd92ede4aff44e7af2e919db86
             pbs_url: https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.11.15+20260602-x86_64-unknown-linux-gnu-install_only.tar.gz
             # Content hash of the asset above (computed at pin time, NOT a
             # build-time sidecar — the release publishes none). Bump in
@@ -83,7 +88,7 @@ jobs:
             # this org's plan, fall back to ubuntu-22.04 + QEMU — but
             # that path is ~10x slower; prefer native.
             runner: ubuntu-22.04-arm
-            image: quay.io/pypa/manylinux2014_aarch64
+            image: quay.io/pypa/manylinux2014_aarch64@sha256:e3ad90ea5f951aff23881f76b790b24abc154e7a1c3ee5107731c71f9cf5ca28
             pbs_url: https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.11.15+20260602-aarch64-unknown-linux-gnu-install_only.tar.gz
             pbs_sha256: 408474860874575864d3d6bcf44c344b6bc558730976131c9e4a9138098596f2
           - target: darwin-x86_64
@@ -138,12 +143,15 @@ jobs:
             "$IMAGE" bash -euo pipefail -c '
               # Fetch the relocatable interpreter, retrying transient
               # network failures. manylinux2014 ships curl 7.29, which
-              # lacks --retry-all-errors, so use a portable loop.
+              # lacks --retry-all-errors, so use a portable loop. Fail
+              # explicitly when all attempts are exhausted (do not rely on
+              # a later step tripping over the missing file).
               for attempt in 1 2 3 4 5; do
                 curl -fSL --connect-timeout 15 "$PBS_URL" -o /tmp/py.tgz && break
-                echo "pbs download attempt $attempt failed; retrying" >&2
-                sleep $((attempt * 3))
+                echo "pbs download attempt $attempt failed" >&2
+                [ "$attempt" -lt 5 ] && sleep $((attempt * 3))
               done
+              [ -f /tmp/py.tgz ] || { echo "::error::PBS download failed after 5 attempts"; exit 1; }
               # Integrity: verify against the hard-pinned content hash
               # before trusting the archive. Aborts if it ever changes.
               echo "$PBS_SHA256  /tmp/py.tgz" | sha256sum -c -
@@ -155,14 +163,26 @@ jobs:
               poetry run pytest -q
               poetry run pyinstaller --clean --noconfirm greffer.spec
               # Static regression guard: fail loudly if any bundled lib
-              # references a glibc symbol newer than our 2.17 floor (e.g.
-              # a future dep that drags in a higher baseline). Complements
-              # the runtime boot test on CentOS 7 below.
+              # references a glibc symbol newer than our 2.17 floor (e.g. a
+              # future dep that drags in a higher baseline). Complements
+              # the runtime boot test below. Assert we actually inspected
+              # something, so an empty result cannot pass as "clean".
               syms=$(find dist/greffer -name "*.so*" -exec objdump -T {} \; 2>/dev/null \
                      | grep -oE "GLIBC_[0-9]+\.[0-9]+")
+              [ -n "$syms" ] || { echo "::error::no glibc symbols inspected — floor guard ineffective"; exit 1; }
               max=$(printf "%s\nGLIBC_2.17\n" "$syms" | sort -V | tail -1)
               echo "max bundled glibc symbol: $max"
               [ "$max" = "GLIBC_2.17" ] || { echo "::error::glibc floor regressed to $max (expected <= 2.17)"; exit 1; }
+              # Everything the root container created on the bind mount
+              # lives under cli/ (dist/, build/, __pycache__/, *.egg-info/,
+              # .pytest_cache/) and is root-owned. Hand that subtree back
+              # to the host user (uid/gid derived from the mount itself)
+              # so: (a) the host-side Package step can write the tarball
+              # inside dist/, and (b) no root-owned leftovers break
+              # workspace cleanup on reused (self-hosted) runners. Scope to
+              # cli/ — it always exists (the working dir) and avoids the
+              # repo .git/ tree, which checkout already owns.
+              chown -R "$(stat -c %u /io):$(stat -c %g /io)" /io/cli
             '
 
       # ── macOS / Windows: build natively on the runner ──
@@ -197,14 +217,15 @@ jobs:
         run: poetry run pyinstaller --clean --noconfirm greffer.spec
 
       - name: Smoke-test the built binary
-        # `--help` exercises Typer's command tree without needing
-        # docker. Catches missing-import bugs that only surface on
-        # the frozen bundle (e.g. a click submodule we forgot to
-        # add to hiddenimports in greffer.spec). The `.exe` suffix
-        # only exists on Windows; the conditional keeps one step for
-        # all platforms instead of two with matrix-conditional `if:`.
-        # Onedir output is a directory; the launcher lives one level
-        # down at dist/greffer/greffer (greffer.exe on Windows).
+        # macOS / Windows only — the Linux legs get their `--help` check
+        # from the dedicated glibc-2.17 boot test below (which exercises
+        # the real floor, not the host's 2.35). `--help` exercises Typer's
+        # command tree without needing docker, catching missing-import
+        # bugs that only surface on the frozen bundle (e.g. a click
+        # submodule absent from hiddenimports in greffer.spec). The `.exe`
+        # suffix only exists on Windows. Onedir output is a directory; the
+        # launcher lives at dist/greffer/greffer (greffer.exe on Windows).
+        if: ${{ !matrix.image }}
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             ./dist/greffer/greffer.exe --help
@@ -212,17 +233,22 @@ jobs:
             ./dist/greffer/greffer --help
           fi
 
-      - name: Verify the binary boots on glibc 2.17 (CentOS 7)
+      - name: Verify the binary boots on glibc 2.17
         if: ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
         # The build step proves the symbol floor statically; this proves
-        # it at runtime on the OLDEST supported glibc. centos:7 is
-        # multi-arch (amd64 + arm64) and glibc 2.17 — if greffer runs
-        # here it runs on everything above (Amazon Linux 2, RHEL/Rocky/
-        # Alma 8 & 9, Ubuntu 18.04+, ...). We only exec the bundle, so
-        # the image being EOL (dead yum repos) is irrelevant.
+        # it at runtime on the OLDEST supported glibc. We reuse the
+        # manylinux2014 image (glibc 2.17) rather than Docker Hub's
+        # centos:7: it is already pulled, lives on quay (no anonymous
+        # pull-rate-limit that could flake a release), is multi-arch, and
+        # is digest-pinned. A clean `docker run` with no build PATH/env
+        # exercises only the self-contained bundle — if greffer starts
+        # here it starts on everything above (Amazon Linux 2, RHEL/Rocky/
+        # Alma 8 & 9, Ubuntu 18.04+, ...).
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE/cli/dist:/d:ro" \
-            centos:7 /d/greffer/greffer --help
+            "$IMAGE" /d/greffer/greffer --help
 
       - name: Package onedir bundle as a tarball
         # Onedir ships a directory (launcher + _internal/), so the
@@ -281,6 +307,17 @@ jobs:
           # All four jobs upload under names matching `greffer-*`.
           pattern: greffer-*
           merge-multiple: true
+
+      - name: Verify all target artifacts are present
+        # `needs: build` already blocks a partial release (any failed leg
+        # fails the build job and skips publish), but assert the exact
+        # expected set so artifact-naming drift can't silently ship a
+        # subset. Keep this list in sync with the build matrix.
+        working-directory: artifacts
+        run: |
+          for t in linux-x86_64 linux-arm64 darwin-x86_64 darwin-arm64 windows-x86_64; do
+            [ -f "greffer-$t.tar.gz" ] || { echo "::error::missing release artifact greffer-$t.tar.gz"; exit 1; }
+          done
 
       - name: Generate sha256sums.txt
         # Format matches the convention used by curl|sh install
