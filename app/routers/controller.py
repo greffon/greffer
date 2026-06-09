@@ -84,6 +84,15 @@ def start_greffon(
     # it. Mutates greffon_info in place (setdefault); create_compose's own
     # context calls are idempotent no-ops afterward.
     compose.build_render_context(greffon_info)
+    # L4 (Tier-C) ports are published directly on their service. The bind
+    # interface depends on this greffer's mode: proxy publishes on the public
+    # interface; tunnel binds host-internal (reached by the rathole-client, not
+    # the public interface). compose.py reads this off greffon_info.
+    greffon_info['l4_bind_host'] = (
+        '127.0.0.1'
+        if _settings(request).greffer_mode == 'tunnel'
+        else '0.0.0.0'
+    )
     compose_template = compose.get_compose_template(compose_file, greffon_info)
     try:
         compose.apply_configuration(greffon_info, compose_file)

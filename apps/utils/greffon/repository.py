@@ -13,11 +13,27 @@ def get_compose_file_from_repository(greffon):
     return yaml.safe_load(r.text)
 
 
+def _split_proto(raw):
+    """'51820/udp' -> ('51820', 'udp'); '8080' -> ('8080', None)."""
+    if '/' in raw:
+        port, proto = raw.rsplit('/', 1)
+        return port, proto.lower()
+    return raw, None
+
+
 def get_greffon_info(compose, greffon):
     greffon_info = create_greffon_info(compose, greffon)
-    ports = get_free_ports(numbers=len(greffon_info['ports']))
+    # Allocate a free host port per declared port, batched by protocol so TCP
+    # and UDP are probed in their own namespace and no number is handed out
+    # twice within a protocol.
+    ports = greffon_info['ports']
+    idx_by_proto = {}
     for i, port in enumerate(ports):
-        greffon_info['ports'][i]['port_host'] = port
+        idx_by_proto.setdefault(port.get('protocol', 'tcp'), []).append(i)
+    for proto, idxs in idx_by_proto.items():
+        free = get_free_ports(numbers=len(idxs), protocol=proto)
+        for idx, host_port in zip(idxs, free):
+            ports[idx]['port_host'] = host_port
     return greffon_info
 
 
@@ -103,22 +119,33 @@ def create_greffon_info(compose, greffon):
         if type(ports) == list:
             for port in ports:
                 port_splited = port.split(':')
-                port_name = f'{name}_{port_splited[-1]}'
+                port_container, parsed_proto = _split_proto(port_splited[-1])
+                port_name = f'{name}_{port_container}'
+                manager_port = greffon.get('ports', {}).get(port_name, {})
                 greffon_info['ports'].append({
-                    'port_container': port_splited[-1],
+                    'port_container': port_container,
                     'container_name': name,
                     'port_name': port_name,
-                    'url': greffon.get('ports', {}).get(port_name, {}).get('url'),
+                    'url': manager_port.get('url'),
+                    # Tier/protocol: manager (catalog) is authoritative; fall
+                    # back to parsing "<h>:<c>/udp" from the compose, then to
+                    # the http/tcp defaults.
+                    'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
+                    'exposure_tier': manager_port.get('exposure_tier', 'http'),
                 })
         else:
             greffon_info['ports'].setdefault(name, {})
-            _, port_container = port.split(':')
+            _, raw_container = port.split(':')
+            port_container, parsed_proto = _split_proto(raw_container)
             port_name = f'{name}_{port_container}'
+            manager_port = greffon.get('ports', {}).get(port_name, {})
             greffon_info['ports'].append({
                 'port_container': port_container,
                 'container_name': name,
                 'port_name': port_name,
-                'url': greffon.get('ports', {}).get(port_name, {}).get('url'),
+                'url': manager_port.get('url'),
+                'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
+                'exposure_tier': manager_port.get('exposure_tier', 'http'),
             })
         volumes = service.get('volumes', [])
         if type(volumes) == list:

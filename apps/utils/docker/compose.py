@@ -56,10 +56,19 @@ class ConfigRenderError(Exception):
 
 def get_nginx_service(greffon):
     #@Todo should handle conflict port
+    # L4 (Tier-C) ports are NOT proxied by nginx (it cannot carry raw TCP/UDP);
+    # they are published directly on their owning service in
+    # create_compose_template_from_greffon. The enumerate index is over the FULL
+    # ports list so {{ports[i].port_host}} still resolves correctly after the
+    # L4 entries are filtered out.
     return {
         'image': 'nginx:1.20.2-alpine-perl',
         'restart': 'unless-stopped',
-        'ports': [ ('{{ports[%s].port_host}}:%s' % (i, port['port_container'])) for i, port in enumerate(greffon['ports'])],
+        'ports': [
+            ('{{ports[%s].port_host}}:%s' % (i, port['port_container']))
+            for i, port in enumerate(greffon['ports'])
+            if port.get('exposure_tier', 'http') != 'l4'
+        ],
         'networks': [greffon['internal_network']],
     }
 
@@ -73,6 +82,21 @@ def create_compose_template_from_greffon(compose, greffon_info):
         if 'container_name' in service:
             del service['container_name']
     compose['services']['greffon_nginx'] = get_nginx_service(greffon_info)
+    # Publish L4 (Tier-C) ports directly on their owning service, bypassing the
+    # nginx sidecar. proxy mode binds the public interface (0.0.0.0); tunnel
+    # mode binds host-internal (127.0.0.1), reachable by the rathole-client.
+    # The /<proto> suffix selects raw TCP or UDP. Keyed by the original service
+    # name (container_name) before the rename below.
+    l4_bind_host = greffon_info.get('l4_bind_host', '0.0.0.0')
+    for i, port in enumerate(greffon_info['ports']):
+        if port.get('exposure_tier', 'http') != 'l4':
+            continue
+        proto_suffix = '/udp' if port.get('protocol') == 'udp' else ''
+        mapping = '%s:{{ports[%s].port_host}}:%s%s' % (
+            l4_bind_host, i, port['port_container'], proto_suffix)
+        service = compose['services'][port['container_name']]
+        service.setdefault('ports', [])
+        service['ports'].append(mapping)
     for _,volume in greffon_info['volumes'].items():
         for container_name, container in volume['containers'].items():
             compose['services'][container_name].setdefault('volumes', [])
@@ -420,6 +444,35 @@ def _compute_instance_context(greffon_info):
     greffon_info.setdefault('instance_host', instance_host)
     greffon_info.setdefault('instance_port', instance_port)
     greffon_info.setdefault('instance_url', instance_url)
+
+    # L4 (Tier-C) endpoint vars for catalog templating. An L4 app needs the
+    # PUBLIC host:port its clients dial (e.g. WireGuard's WG_HOST / WG_PORT),
+    # which is NOT a Tier-A https URL, so {{ instance_url }} can't express it.
+    # In PROXY mode the greffer knows the endpoint at render time:
+    # GREFFER_PUBLIC_HOST + the allocated host port. In TUNNEL mode the public
+    # endpoint is RATHOLE_PUBLIC_HOST:tunnel_port, allocated manager-side AFTER
+    # the greffer responds, so it is not knowable here (tunnel-mode UDP is gated
+    # to phase 2); the vars are left empty. Always set (even empty) so
+    # {{ instance_l4_* }} renders blank instead of erroring.
+    l4_first = next(
+        (p for p in ports
+         if isinstance(p, dict) and p.get('exposure_tier') == 'l4'),
+        None,
+    )
+    if l4_first is not None and greffon_info.get('l4_bind_host') != '127.0.0.1':
+        l4_host = fallback_host
+        l4_port = str(l4_first.get('port_host') or '')
+        greffon_info.setdefault('instance_l4_host', l4_host)
+        greffon_info.setdefault('instance_l4_port', l4_port)
+        greffon_info.setdefault(
+            'instance_l4_endpoint',
+            f'{l4_host}:{l4_port}' if l4_port else l4_host)
+        greffon_info.setdefault('instance_l4_proto', l4_first.get('protocol', 'tcp'))
+    else:
+        greffon_info.setdefault('instance_l4_host', '')
+        greffon_info.setdefault('instance_l4_port', '')
+        greffon_info.setdefault('instance_l4_endpoint', '')
+        greffon_info.setdefault('instance_l4_proto', '')
     return greffon_info
 
 
