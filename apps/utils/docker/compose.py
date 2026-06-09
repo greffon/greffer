@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 # ``{{ config.OIDC_RP_CLIENT_SECRET }}`` is a silent security failure, so we
 # fail the deploy loudly instead. ``autoescape=False`` because these are
 # config files (JSON/conf), not HTML, and we must not HTML-escape values.
+#
+# StrictUndefined is the runtime backstop, not the whole gate: it only fires
+# on attribute/item access, so the idioms ``{{ config.get('X') }}`` and
+# ``{{ ... | default }}`` would still silently render empty. The catalog
+# validator is the author-facing gate that rejects those bypass forms (and
+# rejects ``{{ <integration>.* }}`` refs, which would hard-abort here because
+# an unset integration is ``{}``). The two layers are intentional.
 _FILE_RENDER_ENV = Environment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
 )

@@ -89,9 +89,11 @@ def start_greffon(
         compose.apply_configuration(greffon_info, compose_file)
     except compose.ConfigRenderError as exc:
         # A render-flagged baked file referenced a missing/typo'd variable.
-        # Fail loudly with a clean 422 (no half-started instance — this runs
-        # before create_compose/start and before any volume copy) instead of
-        # an opaque 500.
+        # Fail loudly with a clean 422 instead of an opaque 500. No half-started
+        # instance: this runs before create_compose/start and before any volume
+        # copy. Files written for earlier destinations in the same pass stay on
+        # the greffon path unreferenced (nothing is copied into a volume) and are
+        # overwritten on the next deploy attempt.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     compose.create_compose(compose_template, greffon_info)
     conf.create_nginx_conf(greffon_info)
