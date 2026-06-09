@@ -1,8 +1,11 @@
 import yaml
 import asyncio
 import json
+import logging
 from datauri import DataURI
-from jinja2 import Template
+from jinja2 import StrictUndefined, Template
+from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
+from jinja2.sandbox import SandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -10,6 +13,46 @@ from urllib.parse import urlparse
 client = docker.from_env()
 
 from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create_volume, docker_is_volume_exist
+
+logger = logging.getLogger(__name__)
+
+# Strict Jinja environment for rendering baked `file`/`json` destination
+# contents (feature: baked-config-files). Unlike the lenient ``Template``
+# used for the compose body, a missing/typo'd variable here MUST raise
+# rather than render to empty string: a baked Keycloak realm with an empty
+# ``{{ config.OIDC_RP_CLIENT_SECRET }}`` is a silent security failure, so we
+# fail the deploy loudly instead. ``autoescape=False`` because these are
+# config files (JSON/conf), not HTML, and we must not HTML-escape values.
+#
+# SANDBOXED: the template string is catalog-author-controlled, and the catalog
+# is community-extensible, so we must assume it can be hostile. A plain
+# Environment would allow server-side template injection -> RCE on this worker
+# (which holds the instance's minted secrets, the greffer's manager token, and
+# Docker socket access), e.g.
+# ``{{ cycler.__init__.__globals__.os.popen('id').read() }}``. SandboxedEnvironment
+# blocks attribute traversal to unsafe objects while still rendering the
+# legitimate ``{{ config.X }}`` / ``{{ instance_url }}`` references. A
+# SecurityError surfaces as a clean ConfigRenderError (-> 422), like any other
+# render failure.
+#
+# StrictUndefined makes a missing/typo'd variable raise rather than render empty
+# (a baked secret silently becoming '' is a security failure). The catalog
+# validator is a SEPARATE, author-facing layer that rejects StrictUndefined
+# *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
+# it is NOT an SSTI gate — the sandbox is what stops injection.
+# ``autoescape=False`` because these are config files (JSON/conf), not HTML.
+_FILE_RENDER_ENV = SandboxedEnvironment(
+    undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
+)
+
+
+class ConfigRenderError(Exception):
+    """A render-flagged ``file``/``json`` destination failed to template.
+
+    Raised out of ``apply_configuration`` and caught by the ``start`` router,
+    which re-raises it as an HTTP 422 so the manager (and operator) get a
+    clean, structured failure instead of an opaque 500.
+    """
 
 def get_nginx_service(greffon):
     #@Todo should handle conflict port
@@ -119,6 +162,87 @@ def _compute_integrations_context(greffon_info):
         # never overwrite a key the caller already populated (paranoia).
         greffon_info.setdefault(t, value if _is_integration_set(value) else {})
     return greffon_info
+
+
+def _compute_config_context(greffon_info):
+    """Expose per-instance config values under a ``config`` namespace so a
+    render-flagged baked file can reference them, e.g.
+    ``{{ config.OIDC_RP_CLIENT_SECRET }}`` in a Keycloak realm.
+
+    We key by the env-destination ``key`` (not a catalog alias) so the file
+    and the container provably read the SAME value: the env branch of
+    ``apply_configuration`` and this context both read
+    ``configuration['value'].get('value', '')``. Only configs that have an
+    ``env`` destination are reachable; a file/json-only config contributes
+    nothing here.
+
+    Defensive against malformed payloads (a non-dict ``value``, a non-dict
+    destination): this runs eagerly for EVERY greffon at start, so it must
+    not 500 a deploy that works today.
+    """
+    config = {}
+    for configuration in greffon_info.get('configurations', []) or []:
+        value = configuration.get('value')
+        if not isinstance(value, dict):
+            continue
+        for dest in configuration.get('destinations', []) or []:
+            if isinstance(dest, dict) and dest.get('type') == 'env' and 'key' in dest:
+                config[dest['key']] = value.get('value', '')
+    greffon_info.setdefault('config', config)
+    return greffon_info
+
+
+def build_render_context(greffon_info):
+    """Compute the full Jinja render context ONCE, up front, so both
+    ``apply_configuration`` (which renders baked file contents) and
+    ``create_compose`` (which renders the compose body) see the same
+    ``instance_*`` / integration / ``config`` variables.
+
+    All three sub-builders use ``setdefault`` and are idempotent, so
+    ``create_compose`` calling the first two again is a harmless no-op and
+    needs no change. This must run BEFORE ``apply_configuration`` because
+    file destinations are written (and rendered) there, before
+    ``create_compose`` runs.
+    """
+    greffon_info = _compute_instance_context(greffon_info)
+    greffon_info = _compute_integrations_context(greffon_info)
+    greffon_info = _compute_config_context(greffon_info)
+    return greffon_info
+
+
+def _render_baked_file(raw, greffon_info, dest_name):
+    """Sandboxed strict-render of baked file content (str or bytes). Raises
+    ConfigRenderError (-> HTTP 422) on a missing/typo'd variable, an SSTI/
+    security violation, or non-UTF-8 bytes — so none of those leak as a 500 or
+    a silently-wrong file. SecurityError is a TemplateError subclass (listed
+    explicitly for clarity)."""
+    try:
+        text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+        return _FILE_RENDER_ENV.from_string(text).render(**greffon_info)
+    except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError,
+            TypeError, ValueError) as exc:
+        # TypeError/ValueError: e.g. `{{ x | tojson }}` on an undefined x raises
+        # "not JSON serializable" rather than UndefinedError — still a render
+        # failure, so a clean 422, not a 500.
+        # Log the offending variable name / reason, never the resolved secret.
+        logger.error("baked-file render failed for %s: %s", dest_name, exc)
+        raise ConfigRenderError(f"{dest_name}: {exc}") from exc
+
+
+def _render_json_value(value, greffon_info, dest_name):
+    """Render Jinja in the STRING LEAVES of a json-destination value (then the
+    caller ``json.dumps`` the result). Rendering leaves rather than the
+    serialized string means ``json.dumps`` escapes the substituted values, so a
+    minted secret containing a quote or backslash can't corrupt the JSON."""
+    if isinstance(value, str):
+        return _render_baked_file(value, greffon_info, dest_name)
+    if isinstance(value, dict):
+        # Values only, not keys — templated keys are unneeded and would add a
+        # duplicate-key failure mode. (Intentional.)
+        return {k: _render_json_value(v, greffon_info, dest_name) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_render_json_value(v, greffon_info, dest_name) for v in value]
+    return value
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
@@ -390,8 +514,14 @@ def apply_configuration(greffon_info, compose):
         for destination in configuration.get('destinations', []):
             if destination['type'] == 'json':
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
-                with open(file_path, "w") as f:   # Opens file and casts as f 
-                    f.write(json.dumps(configuration['value']))
+                value = configuration['value']
+                if destination.get('x-greffon-render'):
+                    # Render the value's string leaves, THEN serialize, so
+                    # json.dumps escapes substituted values (no corrupt JSON).
+                    value = _render_json_value(value, greffon_info, destination['name'])
+                text = json.dumps(value)
+                with open(file_path, "w") as f:   # Opens file and casts as f
+                    f.write(text)
                 greffon_info['volumes'][destination['volume']]['files'].append({
                             'type': 'path',
                             'src': file_path,
@@ -407,9 +537,26 @@ def apply_configuration(greffon_info, compose):
             elif destination['type'] == 'file':
                 remove_compose_file(greffon_info)
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
-                uri = DataURI(configuration['value']['file'])
-                with open(file_path, "wb") as f:   # Opens file and casts as f 
-                    f.write(uri.data)
+                # ``DataURI.data`` is ``bytes`` for base64 data-URIs but ``str``
+                # for percent-encoded ones — normalize before writing/rendering.
+                raw = DataURI(configuration['value']['file']).data
+                if destination.get('x-greffon-render'):
+                    # _render_baked_file decodes (and turns non-UTF-8 into a
+                    # clean 422) — pass raw str/bytes straight through.
+                    data = _render_baked_file(raw, greffon_info, destination['name']).encode('utf-8')
+                else:
+                    data = raw if isinstance(raw, bytes) else raw.encode('utf-8')
+                    # Rollout self-warn: a verbatim file that still carries Jinja
+                    # markers is almost certainly a render-flag/greffer-version
+                    # mismatch (catalog expects rendering this greffer didn't do).
+                    if b'{{' in data or b'{%' in data:
+                        logger.warning(
+                            "file destination %s contains Jinja markers but is not "
+                            "x-greffon-render; writing verbatim (flag/version mismatch?)",
+                            destination['name'],
+                        )
+                with open(file_path, "wb") as f:   # Opens file and casts as f
+                    f.write(data)
                 greffon_info['volumes'][destination['volume']]['files'].append({
                             'type': 'path',
                             'src': file_path,

@@ -7,6 +7,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.auth import TOKEN_HEADER
+from apps.utils.docker import compose
 
 
 SAMPLE_CERT = {
@@ -31,6 +32,33 @@ SAMPLE_START_PAYLOAD = {
 # ---------------------------------------------------------------------------
 # POST /api/controller/start/
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_render_failure_returns_422(client: AsyncClient) -> None:
+    """A ConfigRenderError out of apply_configuration becomes a clean HTTP 422
+    with the detail, and create_compose/start never run (no half-started instance)."""
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+        # The router's `except compose.ConfigRenderError` needs the REAL class.
+        mock_compose.ConfigRenderError = compose.ConfigRenderError
+        mock_compose.apply_configuration.side_effect = compose.ConfigRenderError(
+            "realm.json: 'config' has no attribute 'OIDC_RP_CLIENT_SECRET'"
+        )
+
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 422
+    assert "realm.json" in r.json()["detail"]
+    mock_compose.create_compose.assert_not_called()
+    mock_compose.start.assert_not_called()
 
 
 @pytest.mark.asyncio

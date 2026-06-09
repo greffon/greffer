@@ -15,7 +15,7 @@ import logging
 import time
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth import require_token
 from app.models.controller import (
@@ -79,6 +79,11 @@ def start_greffon(
     greffon = payload.model_dump()
     compose_file = repository.get_compose_file_from_repository(greffon)
     greffon_info = repository.get_greffon_info(compose_file, greffon)
+    # Build the Jinja render context (instance_*, integrations, config) ONCE,
+    # before apply_configuration, so render-flagged baked files can reference
+    # it. Mutates greffon_info in place (setdefault); create_compose's own
+    # context calls are idempotent no-ops afterward.
+    compose.build_render_context(greffon_info)
     # L4 (Tier-C) ports are published directly on their service. The bind
     # interface depends on this greffer's mode: proxy publishes on the public
     # interface; tunnel binds host-internal (reached by the rathole-client, not
@@ -89,7 +94,16 @@ def start_greffon(
         else '0.0.0.0'
     )
     compose_template = compose.get_compose_template(compose_file, greffon_info)
-    compose.apply_configuration(greffon_info, compose_file)
+    try:
+        compose.apply_configuration(greffon_info, compose_file)
+    except compose.ConfigRenderError as exc:
+        # A render-flagged baked file referenced a missing/typo'd variable.
+        # Fail loudly with a clean 422 instead of an opaque 500. No half-started
+        # instance: this runs before create_compose/start and before any volume
+        # copy. Files written for earlier destinations in the same pass stay on
+        # the greffon path unreferenced (nothing is copied into a volume) and are
+        # overwritten on the next deploy attempt.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     compose.create_compose(compose_template, greffon_info)
     conf.create_nginx_conf(greffon_info)
     compose.create_volumes_then_copy_files(greffon_info)
