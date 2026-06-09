@@ -162,6 +162,177 @@ class ComputeInstanceContextTests(TestCase):
                 f'malformed url {bad!r} should fall back',
             )
 
+    # ------------------------------------------------------------------
+    # L4 (Tier-C) endpoint vars — instance_l4_host / _port / _endpoint /
+    # _proto. An L4 catalog app (e.g. WireGuard) needs the PUBLIC host:port
+    # its clients dial, which is not a Tier-A https URL, so it templates
+    # {{ instance_l4_endpoint }} / {{ instance_l4_host }} / {{ instance_l4_port }}.
+    # ------------------------------------------------------------------
+
+    _L4_KEYS = (
+        'instance_l4_host',
+        'instance_l4_port',
+        'instance_l4_endpoint',
+        'instance_l4_proto',
+    )
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_proxy_l4_endpoint_from_public_host_and_port_host(self):
+        """PROXY mode (l4_bind_host absent / 0.0.0.0): the greffer knows the
+        public endpoint at render time. Host is GREFFER_PUBLIC_HOST, port is
+        the L4 port's allocated port_host, proto comes from the port."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_host'], 'vpn.example.com')
+        self.assertEqual(info['instance_l4_port'], '51820')
+        self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com:51820')
+        self.assertEqual(info['instance_l4_proto'], 'udp')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_proxy_l4_explicit_bind_host_0000(self):
+        """An explicit l4_bind_host of 0.0.0.0 is still proxy mode and yields a
+        populated endpoint (only 127.0.0.1 means tunnel mode)."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '0.0.0.0',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com:51820')
+        self.assertEqual(info['instance_l4_proto'], 'udp')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_proxy_l4_uses_first_l4_port(self):
+        """The endpoint is computed from the FIRST port whose exposure_tier is
+        'l4', skipping earlier http ports and ignoring later l4 ports."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'ports': [
+                {'port_host': 8080, 'port_container': 80, 'exposure_tier': 'http'},
+                {'port_host': 51820, 'port_container': 51820,
+                 'protocol': 'udp', 'exposure_tier': 'l4'},
+                {'port_host': 51821, 'port_container': 51821,
+                 'protocol': 'tcp', 'exposure_tier': 'l4'},
+            ],
+        })
+
+        self.assertEqual(info['instance_l4_port'], '51820')
+        self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com:51820')
+        self.assertEqual(info['instance_l4_proto'], 'udp')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_tunnel_l4_endpoint_is_empty(self):
+        """TUNNEL mode (l4_bind_host == 127.0.0.1): the public endpoint is
+        allocated manager-side after the greffer responds, so it is not
+        knowable at render time — all four L4 vars are empty."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '127.0.0.1',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        for key in self._L4_KEYS:
+            self.assertEqual(info[key], '', f'{key} must be empty in tunnel mode')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_no_l4_port_yields_empty_l4_vars(self):
+        """Only http ports ⇒ no L4 endpoint ⇒ all four L4 vars are empty."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'web',
+            'ports': [
+                {'port_host': 8080, 'port_container': 80, 'exposure_tier': 'http'},
+            ],
+        })
+
+        for key in self._L4_KEYS:
+            self.assertEqual(info[key], '', f'{key} must be empty with no l4 port')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_l4_vars_always_present(self):
+        """The four L4 vars must ALWAYS be defined (never missing) so
+        {{ instance_l4_* }} renders blank instead of raising — across the
+        proxy, tunnel, no-l4-port, and no-ports cases."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        cases = [
+            # proxy l4
+            {'id': 'a', 'ports': [{'port_host': 51820, 'port_container': 51820,
+                                    'protocol': 'udp', 'exposure_tier': 'l4'}]},
+            # tunnel l4
+            {'id': 'b', 'l4_bind_host': '127.0.0.1',
+             'ports': [{'port_host': 51820, 'port_container': 51820,
+                        'protocol': 'udp', 'exposure_tier': 'l4'}]},
+            # http only
+            {'id': 'c', 'ports': [{'port_host': 8080, 'port_container': 80,
+                                    'exposure_tier': 'http'}]},
+            # no ports at all
+            {'id': 'd', 'ports': []},
+        ]
+        for case in cases:
+            info = _compute_instance_context(case)
+            for key in self._L4_KEYS:
+                self.assertIn(key, info, f'{key} missing for case {case["id"]!r}')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_jinja_render_substitutes_instance_l4_endpoint(self):
+        """End-to-end: a compose env var containing {{ instance_l4_endpoint }}
+        is resolved through the real Template(yaml.dump(...)) render path."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+        compose = {
+            'services': {
+                'wireguard': {
+                    'environment': [
+                        'WG_HOST={{ instance_l4_host }}',
+                        'WG_PORT={{ instance_l4_port }}',
+                        'WG_ENDPOINT={{ instance_l4_endpoint }}',
+                    ],
+                },
+            },
+        }
+        rendered = Template(yaml.dump(compose)).render(**info)
+
+        self.assertIn('WG_HOST=vpn.example.com', rendered)
+        self.assertIn('WG_PORT=51820', rendered)
+        self.assertIn('WG_ENDPOINT=vpn.example.com:51820', rendered)
+
 
 class GetNginxServiceTests(TestCase):
     """Tests for get_nginx_service."""

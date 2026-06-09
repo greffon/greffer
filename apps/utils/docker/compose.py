@@ -320,6 +320,35 @@ def _compute_instance_context(greffon_info):
     greffon_info.setdefault('instance_host', instance_host)
     greffon_info.setdefault('instance_port', instance_port)
     greffon_info.setdefault('instance_url', instance_url)
+
+    # L4 (Tier-C) endpoint vars for catalog templating. An L4 app needs the
+    # PUBLIC host:port its clients dial (e.g. WireGuard's WG_HOST / WG_PORT),
+    # which is NOT a Tier-A https URL, so {{ instance_url }} can't express it.
+    # In PROXY mode the greffer knows the endpoint at render time:
+    # GREFFER_PUBLIC_HOST + the allocated host port. In TUNNEL mode the public
+    # endpoint is RATHOLE_PUBLIC_HOST:tunnel_port, allocated manager-side AFTER
+    # the greffer responds, so it is not knowable here (tunnel-mode UDP is gated
+    # to phase 2); the vars are left empty. Always set (even empty) so
+    # {{ instance_l4_* }} renders blank instead of erroring.
+    l4_first = next(
+        (p for p in ports
+         if isinstance(p, dict) and p.get('exposure_tier') == 'l4'),
+        None,
+    )
+    if l4_first is not None and greffon_info.get('l4_bind_host') != '127.0.0.1':
+        l4_host = fallback_host
+        l4_port = str(l4_first.get('port_host') or '')
+        greffon_info.setdefault('instance_l4_host', l4_host)
+        greffon_info.setdefault('instance_l4_port', l4_port)
+        greffon_info.setdefault(
+            'instance_l4_endpoint',
+            f'{l4_host}:{l4_port}' if l4_port else l4_host)
+        greffon_info.setdefault('instance_l4_proto', l4_first.get('protocol', 'tcp'))
+    else:
+        greffon_info.setdefault('instance_l4_host', '')
+        greffon_info.setdefault('instance_l4_port', '')
+        greffon_info.setdefault('instance_l4_endpoint', '')
+        greffon_info.setdefault('instance_l4_proto', '')
     return greffon_info
 
 
