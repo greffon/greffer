@@ -169,6 +169,8 @@ class GetGreffonInfoTests(TestCase):
 
         result = get_greffon_info(compose, greffon)
 
-        mock_get_free_ports.assert_called_once_with(numbers=1)
+        # L4 feature: host ports are now allocated batched per protocol, so the
+        # call carries the explicit protocol kwarg (a single tcp port here).
+        mock_get_free_ports.assert_called_once_with(numbers=1, protocol='tcp')
         # The first (and only) port should have port_host set
         self.assertEqual(result['ports'][0]['port_host'], 9000)
