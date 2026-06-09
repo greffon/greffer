@@ -209,6 +209,8 @@ def _render_json_value(value, greffon_info, dest_name):
     if isinstance(value, str):
         return _render_baked_file(value, greffon_info, dest_name)
     if isinstance(value, dict):
+        # Values only, not keys — templated keys are unneeded and would add a
+        # duplicate-key failure mode. (Intentional.)
         return {k: _render_json_value(v, greffon_info, dest_name) for k, v in value.items()}
     if isinstance(value, list):
         return [_render_json_value(v, greffon_info, dest_name) for v in value]
