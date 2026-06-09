@@ -3,8 +3,9 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import Environment, StrictUndefined, Template
-from jinja2.exceptions import TemplateError, UndefinedError
+from jinja2 import StrictUndefined, Template
+from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
+from jinja2.sandbox import SandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -23,13 +24,24 @@ logger = logging.getLogger(__name__)
 # fail the deploy loudly instead. ``autoescape=False`` because these are
 # config files (JSON/conf), not HTML, and we must not HTML-escape values.
 #
-# StrictUndefined is the runtime backstop, not the whole gate: it only fires
-# on attribute/item access, so the idioms ``{{ config.get('X') }}`` and
-# ``{{ ... | default }}`` would still silently render empty. The catalog
-# validator is the author-facing gate that rejects those bypass forms (and
-# rejects ``{{ <integration>.* }}`` refs, which would hard-abort here because
-# an unset integration is ``{}``). The two layers are intentional.
-_FILE_RENDER_ENV = Environment(
+# SANDBOXED: the template string is catalog-author-controlled, and the catalog
+# is community-extensible, so we must assume it can be hostile. A plain
+# Environment would allow server-side template injection -> RCE on this worker
+# (which holds the instance's minted secrets, the greffer's manager token, and
+# Docker socket access), e.g.
+# ``{{ cycler.__init__.__globals__.os.popen('id').read() }}``. SandboxedEnvironment
+# blocks attribute traversal to unsafe objects while still rendering the
+# legitimate ``{{ config.X }}`` / ``{{ instance_url }}`` references. A
+# SecurityError surfaces as a clean ConfigRenderError (-> 422), like any other
+# render failure.
+#
+# StrictUndefined makes a missing/typo'd variable raise rather than render empty
+# (a baked secret silently becoming '' is a security failure). The catalog
+# validator is a SEPARATE, author-facing layer that rejects StrictUndefined
+# *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
+# it is NOT an SSTI gate — the sandbox is what stops injection.
+# ``autoescape=False`` because these are config files (JSON/conf), not HTML.
+_FILE_RENDER_ENV = SandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
 )
 
@@ -174,16 +186,33 @@ def build_render_context(greffon_info):
     return greffon_info
 
 
-def _render_baked_file(text, greffon_info, dest_name):
-    """Strict-render baked file/json text; raise ConfigRenderError on a
-    missing/typo'd variable (no silent empty secret)."""
+def _render_baked_file(raw, greffon_info, dest_name):
+    """Sandboxed strict-render of baked file content (str or bytes). Raises
+    ConfigRenderError (-> HTTP 422) on a missing/typo'd variable, an SSTI/
+    security violation, or non-UTF-8 bytes — so none of those leak as a 500 or
+    a silently-wrong file. SecurityError is a TemplateError subclass (listed
+    explicitly for clarity)."""
     try:
+        text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
         return _FILE_RENDER_ENV.from_string(text).render(**greffon_info)
-    except (UndefinedError, TemplateError) as exc:
-        # Log the offending variable name (UndefinedError message), never the
-        # resolved secret values.
+    except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError) as exc:
+        # Log the offending variable name / reason, never the resolved secret.
         logger.error("baked-file render failed for %s: %s", dest_name, exc)
         raise ConfigRenderError(f"{dest_name}: {exc}") from exc
+
+
+def _render_json_value(value, greffon_info, dest_name):
+    """Render Jinja in the STRING LEAVES of a json-destination value (then the
+    caller ``json.dumps`` the result). Rendering leaves rather than the
+    serialized string means ``json.dumps`` escapes the substituted values, so a
+    minted secret containing a quote or backslash can't corrupt the JSON."""
+    if isinstance(value, str):
+        return _render_baked_file(value, greffon_info, dest_name)
+    if isinstance(value, dict):
+        return {k: _render_json_value(v, greffon_info, dest_name) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_render_json_value(v, greffon_info, dest_name) for v in value]
+    return value
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
@@ -426,9 +455,12 @@ def apply_configuration(greffon_info, compose):
         for destination in configuration.get('destinations', []):
             if destination['type'] == 'json':
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
-                text = json.dumps(configuration['value'])
+                value = configuration['value']
                 if destination.get('x-greffon-render'):
-                    text = _render_baked_file(text, greffon_info, destination['name'])
+                    # Render the value's string leaves, THEN serialize, so
+                    # json.dumps escapes substituted values (no corrupt JSON).
+                    value = _render_json_value(value, greffon_info, destination['name'])
+                text = json.dumps(value)
                 with open(file_path, "w") as f:   # Opens file and casts as f
                     f.write(text)
                 greffon_info['volumes'][destination['volume']]['files'].append({
@@ -450,8 +482,9 @@ def apply_configuration(greffon_info, compose):
                 # for percent-encoded ones — normalize before writing/rendering.
                 raw = DataURI(configuration['value']['file']).data
                 if destination.get('x-greffon-render'):
-                    text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
-                    data = _render_baked_file(text, greffon_info, destination['name']).encode('utf-8')
+                    # _render_baked_file decodes (and turns non-UTF-8 into a
+                    # clean 422) — pass raw str/bytes straight through.
+                    data = _render_baked_file(raw, greffon_info, destination['name']).encode('utf-8')
                 else:
                     data = raw if isinstance(raw, bytes) else raw.encode('utf-8')
                     # Rollout self-warn: a verbatim file that still carries Jinja

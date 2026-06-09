@@ -150,8 +150,46 @@ class RenderFileTests(unittest.TestCase):
         with self.assertRaises(ConfigRenderError):
             self._run(info)
 
+    def test_ssti_payload_is_blocked_by_sandbox(self):
+        # A catalog-controlled template must NOT be able to reach Python internals
+        # (SSTI -> RCE). The sandbox raises SecurityError -> ConfigRenderError.
+        payload = "{{ cycler.__init__.__globals__ }}"
+        info = _greffon_info(_b64_datauri(payload), render=True)
+        with self.assertRaises(ConfigRenderError):
+            self._run(info)
+
+    def test_render_flagged_binary_raises_config_render_error(self):
+        # Non-UTF-8 bytes flagged for render -> clean ConfigRenderError (422),
+        # not a raw UnicodeDecodeError (500).
+        uri = "data:application/octet-stream;base64," + base64.b64encode(b"\xff\xfe\xfd").decode("ascii")
+        info = _greffon_info(uri, render=True)
+        with self.assertRaises(ConfigRenderError):
+            self._run(info)
+
 
 class RenderJsonTests(unittest.TestCase):
+    def test_json_render_escapes_substituted_values(self):
+        # A secret with JSON metachars must not corrupt the rendered JSON:
+        # leaves are rendered, THEN json.dumps escapes them.
+        info = {
+            "id": "inst-json2",
+            "ports": [{"url": "https://app.example.com"}],
+            "configurations": [
+                {"value": {"value": 'ab"cd\\ef'},
+                 "destinations": [{"type": "env", "container": "backend", "key": "S"}]},
+                {"value": {"secret": "{{ config.S }}"},
+                 "destinations": [{"type": "json", "name": "s.json", "volume": "v",
+                                   "x-greffon-render": True}]},
+            ],
+            "volumes": {"v": {"files": []}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"GREFFON_PATH": tmp}):
+                build_render_context(info)
+                apply_configuration(info, {"services": {"backend": {"environment": {}}}})
+                with open(os.path.join(tmp, "inst-json2", "s.json")) as f:
+                    data = json.load(f)  # raises if the file is not valid JSON
+        self.assertEqual(data["secret"], 'ab"cd\\ef')
     def test_json_render_when_flagged(self):
         info = {
             "id": "inst-json",
