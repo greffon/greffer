@@ -257,6 +257,66 @@ async def test_start_rejects_path_traversal_id(client: AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# L4 (Tier-C) bind-host stamping: greffer_mode → greffon_info['l4_bind_host']
+#
+# start_greffon stamps l4_bind_host onto greffon_info based on this
+# greffer's mode before handing it to compose. Tunnel mode binds
+# host-internal (127.0.0.1, reached only by rathole-client); proxy mode
+# (and the unset/None default) publishes on the public interface
+# (0.0.0.0). This mapping is exercised at the compose layer elsewhere;
+# here we lock it in at the controller level by capturing the
+# greffon_info dict passed into compose.get_compose_template.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_bind_host"),
+    [
+        ("tunnel", "127.0.0.1"),
+        ("proxy", "0.0.0.0"),
+        (None, "0.0.0.0"),
+    ],
+)
+async def test_start_stamps_l4_bind_host_for_mode(
+    client: AsyncClient, mode, expected_bind_host
+) -> None:
+    captured: dict[str, object] = {}
+
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {
+            "ports": [],
+            "id": "test-instance-123",
+        }
+
+        def _capture(_compose_file, greffon_info):
+            # Snapshot the bind host at the moment compose sees it, so a
+            # later mutation of the shared dict can't mask a wrong value.
+            captured["l4_bind_host"] = greffon_info.get("l4_bind_host")
+            return {}
+
+        mock_compose.get_compose_template.side_effect = _capture
+        # Short-circuit _wait_for_compose_running (not reached here since
+        # SAMPLE_START_PAYLOAD carries no tunnel_client_toml, but harmless).
+        mock_compose.get_status.return_value = {"status": "running"}
+
+        with patch.object(
+            client._transport.app.state.settings, "greffer_mode", mode
+        ):
+            r = await client.post(
+                "/api/controller/start/",
+                json=SAMPLE_START_PAYLOAD,
+                headers={TOKEN_HEADER: "test-token"},
+            )
+
+    assert r.status_code == 200
+    assert captured["l4_bind_host"] == expected_bind_host
+
+
+# ---------------------------------------------------------------------------
 # POST /api/controller/stop/
 # ---------------------------------------------------------------------------
 

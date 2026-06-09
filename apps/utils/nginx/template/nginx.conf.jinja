@@ -43,15 +43,15 @@ http {
   send_timeout 10;
 
   proxy_connect_timeout 15;
-  {% for port in ports %}
-  upstream {{port.container_name}}_{{port.port_container}} {  
+  {% for port in http_ports %}
+  upstream {{port.container_name}}_{{port.port_container}} {
     server {{port.container_name}}:{{port.port_container}};
     keepalive_timeout 0;
   }
   {% endfor %}
 
   # include virtual servers
-  {% for port in ports %}
+  {% for port in http_ports %}
   server {
   #listen 443 ssl default_server;
   listen {{port.port_container}} ssl;

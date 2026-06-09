@@ -13,10 +13,19 @@ from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create
 
 def get_nginx_service(greffon):
     #@Todo should handle conflict port
+    # L4 (Tier-C) ports are NOT proxied by nginx (it cannot carry raw TCP/UDP);
+    # they are published directly on their owning service in
+    # create_compose_template_from_greffon. The enumerate index is over the FULL
+    # ports list so {{ports[i].port_host}} still resolves correctly after the
+    # L4 entries are filtered out.
     return {
         'image': 'nginx:1.20.2-alpine-perl',
         'restart': 'unless-stopped',
-        'ports': [ ('{{ports[%s].port_host}}:%s' % (i, port['port_container'])) for i, port in enumerate(greffon['ports'])],
+        'ports': [
+            ('{{ports[%s].port_host}}:%s' % (i, port['port_container']))
+            for i, port in enumerate(greffon['ports'])
+            if port.get('exposure_tier', 'http') != 'l4'
+        ],
         'networks': [greffon['internal_network']],
     }
 
@@ -30,6 +39,21 @@ def create_compose_template_from_greffon(compose, greffon_info):
         if 'container_name' in service:
             del service['container_name']
     compose['services']['greffon_nginx'] = get_nginx_service(greffon_info)
+    # Publish L4 (Tier-C) ports directly on their owning service, bypassing the
+    # nginx sidecar. proxy mode binds the public interface (0.0.0.0); tunnel
+    # mode binds host-internal (127.0.0.1), reachable by the rathole-client.
+    # The /<proto> suffix selects raw TCP or UDP. Keyed by the original service
+    # name (container_name) before the rename below.
+    l4_bind_host = greffon_info.get('l4_bind_host', '0.0.0.0')
+    for i, port in enumerate(greffon_info['ports']):
+        if port.get('exposure_tier', 'http') != 'l4':
+            continue
+        proto_suffix = '/udp' if port.get('protocol') == 'udp' else ''
+        mapping = '%s:{{ports[%s].port_host}}:%s%s' % (
+            l4_bind_host, i, port['port_container'], proto_suffix)
+        service = compose['services'][port['container_name']]
+        service.setdefault('ports', [])
+        service['ports'].append(mapping)
     for _,volume in greffon_info['volumes'].items():
         for container_name, container in volume['containers'].items():
             compose['services'][container_name].setdefault('volumes', [])
