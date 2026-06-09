@@ -7,6 +7,8 @@ from typing import Literal
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app import __version__
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -22,6 +24,12 @@ class Settings(BaseSettings):
     # token each process. Used as ``X-GREFFON-TOKEN`` on the manager →
     # greffer auth path (start/stop/tunnel-config endpoints).
     greffer_token: str | None = None
+
+    # Greffer software version, reported in the register payload. Defaults to
+    # the worker's ``app.__version__``; overridable via ``GREFFER_VERSION`` (e.g.
+    # a build/release stamp). The manager stamps ``Greffer.version`` from this
+    # and uses it for the per-greffon ``min_greffer_version`` compat gate.
+    greffer_version: str = __version__
 
     # Optional mode declaration, included in the register payload so the
     # manager can stamp ``Greffer.mode`` on first register or validate

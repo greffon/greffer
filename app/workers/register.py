@@ -129,6 +129,12 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
         "port": str(settings.greffer_port),
         "token": token,
         "protocol": settings.greffer_protocol,
+        # Greffer software version (always sent). The manager stamps
+        # Greffer.version from this on every (re-)register and uses it for the
+        # per-greffon min_greffer_version compatibility gate. An older greffer
+        # without this field leaves Greffer.version null -> treated as below any
+        # floor (fail-safe deny).
+        "version": settings.greffer_version,
     }
     # Include greffer_mode in the register payload only when the operator
     # has set it explicitly. The manager's register endpoint accepts an
