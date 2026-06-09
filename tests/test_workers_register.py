@@ -40,11 +40,46 @@ def test_post_register_passes_correct_payload(settings: Settings) -> None:
     assert kwargs["json"]["protocol"] == settings.greffer_protocol
     # port must be posted as a str — legacy wire format.
     assert kwargs["json"]["port"] == str(settings.greffer_port)
+    # version is always sent so the manager can stamp Greffer.version and
+    # enforce the per-greffon min_greffer_version compatibility gate.
+    assert kwargs["json"]["version"] == settings.greffer_version
     assert kwargs["verify"] == settings.greffer_ssl_verify
     # mode is omitted when settings.greffer_mode is unset — preserves the
     # pre-tunnel-feature behaviour for proxy greffers (manager treats a
     # missing mode as MODE_PROXY default).
     assert "mode" not in kwargs["json"]
+
+
+def test_post_register_version_defaults_to_app_version(settings: Settings) -> None:
+    """With GREFFER_VERSION unset, the register payload carries the worker's
+    own ``app.__version__`` — the single source the manager stamps onto
+    ``Greffer.version`` for the compat gate."""
+    from app import __version__
+
+    # Sanity: the fixture didn't set GREFFER_VERSION, so the default applies.
+    assert settings.greffer_version == __version__ == "0.2.0"
+    with patch("app.workers.register.requests") as mock_requests:
+        _post_register(settings, "10.0.0.1", "tok")
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["json"]["version"] == "0.2.0"
+
+
+def test_post_register_version_overridable_via_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``GREFFER_VERSION`` overrides the default (e.g. a build/release stamp);
+    the override flows straight into the register payload."""
+    from app.settings import Settings, get_settings
+
+    monkeypatch.setenv("GREFFER_ID", "test-greffer-id")
+    monkeypatch.setenv("GREFFER_VERSION", "9.9.9-rc1")
+    get_settings.cache_clear()
+    overridden = Settings()
+    assert overridden.greffer_version == "9.9.9-rc1"
+    with patch("app.workers.register.requests") as mock_requests:
+        _post_register(overridden, "10.0.0.1", "tok")
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["json"]["version"] == "9.9.9-rc1"
 
 
 def test_post_register_includes_mode_when_set(settings: Settings) -> None:
