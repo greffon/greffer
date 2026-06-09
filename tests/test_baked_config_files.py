@@ -158,6 +158,13 @@ class RenderFileTests(unittest.TestCase):
         with self.assertRaises(ConfigRenderError):
             self._run(info)
 
+    def test_tojson_on_undefined_raises_config_render_error(self):
+        # `{{ x | tojson }}` on a missing key raises TypeError (not serializable),
+        # which must surface as a clean ConfigRenderError -> 422, not a 500.
+        info = _greffon_info(_b64_datauri('{"s": {{ config.MISSING | tojson }}}'), render=True)
+        with self.assertRaises(ConfigRenderError):
+            self._run(info)
+
     def test_render_flagged_binary_raises_config_render_error(self):
         # Non-UTF-8 bytes flagged for render -> clean ConfigRenderError (422),
         # not a raw UnicodeDecodeError (500).

@@ -195,7 +195,11 @@ def _render_baked_file(raw, greffon_info, dest_name):
     try:
         text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
         return _FILE_RENDER_ENV.from_string(text).render(**greffon_info)
-    except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError) as exc:
+    except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError,
+            TypeError, ValueError) as exc:
+        # TypeError/ValueError: e.g. `{{ x | tojson }}` on an undefined x raises
+        # "not JSON serializable" rather than UndefinedError — still a render
+        # failure, so a clean 422, not a 500.
         # Log the offending variable name / reason, never the resolved secret.
         logger.error("baked-file render failed for %s: %s", dest_name, exc)
         raise ConfigRenderError(f"{dest_name}: {exc}") from exc
