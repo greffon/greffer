@@ -261,6 +261,53 @@ class ComputeInstanceContextTests(TestCase):
             self.assertEqual(info[key], '', f'{key} must be empty in tunnel mode')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_tunnel_tcp_l4_endpoint_is_empty(self):
+        """TUNNEL mode is protocol-agnostic: a TCP (not udp) l4 port with
+        l4_bind_host == 127.0.0.1 still empties all four L4 vars. The tunnel
+        branch keys off l4_bind_host alone, never the port protocol — so it
+        must behave identically for tcp and udp."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '127.0.0.1',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'tcp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        for key in self._L4_KEYS:
+            self.assertEqual(
+                info[key], '', f'{key} must be empty in tunnel mode (tcp)')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_proxy_l4_missing_port_host_yields_host_only_endpoint(self):
+        """PROXY mode with an l4 port that has no (or falsy) port_host: the
+        ``or ''`` guard keeps port empty and the endpoint host-only (no
+        trailing ':'), without raising. Confirms graceful degradation if
+        port_host is ever absent from the manager payload."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '0.0.0.0',
+            'ports': [{
+                # port_host deliberately absent.
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_host'], 'vpn.example.com')
+        self.assertEqual(info['instance_l4_port'], '')
+        self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com')
+        self.assertNotIn(':', info['instance_l4_endpoint'])
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
     def test_no_l4_port_yields_empty_l4_vars(self):
         """Only http ports ⇒ no L4 endpoint ⇒ all four L4 vars are empty."""
         from apps.utils.docker.compose import _compute_instance_context
