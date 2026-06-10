@@ -1,0 +1,44 @@
+# UDP soak rig for the tunnel-mode L4 acceptance bar.
+#
+# Run on a Linux Docker Engine host (the production runtime). Docker Desktop
+# masks loopback-vs-relay behaviour (see Gap 0 in the l4-network-exposure
+# tunnel notes), so numbers from it are not representative.
+#
+# Topology:
+#   echo            a UDP echo, ALSO published directly as the proxy-mode baseline
+#   rathole-server  the relay; publishes the UDP data port :10000 (the relay target)
+#   rathole-client  forwards the relayed service to the echo
+#
+# The driver (udp_soak.py) runs from the host against :7777 (baseline, no relay)
+# and :10000 (relay); compare_soak.py applies the bar. See README.md / run-soak.sh.
+services:
+  echo:
+    image: python:3.12-alpine
+    command: ["python", "/app/udp_echo.py", "0.0.0.0", "7777"]
+    volumes:
+      - ./udp_echo.py:/app/udp_echo.py:ro
+    ports:
+      - "7777:7777/udp"        # baseline: direct UDP echo (proxy-mode equivalent)
+    networks: [soak]
+
+  rathole-server:
+    image: greffon/rathole-server:latest
+    volumes:
+      - ./server.toml:/config/server.toml:ro
+    ports:
+      - "10000:10000/udp"      # relay: rathole-server UDP data port (the relay target)
+    networks: [soak]
+
+  rathole-client:
+    image: greffon/rathole-server:latest
+    # The image entrypoint waits for a server.toml service block, then runs
+    # `rathole --server`. Override it to run as a client instead.
+    entrypoint: ["rathole"]
+    command: ["--client", "/config/client.toml"]
+    volumes:
+      - ./client.toml:/config/client.toml:ro
+    depends_on: [rathole-server, echo]
+    networks: [soak]
+
+networks:
+  soak:
