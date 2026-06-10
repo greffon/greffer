@@ -1,0 +1,72 @@
+name: udp-soak
+
+# Tunnel-mode UDP relay soak (l4-network-exposure). Brings up the rathole rig,
+# runs the proxy-mode baseline and the relay, and reports latency / loss.
+#
+# CI is for RIG VALIDATION + regression detection on a GENEROUS bar; shared
+# runners are too noisy to certify a tight production bar (set that on a quiet
+# host). The compare step is informational here (it does not fail the job) so the
+# numbers always surface, including on a broken rig (you want to SEE 100% loss).
+#
+# The `push` trigger is a one-off so this branch's first push runs the soak on
+# real Linux. Before merge, drop `push` and keep workflow_dispatch (+ a nightly
+# schedule if we want a standing regression check).
+on:
+  workflow_dispatch:
+    inputs:
+      flows:
+        description: concurrent UDP flows
+        default: "10"
+      rate:
+        description: datagrams/s per flow
+        default: "200"
+      duration:
+        description: seconds per run
+        default: "30"
+  push:
+    branches: [feat/tunnel-udp-soak]
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: loadtest/tunnel-udp-soak
+    env:
+      FLOWS: ${{ github.event.inputs.flows || '10' }}
+      RATE: ${{ github.event.inputs.rate || '200' }}
+      DURATION: ${{ github.event.inputs.duration || '30' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring up the rig (echo + rathole-server + rathole-client)
+        run: docker compose -f docker-compose.soak.yml up -d
+
+      - name: Wait for the rathole control + data channel
+        run: sleep 8
+
+      - name: Rig status
+        run: docker compose -f docker-compose.soak.yml ps
+
+      - name: Baseline (direct UDP, proxy-mode equivalent)
+        run: |
+          python3 udp_soak.py --target 127.0.0.1:7777 \
+            --flows "$FLOWS" --rate "$RATE" --duration "$DURATION" | tee baseline.json
+
+      - name: Relay (through rathole)
+        run: |
+          python3 udp_soak.py --target 127.0.0.1:10000 \
+            --flows "$FLOWS" --rate "$RATE" --duration "$DURATION" | tee relay.json
+
+      - name: Compare (informational; generous bar)
+        run: |
+          python3 compare_soak.py --relay relay.json --baseline baseline.json \
+            --max-loss-pct 10 --max-p99-added-ms 200 --max-baseline-loss-pct 5 || true
+
+      - name: Rathole logs (always, for diagnosis)
+        if: always()
+        run: docker compose -f docker-compose.soak.yml logs
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.soak.yml down -v
