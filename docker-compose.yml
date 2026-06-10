@@ -24,7 +24,7 @@ services:
     environment:
       # Feature #3 shipped dormant; flip it on here at the cutover moment.
       # Without this, the greffer would boot with the HTTP surface alive
-      # but no register / monitor / CRL workers — the manager would never
+      # but no register / monitor workers — the manager would never
       # see a cert handshake or instance-status callbacks.
       - GREFFER_WORKERS_ENABLED=true
     extra_hosts:

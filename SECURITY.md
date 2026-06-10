@@ -27,7 +27,7 @@ Include as much as you can:
 
 ## Scope — especially relevant for the greffer
 
-- mTLS certificate / private key handling and the CRL sync path
+- TLS certificate / private key handling (cert install path)
 - Jinja2 rendering of catalog compose templates (template injection, arbitrary host paths)
 - Docker SDK usage (container escape, host mount exposure)
 - The Nginx per-instance proxy config generation

@@ -1,4 +1,4 @@
-"""Register worker — POST to manager, poll for cert, install, fetch initial CRL.
+"""Register worker — POST to manager, poll for cert, install.
 
 Ports ``apps/utils/greffon/base_server.py:register()`` to asyncio. The outer
 loops are rewritten as async so they cancel cleanly on lifespan shutdown;
@@ -101,9 +101,6 @@ async def register_worker(app: FastAPI) -> None:
                 settings,
                 data,
                 abandon_on_cancel=True,
-            )
-            await anyio.to_thread.run_sync(
-                _fetch_and_store_crl, settings, abandon_on_cancel=True
             )
             logger.info("register complete")
             return
@@ -221,27 +218,3 @@ def _maybe_install_initial_tunnel_config(
         return
     if wrote:
         logger.info("initial_tunnel_config_installed path=%s", target)
-
-
-def _fetch_and_store_crl(settings: Settings) -> None:
-    """Fetch CRL from manager, copy into nginx container. Shared with
-    ``crl_sync_worker`` (see ``app/workers/crl.py``)."""
-    from apps.utils.docker.base import copy_file_into_container
-
-    try:
-        res = requests.get(
-            f"{settings.greffon_base_server}/api/greffer/ca/crl/",
-            verify=settings.greffer_ssl_verify,
-            timeout=10,
-        )
-        if res.status_code == 200:
-            copy_file_into_container(
-                settings.docker_nginx_name, "/root", "revoked.crl", res.text
-            )
-            logger.info("CRL updated successfully")
-        else:
-            logger.warning("Failed to fetch CRL: HTTP %s", res.status_code)
-    except Exception as e:
-        # Preserve legacy behavior: log and continue. The caller's async
-        # loop handles retry timing.
-        logger.warning("Failed to fetch CRL: %s", e)

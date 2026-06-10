@@ -38,10 +38,10 @@ async def test_lifespan_no_tasks_when_workers_disabled(
 
 
 @pytest.mark.asyncio
-async def test_lifespan_starts_three_workers_when_enabled(
+async def test_lifespan_starts_workers_when_enabled(
     settings: Settings,
 ) -> None:
-    """``greffer_workers_enabled=True`` → three tasks started with expected
+    """``greffer_workers_enabled=True`` → both tasks started with expected
     names, cancelled on shutdown."""
     settings.greffer_workers_enabled = True  # type: ignore[misc]
     app = create_app(token="t", settings=settings)
@@ -54,20 +54,18 @@ async def test_lifespan_starts_three_workers_when_enabled(
     # reaches them before `start_workers` looks them up.
     with patch("app.workers.register_worker", new=_noop_worker), patch(
         "app.workers.monitor_worker", new=_noop_worker
-    ), patch("app.workers.crl_sync_worker", new=_noop_worker):
+    ):
         async with lifespan(app):
             current_names = {
                 t.get_name() for t in asyncio.all_tasks() if not t.done()
             }
             assert "greffer-register" in current_names
             assert "greffer-monitor" in current_names
-            assert "greffer-crl-sync" in current_names
 
     # After lifespan shutdown the worker tasks must be gone.
     leftover = {t.get_name() for t in asyncio.all_tasks() if not t.done()}
     assert "greffer-register" not in leftover
     assert "greffer-monitor" not in leftover
-    assert "greffer-crl-sync" not in leftover
 
 
 def test_greffer_workers_enabled_env_var_binds(

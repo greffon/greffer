@@ -32,7 +32,6 @@ def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.greffer_public_scheme == "https"
     assert s.greffon_path == Path("/data")
     assert s.docker_nginx_name == "greffer-nginx-1"
-    assert s.crl_sync_interval == 300
     assert s.monitor_interval == 5
     assert s.skip_ops_migrations is False
     assert s.logger_name == "greffer"
@@ -41,11 +40,11 @@ def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_env_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GREFFER_ID", "x")
     monkeypatch.setenv("GREFFON_PATH", "/tmp/alt")
-    monkeypatch.setenv("CRL_SYNC_INTERVAL", "60")
+    monkeypatch.setenv("MONITOR_INTERVAL", "60")
     monkeypatch.setenv("GREFFER_SSL_VERIFY", "false")
     s = Settings()
     assert s.greffon_path == Path("/tmp/alt")
-    assert s.crl_sync_interval == 60
+    assert s.monitor_interval == 60
     assert s.greffer_ssl_verify is False
 
 

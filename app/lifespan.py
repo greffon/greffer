@@ -23,7 +23,7 @@ logger = logging.getLogger("greffer")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """App lifespan — start the three background workers if enabled.
+    """App lifespan — start the background workers if enabled.
 
     ``greffer_workers_enabled`` defaults to False so unit tests don't
     accidentally spawn real workers. Production sets

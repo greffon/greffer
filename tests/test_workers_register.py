@@ -13,7 +13,6 @@ import requests
 from app.main import create_app
 from app.settings import Settings
 from app.workers.register import (
-    _fetch_and_store_crl,
     _fetch_cert,
     _install_cert,
     _maybe_install_initial_tunnel_config,
@@ -148,39 +147,6 @@ def test_install_cert_optional_ca(settings: Settings) -> None:
     )
 
 
-def test_fetch_and_store_crl_happy_path(settings: Settings) -> None:
-    with patch("app.workers.register.requests") as mock_requests, patch(
-        "apps.utils.docker.base.copy_file_into_container"
-    ) as mock_copy:
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.text = "CRL-DATA"
-        mock_requests.get.return_value = mock_response
-        _fetch_and_store_crl(settings)
-    mock_copy.assert_called_once_with(
-        settings.docker_nginx_name, "/root", "revoked.crl", "CRL-DATA"
-    )
-
-
-def test_fetch_and_store_crl_swallows_exception(settings: Settings) -> None:
-    """Any exception is caught and logged — parity with legacy sync_crl."""
-    with patch("app.workers.register.requests") as mock_requests:
-        mock_requests.get.side_effect = requests.ConnectionError("boom")
-        # Must not raise.
-        _fetch_and_store_crl(settings)
-
-
-def test_fetch_and_store_crl_skips_on_non_200(settings: Settings) -> None:
-    with patch("app.workers.register.requests") as mock_requests, patch(
-        "apps.utils.docker.base.copy_file_into_container"
-    ) as mock_copy:
-        mock_response = MagicMock()
-        mock_response.status_code = 500
-        mock_requests.get.return_value = mock_response
-        _fetch_and_store_crl(settings)
-    mock_copy.assert_not_called()
-
-
 def test_resolve_hostname_returns_ip() -> None:
     with patch("app.workers.register.socket") as mock_socket:
         mock_socket.gethostname.return_value = "host"
@@ -195,8 +161,8 @@ def test_resolve_hostname_returns_ip() -> None:
 
 @pytest.mark.asyncio
 async def test_register_worker_happy_path(settings: Settings) -> None:
-    """Happy path: POST succeeds, GET returns 200, cert installs, CRL
-    fetched, worker returns."""
+    """Happy path: POST succeeds, GET returns 200, cert installs,
+    worker returns."""
     app = create_app(token="tok", settings=settings)
     with patch("app.workers.register.requests") as mock_requests, patch(
         "apps.utils.docker.base.copy_file_into_container"
@@ -211,17 +177,13 @@ async def test_register_worker_happy_path(settings: Settings) -> None:
             "certificate": "CERT",
             "private_key": "KEY",
         }
-        crl_response = MagicMock()
-        crl_response.status_code = 200
-        crl_response.text = "CRL"
-        # First GET is cert, second GET is CRL.
-        mock_requests.get.side_effect = [cert_response, crl_response]
+        mock_requests.get.side_effect = [cert_response]
 
         await register_worker(app)
 
     mock_requests.post.assert_called_once()
-    # cert install -> pem.crt + cert.key ; CRL install -> revoked.crl = 3 copies
-    assert mock_copy.call_count == 3
+    # cert install -> pem.crt + cert.key = 2 copies
+    assert mock_copy.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -255,10 +217,7 @@ async def test_register_worker_retries_post_on_connection_error(
         cert_response = MagicMock()
         cert_response.status_code = 200
         cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl_response = MagicMock()
-        crl_response.status_code = 200
-        crl_response.text = "CRL"
-        mock_requests.get.side_effect = [cert_response, crl_response]
+        mock_requests.get.side_effect = [cert_response]
 
         await register_worker(app)
 
@@ -293,10 +252,7 @@ async def test_register_worker_retries_post_on_timeout(
         cert_response = MagicMock()
         cert_response.status_code = 200
         cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl = MagicMock()
-        crl.status_code = 200
-        crl.text = "CRL"
-        mock_requests.get.side_effect = [cert_response, crl]
+        mock_requests.get.side_effect = [cert_response]
 
         await register_worker(app)
 
@@ -352,22 +308,18 @@ async def test_register_worker_survives_cert_poll_transient_error(
         cert_response = MagicMock()
         cert_response.status_code = 200
         cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl = MagicMock()
-        crl.status_code = 200
-        crl.text = "CRL"
-        # Sequence: connection error, timeout, success, CRL.
+        # Sequence: connection error, timeout, success.
         mock_requests.get.side_effect = [
             requests.ConnectionError("blip"),
             requests.Timeout("slow"),
             cert_response,
-            crl,
         ]
 
         # Must complete without propagating the transient errors.
         await register_worker(app)
 
-    # Two failed polls + one successful cert fetch + one CRL fetch = 4 GETs.
-    assert mock_requests.get.call_count == 4
+    # Two failed polls + one successful cert fetch = 3 GETs.
+    assert mock_requests.get.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -391,15 +343,12 @@ async def test_register_worker_polls_cert_until_200(
         success = MagicMock()
         success.status_code = 200
         success.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl = MagicMock()
-        crl.status_code = 200
-        crl.text = "CRL"
-        mock_requests.get.side_effect = [fail, fail, success, crl]
+        mock_requests.get.side_effect = [fail, fail, success]
 
         await register_worker(app)
 
-    # 2 failed cert polls + 1 successful + 1 CRL fetch = 4
-    assert mock_requests.get.call_count == 4
+    # 2 failed cert polls + 1 successful = 3
+    assert mock_requests.get.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -422,10 +371,7 @@ async def test_register_worker_uses_token_from_app_state(
         cert_response = MagicMock()
         cert_response.status_code = 200
         cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl = MagicMock()
-        crl.status_code = 200
-        crl.text = "CRL"
-        mock_requests.get.side_effect = [cert_response, crl]
+        mock_requests.get.side_effect = [cert_response]
 
         await register_worker(app)
 
@@ -455,10 +401,7 @@ async def test_register_worker_falls_back_to_hostname(
         cert_response = MagicMock()
         cert_response.status_code = 200
         cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
-        crl = MagicMock()
-        crl.status_code = 200
-        crl.text = "CRL"
-        mock_requests.get.side_effect = [cert_response, crl]
+        mock_requests.get.side_effect = [cert_response]
 
         await register_worker(app)
 

@@ -1,17 +1,22 @@
 """Background workers — greffer lifecycle tasks running under FastAPI lifespan.
 
-Three workers port the Django daemon threads at ``apps/controller/views.py:14-22``:
+Two workers port the Django daemon threads at ``apps/controller/views.py:14-22``:
 
 * ``register_worker`` — one-shot; POSTs registration + polls for cert.
 * ``monitor_worker`` — forever loop; reports greffon instance status changes.
-* ``crl_sync_worker`` — forever loop; fetches updated CRL periodically.
+
+(A third legacy worker, ``crl_sync_worker``, copied the manager's CRL
+into the nginx container. Removed: no nginx config ever loaded the file
+(``ssl_crl`` requires client-cert verification, which this nginx does
+not do), so the sync had no effect. Revocation enforcement is deferred
+to the platform's planned step-ca migration.)
 
 Startup is gated by ``Settings.greffer_workers_enabled`` (env var
 ``GREFFER_WORKERS_ENABLED``, default False) so unit tests don't
 accidentally spawn real workers. Production sets it to ``true`` in
 ``docker-compose.yml``.
 
-Single-worker uvicorn only. Multi-worker would spawn N × 3 pollers per
+Single-worker uvicorn only. Multi-worker would spawn N × 2 pollers per
 container, each with a distinct token, fighting over manager state.
 """
 from __future__ import annotations
@@ -21,7 +26,6 @@ import logging
 
 from fastapi import FastAPI
 
-from app.workers.crl import crl_sync_worker
 from app.workers.monitor import monitor_worker
 from app.workers.register import register_worker
 
@@ -32,7 +36,6 @@ def start_workers(app: FastAPI) -> list[asyncio.Task]:
     return [
         asyncio.create_task(register_worker(app), name="greffer-register"),
         asyncio.create_task(monitor_worker(app), name="greffer-monitor"),
-        asyncio.create_task(crl_sync_worker(app), name="greffer-crl-sync"),
     ]
 
 
