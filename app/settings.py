@@ -77,6 +77,16 @@ class Settings(BaseSettings):
 
     greffon_path: Path = Path("/data")
 
+    # L4 (Tier-C) host ports are allocated from this dedicated range, NOT the OS
+    # ephemeral range (ip_local_port_range, typically 32768-60999). A sticky L4
+    # port that lives outside the ephemeral range can't be transiently stolen by
+    # an outbound connection's source port while the instance is stopped, so the
+    # endpoint stays stable across restarts (sticky allocation). Tier-A host
+    # ports stay ephemeral (their host port is an internal nginx upstream, never
+    # user-facing).
+    greffer_l4_port_range_start: int = 20000
+    greffer_l4_port_range_end: int = 29999
+
     docker_nginx_name: str = "greffer-nginx-1"
 
     crl_sync_interval: int = 300
