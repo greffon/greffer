@@ -261,6 +261,35 @@ class ComputeInstanceContextTests(TestCase):
             self.assertEqual(info[key], '', f'{key} must be empty in tunnel mode')
 
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
+    def test_tunnel_l4_endpoint_preserves_preset_manager_values(self):
+        """Gap 2: when the controller has pre-seeded the manager-supplied
+        public endpoint (RATHOLE_PUBLIC_HOST:tunnel_port) onto greffon_info,
+        the tunnel branch must NOT clobber it back to empty (the setdefault
+        calls leave the pre-set values intact). This is the mechanism the
+        endpoint hand-off relies on."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '127.0.0.1',
+            'instance_l4_host': 'tunnel.greffon.io',
+            'instance_l4_port': '20007',
+            'instance_l4_endpoint': 'tunnel.greffon.io:20007',
+            'instance_l4_proto': 'udp',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_host'], 'tunnel.greffon.io')
+        self.assertEqual(info['instance_l4_port'], '20007')
+        self.assertEqual(info['instance_l4_endpoint'], 'tunnel.greffon.io:20007')
+        self.assertEqual(info['instance_l4_proto'], 'udp')
+
+    @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
     def test_tunnel_tcp_l4_endpoint_is_empty(self):
         """TUNNEL mode is protocol-agnostic: a TCP (not udp) l4 port with
         l4_bind_host == 127.0.0.1 still empties all four L4 vars. The tunnel

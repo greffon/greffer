@@ -344,6 +344,95 @@ async def test_start_stamps_l4_bind_host_for_mode(
     assert captured["l4_bind_host"] == expected_bind_host
 
 
+@pytest.mark.asyncio
+async def test_start_tunnel_injects_manager_l4_endpoint(client: AsyncClient) -> None:
+    """Gap 2: in tunnel mode the manager supplies the public L4 endpoint
+    (RATHOLE_PUBLIC_HOST:tunnel_port) in the start payload; the controller
+    feeds it into the render context as instance_l4_* so a self-configuring
+    app boots advertising the right endpoint."""
+    captured: dict[str, object] = {}
+
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "test-instance-123"}
+
+        def _capture(_compose_file, greffon_info):
+            for k in (
+                "instance_l4_host", "instance_l4_port",
+                "instance_l4_endpoint", "instance_l4_proto",
+            ):
+                captured[k] = greffon_info.get(k)
+            return {}
+
+        mock_compose.get_compose_template.side_effect = _capture
+        mock_compose.get_status.return_value = {"status": "running"}
+
+        payload = {
+            **SAMPLE_START_PAYLOAD,
+            "instance_l4_host": "tunnel.greffon.io",
+            "instance_l4_port": 20007,
+            "instance_l4_proto": "udp",
+        }
+        with patch.object(
+            client._transport.app.state.settings, "greffer_mode", "tunnel"
+        ):
+            r = await client.post(
+                "/api/controller/start/",
+                json=payload,
+                headers={TOKEN_HEADER: "test-token"},
+            )
+
+    assert r.status_code == 200
+    assert captured["instance_l4_host"] == "tunnel.greffon.io"
+    assert captured["instance_l4_port"] == "20007"
+    assert captured["instance_l4_endpoint"] == "tunnel.greffon.io:20007"
+    assert captured["instance_l4_proto"] == "udp"
+
+
+@pytest.mark.asyncio
+async def test_start_proxy_ignores_manager_l4_endpoint(client: AsyncClient) -> None:
+    """A proxy greffer computes the L4 endpoint locally from the published
+    port, so it must NOT consume a manager-supplied instance_l4_* (which is a
+    tunnel-only hand-off). The controller injects only when l4_bind_host is
+    127.0.0.1; here the keys stay unset and _compute_instance_context fills
+    them from the published port instead."""
+    captured: dict[str, object] = {}
+
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "test-instance-123"}
+
+        def _capture(_compose_file, greffon_info):
+            captured["instance_l4_host"] = greffon_info.get("instance_l4_host")
+            return {}
+
+        mock_compose.get_compose_template.side_effect = _capture
+        mock_compose.get_status.return_value = {"status": "running"}
+
+        payload = {
+            **SAMPLE_START_PAYLOAD,
+            "instance_l4_host": "tunnel.greffon.io",
+            "instance_l4_port": 20007,
+        }
+        with patch.object(
+            client._transport.app.state.settings, "greffer_mode", "proxy"
+        ):
+            r = await client.post(
+                "/api/controller/start/",
+                json=payload,
+                headers={TOKEN_HEADER: "test-token"},
+            )
+
+    assert r.status_code == 200
+    # Not injected by the controller in proxy mode (mocked compose never
+    # ran _compute_instance_context to fill it locally either).
+    assert captured["instance_l4_host"] is None
+
+
 # ---------------------------------------------------------------------------
 # POST /api/controller/stop/
 # ---------------------------------------------------------------------------
