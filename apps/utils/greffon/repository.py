@@ -5,11 +5,6 @@ from apps.utils.os.network import (
     get_free_ports, is_port_free, allocate_ports_in_range)
 from apps.utils.greffon import sticky_ports
 
-# L4/same_port is published on the proxy interface; tunnel-mode L4 binds
-# 127.0.0.1 but a port free on 0.0.0.0 is free on 127.0.0.1 too, so probing
-# 0.0.0.0 is the safe (conservative) choice for allocation.
-_L4_BIND_HOST = '0.0.0.0'
-
 def get_compose_file_from_repository(greffon):
     r = requests.get(greffon['repository_url'])
     if r.status_code != 200:
@@ -28,7 +23,7 @@ def _split_proto(raw):
     return raw, None
 
 
-def get_greffon_info(compose, greffon):
+def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
     greffon_info = create_greffon_info(compose, greffon)
     ports = greffon_info['ports']
     greffon_path = os.getenv('GREFFON_PATH', '/data')
@@ -46,11 +41,17 @@ def get_greffon_info(compose, greffon):
         for idx, host_port in zip(idxs, free):
             ports[idx]['port_host'] = host_port
 
-    # L4 (Tier-C) ports: STICKY. The host:port is the user-facing endpoint
+    # L4 (Tier-C) ports: STICKY. The host:port IS the user-facing endpoint
     # (baked into client configs and persisted inside the app), so reuse the
     # previously-allocated port when it's still free; otherwise take a fresh one
     # from the dedicated L4 range (outside the OS ephemeral range, so a stopped
-    # instance's port can't be transiently stolen). Persist the result.
+    # instance's port can't be transiently stolen as a connection source port).
+    # All L4 ports are sticky (same_port and plain alike): this is reuse-if-free,
+    # not a hard reservation — a stopped instance's port is free for others, and
+    # the live bind-probe below rotates this instance off a taken port on the
+    # next start, so persisting does NOT deplete the pool. Probe + allocate on
+    # the SAME interface the port will publish on (l4_bind_host), so the free
+    # check matches what docker-compose will actually bind.
     l4 = [i for i, p in enumerate(ports) if p.get('exposure_tier') == 'l4']
     if l4:
         range_start = int(os.getenv('GREFFER_L4_PORT_RANGE_START', '20000'))
@@ -67,14 +68,14 @@ def get_greffon_info(compose, greffon):
             for i in idxs:
                 prev = sticky.get(ports[i]['port_name'])
                 if (prev is not None and prev not in used
-                        and is_port_free(_L4_BIND_HOST, prev, proto)):
+                        and is_port_free(l4_bind_host, prev, proto)):
                     assigned[i] = prev
                     used.add(prev)
                 else:
                     fresh_needed.append(i)
             if fresh_needed:
                 fresh = allocate_ports_in_range(
-                    _L4_BIND_HOST, len(fresh_needed), range_start, range_end,
+                    l4_bind_host, len(fresh_needed), range_start, range_end,
                     protocol=proto, reserved=used)
                 for i, host_port in zip(fresh_needed, fresh):
                     assigned[i] = host_port

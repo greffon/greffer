@@ -78,21 +78,26 @@ def start_greffon(
     # about, so the extra field is harmless to pass through.
     greffon = payload.model_dump()
     compose_file = repository.get_compose_file_from_repository(greffon)
-    greffon_info = repository.get_greffon_info(compose_file, greffon)
+    # L4 (Tier-C) ports are published directly on their service. The bind
+    # interface depends on this greffer's mode: proxy publishes on the public
+    # interface; tunnel binds host-internal (reached by the rathole-client, not
+    # the public interface). Resolve it BEFORE allocation so the sticky-port
+    # free-probe and range allocation use the SAME interface the port is
+    # published on (a port free on 0.0.0.0 isn't necessarily free on 127.0.0.1).
+    l4_bind_host = (
+        '127.0.0.1'
+        if _settings(request).greffer_mode == 'tunnel'
+        else '0.0.0.0'
+    )
+    greffon_info = repository.get_greffon_info(
+        compose_file, greffon, l4_bind_host=l4_bind_host)
     # Build the Jinja render context (instance_*, integrations, config) ONCE,
     # before apply_configuration, so render-flagged baked files can reference
     # it. Mutates greffon_info in place (setdefault); create_compose's own
     # context calls are idempotent no-ops afterward.
     compose.build_render_context(greffon_info)
-    # L4 (Tier-C) ports are published directly on their service. The bind
-    # interface depends on this greffer's mode: proxy publishes on the public
-    # interface; tunnel binds host-internal (reached by the rathole-client, not
-    # the public interface). compose.py reads this off greffon_info.
-    greffon_info['l4_bind_host'] = (
-        '127.0.0.1'
-        if _settings(request).greffer_mode == 'tunnel'
-        else '0.0.0.0'
-    )
+    # compose.py reads the bind interface off greffon_info.
+    greffon_info['l4_bind_host'] = l4_bind_host
     compose_template = compose.get_compose_template(compose_file, greffon_info)
     try:
         compose.apply_configuration(greffon_info, compose_file)

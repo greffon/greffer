@@ -184,3 +184,28 @@ class StickyAllocationTests(TestCase):
         self.assertEqual(result['ports'][0]['port_host'], 40002)
         mock_sticky.save.assert_called_once_with(
             '/data', 'inst-sticky', {'wireguard_51820': 40002})
+
+    @patch('apps.utils.greffon.repository.sticky_ports')
+    @patch('apps.utils.greffon.repository.is_port_free', return_value=True)
+    @patch('apps.utils.greffon.repository.allocate_ports_in_range')
+    def test_plain_l4_is_also_sticky(self, mock_alloc, _mock_free, mock_sticky):
+        """A plain (same_port=False) L4 port is ALSO sticky — reuse-if-free is
+        uniform across L4, not gated on same_port (design rev: uniform sticky)."""
+        from apps.utils.greffon.repository import get_greffon_info
+        mock_sticky.load.return_value = {'wireguard_51820': 47777}
+        result = get_greffon_info(self._compose(), self._greffon(same_port=False))
+        self.assertEqual(result['ports'][0]['port_host'], 47777)
+        mock_alloc.assert_not_called()
+        mock_sticky.save.assert_called_once()
+
+    @patch('apps.utils.greffon.repository.sticky_ports')
+    @patch('apps.utils.greffon.repository.is_port_free', return_value=False)
+    @patch('apps.utils.greffon.repository.allocate_ports_in_range', return_value=[40003])
+    def test_probe_and_allocate_use_the_bind_interface(self, mock_alloc, mock_free, mock_sticky):
+        """The free-probe and range allocation run on the SAME interface the
+        port publishes on (l4_bind_host), not a hard-coded 0.0.0.0."""
+        from apps.utils.greffon.repository import get_greffon_info
+        mock_sticky.load.return_value = {'wireguard_51820': 47777}
+        get_greffon_info(self._compose(), self._greffon(), l4_bind_host='127.0.0.1')
+        self.assertEqual(mock_free.call_args.args[0], '127.0.0.1')
+        self.assertEqual(mock_alloc.call_args.args[0], '127.0.0.1')

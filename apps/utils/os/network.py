@@ -33,6 +33,10 @@ def is_port_free(host, port, protocol='tcp'):
     (not the ephemeral range), so transient occupants are rare.
     """
     sock = socket.socket(socket.AF_INET, _sock_type(protocol))
+    # Match docker's publish semantics: docker binds with SO_REUSEADDR, so a TCP
+    # port in TIME_WAIT (which docker could still bind) reads free here too —
+    # otherwise we'd needlessly rotate a sticky port right after a stop.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, int(port)))
         return True
@@ -62,6 +66,7 @@ def allocate_ports_in_range(host, numbers, range_start, range_end,
             if candidate in reserved:
                 continue
             sock = socket.socket(socket.AF_INET, sock_type)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, candidate))
             except OSError:

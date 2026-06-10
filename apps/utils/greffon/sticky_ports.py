@@ -8,13 +8,14 @@ the per-port allocation in a small JSON sidecar in the instance directory under
 ``$GREFFON_PATH`` (next to the rendered docker-compose.yml / nginx.conf), and
 reuse it on the next start when the port is still free.
 
-Reservation policy (see followup-port-semantics.md):
-- ``same_port`` ports: the app baked the port in, so a rotation breaks the
-  datapath — reuse is load-bearing. We keep the sidecar entry for the
-  instance's lifetime and only fall back to a fresh port if the sticky one is
-  genuinely no longer bindable.
-- plain L4 ports: best-effort reuse; a fresh port on conflict is fine (the
-  card re-renders the new endpoint).
+All L4 ports are sticky (``same_port`` and plain alike): reuse the persisted
+port when it's still free, else allocate a fresh one. This is reuse-if-free,
+NOT a hard reservation — a stopped instance's port is free for others to take,
+and the next start's live bind-probe rotates this instance off a taken port. So
+persisting does not deplete the dedicated L4 range; it just keeps the endpoint
+stable across restarts when nothing else grabbed the port. For ``same_port``
+ports a stable endpoint is load-bearing (the app baked the port into its own
+config); for plain L4 it is a (harmless) UX improvement.
 
 The sidecar is NOT cleaned up on delete (the greffer has no delete endpoint;
 the whole instance dir already leaks) — it's correctly reused if the same
@@ -55,19 +56,28 @@ def load(greffon_path, instance_id):
 
 
 def save(greffon_path, instance_id, mapping):
-    """Persist {port_name: host_port} for the instance (exclusive-locked write).
+    """Persist {port_name: host_port} for the instance, atomically.
 
-    The instance dir already exists at start time (compose/nginx are written
-    there); create it defensively anyway so a caller can't crash on a missing
-    dir. Concurrent starts in the single greffer process run in a threadpool,
-    so the flock serializes the read-modify-write.
+    Write to a temp file in the same dir, fsync, then ``os.replace`` onto the
+    target — so a concurrent reader (or a crash mid-write) never sees a
+    truncated/partial sidecar (which ``load`` would treat as empty and rotate a
+    sticky port off). The instance dir already exists at start time
+    (compose/nginx are written there); create it defensively anyway.
+
+    NOTE: this makes the *write* atomic, but it does NOT serialize a full
+    load->decide->save across two concurrent starts of the SAME instance (each
+    is its own lock cycle). Concurrent same-instance starts are a broader
+    greffer concern (they also race on docker-compose up) and are out of scope
+    here; the practical guard is that the manager does not issue overlapping
+    starts for one instance.
     """
     inst_dir = os.path.join(str(greffon_path), instance_id)
     os.makedirs(inst_dir, exist_ok=True)
     path = os.path.join(inst_dir, _SIDECAR_NAME)
+    tmp = path + ".tmp"
     payload = {str(k): int(v) for k, v in mapping.items()}
-    with open(path, "w") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    with open(tmp, "w") as f:
         json.dump(payload, f)
         f.flush()
         os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX
