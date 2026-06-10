@@ -1,0 +1,11 @@
+# rathole-server config for the UDP soak. One UDP relay service: external
+# datagrams to :10000 are carried over the tunnel to the rathole-client, which
+# delivers them to the echo at echo:7777. `type = "udp"` is the Gap 1 render the
+# manager emits for a tunnel-mode UDP L4 field.
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "soak-token-change-me"
+
+[server.services.udp_soak]
+type = "udp"
+bind_addr = "0.0.0.0:10000"

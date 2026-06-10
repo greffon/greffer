@@ -1,0 +1,11 @@
+# rathole-client config: connects to rathole-server and forwards the udp_soak
+# service to the local UDP echo. Mirrors the greffer tunnel-sidecar's client.toml
+# shape: `type = "udp"` (Gap 1) and a local_addr pointing at the L4 service (here
+# the echo container; on a real greffer this is 127.0.0.1:<port_host>, Gap 0).
+[client]
+remote_addr = "rathole-server:2333"
+default_token = "soak-token-change-me"
+
+[client.services.udp_soak]
+type = "udp"
+local_addr = "echo:7777"
