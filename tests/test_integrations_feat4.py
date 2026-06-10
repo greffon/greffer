@@ -90,6 +90,25 @@ class GreffonStartRequestIntegrationsFieldTests(TestCase):
         with self.assertRaises(ValidationError):
             GreffonStartRequest(**self._base(integrations='nope'))
 
+    def test_l4_endpoint_fields_default_none(self):
+        # Old (pre-Gap-2) manager → new greffer: the tunnel L4 hand-off
+        # fields are omitted and default to None, so the controller falls
+        # back to the empty-in-tunnel behavior.
+        req = GreffonStartRequest(**self._base())
+        self.assertIsNone(req.instance_l4_host)
+        self.assertIsNone(req.instance_l4_port)
+        self.assertIsNone(req.instance_l4_proto)
+
+    def test_accepts_l4_endpoint_fields(self):
+        req = GreffonStartRequest(**self._base(
+            instance_l4_host='tunnel.greffon.io',
+            instance_l4_port=20007,
+            instance_l4_proto='udp',
+        ))
+        self.assertEqual(req.instance_l4_host, 'tunnel.greffon.io')
+        self.assertEqual(req.instance_l4_port, 20007)
+        self.assertEqual(req.instance_l4_proto, 'udp')
+
 
 class IsIntegrationSetTests(TestCase):
     """The unset/empty/set boundary that the render pipeline relies on

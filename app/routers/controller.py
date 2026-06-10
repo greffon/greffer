@@ -91,13 +91,33 @@ def start_greffon(
     )
     greffon_info = repository.get_greffon_info(
         compose_file, greffon, l4_bind_host=l4_bind_host)
+    # compose.py and _compute_instance_context both read the bind interface
+    # off greffon_info. Set it BEFORE build_render_context so the instance_l4_*
+    # tunnel/proxy branch is resolved against the real interface on the first
+    # (setdefault-based, idempotent) render-context build. Set too late, a
+    # tunnel greffer would be misread as proxy and bake host-internal
+    # instance_l4_* values.
+    greffon_info['l4_bind_host'] = l4_bind_host
+    # Tunnel-mode L4 endpoint hand-off (Gap 2): the public endpoint a
+    # self-configuring L4 app must advertise is RATHOLE_PUBLIC_HOST:tunnel_port,
+    # which only the manager knows (it owns the relay's port allocation). When
+    # the manager supplies it, feed it into the render context as instance_l4_*
+    # so the app boots advertising the right endpoint; _compute_instance_context
+    # leaves these empty in tunnel mode otherwise (the setdefault calls below
+    # win because they run before build_render_context).
+    if l4_bind_host == '127.0.0.1' and greffon.get('instance_l4_host') \
+            and greffon.get('instance_l4_port'):
+        l4_host = str(greffon['instance_l4_host'])
+        l4_port = str(greffon['instance_l4_port'])
+        greffon_info['instance_l4_host'] = l4_host
+        greffon_info['instance_l4_port'] = l4_port
+        greffon_info['instance_l4_endpoint'] = f'{l4_host}:{l4_port}'
+        greffon_info['instance_l4_proto'] = greffon.get('instance_l4_proto') or 'tcp'
     # Build the Jinja render context (instance_*, integrations, config) ONCE,
     # before apply_configuration, so render-flagged baked files can reference
     # it. Mutates greffon_info in place (setdefault); create_compose's own
     # context calls are idempotent no-ops afterward.
     compose.build_render_context(greffon_info)
-    # compose.py reads the bind interface off greffon_info.
-    greffon_info['l4_bind_host'] = l4_bind_host
     compose_template = compose.get_compose_template(compose_file, greffon_info)
     try:
         compose.apply_configuration(greffon_info, compose_file)

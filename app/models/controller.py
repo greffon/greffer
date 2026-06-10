@@ -59,6 +59,22 @@ class GreffonStartRequest(BaseModel):
     # via `extra=ignore` rather than 422-ing.
     integrations: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    # Tunnel-mode L4 endpoint hand-off (l4-network-exposure Gap 2). A
+    # self-configuring L4 app (e.g. WireGuard) must advertise the PUBLIC
+    # endpoint its clients dial. In tunnel mode that is
+    # RATHOLE_PUBLIC_HOST:tunnel_port, allocated manager-side (the greffer
+    # cannot know the rathole relay's public port), so the manager
+    # pre-allocates it and sends it here; the controller feeds it into the
+    # render context as instance_l4_* so the app boots advertising the right
+    # endpoint. Absent in proxy mode (the greffer computes the endpoint
+    # locally from the published port) and from pre-Gap-2 managers (then
+    # instance_l4_* render empty in tunnel mode, exactly as before). int
+    # port matches the manager's tunnel_port type; coerced to str at the
+    # render boundary.
+    instance_l4_host: str | None = None
+    instance_l4_port: int | None = None
+    instance_l4_proto: str | None = None
+
     model_config = {"extra": "ignore"}
 
     # v3 manager-pushed rathole client config. When present (tunnel-mode
