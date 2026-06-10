@@ -57,11 +57,11 @@ def test_post_register_version_defaults_to_app_version(settings: Settings) -> No
     from app import __version__
 
     # Sanity: the fixture didn't set GREFFER_VERSION, so the default applies.
-    assert settings.greffer_version == __version__ == "0.3.0"
+    assert settings.greffer_version == __version__ == "0.3.1"
     with patch("app.workers.register.requests") as mock_requests:
         _post_register(settings, "10.0.0.1", "tok")
     kwargs = mock_requests.post.call_args.kwargs
-    assert kwargs["json"]["version"] == "0.3.0"
+    assert kwargs["json"]["version"] == "0.3.1"
 
 
 def test_post_register_version_overridable_via_env(
@@ -114,7 +114,7 @@ def test_fetch_cert_returns_data_on_200(settings: Settings) -> None:
         mock_response.status_code = 200
         mock_response.json.return_value = {"certificate": "c", "private_key": "k"}
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings) == {"certificate": "c", "private_key": "k"}
+        assert _fetch_cert(settings, "tok") == {"certificate": "c", "private_key": "k"}
 
 
 def test_fetch_cert_returns_none_on_non_200(settings: Settings) -> None:
@@ -122,7 +122,21 @@ def test_fetch_cert_returns_none_on_non_200(settings: Settings) -> None:
         mock_response = MagicMock()
         mock_response.status_code = 401
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings) is None
+        assert _fetch_cert(settings, "tok") is None
+
+
+def test_fetch_cert_sends_greffer_token_header(settings: Settings) -> None:
+    """The cert response carries the private key (and the tunnel client
+    config in tunnel mode), so the poll must identify itself: the manager
+    authenticates it via ``X-Greffer-Token`` against the token this greffer
+    registered with."""
+    with patch("app.workers.register.requests") as mock_requests:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_requests.get.return_value = mock_response
+        _fetch_cert(settings, "sekret-token")
+    _, kwargs = mock_requests.get.call_args
+    assert kwargs["headers"] == {"X-Greffer-Token": "sekret-token"}
 
 
 def test_install_cert_copies_files(settings: Settings) -> None:
@@ -321,7 +335,7 @@ def test_fetch_cert_carries_timeout(settings: Settings) -> None:
         mock_response.status_code = 200
         mock_response.json.return_value = {}
         mock_requests.get.return_value = mock_response
-        _fetch_cert(settings)
+        _fetch_cert(settings, "tok")
     assert "timeout" in mock_requests.get.call_args.kwargs
     assert mock_requests.get.call_args.kwargs["timeout"] == 10.0
 

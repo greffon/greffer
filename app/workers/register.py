@@ -74,7 +74,7 @@ async def register_worker(app: FastAPI) -> None:
     while True:
         try:
             data = await anyio.to_thread.run_sync(
-                _fetch_cert, settings, abandon_on_cancel=True
+                _fetch_cert, settings, token, abandon_on_cancel=True
             )
         except (requests.ConnectionError, requests.Timeout):
             logger.info(
@@ -159,9 +159,18 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
     )
 
 
-def _fetch_cert(settings: Settings) -> dict[str, Any] | None:
+def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
+    # ``X-Greffer-Token`` authenticates the cert poll: the response carries
+    # the greffer's private key (and, in tunnel mode, the rathole client
+    # config embedding the tunnel token), so the manager must be able to
+    # tell the registered greffer apart from anyone who knows its UUID.
+    # A custom header (not ``Authorization: Token ...``) because the manager
+    # runs DRF TokenAuthentication globally: presenting a non-DRF token
+    # there would 401 the request before the view runs. Managers that
+    # don't enforce yet simply ignore the header.
     res = requests.get(
         f"{settings.greffon_base_server}/api/greffer/certificate/{settings.greffer_id}/",
+        headers={"X-Greffer-Token": token},
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
