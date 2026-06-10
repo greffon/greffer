@@ -1,7 +1,14 @@
 import requests
 import os
 import yaml
-from apps.utils.os.network import get_free_ports
+from apps.utils.os.network import (
+    get_free_ports, is_port_free, allocate_ports_in_range)
+from apps.utils.greffon import sticky_ports
+
+# L4/same_port is published on the proxy interface; tunnel-mode L4 binds
+# 127.0.0.1 but a port free on 0.0.0.0 is free on 127.0.0.1 too, so probing
+# 0.0.0.0 is the safe (conservative) choice for allocation.
+_L4_BIND_HOST = '0.0.0.0'
 
 def get_compose_file_from_repository(greffon):
     r = requests.get(greffon['repository_url'])
@@ -23,17 +30,59 @@ def _split_proto(raw):
 
 def get_greffon_info(compose, greffon):
     greffon_info = create_greffon_info(compose, greffon)
-    # Allocate a free host port per declared port, batched by protocol so TCP
-    # and UDP are probed in their own namespace and no number is handed out
-    # twice within a protocol.
     ports = greffon_info['ports']
+    greffon_path = os.getenv('GREFFON_PATH', '/data')
+    instance_id = greffon['id']
+
+    # Non-L4 (Tier-A) ports: ephemeral host port (an internal nginx upstream,
+    # never user-facing). Batched per protocol so TCP/UDP are probed in their
+    # own namespace and no number is handed out twice within a protocol.
+    non_l4 = [i for i, p in enumerate(ports) if p.get('exposure_tier') != 'l4']
     idx_by_proto = {}
-    for i, port in enumerate(ports):
-        idx_by_proto.setdefault(port.get('protocol', 'tcp'), []).append(i)
+    for i in non_l4:
+        idx_by_proto.setdefault(ports[i].get('protocol', 'tcp'), []).append(i)
     for proto, idxs in idx_by_proto.items():
         free = get_free_ports(numbers=len(idxs), protocol=proto)
         for idx, host_port in zip(idxs, free):
             ports[idx]['port_host'] = host_port
+
+    # L4 (Tier-C) ports: STICKY. The host:port is the user-facing endpoint
+    # (baked into client configs and persisted inside the app), so reuse the
+    # previously-allocated port when it's still free; otherwise take a fresh one
+    # from the dedicated L4 range (outside the OS ephemeral range, so a stopped
+    # instance's port can't be transiently stolen). Persist the result.
+    l4 = [i for i, p in enumerate(ports) if p.get('exposure_tier') == 'l4']
+    if l4:
+        range_start = int(os.getenv('GREFFER_L4_PORT_RANGE_START', '20000'))
+        range_end = int(os.getenv('GREFFER_L4_PORT_RANGE_END', '29999'))
+        sticky = sticky_ports.load(greffon_path, instance_id)
+        new_sticky = {}
+        l4_by_proto = {}
+        for i in l4:
+            l4_by_proto.setdefault(ports[i].get('protocol', 'tcp'), []).append(i)
+        for proto, idxs in l4_by_proto.items():
+            assigned = {}   # port index -> host port
+            used = set()    # host ports taken in this protocol batch
+            fresh_needed = []
+            for i in idxs:
+                prev = sticky.get(ports[i]['port_name'])
+                if (prev is not None and prev not in used
+                        and is_port_free(_L4_BIND_HOST, prev, proto)):
+                    assigned[i] = prev
+                    used.add(prev)
+                else:
+                    fresh_needed.append(i)
+            if fresh_needed:
+                fresh = allocate_ports_in_range(
+                    _L4_BIND_HOST, len(fresh_needed), range_start, range_end,
+                    protocol=proto, reserved=used)
+                for i, host_port in zip(fresh_needed, fresh):
+                    assigned[i] = host_port
+                    used.add(host_port)
+            for i in idxs:
+                ports[i]['port_host'] = assigned[i]
+                new_sticky[ports[i]['port_name']] = assigned[i]
+        sticky_ports.save(greffon_path, instance_id, new_sticky)
     return greffon_info
 
 
@@ -132,6 +181,10 @@ def create_greffon_info(compose, greffon):
                     # the http/tcp defaults.
                     'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
                     'exposure_tier': manager_port.get('exposure_tier', 'http'),
+                    # same_port: publish host P -> container P (not declared
+                    # container port) so the app advertises exactly what it
+                    # binds. Manager-declared (L4 only); default off.
+                    'same_port': bool(manager_port.get('same_port', False)),
                 })
         else:
             greffon_info['ports'].setdefault(name, {})
@@ -146,6 +199,7 @@ def create_greffon_info(compose, greffon):
                 'url': manager_port.get('url'),
                 'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
                 'exposure_tier': manager_port.get('exposure_tier', 'http'),
+                'same_port': bool(manager_port.get('same_port', False)),
             })
         volumes = service.get('volumes', [])
         if type(volumes) == list:

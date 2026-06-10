@@ -92,8 +92,15 @@ def create_compose_template_from_greffon(compose, greffon_info):
         if port.get('exposure_tier', 'http') != 'l4':
             continue
         proto_suffix = '/udp' if port.get('protocol') == 'udp' else ''
+        # same_port: publish host P -> container P (the allocated host port on
+        # both sides) so an app that advertises exactly what it binds sees one
+        # number. The app must bind {{ instance_l4_port }} (== port_host).
+        # Default: host P -> declared container port (unchanged).
+        container_side = (
+            '{{ports[%s].port_host}}' % i if port.get('same_port')
+            else port['port_container'])
         mapping = '%s:{{ports[%s].port_host}}:%s%s' % (
-            l4_bind_host, i, port['port_container'], proto_suffix)
+            l4_bind_host, i, container_side, proto_suffix)
         service = compose['services'][port['container_name']]
         service.setdefault('ports', [])
         service['ports'].append(mapping)

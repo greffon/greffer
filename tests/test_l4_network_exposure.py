@@ -244,10 +244,14 @@ class GetGreffonInfoMixedProtocolTests(TestCase):
         from apps.utils.greffon.repository import get_greffon_info
         return get_greffon_info(compose, greffon)
 
+    @patch('apps.utils.greffon.repository.sticky_ports')
+    @patch('apps.utils.greffon.repository.allocate_ports_in_range')
     @patch('apps.utils.greffon.repository.get_free_ports')
-    def test_allocates_port_host_for_tcp_and_udp(self, mock_get_free_ports):
-        """A compose with one TCP (http) and one UDP (l4) port ⇒ two
-        get_free_ports calls (one per protocol) and a port_host on each entry."""
+    def test_allocates_port_host_for_tcp_and_udp(
+            self, mock_get_free_ports, mock_alloc_range, mock_sticky):
+        """A compose with one Tier-A TCP and one L4 UDP port: the Tier-A port
+        gets an ephemeral host port (get_free_ports), the L4 port a sticky one
+        from the dedicated L4 range (allocate_ports_in_range)."""
         compose = {
             'version': '3',
             'services': {
@@ -264,30 +268,26 @@ class GetGreffonInfoMixedProtocolTests(TestCase):
                 'wireguard_51820': {'exposure_tier': 'l4', 'protocol': 'udp', 'url': None},
             },
         }
-
-        # Return values keyed by protocol so the assertions are deterministic
-        # regardless of dict iteration order.
-        def _fake_free_ports(numbers, protocol='tcp'):
-            base = {'tcp': 30000, 'udp': 40000}[protocol]
-            return [base + i for i in range(numbers)]
-
-        mock_get_free_ports.side_effect = _fake_free_ports
+        mock_sticky.load.return_value = {}  # no prior allocation
+        mock_get_free_ports.side_effect = (
+            lambda numbers, protocol='tcp': [30000 + i for i in range(numbers)])
+        mock_alloc_range.return_value = [40000]
 
         result = self._call(compose, greffon)
 
-        # Every port got a host port.
         self.assertTrue(all('port_host' in p for p in result['ports']))
+        tcp_port = next(p for p in result['ports'] if p['exposure_tier'] != 'l4')
+        udp_port = next(p for p in result['ports'] if p['exposure_tier'] == 'l4')
+        self.assertEqual(tcp_port['port_host'], 30000)  # ephemeral
+        self.assertEqual(udp_port['port_host'], 40000)  # L4 range
 
-        tcp_port = next(p for p in result['ports'] if p['protocol'] == 'tcp')
-        udp_port = next(p for p in result['ports'] if p['protocol'] == 'udp')
-        self.assertEqual(tcp_port['port_host'], 30000)
-        self.assertEqual(udp_port['port_host'], 40000)
-
-        # Probed once per protocol, with the explicit protocol kwarg.
-        called_protocols = sorted(
-            call.kwargs['protocol'] for call in mock_get_free_ports.call_args_list
-        )
-        self.assertEqual(called_protocols, ['tcp', 'udp'])
+        # Tier-A went through get_free_ports (tcp only); L4 went through the
+        # range allocator (udp), and the result was persisted as sticky.
+        self.assertEqual(
+            [c.kwargs['protocol'] for c in mock_get_free_ports.call_args_list], ['tcp'])
+        mock_alloc_range.assert_called_once()
+        self.assertEqual(mock_alloc_range.call_args.kwargs['protocol'], 'udp')
+        mock_sticky.save.assert_called_once()
 
     @patch('apps.utils.greffon.repository.get_free_ports')
     def test_two_udp_ports_get_distinct_host_ports(self, mock_get_free_ports):
