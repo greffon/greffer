@@ -26,6 +26,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import tempfile
 
 _SIDECAR_NAME = "l4_ports.json"
 
@@ -74,10 +75,20 @@ def save(greffon_path, instance_id, mapping):
     inst_dir = os.path.join(str(greffon_path), instance_id)
     os.makedirs(inst_dir, exist_ok=True)
     path = os.path.join(inst_dir, _SIDECAR_NAME)
-    tmp = path + ".tmp"
     payload = {str(k): int(v) for k, v in mapping.items()}
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)  # atomic on POSIX
+    # Unique tmp name (mkstemp, matching tunnel_config / ops_migrations) so two
+    # concurrent saves don't share one ".tmp" and have the second's os.replace
+    # hit a vanished file; also cleaned up if json.dump raises mid-write.
+    fd, tmp = tempfile.mkstemp(dir=inst_dir, prefix=".l4-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic on POSIX
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise

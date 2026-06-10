@@ -102,6 +102,21 @@ class NetworkHelperTests(TestCase):
         with self.assertRaises(RuntimeError):
             allocate_ports_in_range('127.0.0.1', 3, 21100, 21101, protocol='tcp')
 
+    def test_is_port_free_udp_held_with_reuseaddr_reads_taken(self):
+        """A UDP port already held by a SO_REUSEADDR socket (how docker
+        publishes a UDP port) must read TAKEN. is_port_free must NOT set
+        SO_REUSEADDR for UDP, or two live instances would be handed the same
+        UDP host port (WireGuard-breaking)."""
+        from apps.utils.os.network import is_port_free
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(('127.0.0.1', 0))
+        port = holder.getsockname()[1]
+        try:
+            self.assertFalse(is_port_free('127.0.0.1', port, 'udp'))
+        finally:
+            holder.close()
+
 
 # ---------------------------------------------------------------------------
 # 3. sticky_ports sidecar — round-trip + tolerance

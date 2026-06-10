@@ -5,6 +5,18 @@ def _sock_type(protocol):
     return socket.SOCK_DGRAM if protocol == 'udp' else socket.SOCK_STREAM
 
 
+def _maybe_reuseaddr(sock, protocol):
+    # SO_REUSEADDR for TCP ONLY. It matches docker's publish bind so a TCP port
+    # in TIME_WAIT (which docker could still bind) reads free here instead of
+    # forcing a needless sticky-port rotation right after a stop. NOT for UDP:
+    # UDP has no TIME_WAIT, and SO_REUSEADDR on a UDP socket lets it bind a port
+    # another live socket already holds — which would make is_port_free report a
+    # busy UDP port as free and hand the same port to two instances (the
+    # WireGuard datapath the sticky/range design exists to protect).
+    if protocol != 'udp':
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def get_free_ports(host='127.0.0.1', numbers=1, protocol='tcp'):
     # TCP and UDP are independent port namespaces, so probe with the matching
     # socket type. All sockets in a batch are held open until the end so the
@@ -33,10 +45,7 @@ def is_port_free(host, port, protocol='tcp'):
     (not the ephemeral range), so transient occupants are rare.
     """
     sock = socket.socket(socket.AF_INET, _sock_type(protocol))
-    # Match docker's publish semantics: docker binds with SO_REUSEADDR, so a TCP
-    # port in TIME_WAIT (which docker could still bind) reads free here too —
-    # otherwise we'd needlessly rotate a sticky port right after a stop.
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _maybe_reuseaddr(sock, protocol)
     try:
         sock.bind((host, int(port)))
         return True
@@ -66,7 +75,7 @@ def allocate_ports_in_range(host, numbers, range_start, range_end,
             if candidate in reserved:
                 continue
             sock = socket.socket(socket.AF_INET, sock_type)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _maybe_reuseaddr(sock, protocol)
             try:
                 sock.bind((host, candidate))
             except OSError:
