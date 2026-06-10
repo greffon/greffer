@@ -25,6 +25,14 @@ import time
 
 _SEQ = struct.Struct('!Q')
 
+# Each flow's wire sequence numbers live in a disjoint band (idx * _FLOW_STRIDE
+# + local), so they are globally unique across flows. If the relay ever
+# cross-routes a reply to the wrong flow's socket, the wire seq will not be in
+# that flow's `inflight`, so it is ignored (and the originating flow correctly
+# counts the datagram as lost) instead of being false-matched. _FLOW_STRIDE is
+# far larger than any realistic per-flow datagram count (rate * duration).
+_FLOW_STRIDE = 1_000_000_000
+
 
 def _percentile(sorted_vals, pct):
     if not sorted_vals:
@@ -70,8 +78,9 @@ def _run_flow(host, port, rate, duration, payload_size, drain, out, idx):
 
     pad = b'x' * max(0, payload_size - 8)
     interval = 1.0 / rate
+    base_seq = idx * _FLOW_STRIDE
     sent = 0
-    seq = 0
+    local = 0
     start = time.monotonic()
     deadline = start + duration
     next_send = start
@@ -82,16 +91,17 @@ def _run_flow(host, port, rate, duration, payload_size, drain, out, idx):
         if now < next_send:
             time.sleep(min(next_send - now, 0.002))
             continue
-        msg = _SEQ.pack(seq) + pad
+        wire = base_seq + local
+        msg = _SEQ.pack(wire) + pad
         with lock:
-            inflight[seq] = time.monotonic()
+            inflight[wire] = time.monotonic()
         try:
             sock.sendto(msg, (host, port))
             sent += 1
         except OSError:
             with lock:
-                inflight.pop(seq, None)
-        seq += 1
+                inflight.pop(wire, None)
+        local += 1
         next_send += interval
 
     time.sleep(drain)        # let late echoes arrive
@@ -118,13 +128,15 @@ def soak(host, port, flows, rate, duration, payload_size=64, drain=1.0):
     for t in threads:
         t.join()
 
-    sent = sum(r['sent'] for r in out)
-    received = sum(r['received'] for r in out)
-    all_rtts = sorted(rtt for r in out for rtt in r['rtts'])
+    results = [r for r in out if r is not None]   # a dead flow thread leaves None
+    sent = sum(r['sent'] for r in results)
+    received = sum(r['received'] for r in results)
+    all_rtts = sorted(rtt for r in results for rtt in r['rtts'])
     loss = sent - received
     return {
         'target': '%s:%d' % (host, port),
         'flows': flows,
+        'flows_completed': len(results),
         'rate_pps_per_flow': rate,
         'duration_s': duration,
         'payload_bytes': payload_size,
@@ -153,6 +165,8 @@ def main(argv=None):
     host, _, port = args.target.rpartition(':')
     if not host or not port:
         p.error('--target must be HOST:PORT')
+    if args.rate <= 0 or args.flows <= 0 or args.duration <= 0:
+        p.error('--rate, --flows, and --duration must be positive')
     metrics = soak(
         host, int(port), args.flows, args.rate, args.duration,
         payload_size=args.payload, drain=args.drain,

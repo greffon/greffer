@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Trivial UDP echo: reflect every datagram back to its sender.
 
-The soak rig normally uses ``socat UDP-LISTEN:...,fork EXEC:cat`` as the echo
-service (matching the catalog-style tunnel L4 app). This stdlib echo is the
-zero-dependency equivalent, used to validate ``udp_soak.py`` locally without the
-relay (point the driver at this echo to check the measurement logic) and as a
-fallback echo on hosts without socat.
+This is the echo service the soak rig runs (``docker-compose.soak.yml``), and it
+doubles as the local target for validating ``udp_soak.py`` without the relay
+(point the driver at it to check the measurement logic). Stdlib-only, so it needs
+no image build. ``socat UDP-LISTEN:7777,fork,reuseaddr EXEC:cat`` is an
+equivalent if you prefer it, but note socat forks per datagram, which becomes the
+bottleneck sooner under load.
 
 Usage: ``python udp_echo.py [HOST] [PORT]`` (default 127.0.0.1 7777).
 """

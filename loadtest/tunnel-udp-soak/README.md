@@ -59,6 +59,12 @@ healthy relay clears with margin, so the test catches regressions, not noise.
 WireGuard and other latency-sensitive UDP stay on proxy mode regardless, so the
 bar is sized for tolerant UDP (game servers, telemetry, etc.).
 
+`compare_soak.py` also guards against a **saturated test rig**: if the baseline
+(direct) run itself loses more than `MAX_BASELINE_LOSS_PCT` (default 1%), the
+echo or host is the bottleneck, the relay numbers are not a valid measurement,
+and the run is reported `valid: false` (lower `RATE`/`FLOWS` and re-run). This
+stops a slow rig from being misread as a relay failure.
+
 If the relay cannot clear a sane bar, tunnel mode ships TCP-only and UDP stays
 gated, which is the design's documented fallback.
 

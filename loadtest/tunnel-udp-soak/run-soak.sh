@@ -14,6 +14,7 @@ RATE="${RATE:-200}"
 DURATION="${DURATION:-60}"
 MAX_LOSS_PCT="${MAX_LOSS_PCT:-2.0}"
 MAX_P99_ADDED_MS="${MAX_P99_ADDED_MS:-50.0}"
+MAX_BASELINE_LOSS_PCT="${MAX_BASELINE_LOSS_PCT:-1.0}"
 SETTLE="${SETTLE:-8}"
 
 compose() { docker compose -f docker-compose.soak.yml "$@"; }
@@ -35,4 +36,5 @@ python3 udp_soak.py --target 127.0.0.1:10000 \
 
 echo "soak: applying acceptance bar (loss <= ${MAX_LOSS_PCT}%, p99 add <= ${MAX_P99_ADDED_MS}ms)"
 python3 compare_soak.py --relay relay.json --baseline baseline.json \
-  --max-loss-pct "$MAX_LOSS_PCT" --max-p99-added-ms "$MAX_P99_ADDED_MS"
+  --max-loss-pct "$MAX_LOSS_PCT" --max-p99-added-ms "$MAX_P99_ADDED_MS" \
+  --max-baseline-loss-pct "$MAX_BASELINE_LOSS_PCT"
