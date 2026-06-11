@@ -91,6 +91,12 @@ class Settings(BaseSettings):
 
     crl_sync_interval: int = 300
     monitor_interval: int = 5
+    # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
+    # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL
+    # (not the greffer_ prefix — that pitfall applies only to fields whose
+    # documented env var carries the prefix, e.g. greffer_workers_enabled).
+    # The manager derives the unreachable threshold from this value.
+    heartbeat_interval: int = 5
 
     # NOTE: the ops-migrations skip switch (GREFFER_SKIP_OPS_MIGRATIONS) is
     # intentionally NOT a Settings field. The runner reads it via os.getenv

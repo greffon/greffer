@@ -111,3 +111,12 @@ def _atomic_write(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def resolve_token(settings) -> str:
+    """Resolve the greffer's stable token the way ``create_app`` does, minus the
+    test-only explicit kwarg: an operator-set ``GREFFER_TOKEN`` wins, otherwise
+    the persisted on-disk token. Used on (re-)registration (greffer-observability
+    epic) so a rotated on-disk token is picked up after a heartbeat 403."""
+    return settings.greffer_token or load_or_create_token(
+        settings.greffon_path / ".greffer-token")

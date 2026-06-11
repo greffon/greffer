@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import time
+from uuid import uuid4
+
 from fastapi import FastAPI
 
 from app.errors import register_exception_handlers
@@ -7,7 +11,7 @@ from app.lifespan import lifespan
 from app.logging import configure_logging
 from app.routers import controller, health
 from app.settings import Settings, get_settings
-from app.token import load_or_create_token
+from app.token import resolve_token
 
 # Intentionally no module-level `app = create_app()`.
 # Uvicorn uses `--factory app.main:create_app` so importing this module
@@ -37,12 +41,18 @@ def create_app(
     # existing built-in CA cert (greffer already holds one); kills this
     # static-token-on-disk design and aligns with the platform's CA story.
     # See tunnel epic follow-ups.
-    app.state.greffer_token = (
-        token
-        or settings.greffer_token
-        or load_or_create_token(settings.greffon_path / ".greffer-token")
-    )
+    app.state.greffer_token = token or resolve_token(settings)
     app.state.settings = settings
+    # Observability (greffer-observability epic). boot_id is per-process: the
+    # manager pairs it with the heartbeat seq so a restarted greffer (seq reset
+    # to 1) is not dropped as stale. started_at anchors uptime. status_map is the
+    # monitor's most recent collection, reused by the heartbeat so the two timers
+    # don't each sweep docker. reregister_requested lets the heartbeat ask the
+    # register supervisor to re-run registration after a 403.
+    app.state.boot_id = uuid4().hex
+    app.state.started_at = time.monotonic()
+    app.state.status_map = None
+    app.state.reregister_requested = asyncio.Event()
     app.include_router(health.router)
     app.include_router(controller.router)
     register_exception_handlers(app)

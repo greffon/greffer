@@ -20,6 +20,7 @@ import requests
 from fastapi import FastAPI
 
 from app.settings import Settings
+from app.token import resolve_token
 
 logger = logging.getLogger("greffer")
 
@@ -59,21 +60,51 @@ class RegisterRejected(Exception):
 
 
 async def register_worker(app: FastAPI) -> None:
-    """Register with the manager and block until cert is installed.
-
-    All ``anyio.to_thread.run_sync`` calls use ``abandon_on_cancel=True`` so
-    that lifespan shutdown doesn't block waiting for a hung HTTP call — the
-    async task returns immediately on cancel and the thread finishes (or
-    gets killed at process exit) in the background. Every HTTP call also
-    carries a ``timeout`` so the thread can't hang forever in the first
-    place.
-    """
+    """Initial one-shot registration: POST until accepted, poll for cert,
+    install. Returns when registration completes. Later re-runs (after a
+    heartbeat 403) are handled by ``reregister_worker``."""
     settings: Settings = app.state.settings
-    token: str = app.state.greffer_token
+    address = await _resolve_address(settings)
+    await _run_registration(app, settings, address)
 
-    address = settings.greffer_address or await anyio.to_thread.run_sync(
+
+async def reregister_worker(app: FastAPI) -> None:
+    """Supervisor that re-runs registration on demand (greffer-observability
+    epic). The heartbeat sets ``app.state.reregister_requested`` on a 403 (the
+    manager rejected our accepted token); we re-read the on-disk token, in case
+    the operator rotated it, and re-register. Idle the rest of the time."""
+    settings: Settings = app.state.settings
+    event: asyncio.Event = app.state.reregister_requested
+    try:
+        while True:
+            await event.wait()
+            event.clear()
+            logger.warning("re-register requested; re-running registration")
+            app.state.greffer_token = resolve_token(settings)
+            address = await _resolve_address(settings)
+            await _run_registration(app, settings, address)
+    except asyncio.CancelledError:
+        logger.info("reregister supervisor cancelled")
+        raise
+
+
+async def _resolve_address(settings: Settings) -> str:
+    return settings.greffer_address or await anyio.to_thread.run_sync(
         _resolve_hostname, abandon_on_cancel=True
     )
+
+
+async def _run_registration(
+    app: FastAPI, settings: Settings, address: str
+) -> None:
+    """Register with the manager and block until the cert is installed.
+
+    Reads the token from ``app.state`` at call time so a re-register picks up a
+    rotated on-disk token. All ``anyio.to_thread.run_sync`` calls use
+    ``abandon_on_cancel=True`` so lifespan shutdown doesn't block on a hung HTTP
+    call; every HTTP call also carries a ``timeout``.
+    """
+    token: str = app.state.greffer_token
 
     # Phase 1: POST until the manager accepts the registration (2xx). Retries
     # back off exponentially (capped) so a permanently-refused register stays

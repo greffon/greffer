@@ -41,9 +41,9 @@ def test_one_tick_calls_report_status_change_on_first_seen(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, prev, "tok")
 
-    mock_report.assert_called_once_with(settings, "inst-a", "running")
+    mock_report.assert_called_once_with(settings, "inst-a", "running", "tok")
     assert prev == {"inst-a": "running"}
 
 
@@ -63,11 +63,11 @@ def test_one_tick_skips_dotfile_entries(settings: Settings, tmp_path) -> None:
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, prev, "tok")
 
     # Only the real instance is queried and reported; the dotfiles are skipped.
     mock_compose.get_status.assert_called_once_with("inst-a")
-    mock_report.assert_called_once_with(settings, "inst-a", "running")
+    mock_report.assert_called_once_with(settings, "inst-a", "running", "tok")
     assert prev == {"inst-a": "running"}
 
 
@@ -82,7 +82,7 @@ def test_one_tick_skips_report_status_change_when_unchanged(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, prev, "tok")
 
     mock_report.assert_not_called()
 
@@ -98,9 +98,9 @@ def test_one_tick_fires_report_status_change_on_transition(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "stopped"}
-        _one_monitor_tick(settings, prev)
+        _one_monitor_tick(settings, prev, "tok")
 
-    mock_report.assert_called_once_with(settings, "inst-a", "stopped")
+    mock_report.assert_called_once_with(settings, "inst-a", "stopped", "tok")
     assert prev == {"inst-a": "stopped"}
 
 
@@ -113,13 +113,14 @@ def test_report_status_change_posts_correct_payload(settings: Settings) -> None:
     from app.workers.monitor import _report_status_change
 
     with patch("app.workers.monitor.requests") as mock_requests:
-        _report_status_change(settings, "inst-42", "running")
+        _report_status_change(settings, "inst-42", "running", "tok-xyz")
 
     mock_requests.post.assert_called_once()
     url, = mock_requests.post.call_args.args
     kwargs = mock_requests.post.call_args.kwargs
     assert url.endswith("/api/greffer/instances/inst-42/")
     assert kwargs["json"] == {"status": "running"}
+    assert kwargs["headers"] == {"X-Greffer-Token": "tok-xyz"}
     assert kwargs["verify"] == settings.greffer_ssl_verify
     assert kwargs["timeout"] == 10.0
 
@@ -138,11 +139,12 @@ async def test_monitor_worker_continues_after_tick_exception(
 
     call_count = 0
 
-    def _fake_tick(_settings, _prev):
+    def _fake_tick(_settings, _prev, _token):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("boom")
+        return {}
 
     async def _sleep_once_then_cancel(_s: float) -> None:
         if call_count >= 2:
@@ -165,8 +167,8 @@ async def test_monitor_worker_cancellable_during_sleep(
     """Cancellation during asyncio.sleep propagates cleanly."""
     app = create_app(token="t", settings=settings)
 
-    def _noop_tick(_settings, _prev):
-        return
+    def _noop_tick(_settings, _prev, _token):
+        return {}
 
     monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _noop_tick)
 
@@ -192,9 +194,10 @@ async def test_monitor_worker_cancel_is_snappy_during_blocking_tick(
     tick_started = threading.Event()
     never_complete = threading.Event()
 
-    def _blocking_tick(_settings, _prev):
+    def _blocking_tick(_settings, _prev, _token):
         tick_started.set()
         never_complete.wait(timeout=10)
+        return {}
 
     monkeypatch.setattr(
         "app.workers.monitor._one_monitor_tick", _blocking_tick

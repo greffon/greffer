@@ -41,33 +41,35 @@ async def test_lifespan_no_tasks_when_workers_disabled(
 async def test_lifespan_starts_three_workers_when_enabled(
     settings: Settings,
 ) -> None:
-    """``greffer_workers_enabled=True`` → three tasks started with expected
-    names, cancelled on shutdown."""
+    """``greffer_workers_enabled=True`` → all lifecycle tasks started with the
+    expected names, cancelled on shutdown."""
     settings.greffer_workers_enabled = True  # type: ignore[misc]
     app = create_app(token="t", settings=settings)
 
     async def _noop_worker(_app):
         await asyncio.sleep(3600)  # sleep forever; cancellable
 
+    expected = {
+        "greffer-register", "greffer-monitor", "greffer-crl-sync",
+        "greffer-heartbeat", "greffer-reregister",
+    }
     # Patch the bindings that `start_workers` uses — those are module-level
     # imports in `app/workers/__init__.py`, so patching `app.workers.X`
     # reaches them before `start_workers` looks them up.
     with patch("app.workers.register_worker", new=_noop_worker), patch(
         "app.workers.monitor_worker", new=_noop_worker
-    ), patch("app.workers.crl_sync_worker", new=_noop_worker):
+    ), patch("app.workers.crl_sync_worker", new=_noop_worker), patch(
+        "app.workers.heartbeat_worker", new=_noop_worker
+    ), patch("app.workers.reregister_worker", new=_noop_worker):
         async with lifespan(app):
             current_names = {
                 t.get_name() for t in asyncio.all_tasks() if not t.done()
             }
-            assert "greffer-register" in current_names
-            assert "greffer-monitor" in current_names
-            assert "greffer-crl-sync" in current_names
+            assert expected.issubset(current_names)
 
     # After lifespan shutdown the worker tasks must be gone.
     leftover = {t.get_name() for t in asyncio.all_tasks() if not t.done()}
-    assert "greffer-register" not in leftover
-    assert "greffer-monitor" not in leftover
-    assert "greffer-crl-sync" not in leftover
+    assert expected.isdisjoint(leftover)
 
 
 def test_greffer_workers_enabled_env_var_binds(
