@@ -834,43 +834,43 @@ async def test_reregister_runs_registration_when_event_set(
 
 
 @pytest.mark.asyncio
-async def test_reregister_survives_failed_attempt(
+async def test_reregister_retries_failed_attempt_until_registered(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-network failure in one re-registration attempt must NOT kill the
-    supervisor — a later request must still be served."""
+    """A non-network failure in a re-registration attempt must NOT return the
+    supervisor to idle (which would leave registered unset and the heartbeat
+    parked forever). It retries until registration succeeds."""
     app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
     calls = 0
 
     async def _fake_run(_app, _settings, _address):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise KeyError("malformed cert body")
-        raise asyncio.CancelledError  # stop on the second attempt
+            raise KeyError("malformed cert body")  # first attempt fails
+        _app.state.registered.set()  # second attempt succeeds
+        raise asyncio.CancelledError  # stop the supervisor
 
     async def _fake_addr(_settings):
         return "10.0.0.9"
 
+    async def _noop_sleep(_s):
+        return
+
     monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
     monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
     monkeypatch.setattr("app.workers.register.resolve_token", lambda _s: "tok")
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
 
-    async def _runner():
-        await reregister_worker(app)
-
-    task = asyncio.create_task(_runner())
-    # First request fails (KeyError) but the supervisor keeps running.
-    app.state.reregister_requested.set()
-    for _ in range(50):
-        await asyncio.sleep(0)
-        if calls >= 1:
-            break
-    # Second request is still served despite the first failing.
     app.state.reregister_requested.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await reregister_worker(app)
+
+    # Retried after the first failure (no second external request needed) and
+    # re-armed the heartbeat.
     assert calls == 2
+    assert app.state.registered.is_set()
 
 
 @pytest.mark.asyncio

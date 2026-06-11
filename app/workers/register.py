@@ -94,20 +94,25 @@ async def reregister_worker(app: FastAPI) -> None:
             await event.wait()
             event.clear()
             logger.warning("re-register requested; re-running registration")
-            try:
-                app.state.greffer_token = resolve_token(settings)
-                address = await _resolve_address(settings)
-                await _run_registration(app, settings, address)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # A single failed re-registration attempt (e.g. a malformed
-                # cert body, a docker error during install) must NOT kill the
-                # supervisor: the process would then never re-register again.
-                # Log and keep waiting for the next request, mirroring
-                # monitor_worker's per-iteration handling.
-                logger.exception(
-                    "re-registration attempt failed; awaiting next request")
+            # Retry until registration succeeds (which sets app.state.registered
+            # and un-gates the heartbeat). A single failed attempt must NOT
+            # return to idle: registered is cleared and reregister_requested is
+            # cleared, so nothing would ever re-trigger us and the heartbeat
+            # would stay parked forever. Mirror register_worker's retry loop.
+            delay = _REGISTER_RETRY_SECONDS
+            while True:
+                try:
+                    app.state.greffer_token = resolve_token(settings)
+                    address = await _resolve_address(settings)
+                    await _run_registration(app, settings, address)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "re-registration attempt failed; retrying in %ss", delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
     except asyncio.CancelledError:
         logger.info("reregister supervisor cancelled")
         raise

@@ -325,3 +325,35 @@ def test_one_heartbeat_degraded_payload_has_captured_at(
         _one_heartbeat(app, 1)
     body = mock_requests.post.call_args.kwargs["json"]
     assert body["captured_at"]  # always present, even on a degraded beat
+
+
+@pytest.mark.asyncio
+async def test_seq_and_boot_id_stable_across_403_resume(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seq keeps incrementing (not reset) and boot_id stays stable across a
+    403 pause/resume — the manager's restart-safe ordering depends on it."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.set()
+    seqs = []
+    boot_ids = []
+
+    def _fake(_app, seq):
+        seqs.append(seq)
+        boot_ids.append(_app.state.boot_id)
+        return 403 if len(seqs) == 1 else 200
+
+    async def _sleep(_s):
+        if len(seqs) == 1:
+            app.state.registered.set()  # re-arm to resume after the 403 pause
+        elif len(seqs) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.heartbeat._one_heartbeat", _fake)
+    monkeypatch.setattr("app.workers.heartbeat.asyncio.sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_worker(app)
+
+    assert seqs == [1, 2]  # seq not reset on resume
+    assert boot_ids == [app.state.boot_id, app.state.boot_id]  # stable
