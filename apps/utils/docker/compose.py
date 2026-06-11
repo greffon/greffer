@@ -92,13 +92,27 @@ def create_compose_template_from_greffon(compose, greffon_info):
         if port.get('exposure_tier', 'http') != 'l4':
             continue
         proto_suffix = '/udp' if port.get('protocol') == 'udp' else ''
-        # same_port: publish host P -> container P (the allocated host port on
-        # both sides) so an app that advertises exactly what it binds sees one
-        # number. The app must bind {{ instance_l4_port }} (== port_host).
-        # Default: host P -> declared container port (unchanged).
-        container_side = (
-            '{{ports[%s].port_host}}' % i if port.get('same_port')
-            else port['port_container'])
+        # same_port: advertise == listen == public. The container-side port
+        # depends on the publish mode, because the public port differs:
+        #   proxy  -> the public port IS the greffer host port. Publish
+        #             host P -> container P so the app binds == publishes ==
+        #             advertises one number ({{ instance_l4_port }} == port_host
+        #             in proxy mode).
+        #   tunnel -> the public port is the rathole relay's tunnel_port
+        #             (manager-allocated, handed off as {{ instance_l4_port }});
+        #             the host port_host is just the loopback port the
+        #             rathole-client dials. Publish host port_host -> container
+        #             tunnel_port so the app binds the SAME port it is advertised
+        #             on ({{ instance_l4_port }}), and advertise == listen holds
+        #             through the relay. (instance_l4_* is singular: one L4
+        #             endpoint per instance, so a single tunnel_port suffices.)
+        # Non-same_port: host port_host -> declared container port (unchanged).
+        if port.get('same_port'):
+            container_side = (
+                '{{ instance_l4_port }}' if l4_bind_host == '127.0.0.1'
+                else '{{ports[%s].port_host}}' % i)
+        else:
+            container_side = port['port_container']
         mapping = '%s:{{ports[%s].port_host}}:%s%s' % (
             l4_bind_host, i, container_side, proto_suffix)
         service = compose['services'][port['container_name']]

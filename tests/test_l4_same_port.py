@@ -24,9 +24,10 @@ from tests.helpers import SAMPLE_CERT
 # ---------------------------------------------------------------------------
 
 class SamePortPublishTests(TestCase):
-    def _info(self, same_port):
+    def _info(self, same_port, l4_bind_host='0.0.0.0'):
         return {
             'id': 'test-instance',
+            'l4_bind_host': l4_bind_host,
             'ports': [{
                 'port_container': '51820',
                 'container_name': 'wireguard',
@@ -50,15 +51,37 @@ class SamePortPublishTests(TestCase):
             'wireguard': {'image': 'wg', 'ports': ['51820:51820/udp']}}}
 
     @patch('apps.utils.docker.compose.client')
-    def test_same_port_publishes_host_port_on_both_sides(self, _mock_client):
-        """same_port=True -> 0.0.0.0:<host>:<host>/udp (container side is the
-        allocated host port, not the declared 51820)."""
+    def test_same_port_proxy_publishes_host_port_on_both_sides(self, _mock_client):
+        """proxy + same_port=True -> 0.0.0.0:<host>:<host>/udp (container side is
+        the allocated host port, not the declared 51820). In proxy mode the
+        public port IS the host port, so {{ instance_l4_port }} == port_host."""
         from apps.utils.docker.compose import create_compose_template_from_greffon
         result = create_compose_template_from_greffon(self._compose(), self._info(True))
         wg_ports = result['services']['wireguard']['ports']
         self.assertIn(
             '0.0.0.0:{{ports[0].port_host}}:{{ports[0].port_host}}/udp', wg_ports)
         self.assertNotIn('0.0.0.0:{{ports[0].port_host}}:51820/udp', wg_ports)
+
+    @patch('apps.utils.docker.compose.client')
+    def test_same_port_tunnel_publishes_instance_l4_port_container_side(self, _mock_client):
+        """tunnel + same_port=True -> 127.0.0.1:<host>:{{ instance_l4_port }}/udp.
+
+        In tunnel mode the public port is the rathole relay's tunnel_port
+        (manager-allocated, handed off as instance_l4_port); the host port_host
+        is just the loopback port the rathole-client dials. The container side
+        must be the advertised relay port so the app binds the SAME port it is
+        advertised on, NOT the greffer-local port_host (which would leave the
+        app listening on the wrong port). Binds 127.0.0.1 (tunnel)."""
+        from apps.utils.docker.compose import create_compose_template_from_greffon
+        result = create_compose_template_from_greffon(
+            self._compose(), self._info(True, l4_bind_host='127.0.0.1'))
+        wg_ports = result['services']['wireguard']['ports']
+        self.assertIn(
+            '127.0.0.1:{{ports[0].port_host}}:{{ instance_l4_port }}/udp', wg_ports)
+        # NOT the proxy form (container side = port_host) and NOT the declared port.
+        self.assertNotIn(
+            '127.0.0.1:{{ports[0].port_host}}:{{ports[0].port_host}}/udp', wg_ports)
+        self.assertNotIn('127.0.0.1:{{ports[0].port_host}}:51820/udp', wg_ports)
 
     @patch('apps.utils.docker.compose.client')
     def test_default_publishes_declared_container_port(self, _mock_client):
