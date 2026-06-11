@@ -47,6 +47,30 @@ def test_one_tick_calls_report_status_change_on_first_seen(
     assert prev == {"inst-a": "running"}
 
 
+def test_one_tick_skips_dotfile_entries(settings: Settings, tmp_path) -> None:
+    """Internal state files under GREFFON_PATH (.greffer-token, the
+    .greffer-migrations.* markers) are not greffon instances and must be
+    skipped — otherwise the monitor queries docker status for them and POSTs a
+    bogus instance status to the manager (a 404 on /instances/.greffer-token/).
+    UUID instance ids never start with a dot."""
+    (tmp_path / "inst-a").mkdir()
+    (tmp_path / ".greffer-token").write_text("secret")
+    (tmp_path / ".greffer-migrations.lock").write_text("")
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    prev: dict[str, str] = {}
+
+    with patch("apps.utils.docker.compose") as mock_compose, patch(
+        "app.workers.monitor._report_status_change"
+    ) as mock_report:
+        mock_compose.get_status.return_value = {"status": "running"}
+        _one_monitor_tick(settings, prev)
+
+    # Only the real instance is queried and reported; the dotfiles are skipped.
+    mock_compose.get_status.assert_called_once_with("inst-a")
+    mock_report.assert_called_once_with(settings, "inst-a", "running")
+    assert prev == {"inst-a": "running"}
+
+
 def test_one_tick_skips_report_status_change_when_unchanged(
     settings: Settings, tmp_path
 ) -> None:
