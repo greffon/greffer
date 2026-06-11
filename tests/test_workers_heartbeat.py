@@ -134,3 +134,41 @@ async def test_heartbeat_worker_continues_after_exception(
         await heartbeat_worker(app)
 
     assert calls == 2  # second beat ran despite the first raising
+
+
+def test_disk_free_bytes_returns_none_on_oserror(settings: Settings) -> None:
+    from app.workers.heartbeat import _disk_free_bytes
+    with patch("app.workers.heartbeat.shutil.disk_usage",
+               side_effect=OSError("nope")):
+        assert _disk_free_bytes(settings) is None
+
+
+def test_one_heartbeat_healthy_payload_fields(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {"map": {}, "at": time.monotonic()}
+    with patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["version"] == settings.greffer_version
+    assert body["reasons"] == []
+    assert "disk_free_bytes" in body  # int or None
+    assert body["degraded"] is False
+
+
+def test_one_heartbeat_degraded_payload(settings: Settings, tmp_path) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = None
+    with patch("app.workers.heartbeat.collect_status_map",
+               side_effect=RuntimeError("boom")), \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["degraded"] is True
+    assert body["reasons"] == ["docker_unreachable"]
+    assert body["instances"] == {}

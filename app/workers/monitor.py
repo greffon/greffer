@@ -29,12 +29,17 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 
 async def monitor_worker(app: FastAPI) -> None:
     settings: Settings = app.state.settings
-    token: str = app.state.greffer_token
     prev_status: dict[str, str] = {}
     try:
         while True:
             logger.info("monitoring begin")
             try:
+                # Re-read the token each tick (not snapshotted at startup) so a
+                # re-register rotation (reregister_worker mutates
+                # app.state.greffer_token) is honored on the legacy callback,
+                # matching the heartbeat worker. Otherwise post-rotation
+                # callbacks would 403 once GREFFER_CALLBACK_ENFORCE_TOKEN is on.
+                token: str = app.state.greffer_token
                 # abandon_on_cancel=True — lifespan shutdown returns
                 # immediately even if a tick is mid-docker-API or mid-HTTP
                 # call. Inner HTTP call carries timeout=10 so the thread

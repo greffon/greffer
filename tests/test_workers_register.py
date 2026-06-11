@@ -5,6 +5,7 @@ plain pytest + mock — no event loop gymnastics.
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from app.workers.register import (
     _resolve_hostname,
     _safe_body,
     register_worker,
+    reregister_worker,
 )
 
 
@@ -786,3 +788,91 @@ def test_initial_tunnel_config_failure_is_non_fatal(
     assert mock_logger.warning.called
     msg = mock_logger.warning.call_args.args[0]
     assert "non-fatal" in msg
+
+
+# ---------------------------------------------------------------------------
+# reregister_worker — supervised re-register on heartbeat 403
+# (greffer-observability epic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reregister_runs_registration_when_event_set(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(token="t", settings=settings)
+    ran = {}
+
+    async def _fake_run(_app, _settings, _address):
+        ran["called"] = True
+        # Stop the supervisor after the first re-registration.
+        raise asyncio.CancelledError
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+    monkeypatch.setattr(
+        "app.workers.register.resolve_token", lambda _s: "rotated-tok")
+
+    app.state.reregister_requested.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reregister_worker(app)
+
+    assert ran.get("called") is True
+    # The event was cleared and the token re-read.
+    assert app.state.greffer_token == "rotated-tok"
+    assert not app.state.reregister_requested.is_set()
+
+
+@pytest.mark.asyncio
+async def test_reregister_survives_failed_attempt(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-network failure in one re-registration attempt must NOT kill the
+    supervisor — a later request must still be served."""
+    app = create_app(token="t", settings=settings)
+    calls = 0
+
+    async def _fake_run(_app, _settings, _address):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyError("malformed cert body")
+        raise asyncio.CancelledError  # stop on the second attempt
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+    monkeypatch.setattr("app.workers.register.resolve_token", lambda _s: "tok")
+
+    async def _runner():
+        await reregister_worker(app)
+
+    task = asyncio.create_task(_runner())
+    # First request fails (KeyError) but the supervisor keeps running.
+    app.state.reregister_requested.set()
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if calls >= 1:
+            break
+    # Second request is still served despite the first failing.
+    app.state.reregister_requested.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reregister_cancellable_while_idle(
+    settings: Settings,
+) -> None:
+    app = create_app(token="t", settings=settings)
+    task = asyncio.create_task(reregister_worker(app))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

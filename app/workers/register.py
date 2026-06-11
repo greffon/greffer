@@ -80,9 +80,20 @@ async def reregister_worker(app: FastAPI) -> None:
             await event.wait()
             event.clear()
             logger.warning("re-register requested; re-running registration")
-            app.state.greffer_token = resolve_token(settings)
-            address = await _resolve_address(settings)
-            await _run_registration(app, settings, address)
+            try:
+                app.state.greffer_token = resolve_token(settings)
+                address = await _resolve_address(settings)
+                await _run_registration(app, settings, address)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single failed re-registration attempt (e.g. a malformed
+                # cert body, a docker error during install) must NOT kill the
+                # supervisor: the process would then never re-register again.
+                # Log and keep waiting for the next request, mirroring
+                # monitor_worker's per-iteration handling.
+                logger.exception(
+                    "re-registration attempt failed; awaiting next request")
     except asyncio.CancelledError:
         logger.info("reregister supervisor cancelled")
         raise

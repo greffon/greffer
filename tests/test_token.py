@@ -90,3 +90,22 @@ def test_no_temp_file_left_behind_on_write_failure(
     assert not path.exists()
     leftovers = list(tmp_path.glob(".greffer-token.*.tmp"))
     assert leftovers == []
+
+
+def test_resolve_token_prefers_settings_override(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from app.token import resolve_token
+    s = SimpleNamespace(greffer_token="operator-tok", greffon_path=tmp_path)
+    assert resolve_token(s) == "operator-tok"
+    # Disk token file is never created when the override wins.
+    assert not (tmp_path / ".greffer-token").exists()
+
+
+def test_resolve_token_falls_back_to_disk(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from app.token import resolve_token
+    s = SimpleNamespace(greffer_token=None, greffon_path=tmp_path)
+    tok = resolve_token(s)
+    assert tok
+    # Minted and persisted under greffon_path.
+    assert (tmp_path / ".greffer-token").read_text().strip() == tok

@@ -218,3 +218,55 @@ async def test_monitor_worker_cancel_is_snappy_during_blocking_tick(
     assert cancel_duration < 1.0, f"cancel took {cancel_duration}s"
 
     never_complete.set()
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_publishes_status_map(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a successful tick the worker publishes app.state.status_map for
+    the heartbeat worker to reuse (greffer-observability epic)."""
+    app = create_app(token="t", settings=settings)
+
+    def _tick(_settings, _prev, _token):
+        return {"inst-a": "running"}
+
+    async def _sleep_then_cancel(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _tick)
+    monkeypatch.setattr("app.workers.monitor.asyncio.sleep", _sleep_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_worker(app)
+
+    assert app.state.status_map["map"] == {"inst-a": "running"}
+    assert isinstance(app.state.status_map["at"], float)
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_uses_current_token_each_tick(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The monitor must re-read app.state.greffer_token each tick so a
+    re-register rotation is honored on the legacy callback (not snapshotted)."""
+    app = create_app(token="old-tok", settings=settings)
+    seen_tokens = []
+
+    def _tick(_settings, _prev, token):
+        seen_tokens.append(token)
+        if len(seen_tokens) == 1:
+            app.state.greffer_token = "new-tok"  # simulate a rotation
+        return {}
+
+    async def _sleep(_s):
+        if len(seen_tokens) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _tick)
+    monkeypatch.setattr("app.workers.monitor.asyncio.sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_worker(app)
+
+    assert seen_tokens == ["old-tok", "new-tok"]

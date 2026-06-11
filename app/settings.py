@@ -55,6 +55,15 @@ class Settings(BaseSettings):
             return None
         return v
 
+    @field_validator("heartbeat_interval")
+    @classmethod
+    def _heartbeat_interval_positive(cls, v):
+        # A non-positive interval would busy-loop the heartbeat worker and the
+        # manager rejects interval < 1 (400 every beat). Fail fast at startup.
+        if v < 1:
+            raise ValueError("heartbeat_interval must be >= 1")
+        return v
+
     # Where the greffer-side controller handler writes the rathole
     # ``client.toml`` pushed by the manager (in cert-poll responses,
     # start/stop request bodies). The compose tunnel profile mounts this

@@ -64,8 +64,13 @@ def _collect_or_reuse(
     sweep if fresh; else collect. On collection failure, return degraded with an
     empty map (the manager must not treat an empty degraded map as "everything
     missing")."""
+    # Reuse the monitor's sweep if it is recent. The monitor refreshes every
+    # monitor_interval, so judge freshness against monitor_interval + the
+    # heartbeat period: with equal 5s intervals a window of just
+    # heartbeat_interval would frequently miss the last tick and re-sweep.
     cached = getattr(app.state, "status_map", None)
-    if cached and (time.monotonic() - cached["at"]) < settings.heartbeat_interval:
+    window = settings.monitor_interval + settings.heartbeat_interval
+    if cached and (time.monotonic() - cached["at"]) < window:
         return cached["map"], False, []
     try:
         return collect_status_map(settings), False, []
