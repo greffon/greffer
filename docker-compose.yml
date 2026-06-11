@@ -16,8 +16,8 @@ services:
       - sh
       - -c
       - |
-        poetry run python -m app.cli apply_ops_migrations && \
-        exec poetry run uvicorn --factory app.main:create_app \
+        python -m app.cli apply_ops_migrations && \
+        exec uvicorn --factory app.main:create_app \
           --host 0.0.0.0 --port 8000 --workers 1
     env_file: &envfile
       - env.env
