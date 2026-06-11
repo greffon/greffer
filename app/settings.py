@@ -89,7 +89,6 @@ class Settings(BaseSettings):
 
     docker_nginx_name: str = "greffer-nginx-1"
 
-    crl_sync_interval: int = 300
     monitor_interval: int = 5
 
     # NOTE: the ops-migrations skip switch (GREFFER_SKIP_OPS_MIGRATIONS) is
@@ -100,7 +99,7 @@ class Settings(BaseSettings):
     # not the documented env var (see prefix pitfall on greffer_workers_enabled
     # below).
 
-    # Workers (register / monitor_status / CRL sync). Disabled by default
+    # Workers (register / monitor_status). Disabled by default
     # so unit tests don't accidentally start real workers. Production
     # enables via ``GREFFER_WORKERS_ENABLED=true`` in compose.
     #

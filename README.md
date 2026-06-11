@@ -30,7 +30,7 @@ Docker Engine (docker-compose) ──► greffon instances
 Nginx (per-instance TLS reverse proxy)
 ```
 
-The greffer runs as a single uvicorn worker (`--workers 1`) on purpose: three background tasks (register / monitor / CRL sync) live in one process, and multi-worker would spawn duplicate copies that fight over cert state.
+The greffer runs as a single uvicorn worker (`--workers 1`) on purpose: two background tasks (register / monitor) live in one process, and multi-worker would spawn duplicate copies that fight over cert state.
 
 ## Local development
 
@@ -46,7 +46,7 @@ set -a && source env.env && set +a
 # Run on-disk state migrations before the server binds (they must not race request handlers)
 poetry run python -m app.cli apply_ops_migrations
 
-# GREFFER_WORKERS_ENABLED=true turns on the register / monitor / CRL background tasks —
+# GREFFER_WORKERS_ENABLED=true turns on the register / monitor background tasks —
 # without it the greffer starts but never registers with the manager or sends callbacks.
 # GREFFER_PROTOCOL=http: bare uvicorn serves plain HTTP. env.env defaults to https because
 # the full compose stack puts an nginx TLS proxy in front; running uvicorn directly has no

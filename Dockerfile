@@ -25,7 +25,7 @@ COPY . /app
 # than the pre-cutover `;` which started anyway.
 #
 # --workers 1 is a hard requirement: multi-worker uvicorn would spawn N
-# copies of each background task (register / monitor / CRL sync), each
+# copies of each background task (register / monitor), each
 # minting its own token and fighting the manager over cert state. See
 # HLD #3 § Single-worker uvicorn constraint.
 CMD ["sh", "-c", "poetry run python -m app.cli apply_ops_migrations && exec poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8000 --workers 1"]

@@ -16,7 +16,7 @@ Thanks for considering a contribution. This repo is the worker node for [Greffon
 By signing off your commits you certify that you wrote the code (or have the right to submit it) and license it to the project under [AGPL v3](./LICENSE). Full text at [developercertificate.org](https://developercertificate.org/).
 
 ```bash
-git commit -s -m "feat: add CRL refresh backoff"
+git commit -s -m "feat: add monitor status backoff"
 ```
 
 PRs without DCO sign-off cannot be merged.
@@ -34,7 +34,7 @@ GREFFER_WORKERS_ENABLED=true GREFFER_PROTOCOL=http \
   poetry run uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8001
 ```
 
-`source env.env` is required — `Settings` has no auto-loaded env file and `apply_ops_migrations` exits early without `GREFFER_ID`. `GREFFER_WORKERS_ENABLED=true` turns on the register/monitor/CRL tasks. `GREFFER_PROTOCOL=http` overrides env.env's `https` default: bare uvicorn has no TLS, so without the override the greffer registers an `https` callback URL that the manager can't reach. (Run the full compose stack if you want production-like nginx TLS.) The greffer also needs a reachable manager and a Docker daemon. See [README.md](./README.md) for the env var set.
+`source env.env` is required — `Settings` has no auto-loaded env file and `apply_ops_migrations` exits early without `GREFFER_ID`. `GREFFER_WORKERS_ENABLED=true` turns on the register/monitor tasks. `GREFFER_PROTOCOL=http` overrides env.env's `https` default: bare uvicorn has no TLS, so without the override the greffer registers an `https` callback URL that the manager can't reach. (Run the full compose stack if you want production-like nginx TLS.) The greffer also needs a reachable manager and a Docker daemon. See [README.md](./README.md) for the env var set.
 
 ## Code style
 
@@ -44,7 +44,7 @@ GREFFER_WORKERS_ENABLED=true GREFFER_PROTOCOL=http \
 - Use `transaction`-style atomic patterns for multi-step on-disk state changes
 - Never `verify=False` on `requests`/`httpx` calls
 - Secrets from environment variables only — never hardcoded
-- Respect the `--workers 1` invariant: background tasks (register / monitor / CRL sync) assume a single process
+- Respect the `--workers 1` invariant: background tasks (register / monitor) assume a single process
 
 ## Tests
 
