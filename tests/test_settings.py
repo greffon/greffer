@@ -60,3 +60,30 @@ def test_protocol_literal_rejects_invalid(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GREFFER_PROTOCOL", "ftp")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_heartbeat_interval_defaults_to_5(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.delenv("HEARTBEAT_INTERVAL", raising=False)
+    get_settings.cache_clear()
+    assert get_settings().heartbeat_interval == 5
+
+
+def test_heartbeat_interval_binds_unprefixed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL", "9")
+    get_settings.cache_clear()
+    assert get_settings().heartbeat_interval == 9
+
+
+def test_heartbeat_interval_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import ValidationError
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL", "0")
+    get_settings.cache_clear()
+    with pytest.raises(ValidationError):
+        get_settings()

@@ -53,6 +53,11 @@ def create_app(
     app.state.started_at = time.monotonic()
     app.state.status_map = None
     app.state.reregister_requested = asyncio.Event()
+    # Set by registration once the cert is installed; the heartbeat gates every
+    # beat on it so it never POSTs (and never 403-storms / triggers a concurrent
+    # re-register) before the greffer is accepted. Cleared on a heartbeat 403 so
+    # beating pauses until re-registration completes.
+    app.state.registered = asyncio.Event()
     app.include_router(health.router)
     app.include_router(controller.router)
     register_exception_handlers(app)

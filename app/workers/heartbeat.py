@@ -33,6 +33,12 @@ async def heartbeat_worker(app: FastAPI) -> None:
     seq = 0
     try:
         while True:
+            # Gate every beat on registration being complete, so the heartbeat
+            # never POSTs before the greffer is accepted (which would 403 every
+            # beat during the admin-acceptance wait and trigger a concurrent
+            # re-register). Cleared on a 403 below, so beating pauses until
+            # re-registration sets it again.
+            await app.state.registered.wait()
             seq += 1
             try:
                 status_code = await anyio.to_thread.run_sync(
@@ -40,9 +46,17 @@ async def heartbeat_worker(app: FastAPI) -> None:
                 )
                 if status_code == 403:
                     logger.warning(
-                        "heartbeat rejected (403); requesting re-register"
+                        "heartbeat rejected (403); pausing + requesting "
+                        "re-register"
                     )
+                    app.state.registered.clear()
                     app.state.reregister_requested.set()
+                elif status_code and status_code >= 400:
+                    # A non-403 4xx/5xx is a manager-side problem we can't fix by
+                    # re-registering; surface it but keep beating.
+                    logger.warning(
+                        "heartbeat rejected (HTTP %s); continuing", status_code
+                    )
             except asyncio.CancelledError:
                 raise
             except (requests.ConnectionError, requests.Timeout):
@@ -59,11 +73,13 @@ async def heartbeat_worker(app: FastAPI) -> None:
 
 def _collect_or_reuse(
     app: FastAPI, settings: Settings
-) -> tuple[dict[str, str], bool, list[str]]:
-    """Return ``(status_map, degraded, reasons)``. Reuse the monitor's recent
-    sweep if fresh; else collect. On collection failure, return degraded with an
-    empty map (the manager must not treat an empty degraded map as "everything
-    missing")."""
+) -> tuple[dict[str, str], bool, list[str], str]:
+    """Return ``(status_map, degraded, reasons, captured_at)``. Reuse the
+    monitor's recent sweep if fresh (with the sweep's own capture time); else
+    collect fresh (capture time = now). On collection failure, return degraded
+    with an empty map (the manager must not treat an empty degraded map as
+    "everything missing")."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     # Reuse the monitor's sweep if it is recent. The monitor refreshes every
     # monitor_interval, so judge freshness against monitor_interval + the
     # heartbeat period: with equal 5s intervals a window of just
@@ -71,12 +87,12 @@ def _collect_or_reuse(
     cached = getattr(app.state, "status_map", None)
     window = settings.monitor_interval + settings.heartbeat_interval
     if cached and (time.monotonic() - cached["at"]) < window:
-        return cached["map"], False, []
+        return cached["map"], False, [], cached.get("captured_at", now_iso)
     try:
-        return collect_status_map(settings), False, []
+        return collect_status_map(settings), False, [], now_iso
     except Exception:
         logger.exception("heartbeat status collection failed; sending degraded")
-        return {}, True, ["docker_unreachable"]
+        return {}, True, ["docker_unreachable"], now_iso
 
 
 def _disk_free_bytes(settings: Settings) -> int | None:
@@ -90,11 +106,11 @@ def _one_heartbeat(app: FastAPI, seq: int) -> int:
     """Build and POST one heartbeat. Returns the HTTP status code; network
     errors propagate to the worker loop."""
     settings: Settings = app.state.settings
-    status_map, degraded, reasons = _collect_or_reuse(app, settings)
+    status_map, degraded, reasons, captured_at = _collect_or_reuse(app, settings)
     payload = {
         "boot_id": app.state.boot_id,
         "seq": seq,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_at": captured_at,
         "interval": settings.heartbeat_interval,
         "version": settings.greffer_version,
         "uptime_s": int(time.monotonic() - app.state.started_at),

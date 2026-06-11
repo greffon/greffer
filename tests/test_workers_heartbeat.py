@@ -51,7 +51,7 @@ def test_one_heartbeat_posts_payload_with_token(
 def test_collect_or_reuse_uses_fresh_cache(settings: Settings) -> None:
     app = create_app(token="t", settings=settings)
     app.state.status_map = {"map": {"x": "running"}, "at": time.monotonic()}
-    m, degraded, reasons = _collect_or_reuse(app, settings)
+    m, degraded, reasons, _cap = _collect_or_reuse(app, settings)
     assert m == {"x": "running"}
     assert degraded is False
     assert reasons == []
@@ -68,7 +68,7 @@ def test_collect_or_reuse_collects_when_stale(
 
     with patch("apps.utils.docker.compose") as mock_compose:
         mock_compose.get_status.return_value = {"status": "running"}
-        m, degraded, reasons = _collect_or_reuse(app, settings)
+        m, degraded, reasons, _cap = _collect_or_reuse(app, settings)
 
     assert m == {"inst-a": "running"}
     assert degraded is False
@@ -81,7 +81,7 @@ def test_collect_or_reuse_degraded_on_failure(settings: Settings) -> None:
         "app.workers.heartbeat.collect_status_map",
         side_effect=RuntimeError("boom"),
     ):
-        m, degraded, reasons = _collect_or_reuse(app, settings)
+        m, degraded, reasons, _cap = _collect_or_reuse(app, settings)
     assert m == {}
     assert degraded is True
     assert "docker_unreachable" in reasons
@@ -92,6 +92,7 @@ async def test_heartbeat_worker_requests_reregister_on_403(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = create_app(token="t", settings=settings)
+    app.state.registered.set()  # past initial registration, so it beats
 
     def _fake(_app, _seq):
         return 403
@@ -107,6 +108,8 @@ async def test_heartbeat_worker_requests_reregister_on_403(
         await heartbeat_worker(app)
 
     assert app.state.reregister_requested.is_set()
+    # 403 pauses beating until re-registration sets `registered` again.
+    assert not app.state.registered.is_set()
 
 
 @pytest.mark.asyncio
@@ -114,6 +117,7 @@ async def test_heartbeat_worker_continues_after_exception(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = create_app(token="t", settings=settings)
+    app.state.registered.set()
     calls = 0
 
     def _fake(_app, _seq):
@@ -134,6 +138,65 @@ async def test_heartbeat_worker_continues_after_exception(
         await heartbeat_worker(app)
 
     assert calls == 2  # second beat ran despite the first raising
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_worker_waits_for_registration(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before registration completes, the heartbeat must not beat at all (no
+    403 storm, no reregister trigger)."""
+    app = create_app(token="t", settings=settings)
+    # registered intentionally NOT set.
+    beats = 0
+
+    def _fake(_app, _seq):
+        nonlocal beats
+        beats += 1
+        return 200
+
+    monkeypatch.setattr("app.workers.heartbeat._one_heartbeat", _fake)
+
+    task = asyncio.create_task(heartbeat_worker(app))
+    await asyncio.sleep(0.05)
+    assert beats == 0
+    assert not app.state.reregister_requested.is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_worker_non_403_does_not_reregister(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(token="t", settings=settings)
+    app.state.registered.set()
+
+    def _fake(_app, _seq):
+        return 500
+
+    async def _sleep_then_cancel(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.heartbeat._one_heartbeat", _fake)
+    monkeypatch.setattr(
+        "app.workers.heartbeat.asyncio.sleep", _sleep_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_worker(app)
+
+    assert not app.state.reregister_requested.is_set()
+    assert app.state.registered.is_set()  # still beating
+
+
+def test_collect_or_reuse_uses_cached_captured_at(settings: Settings) -> None:
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {
+        "map": {"x": "running"}, "at": time.monotonic(),
+        "captured_at": "2026-06-12T00:00:00+00:00"}
+    _m, _d, _r, captured = _collect_or_reuse(app, settings)
+    assert captured == "2026-06-12T00:00:00+00:00"
 
 
 def test_disk_free_bytes_returns_none_on_oserror(settings: Settings) -> None:
@@ -172,3 +235,21 @@ def test_one_heartbeat_degraded_payload(settings: Settings, tmp_path) -> None:
     assert body["degraded"] is True
     assert body["reasons"] == ["docker_unreachable"]
     assert body["instances"] == {}
+
+
+def test_collect_or_reuse_window_boundary_reuses(
+    settings: Settings, tmp_path
+) -> None:
+    # monitor_interval=5 + heartbeat_interval=5 -> window=10. A 7s-old cache
+    # (older than heartbeat_interval but within the window) must be REUSED, not
+    # re-collected — pins the deliberate monitor_interval+heartbeat_interval
+    # window.
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {
+        "map": {"x": "running"}, "at": time.monotonic() - 7,
+        "captured_at": "t"}
+    with patch("app.workers.heartbeat.collect_status_map") as m:
+        result, _d, _r, _c = _collect_or_reuse(app, settings)
+    m.assert_not_called()
+    assert result == {"x": "running"}

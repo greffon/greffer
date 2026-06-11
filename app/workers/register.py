@@ -216,6 +216,9 @@ async def _run_registration(
         await anyio.to_thread.run_sync(
             _fetch_and_store_crl, settings, abandon_on_cancel=True
         )
+        # Let the heartbeat worker start beating now that we are accepted and
+        # hold a cert (greffer-observability epic).
+        app.state.registered.set()
         logger.info("register complete")
         return
 

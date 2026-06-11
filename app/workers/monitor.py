@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 import anyio
 import requests
@@ -53,8 +54,14 @@ async def monitor_worker(app: FastAPI) -> None:
                 )
                 # Publish the sweep for the heartbeat worker to reuse, so the
                 # two timers don't each hit docker (greffer-observability epic).
+                # ``at`` is monotonic (freshness); ``captured_at`` is the wall
+                # clock the heartbeat sends so a reused map isn't claimed as
+                # freshly captured (keeps the manager's STARTING-grace honest).
                 app.state.status_map = {
-                    "map": status_map, "at": time.monotonic()}
+                    "map": status_map,
+                    "at": time.monotonic(),
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                }
             except asyncio.CancelledError:
                 raise
             except Exception:
