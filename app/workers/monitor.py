@@ -63,6 +63,17 @@ def _one_monitor_tick(settings: Settings, prev_status: dict[str, str]) -> None:
 
     greffon_dir = str(settings.greffon_path)
     for greffon_id in os.listdir(greffon_dir):
+        # Greffon instance dirs are UUID-named. Skip dotfiles so internal
+        # state that also lives under GREFFON_PATH — ``.greffer-token``
+        # (persisted registration token) and the ``.greffer-migrations.*``
+        # ops-migration markers — isn't mistaken for an instance. Otherwise
+        # the monitor calls ``compose.get_status('.greffer-token')`` for a
+        # nonexistent project and POSTs a bogus status to
+        # ``/api/greffer/instances/.greffer-token/`` (404) whenever that
+        # "status" changes. UUIDs never start with a dot, so this can't skip
+        # a real instance.
+        if greffon_id.startswith("."):
+            continue
         status = compose.get_status(greffon_id)["status"]
         if prev_status.get(greffon_id) != status:
             _report_status_change(settings, greffon_id, status)
