@@ -10,19 +10,26 @@ RUN apk add --no-cache build-base libffi-dev \
 
 WORKDIR /app
 COPY pyproject.toml poetry.lock /app/
-# In-project venv so the runtime stage can copy /app/.venv wholesale and
-# run it without poetry installed at all.
-ENV POETRY_VIRTUALENVS_IN_PROJECT=1
+# The venv lives at /opt/venv, NOT inside /app: docker-compose.yml
+# bind-mounts ./:/app, which would shadow anything the image put there.
+# (The old image dodged this only because poetry's venv lived in
+# /root/.cache/pypoetry.) Pre-creating the venv and exporting
+# VIRTUAL_ENV makes poetry install into it instead of creating its own,
+# and building at the same path the runtime uses keeps script shebangs
+# (/opt/venv/bin/python) valid after the cross-stage copy.
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 # --only main: the dev group (pytest, factory-boy/faker, httpx, the
 # setuptools<70 Python-3.12 distutils workaround) is ~25MB of packages
 # the 3.11 runtime never imports. pip/wheel are virtualenv seeds, not
 # deps — nothing installs packages at runtime, so drop them too.
-RUN poetry install --no-root --only main \
-      && rm -rf /app/.venv/lib/python3.11/site-packages/pip \
-                /app/.venv/lib/python3.11/site-packages/pip-* \
-                /app/.venv/lib/python3.11/site-packages/wheel \
-                /app/.venv/lib/python3.11/site-packages/wheel-* \
-                /app/.venv/bin/pip* /app/.venv/bin/wheel*
+RUN python -m venv /opt/venv \
+      && poetry install --no-root --only main \
+      && rm -rf /opt/venv/lib/python3.11/site-packages/pip \
+                /opt/venv/lib/python3.11/site-packages/pip-* \
+                /opt/venv/lib/python3.11/site-packages/wheel \
+                /opt/venv/lib/python3.11/site-packages/wheel-* \
+                /opt/venv/bin/pip* /opt/venv/bin/wheel*
 
 # Stage 2: runtime. docker-cli + the compose plugin only — greffer talks
 # to the HOST daemon through the mounted /var/run/docker.sock, so the
@@ -49,8 +56,9 @@ RUN printf '%s\n' \
       && chmod +x /usr/local/bin/poetry
 
 WORKDIR /app
-COPY --from=builder /app/.venv /app/.venv
-ENV PATH="/app/.venv/bin:${PATH}"
+COPY --from=builder /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 COPY . /app
 
 # Run pending ops migrations BEFORE uvicorn binds, so they can't race with
