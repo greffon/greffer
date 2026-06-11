@@ -60,12 +60,26 @@ class RegisterRejected(Exception):
 
 
 async def register_worker(app: FastAPI) -> None:
-    """Initial one-shot registration: POST until accepted, poll for cert,
-    install. Returns when registration completes. Later re-runs (after a
-    heartbeat 403) are handled by ``reregister_worker``."""
+    """Initial registration: POST until accepted, poll for cert, install.
+    Returns once registration completes (which sets ``app.state.registered``,
+    un-gating the heartbeat). Retries the whole flow on an unexpected failure
+    (e.g. a transient docker error during cert install) so such a failure does
+    NOT leave ``registered`` unset and the heartbeat blocked forever. Later
+    re-runs (after a heartbeat 403) are handled by ``reregister_worker``."""
     settings: Settings = app.state.settings
     address = await _resolve_address(settings)
-    await _run_registration(app, settings, address)
+    delay = _REGISTER_RETRY_SECONDS
+    while True:
+        try:
+            await _run_registration(app, settings, address)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "initial registration failed; retrying in %ss", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
 
 
 async def reregister_worker(app: FastAPI) -> None:

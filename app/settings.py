@@ -20,9 +20,10 @@ class Settings(BaseSettings):
     greffer_id: str
 
     # Optional token override; primarily for tests and operator-driven
-    # explicit rotation. When unset, ``create_app`` mints a fresh random
-    # token each process. Used as ``X-GREFFON-TOKEN`` on the manager →
-    # greffer auth path (start/stop/tunnel-config endpoints).
+    # explicit rotation. When unset, ``create_app`` loads (or mints + persists)
+    # a STABLE token from the data volume (``resolve_token`` ->
+    # ``load_or_create_token``), reused across restarts. Used as
+    # ``X-Greffer-Token`` on the manager auth paths.
     greffer_token: str | None = None
 
     # Greffer software version, reported in the register payload. Defaults to
@@ -57,11 +58,11 @@ class Settings(BaseSettings):
 
     @field_validator("heartbeat_interval")
     @classmethod
-    def _heartbeat_interval_positive(cls, v):
-        # A non-positive interval would busy-loop the heartbeat worker and the
-        # manager rejects interval < 1 (400 every beat). Fail fast at startup.
-        if v < 1:
-            raise ValueError("heartbeat_interval must be >= 1")
+    def _heartbeat_interval_in_range(cls, v):
+        # Below 1 would busy-loop the worker; above the manager's cap (86400)
+        # the manager 400s every beat. Match that contract and fail fast.
+        if not 1 <= v <= 86400:
+            raise ValueError("heartbeat_interval must be between 1 and 86400")
         return v
 
     # Where the greffer-side controller handler writes the rathole

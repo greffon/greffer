@@ -801,10 +801,15 @@ async def test_reregister_runs_registration_when_event_set(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = create_app(token="t", settings=settings)
+    # A 403 would have cleared `registered`; the reregister flow must re-set it
+    # so the heartbeat resumes beating.
+    app.state.registered.clear()
     ran = {}
 
     async def _fake_run(_app, _settings, _address):
         ran["called"] = True
+        # Mirror _run_registration's real contract: re-arm the heartbeat.
+        _app.state.registered.set()
         # Stop the supervisor after the first re-registration.
         raise asyncio.CancelledError
 
@@ -824,6 +829,8 @@ async def test_reregister_runs_registration_when_event_set(
     # The event was cleared and the token re-read.
     assert app.state.greffer_token == "rotated-tok"
     assert not app.state.reregister_requested.is_set()
+    # The heartbeat is re-armed (this closes the 403 -> reregister -> resume loop).
+    assert app.state.registered.is_set()
 
 
 @pytest.mark.asyncio
@@ -876,3 +883,37 @@ async def test_reregister_cancellable_while_idle(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_until_registration_succeeds(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient failure during initial registration (e.g. a docker error in
+    cert install) must NOT leave app.state.registered unset and the heartbeat
+    blocked forever — register_worker retries until it succeeds."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
+    calls = 0
+
+    async def _fake_run(_app, _settings, _address):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("docker boom during cert install")
+        _app.state.registered.set()  # second attempt succeeds
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    async def _noop_sleep(_s):
+        return
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    await register_worker(app)
+
+    assert calls == 2
+    assert app.state.registered.is_set()

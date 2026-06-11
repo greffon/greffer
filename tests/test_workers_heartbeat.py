@@ -253,3 +253,75 @@ def test_collect_or_reuse_window_boundary_reuses(
         result, _d, _r, _c = _collect_or_reuse(app, settings)
     m.assert_not_called()
     assert result == {"x": "running"}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_worker_seq_increments_across_beats(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(token="t", settings=settings)
+    app.state.registered.set()
+    seqs = []
+
+    def _fake(_app, seq):
+        seqs.append(seq)
+        return 200
+
+    async def _sleep(_s):
+        if len(seqs) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.heartbeat._one_heartbeat", _fake)
+    monkeypatch.setattr("app.workers.heartbeat.asyncio.sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_worker(app)
+
+    assert seqs == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_worker_swallows_network_error(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import requests as _requests
+    app = create_app(token="t", settings=settings)
+    app.state.registered.set()
+    calls = 0
+
+    def _fake(_app, _seq):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _requests.ConnectionError("manager down")
+        return 200
+
+    async def _sleep(_s):
+        if calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.heartbeat._one_heartbeat", _fake)
+    monkeypatch.setattr("app.workers.heartbeat.asyncio.sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await heartbeat_worker(app)
+
+    # A network error does not pause beating or trigger re-register.
+    assert calls == 2
+    assert not app.state.reregister_requested.is_set()
+    assert app.state.registered.is_set()
+
+
+def test_one_heartbeat_degraded_payload_has_captured_at(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = None
+    with patch("app.workers.heartbeat.collect_status_map",
+               side_effect=RuntimeError("boom")), \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["captured_at"]  # always present, even on a degraded beat

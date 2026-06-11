@@ -270,3 +270,28 @@ async def test_monitor_worker_uses_current_token_each_tick(
         await monitor_worker(app)
 
     assert seen_tokens == ["old-tok", "new-tok"]
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_publishes_captured_at(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """captured_at (wall clock of the sweep) is published for the heartbeat to
+    reuse, load-bearing for the manager's STARTING-grace."""
+    app = create_app(token="t", settings=settings)
+
+    def _tick(_settings, _prev, _token):
+        return {"inst-a": "running"}
+
+    async def _sleep_then_cancel(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _tick)
+    monkeypatch.setattr("app.workers.monitor.asyncio.sleep", _sleep_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_worker(app)
+
+    assert "captured_at" in app.state.status_map
+    # ISO-8601 UTC string.
+    assert app.state.status_map["captured_at"].endswith("+00:00")
