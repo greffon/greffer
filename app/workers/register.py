@@ -25,8 +25,37 @@ logger = logging.getLogger("greffer")
 
 
 _REGISTER_RETRY_SECONDS = 3.0
+# Cap for the exponential backoff on a persistently-refused register. A 400
+# (mode_mismatch / invalid fields) never self-heals, so a fixed 3s retry would
+# emit ~28k ERROR lines/day forever; backing off to once a minute keeps the
+# signal loud without drowning the log.
+_REGISTER_RETRY_MAX_SECONDS = 60.0
 _CERT_POLL_SECONDS = 5.0
+# Cert-poll log throttle: the worker polls every 5s, but the two steady-state
+# non-200s (401 awaiting acceptance, 403 invalid token) are conditions that can
+# persist for minutes/hours. Log on every status *transition*, then only once
+# per this many identical polls as a heartbeat (12 * 5s ≈ once a minute) so a
+# normal wait-for-admin doesn't produce 720 INFO lines/hour.
+_CERT_LOG_HEARTBEAT_EVERY = 12
 _HTTP_TIMEOUT_SECONDS = 10.0
+
+
+class RegisterRejected(Exception):
+    """The manager answered the register POST with a non-2xx status.
+
+    Carries the HTTP status and (truncated) response body so the
+    register loop can log a *loud, actionable* line instead of silently
+    falling through to the cert-poll phase. The silent fall-through was a
+    real outage mode: a 409 ``greffer_id_claimed`` (or 400 ``mode_mismatch``,
+    429 ``rate_limited``) left the greffer polling the cert endpoint
+    forever, every poll 403ing because the manager never staged this
+    greffer's token — with nothing in the greffer's own logs to say why.
+    """
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"register rejected: HTTP {status_code}: {body}")
 
 
 async def register_worker(app: FastAPI) -> None:
@@ -46,7 +75,10 @@ async def register_worker(app: FastAPI) -> None:
         _resolve_hostname, abandon_on_cancel=True
     )
 
-    # Phase 1: POST until the manager is reachable at all.
+    # Phase 1: POST until the manager accepts the registration (2xx). Retries
+    # back off exponentially (capped) so a permanently-refused register stays
+    # loud without flooding the log.
+    delay = _REGISTER_RETRY_SECONDS
     while True:
         try:
             await anyio.to_thread.run_sync(
@@ -64,16 +96,39 @@ async def register_worker(app: FastAPI) -> None:
             logger.info(
                 "manager not reachable at %s, retrying in %ss",
                 settings.greffon_base_server,
-                _REGISTER_RETRY_SECONDS,
+                delay,
             )
-            await asyncio.sleep(_REGISTER_RETRY_SECONDS)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
+        except RegisterRejected as exc:
+            # The manager is reachable but refused this registration. DON'T
+            # fall through to cert polling — without a staged token the cert
+            # endpoint will 403 every poll forever. Log loudly (the body
+            # names the reason: greffer_id_claimed / mode_mismatch / etc.)
+            # and keep retrying with backoff: a 409 clears once the stale
+            # claim is reset (e.g. operator pins GREFFER_TOKEN or resets the
+            # claim), a 429/503 clears on its own. A 400 won't self-heal, but
+            # a backed-off loud error beats a silent dead-end either way.
+            logger.error(
+                "register refused by manager (HTTP %s): %s — retrying in %ss. "
+                "Cert issuance is blocked until this register succeeds.",
+                exc.status_code,
+                exc.body,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
 
     # Phase 2: poll for cert until 200. Catch transient network errors
     # so a blip after the initial POST doesn't terminate the worker and
-    # leave the greffer stuck unregistered until process restart.
+    # leave the greffer stuck unregistered until process restart. Cert-poll
+    # status logging is throttled (transition + heartbeat) because 401/403
+    # can persist; see _CERT_LOG_HEARTBEAT_EVERY.
+    last_status: int | None = None
+    same_status_polls = 0
     while True:
         try:
-            data = await anyio.to_thread.run_sync(
+            data, cert_status = await anyio.to_thread.run_sync(
                 _fetch_cert, settings, token, abandon_on_cancel=True
             )
         except (requests.ConnectionError, requests.Timeout):
@@ -83,31 +138,44 @@ async def register_worker(app: FastAPI) -> None:
             )
             await asyncio.sleep(_CERT_POLL_SECONDS)
             continue
-        if data is not None:
-            await anyio.to_thread.run_sync(
-                _install_cert, settings, data, abandon_on_cancel=True
-            )
-            # v3 push: the manager embeds the initial rathole client.toml
-            # in the cert response on accept (tunnel mode only). Write it
-            # before the worker exits so rathole-client can come up
-            # immediately. Absent for proxy-mode greffers and for the
-            # transitional v2-manager-+-v3-greffer combo (in which case
-            # the v2 polling sidecar handles updates instead). Failure
-            # is logged but does NOT abort the register flow — without
-            # this file the greffer is still functional in proxy mode
-            # and the next start/stop push will retry.
-            await anyio.to_thread.run_sync(
-                _maybe_install_initial_tunnel_config,
-                settings,
-                data,
-                abandon_on_cancel=True,
-            )
-            await anyio.to_thread.run_sync(
-                _fetch_and_store_crl, settings, abandon_on_cancel=True
-            )
-            logger.info("register complete")
-            return
-        await asyncio.sleep(_CERT_POLL_SECONDS)
+        if data is None:
+            # Throttle: log on every status transition, then once per
+            # heartbeat window so a long awaiting-acceptance (401) or a stuck
+            # invalid-token (403) is visible without spamming every 5s.
+            if cert_status != last_status:
+                _log_cert_poll_status(cert_status, first=True)
+                last_status = cert_status
+                same_status_polls = 0
+            else:
+                same_status_polls += 1
+                if same_status_polls % _CERT_LOG_HEARTBEAT_EVERY == 0:
+                    _log_cert_poll_status(cert_status, first=False)
+            await asyncio.sleep(_CERT_POLL_SECONDS)
+            continue
+        # data is not None -> 200, cert issued. Install and finish.
+        await anyio.to_thread.run_sync(
+            _install_cert, settings, data, abandon_on_cancel=True
+        )
+        # v3 push: the manager embeds the initial rathole client.toml
+        # in the cert response on accept (tunnel mode only). Write it
+        # before the worker exits so rathole-client can come up
+        # immediately. Absent for proxy-mode greffers and for the
+        # transitional v2-manager-+-v3-greffer combo (in which case
+        # the v2 polling sidecar handles updates instead). Failure
+        # is logged but does NOT abort the register flow — without
+        # this file the greffer is still functional in proxy mode
+        # and the next start/stop push will retry.
+        await anyio.to_thread.run_sync(
+            _maybe_install_initial_tunnel_config,
+            settings,
+            data,
+            abandon_on_cancel=True,
+        )
+        await anyio.to_thread.run_sync(
+            _fetch_and_store_crl, settings, abandon_on_cancel=True
+        )
+        logger.info("register complete")
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +187,17 @@ async def register_worker(app: FastAPI) -> None:
 def _resolve_hostname() -> str:
     hostname = socket.gethostname()
     return socket.gethostbyname(hostname)
+
+
+def _safe_body(res: requests.Response, limit: int = 500) -> str:
+    """Best-effort, length-capped response body for log lines. Never raises
+    (a body that isn't decodable text must not mask the original HTTP error)."""
+    try:
+        text = res.text
+    except Exception:
+        return "<unreadable body>"
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _post_register(settings: Settings, address: str, token: str) -> None:
@@ -148,7 +227,7 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
     # payload aligns with the new stored mode.
     if settings.greffer_mode:
         payload["mode"] = settings.greffer_mode
-    requests.post(
+    res = requests.post(
         f"{settings.greffon_base_server}/api/greffer/register/{settings.greffer_id}/",
         json=payload,
         verify=settings.greffer_ssl_verify,
@@ -157,9 +236,16 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
         # side so shutdown is snappy regardless.
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
+    # A reachable-but-refusing manager (4xx/5xx) must NOT look like success.
+    # raise_for_status() drops the body, and the body is the whole point
+    # here (it names the rejection reason), so check explicitly and carry
+    # a truncated body up to the loop. Truncate so a misbehaving manager
+    # can't flood the log with one line.
+    if not 200 <= res.status_code < 300:
+        raise RegisterRejected(res.status_code, _safe_body(res))
 
 
-def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
+def _fetch_cert(settings: Settings, token: str) -> tuple[dict[str, Any] | None, int]:
     # ``X-Greffer-Token`` authenticates the cert poll: the response carries
     # the greffer's private key (and, in tunnel mode, the rathole client
     # config embedding the tunnel token), so the manager must be able to
@@ -168,13 +254,46 @@ def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
     # runs DRF TokenAuthentication globally: presenting a non-DRF token
     # there would 401 the request before the view runs. Managers that
     # don't enforce yet simply ignore the header.
+    #
+    # Returns ``(data, status_code)``: data is the parsed body on 200, else
+    # None. The status is returned (not logged here) so the caller's poll
+    # loop — which holds the cross-poll state — can throttle logging.
     res = requests.get(
         f"{settings.greffon_base_server}/api/greffer/certificate/{settings.greffer_id}/",
         headers={"X-Greffer-Token": token},
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
-    return res.json() if res.status_code == 200 else None
+    if res.status_code == 200:
+        return res.json(), res.status_code
+    return None, res.status_code
+
+
+def _log_cert_poll_status(status_code: int, *, first: bool) -> None:
+    """Log a non-200 cert-poll status. ``first`` is True on a status
+    transition (always logged) and False on a heartbeat tick (periodic
+    reminder). The two expected non-200s mean very different things:
+      401 -> registered but not yet accepted by an admin (normal wait).
+             Logged at INFO on entry, then heartbeat INFO ~once a minute.
+      403 -> invalid_greffer_token: the manager does not recognise this
+             greffer's token. A stuck state, not a wait — stale/rotated
+             token or a register that never succeeded (see RegisterRejected).
+             WARNING on entry and on each heartbeat so it stays visible.
+    """
+    if status_code == 401:
+        if first:
+            logger.info("cert not issued yet — awaiting admin acceptance (HTTP 401)")
+        else:
+            logger.info("still awaiting admin acceptance (HTTP 401)")
+    elif status_code == 403:
+        logger.warning(
+            "cert poll rejected: invalid_greffer_token (HTTP 403). The manager "
+            "does not recognise this greffer's token — registration has not "
+            "succeeded (stale token, or a refused register POST). This will not "
+            "self-resolve by polling.",
+        )
+    else:
+        logger.warning("unexpected cert poll status: HTTP %s", status_code)
 
 
 def _install_cert(settings: Settings, data: dict[str, Any]) -> None:
