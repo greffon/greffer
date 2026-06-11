@@ -1,0 +1,21 @@
+# Allowlist build context: exclude everything, then re-include only what
+# the image needs. The runtime is app/ + apps/ plus the poetry manifests
+# the Dockerfile COPYs; config comes from process env injected by compose
+# (app/settings.py uses env_file=None), so env.env must never be baked
+# into the image: CI bakes the tracked dev copy (with its GREFFER_ID)
+# into the published greffon/greffer image, and in a configured dev
+# checkout env.env carries a live GREFFER_TOKEN that a local build would
+# otherwise ship. This also keeps tests/, cli/, .github, .git (local
+# builds only; buildx git contexts strip it) and local artifacts
+# (db.sqlite3, venv/, data/, rendered instance dirs) out of the context.
+#
+# Adding a new runtime file or directory? Re-include it with a ! line.
+*
+!app
+!apps
+!pyproject.toml
+!poetry.lock
+# Re-exclude junk inside the allowlisted dirs (last matching rule wins).
+**/__pycache__
+**/*.pyc
+**/.DS_Store
