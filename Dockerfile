@@ -21,15 +21,15 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 # --only main: the dev group (pytest, factory-boy/faker, httpx, the
 # setuptools<70 Python-3.12 distutils workaround) is ~25MB of packages
-# the 3.11 runtime never imports. pip/wheel are virtualenv seeds, not
-# deps — nothing installs packages at runtime, so drop them too.
+# the 3.11 runtime never imports. pip is a virtualenv seed, not a dep —
+# nothing installs packages at runtime, so drop it. setuptools (the
+# other seed) is kept deliberately: pkg_resources may be imported by
+# the docker-SDK-5.x dependency tree.
 RUN python -m venv /opt/venv \
       && poetry install --no-root --only main \
       && rm -rf /opt/venv/lib/python*/site-packages/pip \
                 /opt/venv/lib/python*/site-packages/pip-* \
-                /opt/venv/lib/python*/site-packages/wheel \
-                /opt/venv/lib/python*/site-packages/wheel-* \
-                /opt/venv/bin/pip* /opt/venv/bin/wheel* \
+                /opt/venv/bin/pip* \
       && /opt/venv/bin/python -c "import uvicorn, fastapi"
 # The glob (not python3.11) keeps the prune working across base-image
 # bumps — rm -rf on a wrong hardcoded path would succeed silently and
@@ -46,11 +46,12 @@ FROM python:3.11-alpine
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 RUN apk add --no-cache docker-cli docker-cli-compose \
-      && ln -s /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
+      && ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
       && docker-compose version
-# `docker-compose version` asserts the symlink target at build time —
-# `ln -s` succeeds on a missing target, and a path change in the apk
-# package would otherwise only surface at the first greffon deploy.
+# Recent docker-cli-compose packages also ship /usr/bin/docker-compose;
+# the symlink covers older revs that only install the plugin path.
+# `docker-compose version` asserts a working binary at build time
+# rather than at the first greffon deploy.
 
 # Compat shim: poetry itself is no longer installed (the venv is already
 # on PATH), but compose command overrides in the wild — including the
