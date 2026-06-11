@@ -66,8 +66,8 @@ def test_falls_back_to_ephemeral_when_unwritable(
     def _boom(*_a, **_k):
         raise OSError("read-only file system")
 
-    # Make the atomic write fail at the temp-file write step.
-    monkeypatch.setattr(Path, "write_text", _boom)
+    # Make the atomic write fail at the mkstemp step (can't create the temp).
+    monkeypatch.setattr("app.token.tempfile.mkstemp", _boom)
     token = load_or_create_token(path)
     assert isinstance(token, str) and len(token) >= 32
     assert not path.exists()  # nothing persisted
@@ -76,15 +76,17 @@ def test_falls_back_to_ephemeral_when_unwritable(
 def test_no_temp_file_left_behind_on_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """If the publish (os.replace) fails after the temp file is written, the
+    temp file must be cleaned up, not left lying around with the secret."""
     path = tmp_path / ".greffer-token"
-    real_write_text = Path.write_text
 
-    def _fail_on_tmp(self: Path, *a, **k):
-        if self.name.endswith(".tmp"):
-            raise OSError("disk full")
-        return real_write_text(self, *a, **k)
+    def _boom(*_a, **_k):
+        raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "write_text", _fail_on_tmp)
-    load_or_create_token(path)
+    monkeypatch.setattr("app.token.os.replace", _boom)
+    token = load_or_create_token(path)
+    # Fallback token returned, nothing published, and no temp leftover.
+    assert isinstance(token, str) and len(token) >= 32
+    assert not path.exists()
     leftovers = list(tmp_path.glob(".greffer-token.*.tmp"))
     assert leftovers == []

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger("greffer")
@@ -48,9 +49,13 @@ def load_or_create_token(path: Path) -> str:
     except FileNotFoundError:
         existing = ""
     except OSError as exc:
-        logger.warning(
+        # A read failure on an existing token (perms/IO) is a misconfig, not a
+        # routine condition — log at ERROR so it's not lost in normal volume.
+        logger.error(
             "could not read greffer token file %s (%s); using an ephemeral "
-            "token for this process",
+            "token for this process. The greffer will look like a NEW claimant "
+            "to the manager and may be rejected (greffer_id_claimed) on an IP "
+            "change until this is fixed.",
             path, exc,
         )
         return _mint()
@@ -61,10 +66,12 @@ def load_or_create_token(path: Path) -> str:
     try:
         _atomic_write(path, token)
     except OSError as exc:
-        logger.warning(
+        logger.error(
             "could not persist greffer token to %s (%s); using an ephemeral "
-            "token for this process. The greffer will look like a new claimant "
-            "to the manager on the next IP change until persistence succeeds.",
+            "token for this process. The greffer will look like a NEW claimant "
+            "to the manager and may be rejected (greffer_id_claimed) on an IP "
+            "change until persistence succeeds. Check that GREFFON_PATH is a "
+            "writable, persistent volume.",
             path, exc,
         )
         return token
@@ -78,12 +85,23 @@ def _mint() -> str:
 
 def _atomic_write(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically so a crash mid-write never
-    leaves a half-written (and thus identity-changing) token: write a temp
-    file in the same directory, chmod it, then rename into place."""
+    leaves a half-written (and thus identity-changing) token.
+
+    ``tempfile.mkstemp`` creates a uniquely-named file in the same directory
+    with mode 0600 *at creation* — so the bearer token is never briefly
+    world-readable (the old write_text+chmod left a 0644 window), and the
+    unique name removes the temp-name collision/symlink risk. We then rename
+    into place (atomic on the same filesystem)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp",
+    )
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(content, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        # mkstemp already creates 0600; normalise explicitly in case of an
+        # unusual prior umask interaction, before publishing.
         os.chmod(tmp, _TOKEN_FILE_MODE)
         os.replace(tmp, path)
     except OSError:
