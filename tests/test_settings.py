@@ -34,7 +34,6 @@ def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.docker_nginx_name == "greffer-nginx-1"
     assert s.crl_sync_interval == 300
     assert s.monitor_interval == 5
-    assert s.skip_ops_migrations is False
     assert s.logger_name == "greffer"
 
 

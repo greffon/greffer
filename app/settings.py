@@ -92,7 +92,13 @@ class Settings(BaseSettings):
     crl_sync_interval: int = 300
     monitor_interval: int = 5
 
-    skip_ops_migrations: bool = False
+    # NOTE: the ops-migrations skip switch (GREFFER_SKIP_OPS_MIGRATIONS) is
+    # intentionally NOT a Settings field. The runner reads it via os.getenv
+    # because apps/utils/ops_migrations/ runs from the CLI entrypoint before
+    # the app boots and stays import-independent of app.settings. A bare
+    # ``skip_ops_migrations`` field here would also bind SKIP_OPS_MIGRATIONS,
+    # not the documented env var (see prefix pitfall on greffer_workers_enabled
+    # below).
 
     # Workers (register / monitor_status / CRL sync). Disabled by default
     # so unit tests don't accidentally start real workers. Production
