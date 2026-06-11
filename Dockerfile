@@ -25,11 +25,16 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # deps — nothing installs packages at runtime, so drop them too.
 RUN python -m venv /opt/venv \
       && poetry install --no-root --only main \
-      && rm -rf /opt/venv/lib/python3.11/site-packages/pip \
-                /opt/venv/lib/python3.11/site-packages/pip-* \
-                /opt/venv/lib/python3.11/site-packages/wheel \
-                /opt/venv/lib/python3.11/site-packages/wheel-* \
-                /opt/venv/bin/pip* /opt/venv/bin/wheel*
+      && rm -rf /opt/venv/lib/python*/site-packages/pip \
+                /opt/venv/lib/python*/site-packages/pip-* \
+                /opt/venv/lib/python*/site-packages/wheel \
+                /opt/venv/lib/python*/site-packages/wheel-* \
+                /opt/venv/bin/pip* /opt/venv/bin/wheel* \
+      && /opt/venv/bin/python -c "import uvicorn, fastapi"
+# The glob (not python3.11) keeps the prune working across base-image
+# bumps — rm -rf on a wrong hardcoded path would succeed silently and
+# re-ship ~15MB of pip. The import check asserts poetry actually
+# installed into /opt/venv rather than a venv of its own.
 
 # Stage 2: runtime. docker-cli + the compose plugin only — greffer talks
 # to the HOST daemon through the mounted /var/run/docker.sock, so the
@@ -41,7 +46,11 @@ FROM python:3.11-alpine
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 RUN apk add --no-cache docker-cli docker-cli-compose \
-      && ln -s /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+      && ln -s /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
+      && docker-compose version
+# `docker-compose version` asserts the symlink target at build time —
+# `ln -s` succeeds on a missing target, and a path change in the apk
+# package would otherwise only surface at the first greffon deploy.
 
 # Compat shim: poetry itself is no longer installed (the venv is already
 # on PATH), but compose command overrides in the wild — including the
@@ -49,7 +58,12 @@ RUN apk add --no-cache docker-cli docker-cli-compose \
 # that to a plain exec so they keep working; reject anything else loudly.
 RUN printf '%s\n' \
       '#!/bin/sh' \
-      'if [ "$1" = "run" ]; then shift; exec "$@"; fi' \
+      'if [ "$1" = "run" ]; then' \
+      '  shift' \
+      '  [ "$1" = "--" ] && shift' \
+      '  [ $# -eq 0 ] && { echo "poetry run: no command given" >&2; exit 1; }' \
+      '  exec "$@"' \
+      'fi' \
       'echo "poetry is not installed in this slim image; only \"poetry run <cmd>\" is shimmed" >&2' \
       'exit 1' \
       > /usr/local/bin/poetry \
