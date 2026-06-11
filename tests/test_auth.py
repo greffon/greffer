@@ -66,6 +66,27 @@ def test_create_app_mints_token_when_none_passed(settings: Settings) -> None:
     assert len(app.state.greffer_token) >= 32
 
 
+def test_create_app_token_is_stable_across_restarts(settings: Settings) -> None:
+    """Two create_app calls with the same data volume (a process restart)
+    resolve the SAME token — it's persisted, not minted per process. This is
+    what lets the manager recognise a restarted greffer on a new container IP
+    as the same claimant instead of rejecting it as a hijack."""
+    first = create_app(settings=settings)
+    second = create_app(settings=settings)
+    assert first.state.greffer_token == second.state.greffer_token
+    # And it's actually on disk under the data volume.
+    assert (settings.greffon_path / ".greffer-token").read_text().strip() == (
+        first.state.greffer_token
+    )
+
+
+def test_create_app_explicit_token_not_persisted(settings: Settings) -> None:
+    """An explicit/env token wins and must NOT be written to the volume — only
+    the auto-minted default is persisted."""
+    create_app(token="explicit-token", settings=settings)
+    assert not (settings.greffon_path / ".greffer-token").exists()
+
+
 def test_create_app_uses_provided_token(settings: Settings) -> None:
     app = create_app(token="fixed-token", settings=settings)
     assert app.state.greffer_token == "fixed-token"
