@@ -17,8 +17,12 @@ def _clear_settings_cache() -> Iterator[None]:
 
 
 @pytest.fixture
-def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setenv("GREFFER_ID", "test-greffer-id")
+    # Point the data volume at a per-test temp dir so token persistence
+    # (``create_app`` -> ``load_or_create_token`` under ``greffon_path``)
+    # never writes to the real ``/data`` and never leaks a token across tests.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
     return get_settings()
 
 
