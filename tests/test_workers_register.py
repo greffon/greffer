@@ -17,9 +17,11 @@ from app.workers.register import (
     _fetch_and_store_crl,
     _fetch_cert,
     _install_cert,
+    _log_cert_poll_status,
     _maybe_install_initial_tunnel_config,
     _post_register,
     _resolve_hostname,
+    _safe_body,
     register_worker,
 )
 
@@ -177,38 +179,45 @@ async def test_register_worker_does_not_poll_cert_after_rejected_register(
     assert mock_requests.get.call_count == 2
 
 
-def test_fetch_cert_logs_warning_on_403(settings: Settings) -> None:
+def test_log_cert_poll_status_warns_on_403(settings: Settings) -> None:
     """403 (invalid_greffer_token) is a stuck state, not a normal wait, so
     it must be surfaced at WARNING in the greffer's own logs — that silence
-    was the whole reason the original incident took so long to diagnose.
-    (The ``greffer`` logger sets ``propagate=False``, so assert on the
-    module logger directly rather than via caplog's root handler.)"""
-    with patch("app.workers.register.requests") as mock_requests, patch(
-        "app.workers.register.logger"
-    ) as mock_logger:
-        resp = MagicMock()
-        resp.status_code = 403
-        mock_requests.get.return_value = resp
-        assert _fetch_cert(settings, "tok") is None
+    was the whole reason the original incident took so long to diagnose."""
+    with patch("app.workers.register.logger") as mock_logger:
+        _log_cert_poll_status(403, first=True)
     mock_logger.warning.assert_called_once()
     assert "invalid_greffer_token" in mock_logger.warning.call_args.args[0]
 
 
-def test_fetch_cert_returns_data_on_200(settings: Settings) -> None:
+def test_log_cert_poll_status_401_is_info_not_warning(settings: Settings) -> None:
+    """401 (awaiting admin acceptance) is the expected wait, so it logs at
+    INFO, never WARNING — both on entry and on the heartbeat tick."""
+    with patch("app.workers.register.logger") as mock_logger:
+        _log_cert_poll_status(401, first=True)
+        _log_cert_poll_status(401, first=False)
+    assert mock_logger.warning.call_count == 0
+    assert mock_logger.info.call_count == 2
+
+
+def test_fetch_cert_returns_data_and_status_on_200(settings: Settings) -> None:
     with patch("app.workers.register.requests") as mock_requests:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"certificate": "c", "private_key": "k"}
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings, "tok") == {"certificate": "c", "private_key": "k"}
+        data, code = _fetch_cert(settings, "tok")
+    assert data == {"certificate": "c", "private_key": "k"}
+    assert code == 200
 
 
-def test_fetch_cert_returns_none_on_non_200(settings: Settings) -> None:
+def test_fetch_cert_returns_none_and_status_on_non_200(settings: Settings) -> None:
     with patch("app.workers.register.requests") as mock_requests:
         mock_response = MagicMock()
         mock_response.status_code = 401
         mock_requests.get.return_value = mock_response
-        assert _fetch_cert(settings, "tok") is None
+        data, code = _fetch_cert(settings, "tok")
+    assert data is None
+    assert code == 401
 
 
 def test_fetch_cert_sends_greffer_token_header(settings: Settings) -> None:
@@ -568,6 +577,113 @@ async def test_register_worker_falls_back_to_hostname(
         await register_worker(app)
 
     assert mock_requests.post.call_args.kwargs["json"]["address"] == "9.9.9.9"
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_refused_register_with_backoff(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistently-refused register (e.g. 400) must keep retrying with
+    exponential backoff and must NOT advance to the cert poll until a 2xx
+    lands — the cert poll would 403 forever without a staged token."""
+    app = create_app(token="tok", settings=settings)
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(s: float) -> None:
+        sleeps.append(s)
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _record_sleep)
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.ConnectionError = requests.ConnectionError
+        mock_requests.Timeout = requests.Timeout
+
+        refused = MagicMock()
+        refused.status_code = 400
+        refused.text = '{"message": "mode_mismatch"}'
+        accepted = MagicMock()
+        accepted.status_code = 200
+        # Refused twice, then accepted — exercises backoff growth.
+        mock_requests.post.side_effect = [refused, refused, accepted]
+
+        cert_response = MagicMock()
+        cert_response.status_code = 200
+        cert_response.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock()
+        crl.status_code = 200
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [cert_response, crl]
+
+        await register_worker(app)
+
+    # 3 POSTs (two refused, one accepted); NO cert GET happened while refused
+    # — the first GET only after the 2xx register (cert + CRL = 2 GETs).
+    assert mock_requests.post.call_count == 3
+    assert mock_requests.get.call_count == 2
+    # Backoff grew between the two refusals: 3.0 then 6.0.
+    assert sleeps[0] == 3.0
+    assert 6.0 in sleeps
+
+
+@pytest.mark.asyncio
+async def test_register_worker_throttles_repeated_cert_poll_403(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 403 that persists across consecutive polls is logged once on the
+    status transition, not on every 5s poll — otherwise a stuck greffer
+    floods the log at WARNING. (Heartbeat re-logging only after the throttle
+    window, which is longer than this test's 3-poll run.)"""
+    app = create_app(token="tok", settings=settings)
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "app.workers.register.logger"
+    ) as mock_logger, patch("apps.utils.docker.base.copy_file_into_container"):
+        mock_requests.ConnectionError = requests.ConnectionError
+        mock_requests.Timeout = requests.Timeout
+        mock_requests.post.return_value.status_code = 200
+
+        denied = MagicMock()
+        denied.status_code = 403
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock()
+        crl.status_code = 200
+        crl.text = "CRL"
+        # Three consecutive 403s then success — within one heartbeat window.
+        mock_requests.get.side_effect = [denied, denied, denied, success, crl]
+
+        await register_worker(app)
+
+    # Exactly one WARNING for the 403 run (the transition), not three.
+    assert mock_logger.warning.call_count == 1
+    assert "invalid_greffer_token" in mock_logger.warning.call_args.args[0]
+
+
+def test_safe_body_truncates_long_bodies() -> None:
+    """A misbehaving/malicious manager must not flood the log via the register
+    rejection body — _safe_body caps length and marks truncation."""
+    resp = MagicMock()
+    resp.text = "x" * 5000
+    out = _safe_body(resp, limit=500)
+    assert len(out) == 501  # 500 chars + the ellipsis
+    assert out.endswith("…")
+
+
+def test_safe_body_handles_unreadable_text() -> None:
+    """_safe_body never raises even if .text blows up — the HTTP error it
+    annotates must not be masked by a decoding failure."""
+    resp = MagicMock()
+    type(resp).text = property(lambda self: (_ for _ in ()).throw(ValueError("boom")))
+    assert _safe_body(resp) == "<unreadable body>"
 
 
 # ---------------------------------------------------------------------------
