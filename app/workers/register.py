@@ -29,6 +29,24 @@ _CERT_POLL_SECONDS = 5.0
 _HTTP_TIMEOUT_SECONDS = 10.0
 
 
+class RegisterRejected(Exception):
+    """The manager answered the register POST with a non-2xx status.
+
+    Carries the HTTP status and (truncated) response body so the
+    register loop can log a *loud, actionable* line instead of silently
+    falling through to the cert-poll phase. The silent fall-through was a
+    real outage mode: a 409 ``greffer_id_claimed`` (or 400 ``mode_mismatch``,
+    429 ``rate_limited``) left the greffer polling the cert endpoint
+    forever, every poll 403ing because the manager never staged this
+    greffer's token — with nothing in the greffer's own logs to say why.
+    """
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"register rejected: HTTP {status_code}: {body}")
+
+
 async def register_worker(app: FastAPI) -> None:
     """Register with the manager and block until cert is installed.
 
@@ -46,7 +64,7 @@ async def register_worker(app: FastAPI) -> None:
         _resolve_hostname, abandon_on_cancel=True
     )
 
-    # Phase 1: POST until the manager is reachable at all.
+    # Phase 1: POST until the manager accepts the registration (2xx).
     while True:
         try:
             await anyio.to_thread.run_sync(
@@ -64,6 +82,22 @@ async def register_worker(app: FastAPI) -> None:
             logger.info(
                 "manager not reachable at %s, retrying in %ss",
                 settings.greffon_base_server,
+                _REGISTER_RETRY_SECONDS,
+            )
+            await asyncio.sleep(_REGISTER_RETRY_SECONDS)
+        except RegisterRejected as exc:
+            # The manager is reachable but refused this registration. DON'T
+            # fall through to cert polling — without a staged token the cert
+            # endpoint will 403 every poll forever. Log loudly (the body
+            # names the reason: greffer_id_claimed / mode_mismatch / etc.)
+            # and keep retrying: a 409 clears once the stale claim is reset,
+            # a 429/503 clears on its own. A 400 won't self-heal, but a loud
+            # repeating error beats a silent dead-end either way.
+            logger.error(
+                "register refused by manager (HTTP %s): %s — retrying in %ss. "
+                "Cert issuance is blocked until this register succeeds.",
+                exc.status_code,
+                exc.body,
                 _REGISTER_RETRY_SECONDS,
             )
             await asyncio.sleep(_REGISTER_RETRY_SECONDS)
@@ -121,6 +155,17 @@ def _resolve_hostname() -> str:
     return socket.gethostbyname(hostname)
 
 
+def _safe_body(res: requests.Response, limit: int = 500) -> str:
+    """Best-effort, length-capped response body for log lines. Never raises
+    (a body that isn't decodable text must not mask the original HTTP error)."""
+    try:
+        text = res.text
+    except Exception:
+        return "<unreadable body>"
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _post_register(settings: Settings, address: str, token: str) -> None:
     payload = {
         "address": address,
@@ -148,7 +193,7 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
     # payload aligns with the new stored mode.
     if settings.greffer_mode:
         payload["mode"] = settings.greffer_mode
-    requests.post(
+    res = requests.post(
         f"{settings.greffon_base_server}/api/greffer/register/{settings.greffer_id}/",
         json=payload,
         verify=settings.greffer_ssl_verify,
@@ -157,6 +202,13 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
         # side so shutdown is snappy regardless.
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
+    # A reachable-but-refusing manager (4xx/5xx) must NOT look like success.
+    # raise_for_status() drops the body, and the body is the whole point
+    # here (it names the rejection reason), so check explicitly and carry
+    # a truncated body up to the loop. Truncate so a misbehaving manager
+    # can't flood the log with one line.
+    if not 200 <= res.status_code < 300:
+        raise RegisterRejected(res.status_code, _safe_body(res))
 
 
 def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
@@ -174,7 +226,28 @@ def _fetch_cert(settings: Settings, token: str) -> dict[str, Any] | None:
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
-    return res.json() if res.status_code == 200 else None
+    if res.status_code == 200:
+        return res.json()
+    # Non-200 is not always benign. The two expected non-200s mean very
+    # different things, and conflating them as "keep polling silently" is
+    # what made a stuck greffer impossible to diagnose from its own logs:
+    #   401 -> registered but not yet accepted by an admin (normal wait).
+    #   403 -> invalid_greffer_token: the manager does not recognise this
+    #          greffer's token. This is a stuck state, not a wait — usually
+    #          a stale/rotated token or a register that never succeeded
+    #          (see RegisterRejected). It will 403 forever until fixed.
+    if res.status_code == 403:
+        logger.warning(
+            "cert poll rejected: invalid_greffer_token (HTTP 403). The manager "
+            "does not recognise this greffer's token — registration has not "
+            "succeeded (stale token, or a refused register POST). This will not "
+            "self-resolve by polling.",
+        )
+    elif res.status_code == 401:
+        logger.info("cert not issued yet — awaiting admin acceptance (HTTP 401)")
+    else:
+        logger.warning("unexpected cert poll status: HTTP %s", res.status_code)
+    return None
 
 
 def _install_cert(settings: Settings, data: dict[str, Any]) -> None:
