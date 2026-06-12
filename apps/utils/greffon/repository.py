@@ -66,6 +66,17 @@ def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
             used = set()    # host ports taken in this protocol batch
             fresh_needed = []
             for i in idxs:
+                # same_port: the app advertises exactly what it binds (e.g. a
+                # WebRTC media server in its ICE candidates), so the published
+                # host port MUST equal the container port — it cannot be remapped
+                # to a range port. Pin it (and reserve it in this batch so a
+                # sibling can't grab it); a genuine host collision surfaces at
+                # the docker bind rather than being silently moved.
+                if ports[i].get('same_port'):
+                    cport = int(ports[i]['port_container'])
+                    assigned[i] = cport
+                    used.add(cport)
+                    continue
                 prev = sticky.get(ports[i]['port_name'])
                 if (prev is not None and prev not in used
                         and is_port_free(l4_bind_host, prev, proto)):
