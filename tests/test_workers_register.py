@@ -487,6 +487,46 @@ async def test_register_worker_survives_cert_poll_transient_error(
 
 
 @pytest.mark.asyncio
+async def test_cert_poll_reresolves_rotated_token_mid_flight(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token rotated WHILE _run_registration is cert-polling must be picked
+    up, not 403-looped forever on the token captured at entry. resolve_token is
+    re-read each poll, so the successful poll uses the rotated value."""
+    app = create_app(token="tok-old", settings=settings)
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+    # Phase 1 POST resolves once, then each cert poll resolves again. The token
+    # rotates on disk before the second (successful) poll.
+    monkeypatch.setattr(
+        "app.workers.register.resolve_token",
+        MagicMock(side_effect=["tok-old", "tok-old", "tok-new", "tok-new"]),
+    )
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.post.return_value.status_code = 200
+        fail = MagicMock(status_code=401)  # awaiting acceptance
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock(status_code=200)
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [fail, success, crl]
+
+        await register_worker(app)
+
+    # The successful cert poll (2nd GET) carried the rotated token, not tok-old.
+    success_call = mock_requests.get.call_args_list[1]
+    assert success_call.kwargs["headers"]["X-Greffer-Token"] == "tok-new"
+    # app.state is kept in sync so the heartbeat beats with the fresh token.
+    assert app.state.greffer_token == "tok-new"
+
+
+@pytest.mark.asyncio
 async def test_register_worker_polls_cert_until_200(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -522,8 +562,11 @@ async def test_register_worker_polls_cert_until_200(
 async def test_register_worker_uses_token_from_app_state(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Token must come from ``app.state.greffer_token``, not the Django
-    module-global in ``apps/utils/auth.py``."""
+    """Token must come from the FastAPI config (settings/app.state), not the
+    Django module-global in ``apps/utils/auth.py``. ``_run_registration``
+    re-resolves it via ``resolve_token`` each attempt (so a mid-flight rotation
+    is picked up), which honors the env-pinned ``settings.greffer_token``."""
+    settings.greffer_token = "fastapi-specific-token"  # type: ignore[misc]
     app = create_app(token="fastapi-specific-token", settings=settings)
 
     async def _noop_sleep(_s: float) -> None:

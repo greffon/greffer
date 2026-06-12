@@ -41,6 +41,14 @@ async def monitor_worker(app: FastAPI) -> None:
                 # matching the heartbeat worker. Otherwise post-rotation
                 # callbacks would 403 once GREFFER_CALLBACK_ENFORCE_TOKEN is on.
                 token: str = app.state.greffer_token
+                # Stamp captured_at BEFORE the tick, not after. _one_monitor_tick
+                # both collects docker state and runs per-instance callbacks; a
+                # start committing during that window would otherwise be older
+                # than an after-the-fact captured_at, letting a reused (stale)
+                # map's timestamp postdate the start and defeat the manager's
+                # STARTING grace. Stamping before the sweep keeps captured_at <=
+                # the actual collection time, so the grace stays fail-safe.
+                captured_at = datetime.now(timezone.utc).isoformat()
                 # abandon_on_cancel=True — lifespan shutdown returns
                 # immediately even if a tick is mid-docker-API or mid-HTTP
                 # call. Inner HTTP call carries timeout=10 so the thread
@@ -60,7 +68,7 @@ async def monitor_worker(app: FastAPI) -> None:
                 app.state.status_map = {
                     "map": status_map,
                     "at": time.monotonic(),
-                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "captured_at": captured_at,
                 }
             except asyncio.CancelledError:
                 raise

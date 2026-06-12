@@ -132,18 +132,23 @@ async def _run_registration(
 ) -> None:
     """Register with the manager and block until the cert is installed.
 
-    Reads the token from ``app.state`` at call time so a re-register picks up a
-    rotated on-disk token. All ``anyio.to_thread.run_sync`` calls use
+    Re-resolves the token before every register POST and every cert poll (and
+    mirrors it into ``app.state``) so a rotation landing mid-flight is picked up
+    instead of looping forever on a stale token. All ``anyio.to_thread.run_sync`` calls use
     ``abandon_on_cancel=True`` so lifespan shutdown doesn't block on a hung HTTP
     call; every HTTP call also carries a ``timeout``.
     """
-    token: str = app.state.greffer_token
-
     # Phase 1: POST until the manager accepts the registration (2xx). Retries
     # back off exponentially (capped) so a permanently-refused register stays
     # loud without flooding the log.
     delay = _REGISTER_RETRY_SECONDS
     while True:
+        # Re-resolve the token each attempt so a rotation landing mid-flight
+        # (operator re-pins GREFFER_TOKEN, or the manager stages a new one after
+        # the 403 that triggered this re-register) is picked up, instead of
+        # looping forever on a stale token captured at entry. Keep app.state in
+        # sync so the heartbeat worker beats with the same token post-register.
+        token = app.state.greffer_token = resolve_token(settings)
         try:
             await anyio.to_thread.run_sync(
                 _post_register,
@@ -191,6 +196,9 @@ async def _run_registration(
     last_status: int | None = None
     same_status_polls = 0
     while True:
+        # Re-resolve per poll for the same reason as Phase 1: a 403-looping cert
+        # poll must observe a token rotated mid-flight rather than 403 forever.
+        token = app.state.greffer_token = resolve_token(settings)
         try:
             data, cert_status = await anyio.to_thread.run_sync(
                 _fetch_cert, settings, token, abandon_on_cancel=True
