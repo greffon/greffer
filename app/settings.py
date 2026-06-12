@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     # ``X-Greffer-Token`` on the manager auth paths.
     greffer_token: str | None = None
 
-    # Greffer software version, reported in the register payload. Defaults to
+    # Greffer software version, reported in the register payload and on every
+    # heartbeat (see workers/heartbeat.py). Defaults to
     # the worker's ``app.__version__``; overridable via ``GREFFER_VERSION`` (e.g.
     # a build/release stamp). The manager stamps ``Greffer.version`` from this
     # and uses it for the per-greffon ``min_greffer_version`` compat gate.
