@@ -67,6 +67,10 @@ async def monitor_worker(app: FastAPI) -> None:
             except Exception:
                 # Deviation from legacy: one bad tick does not kill the
                 # worker. Next iteration tries again after the same delay.
+                # Invalidate the published sweep so the heartbeat collects
+                # fresh (and surfaces a degraded beat promptly) on a docker
+                # outage instead of reusing the last healthy map for the window.
+                app.state.status_map = None
                 logger.exception("monitor tick failed; continuing")
             await asyncio.sleep(settings.monitor_interval)
     except asyncio.CancelledError:

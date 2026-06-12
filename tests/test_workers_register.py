@@ -917,3 +917,35 @@ async def test_register_worker_retries_until_registration_succeeds(
 
     assert calls == 2
     assert app.state.registered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_on_address_resolution_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DNS failure in address resolution must retry (inside the loop), not
+    kill the task and park the heartbeat."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
+    addr_calls = 0
+
+    async def _flaky_addr(_settings):
+        nonlocal addr_calls
+        addr_calls += 1
+        if addr_calls == 1:
+            raise OSError("name resolution failed")
+        return "10.0.0.9"
+
+    async def _ok_run(_app, _settings, _address):
+        _app.state.registered.set()
+
+    async def _noop_sleep(_s):
+        return
+
+    monkeypatch.setattr("app.workers.register._resolve_address", _flaky_addr)
+    monkeypatch.setattr("app.workers.register._run_registration", _ok_run)
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    await register_worker(app)
+    assert addr_calls == 2
+    assert app.state.registered.is_set()

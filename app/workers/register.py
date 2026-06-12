@@ -67,10 +67,13 @@ async def register_worker(app: FastAPI) -> None:
     NOT leave ``registered`` unset and the heartbeat blocked forever. Later
     re-runs (after a heartbeat 403) are handled by ``reregister_worker``."""
     settings: Settings = app.state.settings
-    address = await _resolve_address(settings)
     delay = _REGISTER_RETRY_SECONDS
     while True:
         try:
+            # Resolve the address inside the retry loop: a DNS failure
+            # (_resolve_hostname -> socket.gaierror) must also retry rather than
+            # kill the task and leave the heartbeat parked.
+            address = await _resolve_address(settings)
             await _run_registration(app, settings, address)
             return
         except asyncio.CancelledError:

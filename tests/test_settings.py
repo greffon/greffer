@@ -87,3 +87,12 @@ def test_heartbeat_interval_rejects_non_positive(
     get_settings.cache_clear()
     with pytest.raises(ValidationError):
         get_settings()
+
+
+def test_greffer_version_truncated_to_32(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("GREFFER_VERSION", "0.3.3-rc1-42-gdeadbeef-dirty-20260611-extra")
+    get_settings.cache_clear()
+    v = get_settings().greffer_version
+    assert len(v) == 32
+    assert v == "0.3.3-rc1-42-gdeadbeef-dirty-2026"[:32]

@@ -295,3 +295,28 @@ async def test_monitor_worker_publishes_captured_at(
     assert "captured_at" in app.state.status_map
     # ISO-8601 UTC string.
     assert app.state.status_map["captured_at"].endswith("+00:00")
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_invalidates_cache_on_tick_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed tick invalidates the published map so the heartbeat collects
+    fresh (and surfaces degraded) rather than reusing the last healthy sweep."""
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {"map": {"x": "running"}, "at": 1.0,
+                            "captured_at": "t"}
+
+    def _boom_tick(_settings, _prev, _token):
+        raise RuntimeError("docker down")
+
+    async def _sleep_then_cancel(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.workers.monitor._one_monitor_tick", _boom_tick)
+    monkeypatch.setattr("app.workers.monitor.asyncio.sleep", _sleep_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_worker(app)
+
+    assert app.state.status_map is None

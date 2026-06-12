@@ -357,3 +357,20 @@ async def test_seq_and_boot_id_stable_across_403_resume(
 
     assert seqs == [1, 2]  # seq not reset on resume
     assert boot_ids == [app.state.boot_id, app.state.boot_id]  # stable
+
+
+def test_heartbeat_reuses_monitor_map_no_double_sweep(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {
+        "map": {"inst-a": "running"}, "at": time.monotonic(),
+        "captured_at": "2026-06-12T00:00:00+00:00"}
+    with patch("app.workers.heartbeat.collect_status_map") as m, \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    m.assert_not_called()  # reused the monitor sweep, no second docker sweep
+    assert mock_requests.post.call_args.kwargs["json"]["instances"] == {
+        "inst-a": "running"}

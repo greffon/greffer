@@ -56,6 +56,16 @@ class Settings(BaseSettings):
             return None
         return v
 
+    @field_validator("greffer_version")
+    @classmethod
+    def _truncate_version(cls, v):
+        # The manager stores Greffer.version in a max_length=32 column and the
+        # heartbeat serializer enforces 32, so an operator GREFFER_VERSION build
+        # stamp longer than 32 would 400 every heartbeat (live greffer reads
+        # unreachable). Truncate so a long stamp degrades to a valid value on
+        # both the register and heartbeat paths.
+        return v[:32] if v else v
+
     @field_validator("heartbeat_interval")
     @classmethod
     def _heartbeat_interval_in_range(cls, v):
