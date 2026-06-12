@@ -65,11 +65,12 @@ async def monitor_worker(app: FastAPI) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # Deviation from legacy: one bad tick does not kill the
-                # worker. Next iteration tries again after the same delay.
-                # Invalidate the published sweep so the heartbeat collects
-                # fresh (and surfaces a degraded beat promptly) on a docker
-                # outage instead of reusing the last healthy map for the window.
+                # Deviation from legacy: one bad tick does not kill the worker.
+                # Reaching here means status COLLECTION failed (a docker outage;
+                # transition-callback failures are caught per-instance and do
+                # not abort the tick). Invalidate the published sweep so the
+                # heartbeat collects fresh and surfaces a degraded beat promptly
+                # rather than reusing the last healthy map for the window.
                 app.state.status_map = None
                 logger.exception("monitor tick failed; continuing")
             await asyncio.sleep(settings.monitor_interval)
@@ -87,7 +88,17 @@ def _one_monitor_tick(
     status_map = collect_status_map(settings)
     for greffon_id, status in status_map.items():
         if prev_status.get(greffon_id) != status:
-            _report_status_change(settings, greffon_id, status, token)
+            try:
+                _report_status_change(settings, greffon_id, status, token)
+            except (requests.ConnectionError, requests.Timeout):
+                # The manager is briefly unreachable for the callback. Don't
+                # abort the tick (which would discard a good docker sweep and
+                # leave prev_status half-updated) and don't advance prev_status
+                # for this instance, so the transition is retried next tick.
+                logger.info(
+                    "status callback for %s failed; retrying next tick",
+                    greffon_id)
+                continue
         prev_status[greffon_id] = status
     return status_map
 

@@ -13,6 +13,7 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
+import requests
 
 # Force import of the lazy compose submodule so its attribute exists on
 # its parent package. Python only attaches submodules to parent package
@@ -320,3 +321,27 @@ async def test_monitor_worker_invalidates_cache_on_tick_failure(
         await monitor_worker(app)
 
     assert app.state.status_map is None
+
+
+def test_one_tick_preserves_sweep_when_callback_fails(
+    settings: Settings, tmp_path
+) -> None:
+    """A failed transition callback (manager briefly unreachable) must NOT abort
+    the tick: the good docker sweep is still returned and prev_status for the
+    failed instance is left unadvanced so it retries next tick."""
+    (tmp_path / "inst-a").mkdir()
+    (tmp_path / "inst-b").mkdir()
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    prev: dict[str, str] = {}
+
+    with patch("apps.utils.docker.compose") as mock_compose, patch(
+        "app.workers.monitor._report_status_change"
+    ) as mock_report:
+        mock_compose.get_status.return_value = {"status": "running"}
+        mock_report.side_effect = requests.ConnectionError("manager down")
+        result = _one_monitor_tick(settings, prev, "tok")
+
+    # The sweep is returned despite the callback failures.
+    assert result == {"inst-a": "running", "inst-b": "running"}
+    # No instance's prev_status advanced (both callbacks failed) -> retried next.
+    assert prev == {}
