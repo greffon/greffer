@@ -20,9 +20,25 @@ import requests
 from fastapi import FastAPI
 
 from app.settings import Settings
-from app.token import resolve_token
+from app.token import load_persisted_token, resolve_token
 
 logger = logging.getLogger("greffer")
+
+
+def _inflight_token(app: FastAPI, settings: Settings) -> str:
+    """Freshest token to use for the current (re-)registration attempt.
+
+    An operator-pinned ``GREFFER_TOKEN`` wins; otherwise a PERSISTED on-disk
+    token (re-read each retry so a rotation that lands mid-flight is picked up);
+    otherwise the stable token already in ``app.state``. Crucially this never
+    re-mints the ephemeral in-memory fallback that ``load_or_create_token`` uses
+    when ``GREFFON_PATH`` is unwritable: minting a new token per cert poll would
+    diverge from the token the register POST staged and 403 forever.
+    """
+    if settings.greffer_token:
+        return settings.greffer_token
+    persisted = load_persisted_token(settings.greffon_path / ".greffer-token")
+    return persisted or app.state.greffer_token
 
 
 _REGISTER_RETRY_SECONDS = 3.0
@@ -148,7 +164,7 @@ async def _run_registration(
         # the 403 that triggered this re-register) is picked up, instead of
         # looping forever on a stale token captured at entry. Keep app.state in
         # sync so the heartbeat worker beats with the same token post-register.
-        token = app.state.greffer_token = resolve_token(settings)
+        token = app.state.greffer_token = _inflight_token(app, settings)
         try:
             await anyio.to_thread.run_sync(
                 _post_register,
@@ -198,7 +214,7 @@ async def _run_registration(
     while True:
         # Re-resolve per poll for the same reason as Phase 1: a 403-looping cert
         # poll must observe a token rotated mid-flight rather than 403 forever.
-        token = app.state.greffer_token = resolve_token(settings)
+        token = app.state.greffer_token = _inflight_token(app, settings)
         try:
             data, cert_status = await anyio.to_thread.run_sync(
                 _fetch_cert, settings, token, abandon_on_cancel=True

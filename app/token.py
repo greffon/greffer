@@ -79,6 +79,23 @@ def load_or_create_token(path: Path) -> str:
     return token
 
 
+def load_persisted_token(path: Path) -> str | None:
+    """Return the on-disk token if present and readable, else None.
+
+    Unlike ``load_or_create_token`` this NEVER mints or persists. It exists so a
+    long-running (re-)registration can re-read a possibly-rotated token between
+    retries without churning a fresh ephemeral token each call when the volume
+    is unwritable (which would hand a different token to every cert poll and
+    403 the endpoint forever). Callers fall back to the process's stable token
+    when this returns None.
+    """
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return existing or None
+
+
 def _mint() -> str:
     return secrets.token_urlsafe(_TOKEN_BYTES)
 

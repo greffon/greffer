@@ -490,19 +490,21 @@ async def test_register_worker_survives_cert_poll_transient_error(
 async def test_cert_poll_reresolves_rotated_token_mid_flight(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A token rotated WHILE _run_registration is cert-polling must be picked
-    up, not 403-looped forever on the token captured at entry. resolve_token is
-    re-read each poll, so the successful poll uses the rotated value."""
+    """A token rotated ON DISK WHILE _run_registration is cert-polling must be
+    picked up, not 403-looped forever on the token captured at entry. The
+    persisted token is re-read each poll, so the successful poll uses the
+    rotated value."""
     app = create_app(token="tok-old", settings=settings)
+    settings.greffer_token = None  # type: ignore[misc]  # no env pin -> read disk
 
     async def _noop_sleep(_s: float) -> None:
         return
 
     monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
-    # Phase 1 POST resolves once, then each cert poll resolves again. The token
-    # rotates on disk before the second (successful) poll.
+    # Phase 1 POST reads the persisted token once, then each cert poll re-reads
+    # it. The on-disk token rotates before the second (successful) poll.
     monkeypatch.setattr(
-        "app.workers.register.resolve_token",
+        "app.workers.register.load_persisted_token",
         MagicMock(side_effect=["tok-old", "tok-old", "tok-new", "tok-new"]),
     )
 
@@ -524,6 +526,45 @@ async def test_cert_poll_reresolves_rotated_token_mid_flight(
     assert success_call.kwargs["headers"]["X-Greffer-Token"] == "tok-new"
     # app.state is kept in sync so the heartbeat beats with the fresh token.
     assert app.state.greffer_token == "tok-new"
+
+
+@pytest.mark.asyncio
+async def test_unpersisted_token_is_stable_across_register_and_poll(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When GREFFON_PATH is unwritable the token is an ephemeral in-memory one
+    (no file to re-read). The register POST and every cert poll must use that
+    SAME stable token, not a freshly-minted one per call (which would 403 the
+    cert endpoint forever and never set `registered`)."""
+    app = create_app(token="ephemeral-tok", settings=settings)
+    settings.greffer_token = None  # type: ignore[misc]  # no env pin
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+    # No persisted token (read-only volume): every re-read returns None, so
+    # _inflight_token must fall back to the stable app.state token.
+    monkeypatch.setattr(
+        "app.workers.register.load_persisted_token", MagicMock(return_value=None)
+    )
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.post.return_value.status_code = 200
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock(status_code=200)
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [success, crl]
+
+        await register_worker(app)
+
+    # POST and the cert poll used the same stable ephemeral token, so it completed.
+    assert mock_requests.post.call_args.kwargs["json"]["token"] == "ephemeral-tok"
+    assert mock_requests.get.call_args_list[0].kwargs["headers"]["X-Greffer-Token"] == "ephemeral-tok"
+    assert app.state.registered.is_set()
 
 
 @pytest.mark.asyncio
