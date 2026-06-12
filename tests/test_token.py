@@ -7,7 +7,25 @@ from pathlib import Path
 
 import pytest
 
-from app.token import load_or_create_token
+from app.token import load_or_create_token, load_persisted_token
+
+
+def test_load_persisted_returns_token_when_present(tmp_path: Path) -> None:
+    path = tmp_path / ".greffer-token"
+    path.write_text("on-disk-tok", encoding="utf-8")
+    assert load_persisted_token(path) == "on-disk-tok"
+
+
+def test_load_persisted_returns_none_when_absent(tmp_path: Path) -> None:
+    # Never mints (unlike load_or_create_token): a missing file is None so the
+    # caller keeps its stable token instead of churning a fresh ephemeral one.
+    assert load_persisted_token(tmp_path / ".greffer-token") is None
+
+
+def test_load_persisted_returns_none_for_blank_file(tmp_path: Path) -> None:
+    path = tmp_path / ".greffer-token"
+    path.write_text("  \n", encoding="utf-8")
+    assert load_persisted_token(path) is None
 
 
 def test_mints_and_persists_when_absent(tmp_path: Path) -> None:
