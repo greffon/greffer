@@ -20,7 +20,7 @@ import requests
 from fastapi import FastAPI
 
 from app.settings import Settings
-from app.token import load_persisted_token, resolve_token
+from app.token import load_persisted_token
 
 logger = logging.getLogger("greffer")
 
@@ -104,8 +104,8 @@ async def register_worker(app: FastAPI) -> None:
 async def reregister_worker(app: FastAPI) -> None:
     """Supervisor that re-runs registration on demand (greffer-observability
     epic). The heartbeat sets ``app.state.reregister_requested`` on a 403 (the
-    manager rejected our accepted token); we re-read the on-disk token, in case
-    the operator rotated it, and re-register. Idle the rest of the time."""
+    manager rejected our accepted token); we re-register, picking up a rotated
+    on-disk token via _inflight_token inside _run_registration. Idle otherwise."""
     settings: Settings = app.state.settings
     event: asyncio.Event = app.state.reregister_requested
     try:
@@ -121,7 +121,12 @@ async def reregister_worker(app: FastAPI) -> None:
             delay = _REGISTER_RETRY_SECONDS
             while True:
                 try:
-                    app.state.greffer_token = resolve_token(settings)
+                    # Token resolution is left to _inflight_token inside
+                    # _run_registration: it re-reads a rotated on-disk token each
+                    # attempt AND never re-mints the ephemeral fallback. Resolving
+                    # here too would, on an unwritable volume, mint a fresh
+                    # ephemeral token per retry and re-stage a different one at the
+                    # manager.
                     address = await _resolve_address(settings)
                     await _run_registration(app, settings, address)
                     break

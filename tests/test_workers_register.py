@@ -902,16 +902,14 @@ async def test_reregister_runs_registration_when_event_set(
 
     monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
     monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
-    monkeypatch.setattr(
-        "app.workers.register.resolve_token", lambda _s: "rotated-tok")
 
     app.state.reregister_requested.set()
     with pytest.raises(asyncio.CancelledError):
         await reregister_worker(app)
 
     assert ran.get("called") is True
-    # The event was cleared and the token re-read.
-    assert app.state.greffer_token == "rotated-tok"
+    # The event was cleared; token (re-)resolution now lives in _run_registration
+    # (via _inflight_token), which is mocked here.
     assert not app.state.reregister_requested.is_set()
     # The heartbeat is re-armed (this closes the 403 -> reregister -> resume loop).
     assert app.state.registered.is_set()
@@ -944,7 +942,6 @@ async def test_reregister_retries_failed_attempt_until_registered(
 
     monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
     monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
-    monkeypatch.setattr("app.workers.register.resolve_token", lambda _s: "tok")
     monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
 
     app.state.reregister_requested.set()
