@@ -605,7 +605,7 @@ async def test_register_worker_uses_token_from_app_state(
 ) -> None:
     """Token must come from the FastAPI config (settings/app.state), not the
     Django module-global in ``apps/utils/auth.py``. ``_run_registration``
-    re-resolves it via ``resolve_token`` each attempt (so a mid-flight rotation
+    re-resolves it via ``_inflight_token`` each attempt (so a mid-flight rotation
     is picked up), which honors the env-pinned ``settings.greffer_token``."""
     settings.greffer_token = "fastapi-specific-token"  # type: ignore[misc]
     app = create_app(token="fastapi-specific-token", settings=settings)
