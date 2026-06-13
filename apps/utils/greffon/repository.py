@@ -66,26 +66,6 @@ def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
             used = set()    # host ports taken in this protocol batch
             fresh_needed = []
             for i in idxs:
-                # same_port (PROXY mode only): the app advertises exactly what it
-                # binds (e.g. a WebRTC media server in its ICE candidates), so the
-                # PUBLISHED public host port MUST equal the container port — it
-                # cannot be remapped to a range port. Pin it (and reserve it in
-                # this batch so a sibling can't grab it); a genuine host collision
-                # surfaces at the docker bind rather than being silently moved.
-                #
-                # In TUNNEL mode (l4_bind_host == 127.0.0.1) this pinning is WRONG:
-                # the public port is the relay's per-instance tunnel_port, and
-                # port_host is just the loopback handle the rathole-client dials
-                # (create_compose maps the container side to {{ instance_l4_port }},
-                # so advertise == listen still holds). Pinning port_host to the
-                # container port would make every tunnel instance of the same app
-                # bind the SAME loopback port and the second one fail to start, so
-                # tunnel L4 must fall through to normal per-instance allocation.
-                if ports[i].get('same_port') and l4_bind_host != '127.0.0.1':
-                    cport = int(ports[i]['port_container'])
-                    assigned[i] = cport
-                    used.add(cport)
-                    continue
                 prev = sticky.get(ports[i]['port_name'])
                 if (prev is not None and prev not in used
                         and is_port_free(l4_bind_host, prev, proto)):
