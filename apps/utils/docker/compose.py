@@ -409,7 +409,17 @@ def _compute_instance_context(greffon_info):
     explicit for non-default).
     """
     ports = greffon_info.get('ports') or []
-    first_port = ports[0] if ports and isinstance(ports[0], dict) else {}
+    # instance_url / instance_host / instance_port describe the Tier-A WEB entry
+    # point, so pick the first non-L4 (nginx-proxied) port — never an L4 port,
+    # whose public endpoint is a raw host:port carried by instance_l4_* instead.
+    # A mixed greffon (e.g. a web UI + a raw UDP media/VPN port) would otherwise
+    # leak the L4 subdomain into instance_url if the L4 port sorts first. A
+    # purely-L4 greffon falls back to ports[0].
+    first_port = next(
+        (p for p in ports
+         if isinstance(p, dict) and p.get('exposure_tier', 'http') != 'l4'),
+        ports[0] if ports and isinstance(ports[0], dict) else {},
+    )
     raw = first_port.get('url')
     port_host = first_port.get('port_host') or ''
     scheme = os.getenv('GREFFER_PUBLIC_SCHEME', 'https')
