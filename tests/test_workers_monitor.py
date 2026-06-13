@@ -42,6 +42,7 @@ def test_one_tick_calls_report_status_change_on_first_seen(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
+        mock_report.return_value = 200
         _one_monitor_tick(settings, prev, "tok")
 
     mock_report.assert_called_once_with(settings, "inst-a", "running", "tok")
@@ -64,6 +65,7 @@ def test_one_tick_skips_dotfile_entries(settings: Settings, tmp_path) -> None:
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "running"}
+        mock_report.return_value = 200
         _one_monitor_tick(settings, prev, "tok")
 
     # Only the real instance is queried and reported; the dotfiles are skipped.
@@ -99,10 +101,33 @@ def test_one_tick_fires_report_status_change_on_transition(
         "app.workers.monitor._report_status_change"
     ) as mock_report:
         mock_compose.get_status.return_value = {"status": "stopped"}
+        mock_report.return_value = 200
         _one_monitor_tick(settings, prev, "tok")
 
     mock_report.assert_called_once_with(settings, "inst-a", "stopped", "tok")
     assert prev == {"inst-a": "stopped"}
+
+
+def test_one_tick_rejected_callback_does_not_advance_prev_status(
+    settings: Settings, tmp_path
+) -> None:
+    """codex review on greffer#66: a non-2xx callback (e.g. 403 from a
+    stale/rotated token) must NOT be treated as delivered — prev_status stays so
+    the transition retries next tick. requests.post doesn't raise on 4xx."""
+    (tmp_path / "inst-a").mkdir()
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    prev = {"inst-a": "running"}
+
+    with patch("apps.utils.docker.compose") as mock_compose, patch(
+        "app.workers.monitor._report_status_change"
+    ) as mock_report:
+        mock_compose.get_status.return_value = {"status": "stopped"}
+        mock_report.return_value = 403  # manager rejected the callback
+        _one_monitor_tick(settings, prev, "tok")
+
+    mock_report.assert_called_once_with(settings, "inst-a", "stopped", "tok")
+    # NOT advanced — the transition is retried next tick.
+    assert prev == {"inst-a": "running"}
 
 
 # ---------------------------------------------------------------------------

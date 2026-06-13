@@ -97,7 +97,7 @@ def _one_monitor_tick(
     for greffon_id, status in status_map.items():
         if prev_status.get(greffon_id) != status:
             try:
-                _report_status_change(settings, greffon_id, status, token)
+                code = _report_status_change(settings, greffon_id, status, token)
             except (requests.ConnectionError, requests.Timeout):
                 # The manager is briefly unreachable for the callback. Don't
                 # abort the tick (which would discard a good docker sweep and
@@ -107,24 +107,37 @@ def _one_monitor_tick(
                     "status callback for %s failed; retrying next tick",
                     greffon_id)
                 continue
+            if code >= 400:
+                # The manager REJECTED the callback (e.g. 403 from a stale/rotated
+                # token once GREFFER_CALLBACK_ENFORCE_TOKEN is on). requests.post
+                # does NOT raise on 4xx/5xx, so without this the transition would
+                # be treated as delivered and lost. Leave prev_status unchanged so
+                # it retries next tick, after a heartbeat-driven re-register
+                # restages the token.
+                logger.warning(
+                    "status callback for %s rejected (HTTP %s); retrying next tick",
+                    greffon_id, code)
+                continue
         prev_status[greffon_id] = status
     return status_map
 
 
 def _report_status_change(
     settings: Settings, greffon_id: str, status: str, token: str
-) -> None:
-    """POST a status change to the manager.
+) -> int:
+    """POST a status change to the manager; return the HTTP status code.
 
     Inlined from the now-deleted ``apps/utils/greffon/base_server.py``'s
     ``change_status``. Sends ``X-Greffer-Token`` so the manager can enforce auth
     on this callback once GREFFER_CALLBACK_ENFORCE_TOKEN flips on (old managers
-    ignore the header).
+    ignore the header). The caller inspects the code so a rejected (non-2xx)
+    callback isn't treated as a delivered transition.
     """
-    requests.post(
+    res = requests.post(
         f"{settings.greffon_base_server}/api/greffer/instances/{greffon_id}/",
         json={"status": status},
         headers={"X-Greffer-Token": token},
         verify=settings.greffer_ssl_verify,
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
+    return res.status_code

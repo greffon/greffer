@@ -153,9 +153,10 @@ async def _run_registration(
 ) -> None:
     """Register with the manager and block until the cert is installed.
 
-    Re-resolves the token before every register POST and every cert poll (and
-    mirrors it into ``app.state``) so a rotation landing mid-flight is picked up
-    instead of looping forever on a stale token. All ``anyio.to_thread.run_sync`` calls use
+    Re-resolves the token before every register POST (Phase 1) so an on-disk
+    rotation is restaged at the manager; the cert poll (Phase 2) then sticks with
+    that REGISTERED token rather than switching to an unstaged one. All
+    ``anyio.to_thread.run_sync`` calls use
     ``abandon_on_cancel=True`` so lifespan shutdown doesn't block on a hung HTTP
     call; every HTTP call also carries a ``timeout``.
     """
@@ -217,9 +218,12 @@ async def _run_registration(
     last_status: int | None = None
     same_status_polls = 0
     while True:
-        # Re-resolve per poll for the same reason as Phase 1: a 403-looping cert
-        # poll must observe a token rotated mid-flight rather than 403 forever.
-        token = app.state.greffer_token = _inflight_token(app, settings)
+        # Poll with the token that Phase 1 just REGISTERED (the manager staged it
+        # via _post_register). Do NOT re-resolve here: a token rotated on disk
+        # mid-poll was never staged at the manager, so switching the cert header
+        # to it would 403 every poll forever with no path back to Phase 1. A
+        # rotation during the admin-acceptance wait is instead picked up after
+        # registration completes, via the heartbeat-403 -> reregister flow.
         try:
             data, cert_status = await anyio.to_thread.run_sync(
                 _fetch_cert, settings, token, abandon_on_cancel=True

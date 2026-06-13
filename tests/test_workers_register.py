@@ -487,13 +487,13 @@ async def test_register_worker_survives_cert_poll_transient_error(
 
 
 @pytest.mark.asyncio
-async def test_cert_poll_reresolves_rotated_token_mid_flight(
+async def test_cert_poll_keeps_registered_token_when_disk_rotates(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A token rotated ON DISK WHILE _run_registration is cert-polling must be
-    picked up, not 403-looped forever on the token captured at entry. The
-    persisted token is re-read each poll, so the successful poll uses the
-    rotated value."""
+    """The cert poll must keep using the token Phase 1 REGISTERED, not switch to
+    a token that rotates on disk mid-poll. The manager only staged the
+    registered token via the register POST; polling with an unstaged rotated
+    token would 403 forever. (codex review on greffer#66.)"""
     app = create_app(token="tok-old", settings=settings)
     settings.greffer_token = None  # type: ignore[misc]  # no env pin -> read disk
 
@@ -501,11 +501,11 @@ async def test_cert_poll_reresolves_rotated_token_mid_flight(
         return
 
     monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
-    # Phase 1 POST reads the persisted token once, then each cert poll re-reads
-    # it. The on-disk token rotates before the second (successful) poll.
+    # Phase 1 registers with tok-old; the on-disk token then rotates to tok-new
+    # during the cert-poll wait. The poll must still carry tok-old.
     monkeypatch.setattr(
         "app.workers.register.load_persisted_token",
-        MagicMock(side_effect=["tok-old", "tok-old", "tok-new", "tok-new"]),
+        MagicMock(side_effect=["tok-old", "tok-new", "tok-new", "tok-new"]),
     )
 
     with patch("app.workers.register.requests") as mock_requests, patch(
@@ -521,11 +521,12 @@ async def test_cert_poll_reresolves_rotated_token_mid_flight(
 
         await register_worker(app)
 
-    # The successful cert poll (2nd GET) carried the rotated token, not tok-old.
-    success_call = mock_requests.get.call_args_list[1]
-    assert success_call.kwargs["headers"]["X-Greffer-Token"] == "tok-new"
-    # app.state is kept in sync so the heartbeat beats with the fresh token.
-    assert app.state.greffer_token == "tok-new"
+    # Phase 1 POST staged tok-old...
+    assert mock_requests.post.call_args.kwargs["json"]["token"] == "tok-old"
+    # ...and BOTH cert polls (incl. the successful 2nd) kept tok-old, never the
+    # mid-flight rotated tok-new.
+    for call in mock_requests.get.call_args_list[:2]:
+        assert call.kwargs["headers"]["X-Greffer-Token"] == "tok-old"
 
 
 @pytest.mark.asyncio
