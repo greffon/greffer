@@ -139,6 +139,45 @@ class Settings(BaseSettings):
     # bug Codex caught before merge (greffon/greffer#17 review).
     greffer_workers_enabled: bool = False
 
+    # Self-health watchdog (greffer-observability epic, Feature #3). The
+    # watchdog evaluates /readyz's FATAL conditions and, when one is sustained
+    # past the grace window, exits the uvicorn process so ``restart:
+    # unless-stopped`` recovers it (plain ``docker compose`` does NOT restart a
+    # container on an unhealthy healthcheck). On by default. Degraded states
+    # (e.g. registration pending acceptance) are NEVER fatal, so a greffer
+    # awaiting acceptance does not restart-loop. ``grace`` rides out transient
+    # docker blips. Field names carry the ``greffer_`` prefix to bind the
+    # documented GREFFER_WATCHDOG_* env vars (see prefix pitfall above).
+    greffer_watchdog_enabled: bool = True
+    greffer_watchdog_interval: int = 10
+    greffer_watchdog_grace: int = 30
+    # Upper bound on a single readiness probe so a HUNG (not just down) docker
+    # daemon can't block the watchdog inside the ping forever — otherwise it
+    # would never advance the grace clock or reach the restart for exactly the
+    # docker failure it exists to heal. A probe that exceeds this is itself
+    # treated as fatal. Keep < interval and < grace.
+    greffer_watchdog_probe_timeout: int = 5
+
+    # Compose log rotation for the greffon INSTANCE containers the greffer
+    # renders (the real disk risk: an instance can log unbounded under the
+    # docker json-file driver's default of no rotation). Injected per service
+    # in ``create_compose`` unless the catalog author already set ``logging``.
+    # The greffer's OWN services carry static logging in docker-compose.yml.
+    greffer_instance_log_max_size: str = "10m"
+    greffer_instance_log_max_file: int = 3
+
+    @field_validator("greffer_instance_log_max_file", mode="before")
+    @classmethod
+    def _coerce_log_max_file(cls, v):
+        # An operator typo (e.g. GREFFER_INSTANCE_LOG_MAX_FILE=2x) must NOT crash
+        # the app at pydantic parse and take down ALL instance operations over an
+        # optional logging knob; fall back to the default (codex P2 on
+        # greffon/greffer#72). Mirrors _inject_instance_log_rotation's fallback.
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 3
+
     logger_name: str = "greffer"
 
 

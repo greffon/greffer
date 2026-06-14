@@ -1,9 +1,22 @@
 version: "3.8"
+
+# Log rotation for the greffer's OWN containers (greffer-observability epic,
+# Feature #3). Docker's json-file driver does not rotate by default; without a
+# cap, uvicorn/nginx/rathole logs grow unbounded on the operator's box. The
+# greffon INSTANCE containers the greffer renders get the same treatment via
+# create_compose's _inject_instance_log_rotation (the larger disk risk).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   greffer:
     build: .
     image: &app app
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - internal
     # Run pending ops migrations BEFORE uvicorn binds so they can't race
@@ -46,9 +59,39 @@ services:
       # picks up changes. Always mounted so proxy-mode deployments
       # don't need a separate compose layer.
       - rathole-client-config:/config
+    # Self-health visibility (Feature #3). Targets /readyz so `docker compose
+    # ps` shows when the greffer is wedged. This is NOT the restart trigger:
+    # plain compose does not restart on `unhealthy`; the in-process watchdog
+    # exits the process on a sustained FATAL readyz, and `restart:
+    # unless-stopped` recovers it. A greffer pending acceptance is DEGRADED ->
+    # 200 -> healthy, so it is not flapped. start_period covers ops-migrations +
+    # uvicorn bind + token resolve before failures count. The probe resolves the
+    # token the way create_app does (resolve_token = GREFFER_TOKEN env, else the
+    # persisted file), so an operator-set GREFFER_TOKEN authenticates correctly
+    # instead of reading a stale/absent file. A missing token (no env + no file:
+    # an ephemeral-token deployment on an unwritable volume) exits 0 rather than
+    # crashing the probe, so a healthy greffer is never shown perpetually-
+    # unhealthy; a present token + FATAL /readyz (503) raises and is reported
+    # unhealthy as intended.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,os;
+          p=os.path.join(os.getenv('GREFFON_PATH','/data'),'.greffer-token');
+          t=os.getenv('GREFFER_TOKEN') or
+          (open(p).read().strip() if os.path.exists(p) else '');
+          t and urllib.request.urlopen(urllib.request.Request(
+          'http://localhost:8000/readyz',
+          headers={'X-GREFFON-TOKEN': t}), timeout=4)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
   nginx:
     build: ./nginx
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - internal
     volumes:
@@ -76,6 +119,7 @@ services:
     profiles: ["tunnel"]
     network_mode: host
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - greffer
     # rathole-client forwards inbound tunnel traffic to whatever host the

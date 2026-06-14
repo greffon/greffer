@@ -518,6 +518,38 @@ def _compute_instance_context(greffon_info):
     return greffon_info
 
 
+def _inject_instance_log_rotation(compose):
+    """Cap per-container log disk on the greffon INSTANCE containers
+    (greffer-observability epic, Feature #3). Docker's json-file driver does
+    NOT rotate by default, so a chatty instance can fill the operator's disk.
+    Set ``max-size``/``max-file`` on every service that has not already declared
+    its own ``logging`` (a catalog author's explicit choice wins). Values come
+    from GREFFER_INSTANCE_LOG_MAX_SIZE / _MAX_FILE (read via os.getenv here,
+    matching this module's env style; the same vars bind Settings fields)."""
+    services = (compose or {}).get('services')
+    if not isinstance(services, dict):
+        return
+    max_size = os.getenv('GREFFER_INSTANCE_LOG_MAX_SIZE', '10m')
+    # ``max-file`` must be an integer string; coerce with a fallback so a
+    # malformed GREFFER_INSTANCE_LOG_MAX_FILE does not write an invalid value
+    # into EVERY rendered instance compose and break every greffon start.
+    raw_max_file = os.getenv('GREFFER_INSTANCE_LOG_MAX_FILE', '3')
+    try:
+        max_file = str(int(raw_max_file))
+    except (TypeError, ValueError):
+        logger.warning(
+            'invalid GREFFER_INSTANCE_LOG_MAX_FILE=%r; using default 3',
+            raw_max_file)
+        max_file = '3'
+    for service in services.values():
+        if not isinstance(service, dict) or 'logging' in service:
+            continue
+        service['logging'] = {
+            'driver': 'json-file',
+            'options': {'max-size': max_size, 'max-file': str(max_file)},
+        }
+
+
 def create_compose(compose, greffon_info):
     greffon_path = os.path.join(os.getenv('GREFFON_PATH', '/data'), greffon_info['id'])
     if not os.path.exists(greffon_path):
@@ -531,6 +563,7 @@ def create_compose(compose, greffon_info):
     # values would otherwise be templated `{{ smtp.host }}` strings.
     greffon_info = _compute_integrations_context(greffon_info)
     _delete_unset_integration_env_keys(compose, greffon_info)
+    _inject_instance_log_rotation(compose)
     t = Template(yaml.dump(compose))
     compose_file = t.render(**greffon_info)
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:

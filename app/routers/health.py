@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+import asyncio
+
+import anyio
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
+
+from app.auth import require_token
+from app.readiness import Readiness, evaluate_readiness
 
 router = APIRouter()
 
@@ -21,3 +28,41 @@ async def healthz(request: Request) -> dict[str, str]:
         "id": request.app.state.settings.greffer_id,
         "status": "ok",
     }
+
+
+@router.get("/readyz", dependencies=[Depends(require_token)])
+async def readyz(request: Request) -> JSONResponse:
+    """Readiness with a fatal-vs-degraded split (greffer-observability epic,
+    Feature #3).
+
+    Returns **503** on a FATAL condition (docker daemon unreachable, a
+    long-lived worker dead) so the compose healthcheck can surface it; **200**
+    otherwise, including when ``degraded`` (a greffer pending acceptance is
+    healthy and must not be flapped). The ``reasons`` list is machine-readable.
+
+    Auth is ``X-GREFFON-TOKEN`` (same as the controller routes) because this
+    endpoint is publicly routed like ``/healthz`` and would otherwise leak the
+    greffer's internal state. The in-process watchdog shares
+    ``evaluate_readiness`` so the endpoint and the self-heal decision can never
+    drift. ``/healthz`` stays liveness-only (a greffer-cli contract).
+    """
+    # ``evaluate_readiness`` pings docker (a blocking SDK call). Offload it so a
+    # hung daemon can't stall the uvicorn event loop (mirrors the heartbeat
+    # worker's anyio.to_thread offload), and bound it so a HUNG daemon reports
+    # fatal promptly instead of holding the request open.
+    timeout = request.app.state.settings.greffer_watchdog_probe_timeout
+    try:
+        r = await asyncio.wait_for(
+            anyio.to_thread.run_sync(
+                evaluate_readiness, request.app, abandon_on_cancel=True),
+            timeout=timeout)
+    except asyncio.TimeoutError:
+        r = Readiness(fatal=True, reasons=["readiness_probe_timeout"])
+    return JSONResponse(
+        {
+            "id": request.app.state.settings.greffer_id,
+            "status": r.status,
+            "reasons": r.reasons,
+        },
+        status_code=503 if r.fatal else 200,
+    )

@@ -20,6 +20,24 @@ def test_loads_greffer_id_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.greffer_id == "abc-123"
 
 
+def test_malformed_log_max_file_falls_back_not_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A typo in this optional knob must NOT crash startup (codex P2 on #72): a
+    # ValidationError here would take down every instance operation.
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_INSTANCE_LOG_MAX_FILE", "2x")
+    s = Settings()
+    assert s.greffer_instance_log_max_file == 3
+
+
+def test_valid_log_max_file_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_INSTANCE_LOG_MAX_FILE", "5")
+    s = Settings()
+    assert s.greffer_instance_log_max_file == 5
+
+
 def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GREFFER_ID", "x")
     s = Settings()

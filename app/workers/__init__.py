@@ -29,12 +29,13 @@ from app.workers.crl import crl_sync_worker
 from app.workers.heartbeat import heartbeat_worker
 from app.workers.monitor import monitor_worker
 from app.workers.register import register_worker, reregister_worker
+from app.workers.watchdog import watchdog_worker
 
 logger = logging.getLogger("greffer")
 
 
 def start_workers(app: FastAPI) -> list[asyncio.Task]:
-    return [
+    tasks = [
         asyncio.create_task(register_worker(app), name="greffer-register"),
         asyncio.create_task(monitor_worker(app), name="greffer-monitor"),
         asyncio.create_task(crl_sync_worker(app), name="greffer-crl-sync"),
@@ -42,6 +43,12 @@ def start_workers(app: FastAPI) -> list[asyncio.Task]:
         asyncio.create_task(
             reregister_worker(app), name="greffer-reregister"),
     ]
+    # Self-heal watchdog (Feature #3), on by default. Appended after the others
+    # so their tasks exist by the time it first evaluates readiness.
+    if app.state.settings.greffer_watchdog_enabled:
+        tasks.append(asyncio.create_task(
+            watchdog_worker(app), name="greffer-watchdog"))
+    return tasks
 
 
 async def stop_workers(tasks: list[asyncio.Task]) -> None:
