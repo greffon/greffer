@@ -151,6 +151,12 @@ class Settings(BaseSettings):
     greffer_watchdog_enabled: bool = True
     greffer_watchdog_interval: int = 10
     greffer_watchdog_grace: int = 30
+    # Upper bound on a single readiness probe so a HUNG (not just down) docker
+    # daemon can't block the watchdog inside the ping forever — otherwise it
+    # would never advance the grace clock or reach the restart for exactly the
+    # docker failure it exists to heal. A probe that exceeds this is itself
+    # treated as fatal. Keep < interval and < grace.
+    greffer_watchdog_probe_timeout: int = 5
 
     # Compose log rotation for the greffon INSTANCE containers the greffer
     # renders (the real disk risk: an instance can log unbounded under the

@@ -19,9 +19,10 @@ from app.workers.watchdog import watchdog_worker
 WD = "app.workers.watchdog"
 
 
-def _app(interval: int = 0, grace: int = 0):
+def _app(interval: int = 0, grace: int = 0, probe_timeout: int = 5):
     return SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(
-        greffer_watchdog_interval=interval, greffer_watchdog_grace=grace)))
+        greffer_watchdog_interval=interval, greffer_watchdog_grace=grace,
+        greffer_watchdog_probe_timeout=probe_timeout)))
 
 
 @pytest.mark.asyncio
@@ -30,6 +31,22 @@ async def test_terminates_on_sustained_fatal():
     fatal = Readiness(fatal=True, reasons=["docker_unreachable"])
     with patch(f"{WD}.asyncio.sleep", new=AsyncMock()), \
             patch(f"{WD}.evaluate_readiness", return_value=fatal), \
+            patch(f"{WD}._terminate") as term:
+        await watchdog_worker(_app(grace=0))
+    term.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_is_fatal_and_terminates():
+    # A HUNG docker ping makes the probe time out; that must itself be treated
+    # as fatal so the watchdog can self-heal the very docker-hang it exists for
+    # (codex P2 on greffer#72) — not block forever inside the probe.
+    async def _timeout(awaitable, *a, **k):
+        awaitable.close()  # avoid an un-awaited-coroutine warning
+        raise asyncio.TimeoutError
+
+    with patch(f"{WD}.asyncio.sleep", new=AsyncMock()), \
+            patch(f"{WD}.asyncio.wait_for", new=_timeout), \
             patch(f"{WD}._terminate") as term:
         await watchdog_worker(_app(grace=0))
     term.assert_called_once()

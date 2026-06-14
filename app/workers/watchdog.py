@@ -23,7 +23,7 @@ import time
 import anyio
 from fastapi import FastAPI
 
-from app.readiness import evaluate_readiness
+from app.readiness import Readiness, evaluate_readiness
 from app.settings import Settings
 
 logger = logging.getLogger("greffer")
@@ -45,9 +45,24 @@ async def watchdog_worker(app: FastAPI) -> None:
     try:
         while True:
             await asyncio.sleep(settings.greffer_watchdog_interval)
-            # Offload the docker-pinging evaluation so a hung daemon cannot
-            # block the event loop the other workers share.
-            readiness = await anyio.to_thread.run_sync(evaluate_readiness, app)
+            # Offload the docker-pinging evaluation (so a hung daemon cannot
+            # block the shared event loop) AND bound it: a probe that runs past
+            # the timeout is itself the FATAL docker-hang the watchdog exists to
+            # heal, so synthesize that rather than blocking here forever.
+            # ``abandon_on_cancel`` lets the timeout (and shutdown cancellation)
+            # return promptly instead of waiting on the stuck ping thread.
+            try:
+                readiness = await asyncio.wait_for(
+                    anyio.to_thread.run_sync(
+                        evaluate_readiness, app, abandon_on_cancel=True),
+                    timeout=settings.greffer_watchdog_probe_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "watchdog: readiness probe exceeded %ss (docker likely "
+                    "hung); treating as FATAL",
+                    settings.greffer_watchdog_probe_timeout)
+                readiness = Readiness(
+                    fatal=True, reasons=["readiness_probe_timeout"])
             if not readiness.fatal:
                 if fatal_since is not None:
                     logger.info(

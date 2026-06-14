@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+
 import anyio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from app.auth import require_token
-from app.readiness import evaluate_readiness
+from app.readiness import Readiness, evaluate_readiness
 
 router = APIRouter()
 
@@ -46,8 +48,16 @@ async def readyz(request: Request) -> JSONResponse:
     """
     # ``evaluate_readiness`` pings docker (a blocking SDK call). Offload it so a
     # hung daemon can't stall the uvicorn event loop (mirrors the heartbeat
-    # worker's anyio.to_thread offload).
-    r = await anyio.to_thread.run_sync(evaluate_readiness, request.app)
+    # worker's anyio.to_thread offload), and bound it so a HUNG daemon reports
+    # fatal promptly instead of holding the request open.
+    timeout = request.app.state.settings.greffer_watchdog_probe_timeout
+    try:
+        r = await asyncio.wait_for(
+            anyio.to_thread.run_sync(
+                evaluate_readiness, request.app, abandon_on_cancel=True),
+            timeout=timeout)
+    except asyncio.TimeoutError:
+        r = Readiness(fatal=True, reasons=["readiness_probe_timeout"])
     return JSONResponse(
         {
             "id": request.app.state.settings.greffer_id,
