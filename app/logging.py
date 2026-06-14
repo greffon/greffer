@@ -12,6 +12,12 @@ from app.settings import Settings
 # internals. The context fields are emitted explicitly below.
 _RESERVED = frozenset(vars(logging.makeLogRecord({})).keys()) | {
     "message", "asctime", "request_id", "instance_id", "worker", "taskName",
+    # Formatter-OWNED output keys. These are not LogRecord-internal names, so
+    # ``extra={"level": ...}`` / ``greffer_id`` / ``timestamp`` / ``logger``
+    # would otherwise be accepted by the stdlib and overwrite the authoritative
+    # field in the merge below (a log line could spoof its own greffer_id /
+    # level). Reserving them makes the formatter's value win (codex P2 on #73).
+    "timestamp", "level", "logger", "greffer_id",
 }
 
 

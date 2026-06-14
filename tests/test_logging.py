@@ -47,6 +47,21 @@ def test_json_formatter_includes_exception():
     assert "exc" in out and "ValueError" in out["exc"]
 
 
+def test_extra_cannot_overwrite_formatter_owned_fields():
+    # A caller extra={...} must NOT shadow the authoritative fields (codex P2
+    # on #73): no log line can spoof its own greffer_id / level / logger.
+    rec = _record()
+    rec.level = "SPOOFED"
+    rec.logger = "evil"
+    rec.greffer_id = "not-me"
+    rec.timestamp = "1999"
+    out = json.loads(JsonFormatter(greffer_id="g1").format(rec))
+    assert out["level"] == "INFO"
+    assert out["logger"] == "greffer"
+    assert out["greffer_id"] == "g1"
+    assert out["timestamp"] != "1999"
+
+
 def test_json_formatter_tolerates_bad_arg_count():
     # A %-arg-count mismatch must not raise inside the formatter (the stdlib
     # tolerates it; the hand-rolled formatter must too).
