@@ -22,12 +22,38 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       -
+        # The build steps below use the Git context ({{defaultContext}}), so the
+        # repo is not otherwise checked out; this step puts app/__init__.py on
+        # the runner for the version read.
+        name: Checkout (for version extraction)
+        uses: actions/checkout@v4
+      -
+        name: Extract greffer node version
+        id: version
+        # Publish the greffer-node images (greffer, greffer-nginx,
+        # tunnel-sidecar) under BOTH :latest and the node version, so the
+        # self-update flow has a concrete tag to update to and a prior
+        # tag/digest to roll back to. The version is app/__init__.py
+        # __version__, the same value reported to the manager as
+        # Greffer.version, so the published tag matches what the manager's
+        # "update available" check compares against.
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' app/__init__.py)"
+          if [ -z "$version" ]; then
+            echo "could not read __version__ from app/__init__.py" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing greffer-node images at :latest and :$version"
+      -
         name: Build and push Greffer Nginx
         uses: docker/build-push-action@v3
         with:
           context: "{{defaultContext}}:nginx"
           push: true
-          tags: greffon/greffer-nginx:latest
+          tags: |
+            greffon/greffer-nginx:latest
+            greffon/greffer-nginx:${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. Base is nginx:1.20.2-alpine-perl
           # (multi-arch manifest, no per-arch downloads), so arm64 is a
           # pure rebuild. Without this the image is amd64-only and the
@@ -40,7 +66,9 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           push: true
-          tags: greffon/greffer:latest
+          tags: |
+            greffon/greffer:latest
+            greffon/greffer:${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. Base is python:3.11-alpine
           # (multi-arch manifest, no per-arch downloads), so arm64 is a
           # pure rebuild. Pairs with the greffer-nginx step above — both
@@ -53,7 +81,9 @@ jobs:
         with:
           context: "{{defaultContext}}:tunnel-sidecar"
           push: true
-          tags: greffon/tunnel-sidecar:latest
+          tags: |
+            greffon/tunnel-sidecar:latest
+            greffon/tunnel-sidecar:${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. The tunnel-sidecar Dockerfile
           # downloads the correct rathole binary per TARGETARCH; the
           # smoke-test on greffon/greffon root confirmed Debian-slim
