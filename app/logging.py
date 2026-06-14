@@ -95,8 +95,15 @@ def configure_logging(settings: Settings) -> None:
                     "level": level,
                     "propagate": False,
                 }
+                # "apps" is the greffer's OWN package tree
+                # (apps.utils.docker.compose etc. use getLogger(__name__)); it
+                # MUST route through the same handler or the compose start/stop
+                # logs — the ones request_id is meant to correlate — would skip
+                # the JSON formatter + ContextFilter entirely (codex P2 on #73).
+                # It is greffer-owned, so no third-party logger is captured.
                 for name in (
-                    settings.logger_name, "uvicorn.error", "uvicorn.access")
+                    settings.logger_name, "apps",
+                    "uvicorn.error", "uvicorn.access")
             },
         }
     )

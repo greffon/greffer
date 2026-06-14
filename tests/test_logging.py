@@ -82,3 +82,18 @@ def test_configure_logging_selects_text(settings):
     configure_logging(settings)
     fmt = logging.getLogger(settings.logger_name).handlers[0].formatter
     assert not isinstance(fmt, JsonFormatter)
+
+
+def test_configure_logging_covers_apps_tree(settings):
+    # apps.* loggers (the compose helper) must route through the JSON+context
+    # handler, else the start/stop logs request_id correlates with would skip
+    # it (codex P2 on #73).
+    settings.greffer_log_format = "json"  # type: ignore[misc]
+    configure_logging(settings)
+    apps_logger = logging.getLogger("apps")
+    assert apps_logger.handlers, "apps tree has no handler"
+    assert any(isinstance(h.formatter, JsonFormatter)
+               for h in apps_logger.handlers)
+    # the context filter is attached so request_id/instance_id are surfaced
+    assert any(f.__class__.__name__ == "ContextFilter"
+               for h in apps_logger.handlers for f in h.filters)
