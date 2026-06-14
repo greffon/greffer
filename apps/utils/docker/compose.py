@@ -530,7 +530,17 @@ def _inject_instance_log_rotation(compose):
     if not isinstance(services, dict):
         return
     max_size = os.getenv('GREFFER_INSTANCE_LOG_MAX_SIZE', '10m')
-    max_file = os.getenv('GREFFER_INSTANCE_LOG_MAX_FILE', '3')
+    # ``max-file`` must be an integer string; coerce with a fallback so a
+    # malformed GREFFER_INSTANCE_LOG_MAX_FILE does not write an invalid value
+    # into EVERY rendered instance compose and break every greffon start.
+    raw_max_file = os.getenv('GREFFER_INSTANCE_LOG_MAX_FILE', '3')
+    try:
+        max_file = str(int(raw_max_file))
+    except (TypeError, ValueError):
+        logger.warning(
+            'invalid GREFFER_INSTANCE_LOG_MAX_FILE=%r; using default 3',
+            raw_max_file)
+        max_file = '3'
     for service in services.values():
         if not isinstance(service, dict) or 'logging' in service:
             continue

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anyio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
@@ -43,7 +44,10 @@ async def readyz(request: Request) -> JSONResponse:
     ``evaluate_readiness`` so the endpoint and the self-heal decision can never
     drift. ``/healthz`` stays liveness-only (a greffer-cli contract).
     """
-    r = evaluate_readiness(request.app)
+    # ``evaluate_readiness`` pings docker (a blocking SDK call). Offload it so a
+    # hung daemon can't stall the uvicorn event loop (mirrors the heartbeat
+    # worker's anyio.to_thread offload).
+    r = await anyio.to_thread.run_sync(evaluate_readiness, request.app)
     return JSONResponse(
         {
             "id": request.app.state.settings.greffer_id,

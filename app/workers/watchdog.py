@@ -20,6 +20,7 @@ import os
 import signal
 import time
 
+import anyio
 from fastapi import FastAPI
 
 from app.readiness import evaluate_readiness
@@ -44,7 +45,9 @@ async def watchdog_worker(app: FastAPI) -> None:
     try:
         while True:
             await asyncio.sleep(settings.greffer_watchdog_interval)
-            readiness = evaluate_readiness(app)
+            # Offload the docker-pinging evaluation so a hung daemon cannot
+            # block the event loop the other workers share.
+            readiness = await anyio.to_thread.run_sync(evaluate_readiness, app)
             if not readiness.fatal:
                 if fatal_since is not None:
                     logger.info(
