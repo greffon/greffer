@@ -139,6 +139,27 @@ class Settings(BaseSettings):
     # bug Codex caught before merge (greffon/greffer#17 review).
     greffer_workers_enabled: bool = False
 
+    # Self-health watchdog (greffer-observability epic, Feature #3). The
+    # watchdog evaluates /readyz's FATAL conditions and, when one is sustained
+    # past the grace window, exits the uvicorn process so ``restart:
+    # unless-stopped`` recovers it (plain ``docker compose`` does NOT restart a
+    # container on an unhealthy healthcheck). On by default. Degraded states
+    # (e.g. registration pending acceptance) are NEVER fatal, so a greffer
+    # awaiting acceptance does not restart-loop. ``grace`` rides out transient
+    # docker blips. Field names carry the ``greffer_`` prefix to bind the
+    # documented GREFFER_WATCHDOG_* env vars (see prefix pitfall above).
+    greffer_watchdog_enabled: bool = True
+    greffer_watchdog_interval: int = 10
+    greffer_watchdog_grace: int = 30
+
+    # Compose log rotation for the greffon INSTANCE containers the greffer
+    # renders (the real disk risk: an instance can log unbounded under the
+    # docker json-file driver's default of no rotation). Injected per service
+    # in ``create_compose`` unless the catalog author already set ``logging``.
+    # The greffer's OWN services carry static logging in docker-compose.yml.
+    greffer_instance_log_max_size: str = "10m"
+    greffer_instance_log_max_file: int = 3
+
     logger_name: str = "greffer"
 
 

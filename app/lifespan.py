@@ -34,6 +34,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         return
     tasks = start_workers(app)
+    # Expose the task handles by name so /readyz and the watchdog can tell a
+    # live long-lived worker from a crashed one (Feature #3). Set synchronously
+    # before the first ``yield``, so it is populated before any task runs.
+    app.state.worker_tasks = {t.get_name(): t for t in tasks}
     logger.info("started %d background workers", len(tasks))
     try:
         yield
