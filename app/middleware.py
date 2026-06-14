@@ -12,11 +12,20 @@ echoes it back on the response header.
 """
 from __future__ import annotations
 
+import re
 from uuid import uuid4
 
 from app.log_context import request_id_var
 
 _HEADER = b"x-request-id"
+# Allowlist for an accepted inbound request id. This is the security boundary:
+# it rules out CR/LF (so the echoed response header can't be split — the prod
+# runtime is httptools, which does NOT validate header values) and all control
+# bytes (so a crafted id can't forge a line in text-format logs), and the cap
+# bounds header/log size. A value that fails ANY check is replaced by a fresh
+# id rather than partially scrubbed, so a forged id can't masquerade as chosen.
+_RID_RE = re.compile(r"[A-Za-z0-9._-]+")
+_RID_MAX_LEN = 128
 
 
 class RequestIDMiddleware:
@@ -31,9 +40,14 @@ class RequestIDMiddleware:
         incoming = None
         for key, value in scope.get("headers", []):
             if key.lower() == _HEADER:
-                incoming = value.decode("latin-1").strip()
+                incoming = value.decode("latin-1")
                 break
-        request_id = incoming or uuid4().hex
+        request_id = (
+            incoming
+            if incoming and len(incoming) <= _RID_MAX_LEN
+            and _RID_RE.fullmatch(incoming)
+            else uuid4().hex
+        )
         token = request_id_var.set(request_id)
 
         async def send_with_header(message):

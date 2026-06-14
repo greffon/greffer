@@ -47,6 +47,14 @@ def test_json_formatter_includes_exception():
     assert "exc" in out and "ValueError" in out["exc"]
 
 
+def test_json_formatter_tolerates_bad_arg_count():
+    # A %-arg-count mismatch must not raise inside the formatter (the stdlib
+    # tolerates it; the hand-rolled formatter must too).
+    rec = _record("need %s %s", ("only-one",))
+    out = json.loads(JsonFormatter().format(rec))
+    assert out["message"] == "need %s %s"  # raw template, no crash
+
+
 def test_configure_logging_selects_json(settings):
     settings.greffer_log_format = "json"  # type: ignore[misc]
     configure_logging(settings)

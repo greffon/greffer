@@ -29,12 +29,19 @@ class JsonFormatter(logging.Formatter):
         self.greffer_id = greffer_id
 
     def format(self, record: logging.LogRecord) -> str:
+        try:
+            message = record.getMessage()
+        except (TypeError, ValueError):
+            # A %-arg-count mismatch at the call site would raise here; the
+            # stdlib formatter tolerates it, so we do too (log the raw template
+            # rather than let one bad call site break the formatter).
+            message = str(record.msg)
         payload = {
             "timestamp": _dt.datetime.fromtimestamp(
                 record.created, tz=_dt.timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": message,
             "greffer_id": self.greffer_id,
         }
         for attr in ("request_id", "instance_id", "worker"):
