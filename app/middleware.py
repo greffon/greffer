@@ -12,10 +12,13 @@ echoes it back on the response header.
 """
 from __future__ import annotations
 
+import logging
 import re
 from uuid import uuid4
 
 from app.log_context import request_id_var
+
+logger = logging.getLogger("greffer")
 
 _HEADER = b"x-request-id"
 # Allowlist for an accepted inbound request id. This is the security boundary:
@@ -50,8 +53,12 @@ class RequestIDMiddleware:
         )
         token = request_id_var.set(request_id)
 
+        started = False
+
         async def send_with_header(message):
+            nonlocal started
             if message["type"] == "http.response.start":
+                started = True
                 headers = message.setdefault("headers", [])
                 # Drop any echoed-through duplicate, then set ours.
                 headers[:] = [(k, v) for k, v in headers
@@ -61,5 +68,26 @@ class RequestIDMiddleware:
 
         try:
             await self.app(scope, receive, send_with_header)
+        except Exception:
+            # An unhandled exception would otherwise bubble to the OUTER
+            # ServerErrorMiddleware, whose 500 + stack-trace log bypass THIS
+            # middleware: no X-Request-ID header and no request_id in the error
+            # log (our context is already unwinding). Handle it in-context so
+            # the failure stays correlatable. Only when nothing has been sent
+            # yet — a half-sent response can't be rewritten, so re-raise and let
+            # the server abort the connection. CancelledError (BaseException) is
+            # intentionally not caught: a client disconnect must propagate.
+            if started:
+                raise
+            logger.exception("unhandled error during request")
+            await send_with_header({
+                "type": "http.response.start",
+                "status": 500,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"message": "internal_error"}',
+            })
         finally:
             request_id_var.reset(token)

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+
+from app.main import create_app
+from app.settings import Settings
 
 
 @pytest.mark.asyncio
@@ -42,3 +45,22 @@ async def test_crlf_injection_request_id_is_rejected(client: AsyncClient) -> Non
 async def test_overlong_request_id_is_rejected(client: AsyncClient) -> None:
     r = await client.get("/healthz", headers={"X-Request-ID": "a" * 500})
     assert len(r.headers["x-request-id"]) <= 128
+
+
+@pytest.mark.asyncio
+async def test_request_id_preserved_on_unhandled_500(settings: Settings) -> None:
+    # An unhandled exception must still carry X-Request-ID on the 500 (the
+    # middleware handles it in-context before ServerErrorMiddleware, which would
+    # otherwise bypass the header + drop request_id from the error log).
+    app = create_app(token="test-token", settings=settings)
+
+    @app.get("/_boom")
+    async def _boom():  # pragma: no cover - body is the raise
+        raise RuntimeError("kaboom")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        r = await ac.get("/_boom", headers={"X-Request-ID": "err-trace-1"})
+    assert r.status_code == 500
+    assert r.headers.get("x-request-id") == "err-trace-1"
