@@ -778,3 +778,45 @@ class GetStatusTests(TestCase):
         result = get_status('test-id')
         # The migrate container is skipped, so only the running container counts
         self.assertEqual(result['status'], 'running')
+
+    @patch('apps.utils.docker.compose.client')
+    def test_get_status_excludes_labeled_one_shot(self, mock_client):
+        """A completed one-shot labeled com.greffon.status=ignore is skipped,
+        so an otherwise-running instance reports 'running' not 'unknow'.
+
+        This is the glitchtip_seed / docs createbuckets case: the helper
+        exits after doing its job and is not named 'migrate'."""
+        from apps.utils.docker.compose import get_status
+
+        app = MagicMock()
+        app.name = 'test-id_app_1'
+        app.status = 'running'
+        app.labels = {}
+        seed = MagicMock()
+        seed.name = 'test-id_createbuckets_1'
+        seed.status = 'exited'
+        seed.labels = {'com.greffon.status': 'ignore'}
+        mock_client.containers.list.return_value = [app, seed]
+
+        result = get_status('test-id')
+        self.assertEqual(result['status'], 'running')
+
+    @patch('apps.utils.docker.compose.client')
+    def test_get_status_unlabeled_one_shot_still_counts(self, mock_client):
+        """An exited helper that is neither named 'migrate' nor labeled is
+        counted: the mixed state regresses to 'unknow', which is exactly the
+        bug the label fixes for callers that have not yet adopted it."""
+        from apps.utils.docker.compose import get_status
+
+        app = MagicMock()
+        app.name = 'test-id_app_1'
+        app.status = 'running'
+        app.labels = {}
+        seed = MagicMock()
+        seed.name = 'test-id_createbuckets_1'
+        seed.status = 'exited'
+        seed.labels = {}
+        mock_client.containers.list.return_value = [app, seed]
+
+        result = get_status('test-id')
+        self.assertEqual(result['status'], 'unknow')

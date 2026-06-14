@@ -616,22 +616,58 @@ def stop(greffon_info):
     'docker-compose.yml'), 'stop'])
 
 
-def get_status(greffon_id): 
+# Label a catalog service carries to declare it a one-shot lifecycle helper
+# (DB migration, object-store bucket creation, first-run superuser seed).
+# Such a container runs to completion and then sits in ``exited`` forever,
+# which is normal. It must NOT drag the instance into a mixed ``unknow``
+# status. The status computation excludes any container carrying this label.
+STATUS_IGNORE_LABEL = 'com.greffon.status'
+STATUS_IGNORE_VALUE = 'ignore'
+
+
+def _ignore_for_status(container):
+    """Whether a container is excluded from the instance-status computation.
+
+    Two mechanisms, both meaning "this container's state never reflects
+    instance health":
+
+    1. The ``com.greffon.status: ignore`` label: the general, per-container
+       declaration the catalog author puts on a one-shot service. Covers any
+       one-shot regardless of name or restart policy (e.g. the Docs/Visio
+       ``createbuckets`` helper uses ``restart: on-failure``, not ``"no"``,
+       so it can't be inferred from the restart policy).
+    2. Legacy fallback: a name containing ``migrate``. Predates the label and
+       is kept so instances started from an *unlabelled* compose (older
+       catalog) don't regress when a greffer is upgraded ahead of the catalog.
+       Removable once every template carries the label.
+
+    The exclusion is unconditional. It does not look at the exit code,
+    matching the legacy ``migrate`` skip. The catalog one-shots force
+    ``exit 0`` regardless, and a one-shot that genuinely failed is already
+    surfaced by its dependent app container failing to reach ``running``, so
+    distinguishing a clean from a failed completion would add complexity for
+    no signal the instance status doesn't already carry.
+    """
+    if 'migrate' in container.name:
+        return True
+    labels = container.labels or {}
+    return labels.get(STATUS_IGNORE_LABEL) == STATUS_IGNORE_VALUE
+
+
+def get_status(greffon_id):
     containers = []
     is_all_stopped = True
     is_all_running = True
-    #Todo should find a way to have all status pullling error...
     for container in client.containers.list(all=True, filters={'name': greffon_id}):
-        if 'migrate' not in container.name:
-            container_status = container.status
-            if container_status != 'running': 
-                container_status = 'stopped'
-                is_all_running = False
-            else:
-                is_all_stopped = False
-            containers.append({
-                'status': container_status
-            })
+        if _ignore_for_status(container):
+            continue
+        container_status = container.status
+        if container_status != 'running':
+            container_status = 'stopped'
+            is_all_running = False
+        else:
+            is_all_stopped = False
+        containers.append({'status': container_status})
     if is_all_running and not is_all_stopped:
         status = 'running'
     elif not is_all_running and is_all_stopped:
