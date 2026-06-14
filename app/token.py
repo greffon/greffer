@@ -79,6 +79,23 @@ def load_or_create_token(path: Path) -> str:
     return token
 
 
+def load_persisted_token(path: Path) -> str | None:
+    """Return the on-disk token if present and readable, else None.
+
+    Unlike ``load_or_create_token`` this NEVER mints or persists. It exists so a
+    long-running (re-)registration can re-read a possibly-rotated token between
+    retries without churning a fresh ephemeral token each call when the volume
+    is unwritable (which would hand a different token to every cert poll and
+    403 the endpoint forever). Callers fall back to the process's stable token
+    when this returns None.
+    """
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return existing or None
+
+
 def _mint() -> str:
     return secrets.token_urlsafe(_TOKEN_BYTES)
 
@@ -111,3 +128,12 @@ def _atomic_write(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def resolve_token(settings) -> str:
+    """Resolve the greffer's stable token the way ``create_app`` does, minus the
+    test-only explicit kwarg: an operator-set ``GREFFER_TOKEN`` wins, otherwise
+    the persisted on-disk token. Used on (re-)registration (greffer-observability
+    epic) so a rotated on-disk token is picked up after a heartbeat 403."""
+    return settings.greffer_token or load_or_create_token(
+        settings.greffon_path / ".greffer-token")

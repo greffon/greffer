@@ -20,8 +20,25 @@ import requests
 from fastapi import FastAPI
 
 from app.settings import Settings
+from app.token import load_persisted_token
 
 logger = logging.getLogger("greffer")
+
+
+def _inflight_token(app: FastAPI, settings: Settings) -> str:
+    """Freshest token to use for the current (re-)registration attempt.
+
+    An operator-pinned ``GREFFER_TOKEN`` wins; otherwise a PERSISTED on-disk
+    token (re-read each retry so a rotation that lands mid-flight is picked up);
+    otherwise the stable token already in ``app.state``. Crucially this never
+    re-mints the ephemeral in-memory fallback that ``load_or_create_token`` uses
+    when ``GREFFON_PATH`` is unwritable: minting a new token per cert poll would
+    diverge from the token the register POST staged and 403 forever.
+    """
+    if settings.greffer_token:
+        return settings.greffer_token
+    persisted = load_persisted_token(settings.greffon_path / ".greffer-token")
+    return persisted or app.state.greffer_token
 
 
 _REGISTER_RETRY_SECONDS = 3.0
@@ -59,27 +76,101 @@ class RegisterRejected(Exception):
 
 
 async def register_worker(app: FastAPI) -> None:
-    """Register with the manager and block until cert is installed.
-
-    All ``anyio.to_thread.run_sync`` calls use ``abandon_on_cancel=True`` so
-    that lifespan shutdown doesn't block waiting for a hung HTTP call — the
-    async task returns immediately on cancel and the thread finishes (or
-    gets killed at process exit) in the background. Every HTTP call also
-    carries a ``timeout`` so the thread can't hang forever in the first
-    place.
-    """
+    """Initial registration: POST until accepted, poll for cert, install.
+    Returns once registration completes (which sets ``app.state.registered``,
+    un-gating the heartbeat). Retries the whole flow on an unexpected failure
+    (e.g. a transient docker error during cert install) so such a failure does
+    NOT leave ``registered`` unset and the heartbeat blocked forever. Later
+    re-runs (after a heartbeat 403) are handled by ``reregister_worker``."""
     settings: Settings = app.state.settings
-    token: str = app.state.greffer_token
+    delay = _REGISTER_RETRY_SECONDS
+    while True:
+        try:
+            # Resolve the address inside the retry loop: a DNS failure
+            # (_resolve_hostname -> socket.gaierror) must also retry rather than
+            # kill the task and leave the heartbeat parked.
+            address = await _resolve_address(settings)
+            await _run_registration(app, settings, address)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "initial registration failed; retrying in %ss", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
 
-    address = settings.greffer_address or await anyio.to_thread.run_sync(
+
+async def reregister_worker(app: FastAPI) -> None:
+    """Supervisor that re-runs registration on demand (greffer-observability
+    epic). The heartbeat sets ``app.state.reregister_requested`` on a 403 (the
+    manager rejected our accepted token); we re-register, picking up a rotated
+    on-disk token via _inflight_token inside _run_registration. Idle otherwise."""
+    settings: Settings = app.state.settings
+    event: asyncio.Event = app.state.reregister_requested
+    try:
+        while True:
+            await event.wait()
+            event.clear()
+            logger.warning("re-register requested; re-running registration")
+            # Retry until registration succeeds (which sets app.state.registered
+            # and un-gates the heartbeat). A single failed attempt must NOT
+            # return to idle: registered is cleared and reregister_requested is
+            # cleared, so nothing would ever re-trigger us and the heartbeat
+            # would stay parked forever. Mirror register_worker's retry loop.
+            delay = _REGISTER_RETRY_SECONDS
+            while True:
+                try:
+                    # Token resolution is left to _inflight_token inside
+                    # _run_registration: it re-reads a rotated on-disk token each
+                    # attempt AND never re-mints the ephemeral fallback. Resolving
+                    # here too would, on an unwritable volume, mint a fresh
+                    # ephemeral token per retry and re-stage a different one at the
+                    # manager.
+                    address = await _resolve_address(settings)
+                    await _run_registration(app, settings, address)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "re-registration attempt failed; retrying in %ss", delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _REGISTER_RETRY_MAX_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("reregister supervisor cancelled")
+        raise
+
+
+async def _resolve_address(settings: Settings) -> str:
+    return settings.greffer_address or await anyio.to_thread.run_sync(
         _resolve_hostname, abandon_on_cancel=True
     )
 
+
+async def _run_registration(
+    app: FastAPI, settings: Settings, address: str
+) -> None:
+    """Register with the manager and block until the cert is installed.
+
+    Re-resolves the token before every register POST (Phase 1) so an on-disk
+    rotation is restaged at the manager; the cert poll (Phase 2) then sticks with
+    that REGISTERED token rather than switching to an unstaged one. All
+    ``anyio.to_thread.run_sync`` calls use
+    ``abandon_on_cancel=True`` so lifespan shutdown doesn't block on a hung HTTP
+    call; every HTTP call also carries a ``timeout``.
+    """
     # Phase 1: POST until the manager accepts the registration (2xx). Retries
     # back off exponentially (capped) so a permanently-refused register stays
     # loud without flooding the log.
     delay = _REGISTER_RETRY_SECONDS
     while True:
+        # Re-resolve the token each attempt so a rotation landing mid-flight
+        # (operator re-pins GREFFER_TOKEN, or the manager stages a new one after
+        # the 403 that triggered this re-register) is picked up, instead of
+        # looping forever on a stale token captured at entry. Keep app.state in
+        # sync so the heartbeat worker beats with the same token post-register.
+        token = app.state.greffer_token = _inflight_token(app, settings)
         try:
             await anyio.to_thread.run_sync(
                 _post_register,
@@ -127,6 +218,12 @@ async def register_worker(app: FastAPI) -> None:
     last_status: int | None = None
     same_status_polls = 0
     while True:
+        # Poll with the token that Phase 1 just REGISTERED (the manager staged it
+        # via _post_register). Do NOT re-resolve here: a token rotated on disk
+        # mid-poll was never staged at the manager, so switching the cert header
+        # to it would 403 every poll forever with no path back to Phase 1. A
+        # rotation during the admin-acceptance wait is instead picked up after
+        # registration completes, via the heartbeat-403 -> reregister flow.
         try:
             data, cert_status = await anyio.to_thread.run_sync(
                 _fetch_cert, settings, token, abandon_on_cancel=True
@@ -174,6 +271,9 @@ async def register_worker(app: FastAPI) -> None:
         await anyio.to_thread.run_sync(
             _fetch_and_store_crl, settings, abandon_on_cancel=True
         )
+        # Let the heartbeat worker start beating now that we are accepted and
+        # hold a cert (greffer-observability epic).
+        app.state.registered.set()
         logger.info("register complete")
         return
 

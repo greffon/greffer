@@ -60,3 +60,39 @@ def test_protocol_literal_rejects_invalid(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GREFFER_PROTOCOL", "ftp")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_heartbeat_interval_defaults_to_5(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.delenv("HEARTBEAT_INTERVAL", raising=False)
+    get_settings.cache_clear()
+    assert get_settings().heartbeat_interval == 5
+
+
+def test_heartbeat_interval_binds_unprefixed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL", "9")
+    get_settings.cache_clear()
+    assert get_settings().heartbeat_interval == 9
+
+
+def test_heartbeat_interval_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import ValidationError
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL", "0")
+    get_settings.cache_clear()
+    with pytest.raises(ValidationError):
+        get_settings()
+
+
+def test_greffer_version_truncated_to_32(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREFFER_ID", "test")
+    monkeypatch.setenv("GREFFER_VERSION", "0.3.3-rc1-42-gdeadbeef-dirty-20260611-extra")
+    get_settings.cache_clear()
+    v = get_settings().greffer_version
+    assert len(v) == 32
+    assert v == "0.3.3-rc1-42-gdeadbeef-dirty-2026"[:32]

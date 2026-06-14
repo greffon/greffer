@@ -5,6 +5,7 @@ plain pytest + mock — no event loop gymnastics.
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from app.workers.register import (
     _resolve_hostname,
     _safe_body,
     register_worker,
+    reregister_worker,
 )
 
 
@@ -485,6 +487,88 @@ async def test_register_worker_survives_cert_poll_transient_error(
 
 
 @pytest.mark.asyncio
+async def test_cert_poll_keeps_registered_token_when_disk_rotates(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cert poll must keep using the token Phase 1 REGISTERED, not switch to
+    a token that rotates on disk mid-poll. The manager only staged the
+    registered token via the register POST; polling with an unstaged rotated
+    token would 403 forever. (codex review on greffer#66.)"""
+    app = create_app(token="tok-old", settings=settings)
+    settings.greffer_token = None  # type: ignore[misc]  # no env pin -> read disk
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+    # Phase 1 registers with tok-old; the on-disk token then rotates to tok-new
+    # during the cert-poll wait. The poll must still carry tok-old.
+    monkeypatch.setattr(
+        "app.workers.register.load_persisted_token",
+        MagicMock(side_effect=["tok-old", "tok-new", "tok-new", "tok-new"]),
+    )
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.post.return_value.status_code = 200
+        fail = MagicMock(status_code=401)  # awaiting acceptance
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock(status_code=200)
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [fail, success, crl]
+
+        await register_worker(app)
+
+    # Phase 1 POST staged tok-old...
+    assert mock_requests.post.call_args.kwargs["json"]["token"] == "tok-old"
+    # ...and BOTH cert polls (incl. the successful 2nd) kept tok-old, never the
+    # mid-flight rotated tok-new.
+    for call in mock_requests.get.call_args_list[:2]:
+        assert call.kwargs["headers"]["X-Greffer-Token"] == "tok-old"
+
+
+@pytest.mark.asyncio
+async def test_unpersisted_token_is_stable_across_register_and_poll(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When GREFFON_PATH is unwritable the token is an ephemeral in-memory one
+    (no file to re-read). The register POST and every cert poll must use that
+    SAME stable token, not a freshly-minted one per call (which would 403 the
+    cert endpoint forever and never set `registered`)."""
+    app = create_app(token="ephemeral-tok", settings=settings)
+    settings.greffer_token = None  # type: ignore[misc]  # no env pin
+
+    async def _noop_sleep(_s: float) -> None:
+        return
+
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+    # No persisted token (read-only volume): every re-read returns None, so
+    # _inflight_token must fall back to the stable app.state token.
+    monkeypatch.setattr(
+        "app.workers.register.load_persisted_token", MagicMock(return_value=None)
+    )
+
+    with patch("app.workers.register.requests") as mock_requests, patch(
+        "apps.utils.docker.base.copy_file_into_container"
+    ):
+        mock_requests.post.return_value.status_code = 200
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"certificate": "C", "private_key": "K"}
+        crl = MagicMock(status_code=200)
+        crl.text = "CRL"
+        mock_requests.get.side_effect = [success, crl]
+
+        await register_worker(app)
+
+    # POST and the cert poll used the same stable ephemeral token, so it completed.
+    assert mock_requests.post.call_args.kwargs["json"]["token"] == "ephemeral-tok"
+    assert mock_requests.get.call_args_list[0].kwargs["headers"]["X-Greffer-Token"] == "ephemeral-tok"
+    assert app.state.registered.is_set()
+
+
+@pytest.mark.asyncio
 async def test_register_worker_polls_cert_until_200(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -520,8 +604,11 @@ async def test_register_worker_polls_cert_until_200(
 async def test_register_worker_uses_token_from_app_state(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Token must come from ``app.state.greffer_token``, not the Django
-    module-global in ``apps/utils/auth.py``."""
+    """Token must come from the FastAPI config (settings/app.state), not the
+    Django module-global in ``apps/utils/auth.py``. ``_run_registration``
+    re-resolves it via ``_inflight_token`` each attempt (so a mid-flight rotation
+    is picked up), which honors the env-pinned ``settings.greffer_token``."""
+    settings.greffer_token = "fastapi-specific-token"  # type: ignore[misc]
     app = create_app(token="fastapi-specific-token", settings=settings)
 
     async def _noop_sleep(_s: float) -> None:
@@ -786,3 +873,161 @@ def test_initial_tunnel_config_failure_is_non_fatal(
     assert mock_logger.warning.called
     msg = mock_logger.warning.call_args.args[0]
     assert "non-fatal" in msg
+
+
+# ---------------------------------------------------------------------------
+# reregister_worker — supervised re-register on heartbeat 403
+# (greffer-observability epic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reregister_runs_registration_when_event_set(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(token="t", settings=settings)
+    # A 403 would have cleared `registered`; the reregister flow must re-set it
+    # so the heartbeat resumes beating.
+    app.state.registered.clear()
+    ran = {}
+
+    async def _fake_run(_app, _settings, _address):
+        ran["called"] = True
+        # Mirror _run_registration's real contract: re-arm the heartbeat.
+        _app.state.registered.set()
+        # Stop the supervisor after the first re-registration.
+        raise asyncio.CancelledError
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+
+    app.state.reregister_requested.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reregister_worker(app)
+
+    assert ran.get("called") is True
+    # The event was cleared; token (re-)resolution now lives in _run_registration
+    # (via _inflight_token), which is mocked here.
+    assert not app.state.reregister_requested.is_set()
+    # The heartbeat is re-armed (this closes the 403 -> reregister -> resume loop).
+    assert app.state.registered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_reregister_retries_failed_attempt_until_registered(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-network failure in a re-registration attempt must NOT return the
+    supervisor to idle (which would leave registered unset and the heartbeat
+    parked forever). It retries until registration succeeds."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
+    calls = 0
+
+    async def _fake_run(_app, _settings, _address):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyError("malformed cert body")  # first attempt fails
+        _app.state.registered.set()  # second attempt succeeds
+        raise asyncio.CancelledError  # stop the supervisor
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    async def _noop_sleep(_s):
+        return
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    app.state.reregister_requested.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reregister_worker(app)
+
+    # Retried after the first failure (no second external request needed) and
+    # re-armed the heartbeat.
+    assert calls == 2
+    assert app.state.registered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_reregister_cancellable_while_idle(
+    settings: Settings,
+) -> None:
+    app = create_app(token="t", settings=settings)
+    task = asyncio.create_task(reregister_worker(app))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_until_registration_succeeds(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient failure during initial registration (e.g. a docker error in
+    cert install) must NOT leave app.state.registered unset and the heartbeat
+    blocked forever — register_worker retries until it succeeds."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
+    calls = 0
+
+    async def _fake_run(_app, _settings, _address):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("docker boom during cert install")
+        _app.state.registered.set()  # second attempt succeeds
+
+    async def _fake_addr(_settings):
+        return "10.0.0.9"
+
+    async def _noop_sleep(_s):
+        return
+
+    monkeypatch.setattr("app.workers.register._run_registration", _fake_run)
+    monkeypatch.setattr("app.workers.register._resolve_address", _fake_addr)
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    await register_worker(app)
+
+    assert calls == 2
+    assert app.state.registered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_register_worker_retries_on_address_resolution_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DNS failure in address resolution must retry (inside the loop), not
+    kill the task and park the heartbeat."""
+    app = create_app(token="t", settings=settings)
+    app.state.registered.clear()
+    addr_calls = 0
+
+    async def _flaky_addr(_settings):
+        nonlocal addr_calls
+        addr_calls += 1
+        if addr_calls == 1:
+            raise OSError("name resolution failed")
+        return "10.0.0.9"
+
+    async def _ok_run(_app, _settings, _address):
+        _app.state.registered.set()
+
+    async def _noop_sleep(_s):
+        return
+
+    monkeypatch.setattr("app.workers.register._resolve_address", _flaky_addr)
+    monkeypatch.setattr("app.workers.register._run_registration", _ok_run)
+    monkeypatch.setattr("app.workers.register.asyncio.sleep", _noop_sleep)
+
+    await register_worker(app)
+    assert addr_calls == 2
+    assert app.state.registered.is_set()

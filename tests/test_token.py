@@ -7,7 +7,25 @@ from pathlib import Path
 
 import pytest
 
-from app.token import load_or_create_token
+from app.token import load_or_create_token, load_persisted_token
+
+
+def test_load_persisted_returns_token_when_present(tmp_path: Path) -> None:
+    path = tmp_path / ".greffer-token"
+    path.write_text("on-disk-tok", encoding="utf-8")
+    assert load_persisted_token(path) == "on-disk-tok"
+
+
+def test_load_persisted_returns_none_when_absent(tmp_path: Path) -> None:
+    # Never mints (unlike load_or_create_token): a missing file is None so the
+    # caller keeps its stable token instead of churning a fresh ephemeral one.
+    assert load_persisted_token(tmp_path / ".greffer-token") is None
+
+
+def test_load_persisted_returns_none_for_blank_file(tmp_path: Path) -> None:
+    path = tmp_path / ".greffer-token"
+    path.write_text("  \n", encoding="utf-8")
+    assert load_persisted_token(path) is None
 
 
 def test_mints_and_persists_when_absent(tmp_path: Path) -> None:
@@ -90,3 +108,22 @@ def test_no_temp_file_left_behind_on_write_failure(
     assert not path.exists()
     leftovers = list(tmp_path.glob(".greffer-token.*.tmp"))
     assert leftovers == []
+
+
+def test_resolve_token_prefers_settings_override(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from app.token import resolve_token
+    s = SimpleNamespace(greffer_token="operator-tok", greffon_path=tmp_path)
+    assert resolve_token(s) == "operator-tok"
+    # Disk token file is never created when the override wins.
+    assert not (tmp_path / ".greffer-token").exists()
+
+
+def test_resolve_token_falls_back_to_disk(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from app.token import resolve_token
+    s = SimpleNamespace(greffer_token=None, greffon_path=tmp_path)
+    tok = resolve_token(s)
+    assert tok
+    # Minted and persisted under greffon_path.
+    assert (tmp_path / ".greffer-token").read_text().strip() == tok

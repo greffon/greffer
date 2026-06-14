@@ -20,12 +20,14 @@ class Settings(BaseSettings):
     greffer_id: str
 
     # Optional token override; primarily for tests and operator-driven
-    # explicit rotation. When unset, ``create_app`` mints a fresh random
-    # token each process. Used as ``X-GREFFON-TOKEN`` on the manager →
-    # greffer auth path (start/stop/tunnel-config endpoints).
+    # explicit rotation. When unset, ``create_app`` loads (or mints + persists)
+    # a STABLE token from the data volume (``resolve_token`` ->
+    # ``load_or_create_token``), reused across restarts. Used as
+    # ``X-Greffer-Token`` on the manager auth paths.
     greffer_token: str | None = None
 
-    # Greffer software version, reported in the register payload. Defaults to
+    # Greffer software version, reported in the register payload and on every
+    # heartbeat (see workers/heartbeat.py). Defaults to
     # the worker's ``app.__version__``; overridable via ``GREFFER_VERSION`` (e.g.
     # a build/release stamp). The manager stamps ``Greffer.version`` from this
     # and uses it for the per-greffon ``min_greffer_version`` compat gate.
@@ -53,6 +55,25 @@ class Settings(BaseSettings):
         # Codex P2 on greffer#23.
         if isinstance(v, str) and v == "":
             return None
+        return v
+
+    @field_validator("greffer_version")
+    @classmethod
+    def _truncate_version(cls, v):
+        # The manager stores Greffer.version in a max_length=32 column and the
+        # heartbeat serializer enforces 32, so an operator GREFFER_VERSION build
+        # stamp longer than 32 would 400 every heartbeat (live greffer reads
+        # unreachable). Truncate so a long stamp degrades to a valid value on
+        # both the register and heartbeat paths.
+        return v[:32] if v else v
+
+    @field_validator("heartbeat_interval")
+    @classmethod
+    def _heartbeat_interval_in_range(cls, v):
+        # Below 1 would busy-loop the worker; above the manager's cap (86400)
+        # the manager 400s every beat. Match that contract and fail fast.
+        if not 1 <= v <= 86400:
+            raise ValueError("heartbeat_interval must be between 1 and 86400")
         return v
 
     # Where the greffer-side controller handler writes the rathole
@@ -91,6 +112,12 @@ class Settings(BaseSettings):
 
     crl_sync_interval: int = 300
     monitor_interval: int = 5
+    # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
+    # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL
+    # (not the greffer_ prefix — that pitfall applies only to fields whose
+    # documented env var carries the prefix, e.g. greffer_workers_enabled).
+    # The manager derives the unreachable threshold from this value.
+    heartbeat_interval: int = 5
 
     # NOTE: the ops-migrations skip switch (GREFFER_SKIP_OPS_MIGRATIONS) is
     # intentionally NOT a Settings field. The runner reads it via os.getenv
