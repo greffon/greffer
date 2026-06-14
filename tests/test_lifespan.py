@@ -72,6 +72,55 @@ async def test_lifespan_starts_three_workers_when_enabled(
     assert expected.isdisjoint(leftover)
 
 
+async def _noop_worker(_app):
+    await asyncio.sleep(3600)  # sleep forever; cancellable
+
+
+def _patch_all_workers():
+    """Patch every worker (incl. watchdog) so none does real work; the real
+    watchdog would otherwise ping docker / could SIGTERM the test process."""
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    for name in ("register_worker", "monitor_worker", "crl_sync_worker",
+                 "heartbeat_worker", "reregister_worker", "watchdog_worker"):
+        stack.enter_context(patch(f"app.workers.{name}", new=_noop_worker))
+    return stack
+
+
+@pytest.mark.asyncio
+async def test_lifespan_includes_watchdog_and_exposes_worker_tasks(
+    settings: Settings,
+) -> None:
+    """Watchdog is started (on by default) and ``app.state.worker_tasks`` is
+    populated so /readyz and the watchdog can introspect worker liveness
+    (Feature #3)."""
+    settings.greffer_workers_enabled = True  # type: ignore[misc]
+    assert settings.greffer_watchdog_enabled is True  # default on
+    app = create_app(token="t", settings=settings)
+    with _patch_all_workers():
+        async with lifespan(app):
+            assert "greffer-watchdog" in app.state.worker_tasks
+            assert "greffer-monitor" in app.state.worker_tasks
+            names = {t.get_name() for t in asyncio.all_tasks() if not t.done()}
+            assert "greffer-watchdog" in names
+
+
+@pytest.mark.asyncio
+async def test_lifespan_omits_watchdog_when_disabled(
+    settings: Settings,
+) -> None:
+    """``greffer_watchdog_enabled=False`` → no watchdog task, other workers
+    unaffected."""
+    settings.greffer_workers_enabled = True  # type: ignore[misc]
+    settings.greffer_watchdog_enabled = False  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    with _patch_all_workers():
+        async with lifespan(app):
+            assert "greffer-watchdog" not in app.state.worker_tasks
+            assert "greffer-monitor" in app.state.worker_tasks
+
+
 def test_greffer_workers_enabled_env_var_binds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
