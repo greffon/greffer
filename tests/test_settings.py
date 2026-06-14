@@ -38,6 +38,27 @@ def test_valid_log_max_file_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.greffer_instance_log_max_file == 5
 
 
+def test_log_format_defaults_json_and_coerces_garbage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREFFER_ID", "x")
+    assert Settings().greffer_log_format == "json"  # default
+    monkeypatch.setenv("GREFFER_LOG_FORMAT", "yaml")  # bad -> default, no crash
+    assert Settings().greffer_log_format == "json"
+    monkeypatch.setenv("GREFFER_LOG_FORMAT", "text")
+    assert Settings().greffer_log_format == "text"
+
+
+def test_log_level_coerces_and_uppercases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_LOG_LEVEL", "debug")
+    assert Settings().greffer_log_level == "DEBUG"
+    monkeypatch.setenv("GREFFER_LOG_LEVEL", "loud")  # invalid -> INFO, no crash
+    assert Settings().greffer_log_level == "INFO"
+
+
 def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GREFFER_ID", "x")
     s = Settings()

@@ -180,6 +180,26 @@ class Settings(BaseSettings):
 
     logger_name: str = "greffer"
 
+    # Structured logging (greffer-observability epic, Feature #4). JSON is the
+    # default; ``text`` stays selectable as a one-release escape hatch. Field
+    # names carry the ``greffer_`` prefix to bind GREFFER_LOG_FORMAT /
+    # GREFFER_LOG_LEVEL (the prefix pitfall above). Both validators coerce a
+    # malformed value to the default rather than crashing startup (the codex P2
+    # lesson from Feature #3: a bad optional knob must not take the greffer down).
+    greffer_log_format: Literal["json", "text"] = "json"
+    greffer_log_level: str = "INFO"
+
+    @field_validator("greffer_log_format", mode="before")
+    @classmethod
+    def _coerce_log_format(cls, v):
+        return v if v in ("json", "text") else "json"
+
+    @field_validator("greffer_log_level", mode="before")
+    @classmethod
+    def _coerce_log_level(cls, v):
+        valid = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+        return v.upper() if isinstance(v, str) and v.upper() in valid else "INFO"
+
 
 @lru_cache
 def get_settings() -> Settings:

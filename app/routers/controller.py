@@ -18,6 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth import require_token
+from app.log_context import instance_id_var
 from app.models.controller import (
     GreffonStartRequest,
     GreffonStartResponse,
@@ -91,6 +92,9 @@ def start_greffon(
     )
     greffon_info = repository.get_greffon_info(
         compose_file, greffon, l4_bind_host=l4_bind_host)
+    # Tag this request's logs with the instance id (Feature #4), so the compose
+    # run correlates with the manager action by both request_id and instance_id.
+    instance_id_var.set(greffon_info["id"])
     # compose.py and _compute_instance_context both read the bind interface
     # off greffon_info. Set it BEFORE build_render_context so the instance_l4_*
     # tunnel/proxy branch is resolved against the real interface on the first
@@ -175,7 +179,9 @@ def start_greffon(
 def stop_greffon(
     payload: GreffonStopRequest, request: Request
 ) -> GreffonStopResponse:
-    compose.stop(payload.model_dump())
+    greffon = payload.model_dump()
+    instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
+    compose.stop(greffon)
 
     # v3 push: write the manager-rendered client.toml AFTER the
     # container is stopped. The dropped server.toml service on the
