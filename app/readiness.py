@@ -29,6 +29,16 @@ logger = logging.getLogger("greffer")
 # fatal here.
 FATAL_WORKERS = ("greffer-monitor", "greffer-crl-sync", "greffer-heartbeat")
 
+# A short-timeout client dedicated to the readiness ping. The shared
+# apps.utils.docker client uses the SDK default (~60s), so a HUNG (not down)
+# daemon would leave the ping blocked. anyio's abandon_on_cancel stops WAITING
+# on that thread but does not stop the ping, and the AnyIO worker threads are
+# non-daemon, so a stuck ping keeps the process alive past the watchdog's
+# graceful SIGTERM and `restart: unless-stopped` never sees a clean exit (codex
+# P2 on greffon/greffer#72). A bounded client makes the ping itself fail fast.
+_DOCKER_PING_TIMEOUT_SECONDS = 4
+_ping_client = None
+
 
 @dataclass
 class Readiness:
@@ -43,19 +53,26 @@ class Readiness:
 
 
 def _docker_ok() -> bool:
-    """Ping the docker daemon. Imported lazily so unit tests run without the
-    docker SDK initializing its ``from_env()`` client at import (mirrors
+    """Ping the docker daemon with a short-timeout client so a hung daemon fails
+    fast (see ``_DOCKER_PING_TIMEOUT_SECONDS`` above). Imported lazily so unit
+    tests run without the docker SDK initializing a client at import (mirrors
     status_collect / the monitor)."""
+    global _ping_client
     try:
-        from apps.utils.docker.base import client
+        import docker
 
-        client.ping()
+        if _ping_client is None:
+            _ping_client = docker.from_env(
+                timeout=_DOCKER_PING_TIMEOUT_SECONDS)
+        _ping_client.ping()
         return True
     except Exception:
         # A readiness probe must treat ANY ping failure as "daemon unreachable"
         # (the docker SDK raises APIError / connection / socket errors of
-        # several types); logging keeps it from being a silent swallow.
+        # several types); logging keeps it from being a silent swallow. Drop a
+        # possibly-broken client so the next probe rebuilds it.
         logger.warning("readiness: docker ping failed", exc_info=True)
+        _ping_client = None
         return False
 
 

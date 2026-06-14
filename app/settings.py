@@ -166,6 +166,18 @@ class Settings(BaseSettings):
     greffer_instance_log_max_size: str = "10m"
     greffer_instance_log_max_file: int = 3
 
+    @field_validator("greffer_instance_log_max_file", mode="before")
+    @classmethod
+    def _coerce_log_max_file(cls, v):
+        # An operator typo (e.g. GREFFER_INSTANCE_LOG_MAX_FILE=2x) must NOT crash
+        # the app at pydantic parse and take down ALL instance operations over an
+        # optional logging knob; fall back to the default (codex P2 on
+        # greffon/greffer#72). Mirrors _inject_instance_log_rotation's fallback.
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 3
+
     logger_name: str = "greffer"
 
 
