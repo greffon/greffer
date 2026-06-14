@@ -56,6 +56,17 @@ def test_fatal_when_long_lived_worker_dead():
     assert "worker_dead:greffer-monitor" in r.reasons
 
 
+def test_fatal_when_reregister_supervisor_dead():
+    # A dead reregister supervisor permanently wedges 403-recovery (heartbeats
+    # park forever with no consumer of reregister_requested), so it is fatal
+    # (codex P2 on #72).
+    wt = {"greffer-reregister": _task(done=True)}
+    with patch("app.readiness._docker_ok", return_value=True):
+        r = evaluate_readiness(_app(registered=True, worker_tasks=wt))
+    assert r.fatal
+    assert "worker_dead:greffer-reregister" in r.reasons
+
+
 def test_alive_long_lived_worker_not_fatal():
     wt = {"greffer-heartbeat": _task(done=False)}
     with patch("app.readiness._docker_ok", return_value=True):

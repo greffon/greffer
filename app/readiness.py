@@ -24,10 +24,17 @@ logger = logging.getLogger("greffer")
 
 # Long-lived worker tasks whose death means the greffer is wedged (the loop is
 # gone until a restart). ``greffer-register`` is one-shot (it exits normally
-# after success) and ``greffer-reregister`` is an idle supervisor (its death
-# only delays a 403-driven re-register, which is recoverable), so neither is
-# fatal here.
-FATAL_WORKERS = ("greffer-monitor", "greffer-crl-sync", "greffer-heartbeat")
+# after success), so it is excluded. ``greffer-reregister`` IS included: it is an
+# idle supervisor, but it is the ONLY consumer of ``reregister_requested``, so if
+# it dies a later heartbeat 403 parks heartbeats forever (the heartbeat clears
+# ``registered`` and sets an event nobody reads) and the greffer cannot recover
+# without a restart (codex P2 on greffon/greffer#72).
+FATAL_WORKERS = (
+    "greffer-monitor",
+    "greffer-crl-sync",
+    "greffer-heartbeat",
+    "greffer-reregister",
+)
 
 # A short-timeout client dedicated to the readiness ping. The shared
 # apps.utils.docker client uses the SDK default (~60s), so a HUNG (not down)
