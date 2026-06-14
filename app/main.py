@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from app.errors import register_exception_handlers
 from app.lifespan import lifespan
 from app.logging import configure_logging
+from app.middleware import RequestIDMiddleware
 from app.routers import controller, health
 from app.settings import Settings, get_settings
 from app.token import resolve_token
@@ -25,6 +26,10 @@ def create_app(
     settings = settings or get_settings()
     configure_logging(settings)
     app = FastAPI(lifespan=lifespan)
+    # Request-ID correlation (Feature #4): propagate an inbound X-Request-ID
+    # (or generate one), bind it to every log line the request produces, and
+    # echo it on the response so a manager action ties to the greffer-side work.
+    app.add_middleware(RequestIDMiddleware)
     # Token resolution order:
     #   1. explicit ``token=`` kwarg — tests
     #   2. ``settings.greffer_token`` (GREFFER_TOKEN env) — explicit operator
