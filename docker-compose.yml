@@ -65,19 +65,22 @@ services:
     # exits the process on a sustained FATAL readyz, and `restart:
     # unless-stopped` recovers it. A greffer pending acceptance is DEGRADED ->
     # 200 -> healthy, so it is not flapped. start_period covers ops-migrations +
-    # uvicorn bind + token resolve before failures count. A missing token file
-    # (first boot before it is persisted, or an ephemeral-token deployment on an
-    # unwritable volume where the greffer holds the token only in memory) exits
-    # 0 rather than crashing the probe, so a healthy greffer is never shown
-    # perpetually-unhealthy; a present token + FATAL /readyz (503) raises and is
-    # reported unhealthy as intended.
+    # uvicorn bind + token resolve before failures count. The probe resolves the
+    # token the way create_app does (resolve_token = GREFFER_TOKEN env, else the
+    # persisted file), so an operator-set GREFFER_TOKEN authenticates correctly
+    # instead of reading a stale/absent file. A missing token (no env + no file:
+    # an ephemeral-token deployment on an unwritable volume) exits 0 rather than
+    # crashing the probe, so a healthy greffer is never shown perpetually-
+    # unhealthy; a present token + FATAL /readyz (503) raises and is reported
+    # unhealthy as intended.
     healthcheck:
       test:
         - CMD-SHELL
         - >-
           python -c "import urllib.request,os;
           p=os.path.join(os.getenv('GREFFON_PATH','/data'),'.greffer-token');
-          t=(open(p).read().strip() if os.path.exists(p) else '');
+          t=os.getenv('GREFFER_TOKEN') or
+          (open(p).read().strip() if os.path.exists(p) else '');
           t and urllib.request.urlopen(urllib.request.Request(
           'http://localhost:8000/readyz',
           headers={'X-GREFFON-TOKEN': t}), timeout=4)"

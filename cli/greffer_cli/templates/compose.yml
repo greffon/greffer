@@ -26,6 +26,15 @@ version: "3.8"
 # any operator-chosen --config-dir.
 name: greffer
 
+# Log rotation for the greffer's OWN containers (greffer-observability epic,
+# Feature #3). Mirrors greffer/docker-compose.yml; the greffon INSTANCE
+# containers get the same treatment via the greffer's create_compose injection.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   greffer:
     # Image refs match what .github/workflows/docker-publish.yml pushes:
@@ -36,6 +45,7 @@ services:
     # tags and bump cli/IMAGE_TAG in lockstep with each cut.
     image: greffon/greffer:<TAG>
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - internal
     env_file:
@@ -57,10 +67,34 @@ services:
       # mounted so proxy-mode deployments don't need a separate compose
       # layer; the sidecar only starts when --profile tunnel is passed.
       - rathole-client-config:/config
+    # Self-health visibility (Feature #3) — mirrors greffer/docker-compose.yml.
+    # Targets /readyz so `docker compose ps` shows when the greffer is wedged;
+    # NOT the restart trigger (plain compose does not act on `unhealthy` — the
+    # in-process watchdog restarts on a sustained FATAL readyz). A greffer
+    # pending acceptance is DEGRADED -> 200 -> healthy. The probe resolves the
+    # token like create_app (GREFFER_TOKEN env, else the persisted file); a
+    # missing token exits 0 so a healthy greffer is never shown perpetually-
+    # unhealthy.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,os;
+          p=os.path.join(os.getenv('GREFFON_PATH','/data'),'.greffer-token');
+          t=os.getenv('GREFFER_TOKEN') or
+          (open(p).read().strip() if os.path.exists(p) else '');
+          t and urllib.request.urlopen(urllib.request.Request(
+          'http://localhost:8000/readyz',
+          headers={'X-GREFFON-TOKEN': t}), timeout=4)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   nginx:
     image: greffon/greffer-nginx:<TAG>
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - internal
     extra_hosts:
@@ -86,6 +120,7 @@ services:
     profiles: ["tunnel"]
     network_mode: host
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - greffer
     extra_hosts:
