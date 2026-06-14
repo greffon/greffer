@@ -491,7 +491,18 @@ def _compute_instance_context(greffon_info):
         None,
     )
     if l4_first is not None and greffon_info.get('l4_bind_host') != '127.0.0.1':
-        l4_host = fallback_host
+        # Proxy-mode L4 endpoint (the bind-host gate above already means
+        # proxy, independent of GREFFER_MODE which is often unset for the
+        # default proxy mode). The public host clients dial is the explicit
+        # GREFFER_PUBLIC_HOST, else the manager-callback GREFFER_ADDRESS —
+        # control plane and data plane share one host in the common single-IP
+        # deployment. Never host.docker.internal, which is unreachable by
+        # external clients and would break e.g. WireGuard peer configs.
+        l4_host = (
+            os.getenv('GREFFER_PUBLIC_HOST')
+            or os.getenv('GREFFER_ADDRESS')
+            or 'host.docker.internal'
+        )
         l4_port = str(l4_first.get('port_host') or '')
         greffon_info.setdefault('instance_l4_host', l4_host)
         greffon_info.setdefault('instance_l4_port', l4_port)

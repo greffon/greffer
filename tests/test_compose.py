@@ -198,6 +198,54 @@ class ComputeInstanceContextTests(TestCase):
         self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com:51820')
         self.assertEqual(info['instance_l4_proto'], 'udp')
 
+    @patch.dict(
+        os.environ,
+        {'GREFFER_ADDRESS': 'vpn.example.com'},
+        clear=True,
+    )
+    def test_proxy_l4_endpoint_falls_back_to_address_when_public_host_unset(self):
+        """Regression: a proxy greffer that never set GREFFER_PUBLIC_HOST must
+        derive the L4 endpoint host from GREFFER_ADDRESS, NOT the
+        host.docker.internal default — otherwise WireGuard client configs
+        point at a host only reachable from inside Docker and the VPN breaks.
+
+        Note GREFFER_MODE is intentionally unset here: proxy is the default
+        mode and is commonly left blank, so the fallback must key on the L4
+        bind-host (proxy) signal, not on GREFFER_MODE."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'ports': [{
+                'port_host': 51820,
+                'port_container': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_host'], 'vpn.example.com')
+        self.assertEqual(info['instance_l4_endpoint'], 'vpn.example.com:51820')
+
+    @patch.dict(os.environ, {'GREFFER_ADDRESS': 'callback.example.com'}, clear=True)
+    def test_tunnel_l4_endpoint_stays_empty_despite_address(self):
+        """Tunnel mode (l4_bind_host 127.0.0.1) must NOT pick up GREFFER_ADDRESS:
+        its public endpoint is allocated manager-side, so the vars stay empty."""
+        from apps.utils.docker.compose import _compute_instance_context
+
+        info = _compute_instance_context({
+            'id': 'wg',
+            'l4_bind_host': '127.0.0.1',
+            'ports': [{
+                'port_host': 51820,
+                'protocol': 'udp',
+                'exposure_tier': 'l4',
+            }],
+        })
+
+        self.assertEqual(info['instance_l4_host'], '')
+        self.assertEqual(info['instance_l4_endpoint'], '')
+
     @patch.dict(os.environ, {'GREFFER_PUBLIC_HOST': 'vpn.example.com'})
     def test_proxy_l4_explicit_bind_host_0000(self):
         """An explicit l4_bind_host of 0.0.0.0 is still proxy mode and yields a
