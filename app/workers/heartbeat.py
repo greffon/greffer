@@ -20,6 +20,7 @@ import anyio
 import requests
 from fastapi import FastAPI
 
+from app.diagnostics import diag
 from app.settings import Settings
 from app.workers.status_collect import collect_status_map
 
@@ -45,6 +46,8 @@ async def heartbeat_worker(app: FastAPI) -> None:
                     _one_heartbeat, app, seq, abandon_on_cancel=True
                 )
                 if status_code == 403:
+                    diag("heartbeat", level=logging.WARNING, outcome="rejected",
+                         status_code=403)
                     logger.warning(
                         "heartbeat rejected (403); pausing + requesting "
                         "re-register"
@@ -54,15 +57,15 @@ async def heartbeat_worker(app: FastAPI) -> None:
                 elif status_code and status_code >= 400:
                     # A non-403 4xx/5xx is a manager-side problem we can't fix by
                     # re-registering; surface it but keep beating.
-                    logger.warning(
-                        "heartbeat rejected (HTTP %s); continuing", status_code
-                    )
+                    diag("heartbeat", level=logging.WARNING, outcome="rejected",
+                         status_code=status_code)
+                elif status_code and status_code < 400:
+                    diag("heartbeat", level=logging.DEBUG, outcome="ok",
+                         status_code=status_code)
             except asyncio.CancelledError:
                 raise
             except (requests.ConnectionError, requests.Timeout):
-                logger.info(
-                    "manager unreachable for heartbeat; retrying next interval"
-                )
+                diag("heartbeat", outcome="unreachable")
             except Exception:
                 logger.exception("heartbeat failed; continuing")
             await asyncio.sleep(settings.heartbeat_interval)

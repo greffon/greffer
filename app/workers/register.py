@@ -19,6 +19,7 @@ import anyio
 import requests
 from fastapi import FastAPI
 
+from app.diagnostics import diag
 from app.settings import Settings
 from app.token import load_persisted_token
 
@@ -200,6 +201,8 @@ async def _run_registration(
             # claim is reset (e.g. operator pins GREFFER_TOKEN or resets the
             # claim), a 429/503 clears on its own. A 400 won't self-heal, but
             # a backed-off loud error beats a silent dead-end either way.
+            diag("registration", level=logging.WARNING, state="rejected",
+                 status_code=exc.status_code)
             logger.error(
                 "register refused by manager (HTTP %s): %s — retrying in %ss. "
                 "Cert issuance is blocked until this register succeeds.",
@@ -274,6 +277,7 @@ async def _run_registration(
         # Let the heartbeat worker start beating now that we are accepted and
         # hold a cert (greffer-observability epic).
         app.state.registered.set()
+        diag("registration", state="registered")
         logger.info("register complete")
         return
 
