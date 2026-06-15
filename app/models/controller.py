@@ -121,6 +121,44 @@ class GreffonStatusResponse(BaseModel):
     containers: list[dict[str, Any]]
 
 
+# Per-greffon observability digests (resource-monitoring epic, Feature 2).
+# Every metric is nullable: a non-running container, or a metric the daemon
+# did not report, is null rather than an error, so a stopped/partial instance
+# is a 200 not a 500.
+class ContainerStats(BaseModel):
+    service: str
+    name: str
+    state: str
+    cpu_percent: float | None = None
+    mem_used_bytes: int | None = None
+    mem_limit_bytes: int | None = None
+    net_rx_bytes: int | None = None
+    net_tx_bytes: int | None = None
+    blk_read_bytes: int | None = None
+    blk_write_bytes: int | None = None
+
+
+class InstanceStatsResponse(BaseModel):
+    instance_id: str
+    captured_at: str
+    containers: list[ContainerStats]
+
+
+class InstanceVolume(BaseModel):
+    name: str
+    bytes: int | None = None
+
+
+class InstanceDiskResponse(BaseModel):
+    instance_id: str
+    captured_at: str
+    app_dir_bytes: int
+    # null (never a bogus 0) when any matched volume's size is unavailable.
+    volumes_bytes: int | None = None
+    total_bytes: int | None = None
+    volumes: list[InstanceVolume]
+
+
 class TunnelConfigPushRequest(BaseModel):
     """v3 manager-pushed rathole client.toml — second-phase push for
     start/stop flows.

@@ -672,13 +672,13 @@ class StartStopTests(TestCase):
     @patch('apps.utils.docker.compose.client')
     @patch('apps.utils.docker.compose.subprocess')
     def test_start_calls_subprocess(self, mock_subprocess, mock_client):
-        """start() should call subprocess.Popen with docker-compose up."""
+        """start() runs detached `up -d` with `-p <id>` and captures output to
+        deploy.log (resource-monitoring epic, Feature 2)."""
         from apps.utils.docker.compose import start
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
                 greffon_info = {'id': 'test-start'}
-                # Ensure the directory exists for get_greffon_path
                 os.makedirs(os.path.join(tmpdir, 'test-start'), exist_ok=True)
 
                 start(greffon_info)
@@ -686,14 +686,26 @@ class StartStopTests(TestCase):
                 mock_subprocess.Popen.assert_called_once()
                 call_args = mock_subprocess.Popen.call_args[0][0]
                 self.assertEqual(call_args[0], 'docker-compose')
-                self.assertEqual(call_args[1], '-f')
-                self.assertIn('docker-compose.yml', call_args[2])
-                self.assertEqual(call_args[3], 'up')
+                self.assertEqual(call_args[1], '-p')
+                self.assertEqual(call_args[2], 'test-start')  # project = id
+                self.assertEqual(call_args[3], '-f')
+                self.assertIn('docker-compose.yml', call_args[4])
+                self.assertEqual(call_args[5], 'up')
+                self.assertEqual(call_args[6], '-d')  # detached
+                # stdout captured to deploy.log, stderr folded in.
+                kwargs = mock_subprocess.Popen.call_args.kwargs
+                self.assertEqual(kwargs['stderr'], mock_subprocess.STDOUT)
+                self.assertEqual(
+                    kwargs['stdout'].name,
+                    os.path.join(tmpdir, 'test-start', 'deploy.log'))
+                # The deploy.log file was created on disk.
+                self.assertTrue(os.path.isfile(
+                    os.path.join(tmpdir, 'test-start', 'deploy.log')))
 
     @patch('apps.utils.docker.compose.client')
     @patch('apps.utils.docker.compose.subprocess')
     def test_stop_calls_subprocess(self, mock_subprocess, mock_client):
-        """stop() should call subprocess.Popen with docker-compose stop."""
+        """stop() passes the SAME `-p <id>` as start so the two never desync."""
         from apps.utils.docker.compose import stop
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -706,9 +718,11 @@ class StartStopTests(TestCase):
                 mock_subprocess.Popen.assert_called_once()
                 call_args = mock_subprocess.Popen.call_args[0][0]
                 self.assertEqual(call_args[0], 'docker-compose')
-                self.assertEqual(call_args[1], '-f')
-                self.assertIn('docker-compose.yml', call_args[2])
-                self.assertEqual(call_args[3], 'stop')
+                self.assertEqual(call_args[1], '-p')
+                self.assertEqual(call_args[2], 'test-stop')  # project = id
+                self.assertEqual(call_args[3], '-f')
+                self.assertIn('docker-compose.yml', call_args[4])
+                self.assertEqual(call_args[5], 'stop')
 
 
 class GetStatusTests(TestCase):

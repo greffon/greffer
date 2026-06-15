@@ -4,6 +4,7 @@ import asyncio
 import time
 from uuid import uuid4
 
+import anyio
 from fastapi import FastAPI
 
 from app.errors import register_exception_handlers
@@ -63,6 +64,16 @@ def create_app(
     # re-register) before the greffer is accepted. Cleared on a heartbeat 403 so
     # beating pauses until re-registration completes.
     app.state.registered = asyncio.Event()
+    # Dedicated concurrency cap for the per-greffon pull endpoints
+    # (resource-monitoring epic, Feature 2). Their blocking Docker/FS work is
+    # offloaded via anyio.to_thread.run_sync(..., limiter=metrics_limiter), a
+    # CapacityLimiter SEPARATE from the default AnyIO request threadpool limiter
+    # (40 tokens) that runs the plain-def start/stop handlers. Because the two
+    # limiters are independent, a saturating metrics fan-out can occupy at most
+    # ``greffer_metrics_concurrency`` threads and never starves start/stop of
+    # the default pool's tokens (the start/stop non-contention AC).
+    app.state.metrics_limiter = anyio.CapacityLimiter(
+        settings.greffer_metrics_concurrency)
     app.include_router(health.router)
     app.include_router(controller.router)
     register_exception_handlers(app)

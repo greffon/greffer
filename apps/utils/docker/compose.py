@@ -641,12 +641,47 @@ def apply_configuration(greffon_info, compose):
 
 
 def start(greffon_info):
-    return subprocess.Popen(['docker-compose', '-f', os.path.join(get_greffon_path(greffon_info), 
-    'docker-compose.yml'), 'up'])
+    """Bring the instance up (resource-monitoring epic, Feature 2 changes).
+
+    Two changes over the original fire-and-forget ``up``:
+
+    1. ``-p <instance_id>`` pins the compose project name to the instance id as
+       an ENFORCED invariant (rather than relying on the v2 compose-file-dir-
+       basename derivation), so the strict per-instance enumeration label
+       ``com.docker.compose.project=<id>`` is exact by construction and immune
+       to a binary/version/cwd shift. ``stop`` passes the same ``-p`` so the
+       two never desync (a desync would let ``stop`` target a different project
+       and stop nothing).
+    2. ``up -d`` (detached) + stdout/stderr captured to a per-instance
+       ``deploy.log``. Detaching makes the capture naturally pull/create-bounded
+       (the launcher exits after create, so the file stops growing) and removes
+       the lingering attached compose client coupled to the greffer's lifecycle.
+       ``deploy.log`` is the only log available while an instance is pulling or
+       after a failed deploy (no container exists yet to read). ``deploy.log``
+       can echo registry credentials / pull errors, so it is surfaced only via
+       the LOG_SURFACING-gated logs endpoint, never unconditionally.
+    """
+    path = get_greffon_path(greffon_info)
+    compose_file = os.path.join(path, 'docker-compose.yml')
+    # 'wb': each deploy truncates the previous deploy.log. The child process
+    # inherits the fd; closing the parent's handle here is correct (the child
+    # keeps writing until 'up -d' returns after create, then the OS closes it).
+    deploy_log = open(os.path.join(path, 'deploy.log'), 'wb')
+    try:
+        return subprocess.Popen(
+            ['docker-compose', '-p', greffon_info['id'], '-f', compose_file,
+             'up', '-d'],
+            stdout=deploy_log, stderr=subprocess.STDOUT,
+        )
+    finally:
+        deploy_log.close()
+
 
 def stop(greffon_info):
-    return subprocess.Popen(['docker-compose', '-f', os.path.join(get_greffon_path(greffon_info), 
-    'docker-compose.yml'), 'stop'])
+    return subprocess.Popen(
+        ['docker-compose', '-p', greffon_info['id'], '-f',
+         os.path.join(get_greffon_path(greffon_info), 'docker-compose.yml'),
+         'stop'])
 
 
 # Label a catalog service carries to declare it a one-shot lifecycle helper

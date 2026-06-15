@@ -178,6 +178,29 @@ class Settings(BaseSettings):
         except (TypeError, ValueError):
             return 3
 
+    # Per-greffer concurrency cap on blocking metrics/disk collection
+    # (resource-monitoring epic, Feature 2). The pull endpoints offload their
+    # blocking Docker/FS work via ``anyio.to_thread.run_sync`` under a DEDICATED
+    # CapacityLimiter of this size, distinct from the default AnyIO request
+    # threadpool limiter (40) that serves start/stop. Kept well below 40 so a
+    # saturating metrics fan-out can never consume the tokens start/stop needs:
+    # the head-of-line block the epic AC guards against. Field name carries the
+    # ``greffer_`` prefix to bind GREFFER_METRICS_CONCURRENCY (the prefix
+    # pitfall documented on greffer_workers_enabled).
+    greffer_metrics_concurrency: int = 8
+
+    @field_validator("greffer_metrics_concurrency", mode="before")
+    @classmethod
+    def _coerce_metrics_concurrency(cls, v):
+        # A bad optional knob must not crash startup and take down ALL instance
+        # operations (the codex P2 lesson from Features #3/#4). Floor at 1, cap
+        # at 32 to preserve start/stop headroom under the 40-token AnyIO
+        # limiter; coerce anything malformed to the default.
+        try:
+            return min(32, max(1, int(v)))
+        except (TypeError, ValueError):
+            return 8
+
     logger_name: str = "greffer"
 
     # Structured logging (greffer-observability epic, Feature #4). JSON is the
