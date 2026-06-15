@@ -408,7 +408,12 @@ def data_volume_is_named(compose_file: Path) -> bool:
         m = _DATA_MOUNT_RE.match(line)
         if m:
             src = m.group("src")
-            return "/" not in src and not src.startswith((".", "~"))
+            # A Docker volume name is a bare token [A-Za-z0-9][A-Za-z0-9_.-]*;
+            # anything with a path separator (POSIX "/" or Windows "\") or a
+            # relative/home prefix is a bind mount. A positive allowlist is
+            # separator-agnostic, so the classification is identical on every
+            # host the CLI ships to (Linux/macOS/Windows), not just POSIX.
+            return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", src) is not None
     return False
 
 

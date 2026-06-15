@@ -212,6 +212,8 @@ def test_data_volume_is_named(tmp_path: Path) -> None:
         ("      - /srv/greffer:/data", False),   # absolute bind
         ("      - ./data:/data", False),         # relative bind
         ("      - ~/data:/data", False),         # home bind
+        ("      - data/sub:/data", False),       # relative bind (POSIX sep)
+        ("      - data\\sub:/data", False),      # relative bind (Windows sep)
         ("      - greffon-data:/other", False),  # not /data
     ],
 )
