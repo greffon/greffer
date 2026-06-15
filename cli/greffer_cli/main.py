@@ -228,6 +228,12 @@ def update(
     Pulls the target, recreates the node, health-gates on /readyz, and
     rolls back to the previous version on any failure.
     """
+    # Validate --to at the boundary so a bad tag fails fast with a clear
+    # message (the engine also rejects it, but here we can be specific).
+    if to is not None and not compose_mod.is_valid_image_tag(to):
+        typer.echo(strings_mod.UPDATE_BAD_TARGET.format(target=to), err=True)
+        raise typer.Exit(code=2)
+
     cfg = paths.resolve_config_dir(config_dir)
     if not paths.docker_compose_yml_path(cfg).exists():
         typer.echo(

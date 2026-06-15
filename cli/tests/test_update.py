@@ -167,9 +167,14 @@ def test_idempotent_when_already_target(cfg: Path, monkeypatch: pytest.MonkeyPat
     fd.running_image = "sha256:SAME"
     fd.target_image = "sha256:SAME"  # running already == target
     fd.install(monkeypatch)
+    before = (cfg / "docker-compose.yml").read_text()
     rc = _run(cfg, target="0.3.4")
     assert rc == update.EXIT_OK
     assert "Already up to date" in capsys.readouterr().out
+    # the short-circuit must return BEFORE set_image_tag; file untouched
+    text = (cfg / "docker-compose.yml").read_text()
+    assert text == before
+    assert "greffon/greffer:0.3.3" in text and "greffon/greffer:0.3.4" not in text
 
 
 def test_preflight_refuses_without_named_data_volume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,3 +418,184 @@ def test_preflight_refuses_without_greffer_id(cfg: Path, monkeypatch: pytest.Mon
     (cfg / "env.env").write_text('GREFFER_MODE="proxy"\n', encoding="utf-8")  # no GREFFER_ID
     FakeDocker().install(monkeypatch)
     assert _run(cfg, target="0.3.4") == update.EXIT_PREFLIGHT_REFUSED
+
+
+# --- target / manifest hardening (tag injection) ---------------------
+
+def test_resolve_target_rejects_invalid_tag() -> None:
+    # a tampered manifest naming a tag with injected YAML / newline is dropped
+    evil = update.Manifest(latest='latest\n    command: ["sh","-c","x"]')
+    assert update.resolve_target(explicit_to=None, manifest=evil) is None
+    # a non-string manifest latest never stringifies into a ref
+    assert update.resolve_target(explicit_to=None, manifest=update.Manifest(latest=None)) is None
+    # an invalid explicit --to is rejected too
+    assert update.resolve_target(explicit_to="bad:tag", manifest=None) is None
+    # a clean tag still resolves
+    assert update.resolve_target(explicit_to="0.3.4", manifest=None) == "0.3.4"
+
+
+class _FakeResp:
+    def __init__(self, body: str) -> None:
+        self._body = body.encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResp":
+        return self
+
+    def __exit__(self, *a: object) -> bool:
+        return False
+
+
+def test_fetch_manifest_coerces_and_tolerates_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+    holder: dict[str, str] = {}
+    monkeypatch.setattr(
+        update.urllib.request, "urlopen",
+        lambda url, timeout=None: _FakeResp(holder["body"]),
+    )
+    # non-string latest (a list) is coerced to None, not stringified into a ref
+    holder["body"] = json.dumps({"latest": ["a", "b"]})
+    assert update.fetch_manifest("https://x/m.json").latest is None
+    # malformed JSON body -> None manifest (treated as unreachable)
+    holder["body"] = "not json {"
+    assert update.fetch_manifest("https://x/m.json") is None
+    # a non-object JSON body -> None manifest
+    holder["body"] = "[]"
+    assert update.fetch_manifest("https://x/m.json") is None
+    # a well-formed manifest still parses
+    holder["body"] = json.dumps({"latest": "0.3.5", "no_rollback_from": ["a->b"]})
+    m = update.fetch_manifest("https://x/m.json")
+    assert m.latest == "0.3.5" and m.no_rollback_from == ["a->b"]
+
+
+def test_parse_readyz_defensive_shapes() -> None:
+    # JSON that isn't an object -> not ok
+    assert update.parse_readyz(_ok("[]")).ok is False
+    assert update.parse_readyz(_ok("5")).ok is False
+    # reasons present but not a list -> coerced to [] (guards char-iteration
+    # of a scalar into the degraded-reason check)
+    scalar = update.parse_readyz(_ok(json.dumps({"status": "degraded", "reasons": "oops"})))
+    assert scalar.ok is True and scalar.status == "degraded" and scalar.reasons == []
+
+
+# --- rollback-safety gate: listed (True) branch ----------------------
+
+def test_needs_confirm_when_rollback_listed(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeDocker().install(monkeypatch)
+    # manifest reachable AND the current->target pair is flagged no-rollback
+    monkeypatch.setattr(
+        update, "fetch_manifest",
+        lambda url, timeout=10.0: update.Manifest(latest="0.3.4", no_rollback_from=["0.3.3->0.3.4"]),
+    )
+    assert _run(cfg, target="0.3.4") == update.EXIT_PREFLIGHT_REFUSED
+    assert _run(cfg, target="0.3.4", confirm_no_rollback=True) == update.EXIT_OK
+
+
+# --- tunnel mode + partial-services-up -------------------------------
+
+@pytest.fixture
+def tunnel_cfg(tmp_path: Path) -> Path:
+    (tmp_path / "docker-compose.yml").write_text(_COMPOSE, encoding="utf-8")
+    (tmp_path / "env.env").write_text(
+        'GREFFER_ID="g1"\nGREFFER_MODE="tunnel"\n', encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_tunnel_mode_recreates_with_tunnel_profile(tunnel_cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fd = FakeDocker()
+    fd.install(monkeypatch)
+    rec: dict[str, object] = {}
+
+    def up(f, *, profile=None):
+        rec["up_profile"] = profile
+        fd.running_image = fd.target_image
+        return _ok()
+
+    monkeypatch.setattr(compose, "compose_up", up)
+    # the gate must see the sidecar up in tunnel mode
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda f, *, profile=None: {"greffer": True, "nginx": True, "tunnel-sidecar": True},
+    )
+    assert _run(tunnel_cfg, target="0.3.4") == update.EXIT_OK
+    assert rec["up_profile"] == "tunnel"  # recreate ran under --profile tunnel
+
+
+def test_partial_services_up_rolls_back(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fd = FakeDocker()
+    fd.install(monkeypatch)
+    # greffer is ready + version-applied, but nginx never comes up while on
+    # the target -> gate can't reach READY -> times out -> rollback. nginx
+    # comes back once the refs are restored, so the rollback is healthy.
+    def services_running(f, *, profile=None):
+        on_target = "greffon/greffer:0.3.4" in (cfg / "docker-compose.yml").read_text()
+        return {"greffer": True, "nginx": not on_target}
+
+    monkeypatch.setattr(compose, "compose_services_running", services_running)
+    rc = _run(cfg, target="0.3.4", timeout=0.1)
+    assert rc == update.EXIT_FAILED_ROLLED_BACK
+    text = (cfg / "docker-compose.yml").read_text()
+    assert "greffon/greffer:0.3.3" in text and "greffon/greffer:0.3.4" not in text
+
+
+def test_health_gate_single_restart_tolerated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_COMPOSE, encoding="utf-8")
+    seq = [
+        {"id": "g1", "status": "degraded", "reasons": ["registration_pending"]},
+        {"id": "g1", "status": "ready", "reasons": []},
+    ]
+    monkeypatch.setattr(compose, "exec_in_greffer_healthz", lambda f: _ok())
+    monkeypatch.setattr(
+        compose, "exec_in_greffer_readyz",
+        lambda f: _ok(json.dumps(seq.pop(0) if seq else {"id": "g1", "status": "ready", "reasons": []})),
+    )
+    monkeypatch.setattr(compose, "service_container_id", lambda f, s: "cid")
+    counts = iter([0, 1, 1, 1])  # baseline 0, then a single restart (delta 1, tolerated)
+    monkeypatch.setattr(compose, "docker_inspect_restart_count", lambda c: next(counts))
+    monkeypatch.setattr(compose, "container_image_id", lambda f, s: "sha256:X")
+    monkeypatch.setattr(compose, "image_id", lambda ref: "sha256:X")
+    monkeypatch.setattr(compose, "compose_services_running", lambda f, *, profile=None: {"greffer": True})
+    outcome = update.health_gate(
+        f, greffer_id="g1", target="0.3.4", services=["greffer"],
+        profile=None, timeout=10.0, poll_interval=0.0, sleep=lambda _s: None,
+    )
+    assert outcome == update.GATE_READY  # one restart is tolerated; boundary is strictly > 1
+
+
+# --- interrupt safety + concurrency lock -----------------------------
+
+def test_interrupt_after_retag_disarms_compose(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeDocker().install(monkeypatch)
+
+    def boom(f, *, profile=None):
+        raise KeyboardInterrupt  # operator Ctrl-C mid-recreate (after retag)
+
+    monkeypatch.setattr(compose, "compose_up", boom)
+    with pytest.raises(KeyboardInterrupt):
+        _run(cfg, target="0.3.4")
+    # the finally-disarm must have restored the prior refs so a later bare
+    # `docker compose up` can't recreate into the un-gated target
+    text = (cfg / "docker-compose.yml").read_text()
+    assert "greffon/greffer:0.3.3" in text and "greffon/greffer:0.3.4" not in text
+
+
+def test_update_refused_when_lock_held(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fcntl = pytest.importorskip("fcntl")  # POSIX-only; skip on Windows
+    FakeDocker().install(monkeypatch)
+    # set_image_tag must NOT run while another process holds the lock
+    tagged = {"called": False}
+    real_set = compose.set_image_tag
+    monkeypatch.setattr(
+        compose, "set_image_tag",
+        lambda f, t: (tagged.__setitem__("called", True), real_set(f, t))[1],
+    )
+    held = open(cfg / ".update.lock", "w", encoding="utf-8")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert _run(cfg, target="0.3.4") == update.EXIT_PREFLIGHT_REFUSED
+        assert tagged["called"] is False
+    finally:
+        held.close()

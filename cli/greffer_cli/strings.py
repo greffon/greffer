@@ -308,6 +308,18 @@ UPDATE_PREFLIGHT_NO_ID = (
     "  Restore GREFFER_ID (or re-run `greffer up`) and try again."
 )
 
+UPDATE_IN_PROGRESS = (
+    "✗ Another `greffer update` is already running on this host "
+    "(lock: {lock_path}).\n  Wait for it to finish, or if no update is "
+    "actually running, remove that lock file and retry."
+)
+
+UPDATE_BAD_TARGET = (
+    "✗ --to is not a valid image tag: {target}\n"
+    "  A tag is up to 128 chars: letters, digits, '_', '.', '-' "
+    "(leading char a letter/digit/underscore)."
+)
+
 UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
     "✗ Rollback safety for {current} → {target} can't be confirmed "
     "(the release is flagged no-in-place-rollback, or the version manifest is "

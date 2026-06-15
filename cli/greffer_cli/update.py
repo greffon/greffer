@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import signal
 import sys
 import time
 import urllib.error
@@ -97,9 +98,18 @@ def fetch_manifest(
     nrf = data.get("no_rollback_from") or []
     if not isinstance(nrf, list):
         nrf = []
+    # Coerce non-string version fields to None: a tampered/malformed manifest
+    # could carry a list or object here, which must never flow into an image
+    # ref. Tag *grammar* is enforced later (resolve_target / set_image_tag).
+    latest = data.get("latest")
+    if not isinstance(latest, str):
+        latest = None
+    min_supported = data.get("min_supported")
+    if not isinstance(min_supported, str):
+        min_supported = None
     return Manifest(
-        latest=data.get("latest"),
-        min_supported=data.get("min_supported"),
+        latest=latest,
+        min_supported=min_supported,
         no_rollback_from=[str(x) for x in nrf],
     )
 
@@ -108,10 +118,15 @@ def resolve_target(
     *, explicit_to: str | None, manifest: Manifest | None,
 ) -> str | None:
     """Resolve the target tag. ``--to`` wins; else the manifest's latest;
-    else ``None`` (auto-latest with an unreachable manifest -> abort)."""
+    else ``None`` (auto-latest with an unreachable manifest -> abort).
+
+    A syntactically invalid tag (from a tampered manifest or a bad ``--to``)
+    is rejected here (-> ``None``) so it can never reach the compose file;
+    the CLI boundary (`main.update`) also rejects an invalid ``--to`` with a
+    precise message before we get here."""
     if explicit_to:
-        return explicit_to
-    if manifest and manifest.latest:
+        return explicit_to if compose.is_valid_image_tag(explicit_to) else None
+    if manifest and manifest.latest and compose.is_valid_image_tag(manifest.latest):
         return manifest.latest
     return None
 
@@ -294,6 +309,73 @@ def _rollback_health(
     return False
 
 
+# --- concurrency lock + interrupt disarm -----------------------------
+
+# Sentinel: platform without fcntl (Windows) -> proceed without a host lock.
+_NO_HOST_LOCK = object()
+
+
+def _update_lock_path(cfg: Path) -> Path:
+    return cfg / ".update.lock"
+
+
+def _acquire_update_lock(cfg: Path):
+    """Take an exclusive host lock so two concurrent ``greffer update`` runs
+    can't interleave the compose rewrite and rollback-baseline capture (run B
+    reading the file after run A already retagged it would record A's
+    unvalidated target as the "prior" ref).
+
+    Returns an open handle to release later, ``None`` if another run already
+    holds the lock, or ``_NO_HOST_LOCK`` on a platform without ``fcntl``
+    (Windows) where we proceed unlocked; concurrent runs there are the
+    operator's responsibility (v1 is operator-run)."""
+    try:
+        import fcntl
+    except ImportError:
+        return _NO_HOST_LOCK
+    fh = open(_update_lock_path(cfg), "w", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _release_update_lock(handle) -> None:
+    if handle is None or handle is _NO_HOST_LOCK:
+        return
+    try:
+        handle.close()  # closing the fd releases the flock
+    except OSError:
+        pass
+
+
+def _install_sigterm_disarm(disarm: Callable[[], None]):
+    """Route a SIGTERM during the mutating window through ``disarm`` (restore
+    the prior refs) then exit, so a kill mid-update doesn't leave the compose
+    file pinned to an un-gated target. Ctrl-C (KeyboardInterrupt) and
+    exceptions are already covered by the surrounding ``finally``; this adds
+    the bare-SIGTERM case. Returns the prior handler to restore, or ``None``
+    if one can't be installed (non-main thread / unsupported platform)."""
+    def _handler(_signum, _frame):
+        disarm()
+        raise SystemExit(143)
+    try:
+        return signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _restore_sigterm(prev) -> None:
+    if prev is None:
+        return
+    try:
+        signal.signal(signal.SIGTERM, prev)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
 def run_update(
     cfg: Path, *,
     target: str | None = None,
@@ -358,34 +440,66 @@ def run_update(
         print(strings.UPDATE_ALREADY.format(target=resolved))
         return EXIT_OK
 
-    # ---- 3. Rewrite + pull + recreate --------------------------------
-    old_refs = compose.set_image_tag(compose_file, resolved)
-    pull = compose.compose_pull(compose_file, profile=profile, services=services)
-    if not pull.ok:
-        # No recreate happened; restore the prior refs so a later `up`
-        # can't recreate into the unvalidated target. Old containers run on.
-        compose.set_image_refs(compose_file, old_refs)
-        print(strings.UPDATE_PULL_FAILED.format(target=resolved), file=sys.stderr)
-        return EXIT_FAILED_ROLLED_BACK
-    up = compose.compose_up(compose_file, profile=profile)
-    if not up.ok:
-        return _rollback(
-            compose_file, profile=profile, services=services,
-            old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
-        )
+    # Serialize the mutating path on a host lock so two concurrent updates
+    # can't race the compose rewrite / rollback-baseline capture.
+    lock = _acquire_update_lock(cfg)
+    if lock is None:
+        print(strings.UPDATE_IN_PROGRESS.format(lock_path=_update_lock_path(cfg)),
+              file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+    try:
+        # ---- 3. Rewrite + pull + recreate ----------------------------
+        old_refs = compose.set_image_tag(compose_file, resolved)
+        gate_passed = False
 
-    # ---- 4. Health-gate ----------------------------------------------
-    outcome = health_gate(
-        compose_file, greffer_id=greffer_id, target=resolved,
-        services=services, profile=profile, timeout=timeout, sleep=sleep,
-    )
-    if outcome == GATE_READY:
-        print(strings.UPDATE_OK.format(target=resolved))
-        return EXIT_OK
+        def _disarm() -> None:
+            # Backstop for an interrupt/crash between the retag and a passed
+            # gate: restore the prior refs so a later bare `docker compose up`
+            # (operator, deploy script, host reboot) can't recreate the node
+            # into the un-gated target. The failure branches below reach this
+            # via the same flag; it also covers Ctrl-C / SIGTERM mid-pull or
+            # mid-gate, which would otherwise skip rollback entirely.
+            if not gate_passed:
+                compose.set_image_refs(compose_file, old_refs)
 
-    # ---- 5. Rollback (the authority) ---------------------------------
-    print(strings.UPDATE_GATE_FAILED.format(reason=outcome), file=sys.stderr)
-    return _rollback(
-        compose_file, profile=profile, services=services,
-        old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
-    )
+        prev_sigterm = _install_sigterm_disarm(_disarm)
+        try:
+            # Pull (and thereby validate) ALL node images, including the
+            # profile-gated tunnel-sidecar in proxy mode: set_image_tag
+            # retagged its line too, so a bad target tag must be caught here
+            # rather than left to break a later proxy->tunnel switch. Recreate
+            # and the health gate stay mode-scoped below.
+            pull = compose.compose_pull(
+                compose_file, profile="tunnel", services=list(SERVICE_REPO),
+            )
+            if not pull.ok:
+                print(strings.UPDATE_PULL_FAILED.format(target=resolved), file=sys.stderr)
+                return EXIT_FAILED_ROLLED_BACK  # _disarm() (finally) restores refs
+            up = compose.compose_up(compose_file, profile=profile)
+            if not up.ok:
+                return _rollback(
+                    compose_file, profile=profile, services=services,
+                    old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
+                )
+
+            # ---- 4. Health-gate --------------------------------------
+            outcome = health_gate(
+                compose_file, greffer_id=greffer_id, target=resolved,
+                services=services, profile=profile, timeout=timeout, sleep=sleep,
+            )
+            if outcome == GATE_READY:
+                gate_passed = True
+                print(strings.UPDATE_OK.format(target=resolved))
+                return EXIT_OK
+
+            # ---- 5. Rollback (the authority) -------------------------
+            print(strings.UPDATE_GATE_FAILED.format(reason=outcome), file=sys.stderr)
+            return _rollback(
+                compose_file, profile=profile, services=services,
+                old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
+            )
+        finally:
+            _disarm()
+            _restore_sigterm(prev_sigterm)
+    finally:
+        _release_update_lock(lock)

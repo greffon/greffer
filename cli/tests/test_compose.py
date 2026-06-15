@@ -229,6 +229,51 @@ def test_data_volume_absent(tmp_path: Path) -> None:
     assert compose.data_volume_is_named(f) is False
 
 
+@pytest.mark.parametrize(
+    "tag, ok",
+    [
+        ("0.3.4", True),
+        ("latest", True),
+        ("v1.2.3-rc1", True),
+        ("a_b.c-d", True),
+        ("_underscore_lead", True),
+        ("", False),
+        ("bad:tag", False),          # ':' separates repo:tag, never inside a tag
+        ("with@sha256", False),      # '@' is the digest separator
+        ("has space", False),
+        ("line\nbreak", False),      # embedded newline (YAML injection vector)
+        ("trailing\n", False),       # trailing newline must not slip past
+        (".leadingdot", False),
+        ("-leadingdash", False),
+        ("a" * 128, True),           # max length
+        ("a" * 129, False),          # one over
+    ],
+)
+def test_is_valid_image_tag(tag: str, ok: bool) -> None:
+    assert compose.is_valid_image_tag(tag) is ok
+
+
+def test_is_valid_image_tag_non_str() -> None:
+    assert compose.is_valid_image_tag(["a", "b"]) is False
+    assert compose.is_valid_image_tag(None) is False
+
+
+def test_set_image_tag_rejects_invalid_tag(tmp_path: Path) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(
+        "services:\n  greffer:\n    image: greffon/greffer:0.3.3\n", encoding="utf-8",
+    )
+    before = f.read_text()
+    # a YAML-injection target must be refused, and the file left untouched
+    with pytest.raises(ValueError):
+        compose.set_image_tag(f, 'x\n    command: ["sh", "-c", "evil"]')
+    assert f.read_text() == before
+    # a ':'-bearing target (would corrupt repo:tag) is likewise refused
+    with pytest.raises(ValueError):
+        compose.set_image_tag(f, "bad:tag")
+    assert f.read_text() == before
+
+
 def test_exec_in_greffer_readyz_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, list[str]] = {}
     monkeypatch.setattr(

@@ -298,6 +298,26 @@ _IMAGE_LINE_RE = re.compile(
 )
 
 
+# Docker image-tag grammar: up to 128 chars, leading char alphanumeric or
+# "_", then alphanumeric / "_" / "." / "-". An update target is validated
+# against this BEFORE it is written into a compose ``image:`` line, so a
+# tampered version manifest (or a bad --to) can name only a tag in the known
+# repo, never inject a newline / extra YAML key / a different image that
+# `docker compose up` would then execute. (Signature / digest verification
+# of the image itself is a separate, later trust gate.)
+_IMAGE_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+
+
+def is_valid_image_tag(tag: object) -> bool:
+    """True iff ``tag`` is a syntactically valid Docker image tag.
+
+    Uses ``fullmatch`` so the whole string must be a valid tag, so a trailing
+    newline (``"latest\\n"``) can't slip past a ``$`` anchor and add a blank
+    line / break the rewrite.
+    """
+    return isinstance(tag, str) and _IMAGE_TAG_RE.fullmatch(tag) is not None
+
+
 def _rewrite_image_lines(text: str, resolve) -> tuple[str, dict[str, str]]:
     """Rewrite every ``greffon/*`` image line via ``resolve(repo, old_ref)``.
 
@@ -358,6 +378,11 @@ def set_image_tag(compose_file: Path, target: str) -> dict[str, str]:
     map of repo -> prior full ref, so a rollback can restore the exact
     refs that were there before (`set_image_refs`).
     """
+    if not is_valid_image_tag(target):
+        # Defense in depth: callers validate the target, but never write an
+        # unvalidated tag into the compose file. An injected newline / YAML
+        # key would be executed by `docker compose up`.
+        raise ValueError(f"refusing to write invalid image tag: {target!r}")
     text = compose_file.read_text(encoding="utf-8")
     new_text, old_refs = _rewrite_image_lines(
         text, lambda repo, _old: f"{repo}:{target}",
