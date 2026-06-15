@@ -17,6 +17,7 @@ from . import paths
 from . import status as status_mod
 from . import strings as strings_mod
 from . import up as up_mod
+from . import update as update_mod
 
 
 app = typer.Typer(
@@ -200,6 +201,53 @@ def up(
         timeout=float(timeout),
     )
     if rc != up_mod.EXIT_OK:
+        raise typer.Exit(code=rc)
+
+
+@app.command()
+def update(
+    to: Optional[str] = typer.Option(
+        None, "--to", help="Target version tag (default: latest from the manifest)",
+    ),
+    check: bool = typer.Option(
+        False, "--check", help="Read-only: print current/target/available, change nothing",
+    ),
+    timeout: int = typer.Option(
+        600, "--timeout", help="Health-gate timeout in seconds (default 10 min)",
+    ),
+    config_dir: Optional[str] = typer.Option(
+        None, "--config-dir", help="Override the default ~/.greffer/ location",
+    ),
+    confirm_no_rollback: bool = typer.Option(
+        False, "--confirm-no-rollback",
+        help="Proceed even if rollback safety for this version pair can't be confirmed",
+    ),
+) -> None:
+    """Update the greffer node to a newer published image.
+
+    Pulls the target, recreates the node, health-gates on /readyz, and
+    rolls back to the previous version on any failure.
+    """
+    # Validate --to at the boundary so a bad tag fails fast with a clear
+    # message (the engine also rejects it, but here we can be specific).
+    if to is not None and not compose_mod.is_valid_image_tag(to):
+        typer.echo(strings_mod.UPDATE_BAD_TARGET.format(target=to), err=True)
+        raise typer.Exit(code=2)
+
+    cfg = paths.resolve_config_dir(config_dir)
+    if not paths.docker_compose_yml_path(cfg).exists():
+        typer.echo(
+            "no greffer install found here — run `greffer up` first.", err=True,
+        )
+        raise typer.Exit(code=update_mod.EXIT_PREFLIGHT_REFUSED)
+    rc = update_mod.run_update(
+        cfg,
+        target=to,
+        timeout=float(timeout),
+        confirm_no_rollback=confirm_no_rollback,
+        check_only=check,
+    )
+    if rc != update_mod.EXIT_OK:
         raise typer.Exit(code=rc)
 
 

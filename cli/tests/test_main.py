@@ -45,6 +45,30 @@ def _write_proxy_env(cfg: Path, greffer_id: str) -> None:
     paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
 
 
+def test_update_rejects_invalid_to_at_cli_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad --to fails at the CLI boundary (exit 2, UPDATE_BAD_TARGET) BEFORE
+    the engine runs (distinct from the engine's exit-3 / UPDATE_NO_TARGET), so
+    the operator gets a specific "not a valid tag" message and run_update is
+    never reached with an unvalidated tag."""
+    cfg = tmp_path / ".greffer"
+    cfg.mkdir(parents=True)
+    paths.docker_compose_yml_path(cfg).write_text("# placeholder", encoding="utf-8")
+
+    from greffer_cli import update as update_mod
+
+    def _fail_if_called(*a: object, **k: object) -> int:
+        raise AssertionError("run_update reached despite an invalid --to")
+
+    monkeypatch.setattr(update_mod, "run_update", _fail_if_called)
+    result = runner.invoke(
+        main.app, ["update", "--to", "bad:tag", "--config-dir", str(cfg)],
+    )
+    assert result.exit_code == 2, result.output
+    assert "not a valid image tag" in result.output
+
+
 def _stub_run_state_machine(captured: dict) -> "callable":
     """Build a stub for up.run_state_machine that records its args.
 
