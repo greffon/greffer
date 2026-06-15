@@ -18,6 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth import require_token
+from app.diagnostics import diag
 from app.log_context import instance_id_var
 from app.models.controller import (
     GreffonStartRequest,
@@ -133,10 +134,18 @@ def start_greffon(
         # the greffon path unreferenced (nothing is copied into a volume) and are
         # overwritten on the next deploy attempt.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    compose.create_compose(compose_template, greffon_info)
-    conf.create_nginx_conf(greffon_info)
-    compose.create_volumes_then_copy_files(greffon_info)
-    compose.start(greffon_info)
+    _t0 = time.monotonic()
+    try:
+        compose.create_compose(compose_template, greffon_info)
+        conf.create_nginx_conf(greffon_info)
+        compose.create_volumes_then_copy_files(greffon_info)
+        compose.start(greffon_info)
+    except Exception:
+        diag("compose_op", level=logging.WARNING, op="start", outcome="error",
+             duration_ms=round((time.monotonic() - _t0) * 1000))
+        raise
+    diag("compose_op", op="start", outcome="ok",
+         duration_ms=round((time.monotonic() - _t0) * 1000))
 
     # v3 push race fix: compose.start uses subprocess.Popen and returns
     # before docker-compose has actually brought up the containers and
@@ -181,7 +190,15 @@ def stop_greffon(
 ) -> GreffonStopResponse:
     greffon = payload.model_dump()
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
-    compose.stop(greffon)
+    _t0 = time.monotonic()
+    try:
+        compose.stop(greffon)
+    except Exception:
+        diag("compose_op", level=logging.WARNING, op="stop", outcome="error",
+             duration_ms=round((time.monotonic() - _t0) * 1000))
+        raise
+    diag("compose_op", op="stop", outcome="ok",
+         duration_ms=round((time.monotonic() - _t0) * 1000))
 
     # v3 push: write the manager-rendered client.toml AFTER the
     # container is stopped. The dropped server.toml service on the

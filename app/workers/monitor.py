@@ -20,6 +20,7 @@ import anyio
 import requests
 from fastapi import FastAPI
 
+from app.diagnostics import diag
 from app.settings import Settings
 from app.workers.status_collect import collect_status_map
 
@@ -53,6 +54,7 @@ async def monitor_worker(app: FastAPI) -> None:
                 # immediately even if a tick is mid-docker-API or mid-HTTP
                 # call. Inner HTTP call carries timeout=10 so the thread
                 # also can't hang forever.
+                _tick_start = time.monotonic()
                 status_map = await anyio.to_thread.run_sync(
                     _one_monitor_tick,
                     settings,
@@ -60,6 +62,11 @@ async def monitor_worker(app: FastAPI) -> None:
                     token,
                     abandon_on_cancel=True,
                 )
+                # Diagnostic counter (Feature #4 fast-follow): tick duration +
+                # instance count, at DEBUG so the 5s cadence doesn't spam INFO.
+                diag("monitor_tick", level=logging.DEBUG, outcome="ok",
+                     duration_ms=round((time.monotonic() - _tick_start) * 1000),
+                     instances=len(status_map))
                 # Publish the sweep for the heartbeat worker to reuse, so the
                 # two timers don't each hit docker (greffer-observability epic).
                 # ``at`` is monotonic (freshness); ``captured_at`` is the wall
@@ -80,6 +87,7 @@ async def monitor_worker(app: FastAPI) -> None:
                 # heartbeat collects fresh and surfaces a degraded beat promptly
                 # rather than reusing the last healthy map for the window.
                 app.state.status_map = None
+                diag("monitor_tick", level=logging.ERROR, outcome="error")
                 logger.exception("monitor tick failed; continuing")
             await asyncio.sleep(settings.monitor_interval)
     except asyncio.CancelledError:
@@ -103,9 +111,8 @@ def _one_monitor_tick(
                 # abort the tick (which would discard a good docker sweep and
                 # leave prev_status half-updated) and don't advance prev_status
                 # for this instance, so the transition is retried next tick.
-                logger.info(
-                    "status callback for %s failed; retrying next tick",
-                    greffon_id)
+                diag("status_callback", op="status", outcome="unreachable",
+                     greffon_id=greffon_id)
                 continue
             if code >= 400:
                 # The manager REJECTED the callback (e.g. 403 from a stale/rotated
@@ -114,9 +121,8 @@ def _one_monitor_tick(
                 # be treated as delivered and lost. Leave prev_status unchanged so
                 # it retries next tick, after a heartbeat-driven re-register
                 # restages the token.
-                logger.warning(
-                    "status callback for %s rejected (HTTP %s); retrying next tick",
-                    greffon_id, code)
+                diag("status_callback", level=logging.WARNING, op="status",
+                     outcome="rejected", status_code=code, greffon_id=greffon_id)
                 continue
         prev_status[greffon_id] = status
     return status_map
