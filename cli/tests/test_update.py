@@ -599,3 +599,54 @@ def test_update_refused_when_lock_held(cfg: Path, monkeypatch: pytest.MonkeyPatc
         assert tagged["called"] is False
     finally:
         held.close()
+
+
+def test_pull_validates_all_images_in_tunnel_profile(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Even in proxy mode (the cfg fixture), the pull must validate ALL node
+    # images under the tunnel profile (set_image_tag retagged the sidecar
+    # line too), so a bad sidecar tag is caught now, not on a later switch.
+    fd = FakeDocker()
+    fd.install(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def rec_pull(f, *, profile=None, services=None):
+        seen["profile"] = profile
+        seen["services"] = services
+        return _ok()
+
+    monkeypatch.setattr(compose, "compose_pull", rec_pull)
+    assert _run(cfg, target="0.3.4") == update.EXIT_OK
+    assert seen["profile"] == "tunnel"                        # not the proxy profile
+    assert set(seen["services"]) == set(update.SERVICE_REPO)  # all three, incl. sidecar
+
+
+def test_sigterm_after_retag_disarms_and_exits_143(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fcntl")  # POSIX signal path
+    import os
+    import signal
+
+    FakeDocker().install(monkeypatch)
+
+    def kill_self(f, *, profile=None):
+        os.kill(os.getpid(), signal.SIGTERM)  # bare kill mid-recreate
+        return _ok()  # not reached; the installed handler raises first
+
+    monkeypatch.setattr(compose, "compose_up", kill_self)
+    prev = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as ei:
+        _run(cfg, target="0.3.4")
+    assert ei.value.code == 143  # killed before the gate passed
+    text = (cfg / "docker-compose.yml").read_text()
+    assert "greffon/greffer:0.3.3" in text and "greffon/greffer:0.3.4" not in text
+    assert signal.getsignal(signal.SIGTERM) is prev  # _restore_sigterm ran in finally
+
+
+def test_bad_manifest_message_distinct_from_unreachable(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    FakeDocker().install(monkeypatch)
+    # manifest reachable but its `latest` is unusable (coerced to None)
+    monkeypatch.setattr(update, "fetch_manifest", lambda url, timeout=10.0: update.Manifest(latest=None))
+    assert _run(cfg) == update.EXIT_PREFLIGHT_REFUSED  # no --to -> auto-latest
+    err = capsys.readouterr().err
+    assert "did not name a usable latest" in err  # UPDATE_BAD_MANIFEST, not "unreachable"

@@ -351,16 +351,15 @@ def _release_update_lock(handle) -> None:
         pass
 
 
-def _install_sigterm_disarm(disarm: Callable[[], None]):
-    """Route a SIGTERM during the mutating window through ``disarm`` (restore
-    the prior refs) then exit, so a kill mid-update doesn't leave the compose
-    file pinned to an un-gated target. Ctrl-C (KeyboardInterrupt) and
-    exceptions are already covered by the surrounding ``finally``; this adds
-    the bare-SIGTERM case. Returns the prior handler to restore, or ``None``
-    if one can't be installed (non-main thread / unsupported platform)."""
+def _install_sigterm_handler(on_signal: Callable[[], None]):
+    """Route a SIGTERM during the mutating window through ``on_signal`` (which
+    disarms and exits with the right code), so a kill mid-update doesn't leave
+    the compose file pinned to an un-gated target. Ctrl-C (KeyboardInterrupt)
+    and exceptions are already covered by the surrounding ``finally``; this adds
+    the bare-SIGTERM case. Returns the prior handler to restore, or ``None`` if
+    one can't be installed (non-main thread / unsupported platform)."""
     def _handler(_signum, _frame):
-        disarm()
-        raise SystemExit(143)
+        on_signal()
     try:
         return signal.signal(signal.SIGTERM, _handler)
     except (ValueError, OSError, AttributeError):
@@ -398,7 +397,12 @@ def run_update(
     resolved = resolve_target(explicit_to=target, manifest=manifest)
     current_version = compose.exec_greffer_version(compose_file)
     if resolved is None:
-        print(strings.UPDATE_NO_TARGET, file=sys.stderr)
+        if manifest is not None and target is None:
+            # Manifest reached but its `latest` is missing / non-string /
+            # not a valid tag (a server-side problem, not connectivity).
+            print(strings.UPDATE_BAD_MANIFEST, file=sys.stderr)
+        else:
+            print(strings.UPDATE_NO_TARGET, file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED
 
     if check_only:
@@ -462,7 +466,16 @@ def run_update(
             if not gate_passed:
                 compose.set_image_refs(compose_file, old_refs)
 
-        prev_sigterm = _install_sigterm_disarm(_disarm)
+        def _on_sigterm() -> None:
+            # A kill mid-update: disarm, then exit. Once the gate has passed the
+            # update is already applied and the file is correct, so exit success
+            # (0), not 143, so a wrapper keying on the exit code does not read a
+            # confirmed success as a failure during the brief window before the
+            # handler is restored.
+            _disarm()
+            raise SystemExit(EXIT_OK if gate_passed else 143)
+
+        prev_sigterm = _install_sigterm_handler(_on_sigterm)
         try:
             # Pull (and thereby validate) ALL node images, including the
             # profile-gated tunnel-sidecar in proxy mode: set_image_tag

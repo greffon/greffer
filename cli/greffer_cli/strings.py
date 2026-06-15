@@ -320,6 +320,12 @@ UPDATE_BAD_TARGET = (
     "(leading char a letter/digit/underscore)."
 )
 
+UPDATE_BAD_MANIFEST = (
+    "✗ The version manifest was reached but did not name a usable latest "
+    "version (missing, not a string, or not a valid tag).\n"
+    "  → re-run with an explicit target: `greffer update --to <version>`"
+)
+
 UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
     "✗ Rollback safety for {current} → {target} can't be confirmed "
     "(the release is flagged no-in-place-rollback, or the version manifest is "
