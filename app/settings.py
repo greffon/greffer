@@ -201,6 +201,15 @@ class Settings(BaseSettings):
         except (TypeError, ValueError):
             return 8
 
+    # Log surfacing (resource-monitoring epic, Feature 2, logs slice). Default
+    # OFF (fail-closed): container output and especially the captured deploy.log
+    # can echo tenant secrets / registry credentials / pull errors, so the logs
+    # endpoint 404s at the SOURCE until an operator opts in, even if a manager is
+    # misconfigured. The manager has its own LOG_SURFACING_ENABLED gate. Field
+    # name carries the ``greffer_`` prefix to bind GREFFER_LOG_SURFACING_ENABLED
+    # (the prefix pitfall documented on greffer_workers_enabled).
+    greffer_log_surfacing_enabled: bool = False
+
     logger_name: str = "greffer"
 
     # Structured logging (greffer-observability epic, Feature #4). JSON is the
