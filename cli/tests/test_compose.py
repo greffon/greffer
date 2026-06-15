@@ -138,12 +138,14 @@ def test_compose_pull_args(monkeypatch: pytest.MonkeyPatch) -> None:
             or compose.CommandResult(0, "", "")
         ),
     )
+    cpath = Path("/tmp/c.yml")
     compose.compose_pull(
-        Path("/tmp/c.yml"), profile="tunnel",
+        cpath, profile="tunnel",
         services=["greffer", "nginx", "tunnel-sidecar"],
     )
     a = captured["args"]
-    assert a[:4] == ["docker", "compose", "-f", "/tmp/c.yml"]
+    # str(Path(...)) so the assertion holds on Windows too (\tmp\c.yml).
+    assert a[:4] == ["docker", "compose", "-f", str(cpath)]
     assert "--profile" in a and a[a.index("--profile") + 1] == "tunnel"
     assert a[a.index("pull") + 1:] == ["greffer", "nginx", "tunnel-sidecar"]
 
@@ -234,10 +236,11 @@ def test_exec_in_greffer_readyz_probe(monkeypatch: pytest.MonkeyPatch) -> None:
             or compose.CommandResult(0, '{"id":"x","status":"ready","reasons":[]}', "")
         ),
     )
-    compose.exec_in_greffer_readyz(Path("/tmp/c.yml"))
+    cpath = Path("/tmp/c.yml")
+    compose.exec_in_greffer_readyz(cpath)
     a = captured["args"]
     assert a[:7] == [
-        "docker", "compose", "-f", "/tmp/c.yml", "exec", "-T", "greffer",
+        "docker", "compose", "-f", str(cpath), "exec", "-T", "greffer",
     ]
     probe = a[-1]
     assert "/readyz" in probe
@@ -247,12 +250,13 @@ def test_exec_in_greffer_readyz_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_image_id_and_container_image_id(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
+    cpath = Path("/tmp/c.yml")
 
     def fake_run(args, *, timeout=None):
         calls.append(list(args))
         if args[:3] == ["docker", "image", "inspect"]:
             return compose.CommandResult(0, "sha256:deadbeef\n", "")
-        if args[:5] == ["docker", "compose", "-f", "/tmp/c.yml", "ps"]:
+        if args[:5] == ["docker", "compose", "-f", str(cpath), "ps"]:
             return compose.CommandResult(0, "container123\n", "")
         if args[:2] == ["docker", "inspect"]:
             return compose.CommandResult(0, "sha256:cafe\n", "")
@@ -260,4 +264,4 @@ def test_image_id_and_container_image_id(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(compose, "_run", fake_run)
     assert compose.image_id("greffon/greffer:0.3.4") == "sha256:deadbeef"
-    assert compose.container_image_id(Path("/tmp/c.yml"), "greffer") == "sha256:cafe"
+    assert compose.container_image_id(cpath, "greffer") == "sha256:cafe"
