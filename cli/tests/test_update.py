@@ -268,3 +268,148 @@ def test_health_gate_version_not_applied(monkeypatch: pytest.MonkeyPatch, tmp_pa
         profile=None, timeout=10.0, sleep=lambda _s: None,
     )
     assert outcome == update.GATE_NOT_APPLIED
+
+
+# --- health-gate failure outcomes ------------------------------------
+
+def _gate_with_readyz(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, readyz: dict) -> str:
+    """Run health_gate with a fixed /readyz body and healthz live."""
+    f = tmp_path / "c.yml"
+    f.write_text(_COMPOSE, encoding="utf-8")
+    monkeypatch.setattr(compose, "exec_in_greffer_healthz", lambda f: _ok())
+    monkeypatch.setattr(compose, "exec_in_greffer_readyz", lambda f: _ok(json.dumps(readyz)))
+    monkeypatch.setattr(compose, "service_container_id", lambda f, s: "cid")
+    monkeypatch.setattr(compose, "docker_inspect_restart_count", lambda c: 0)
+    # version-applied helpers (only reached on a "ready" status)
+    monkeypatch.setattr(compose, "container_image_id", lambda f, s: "sha256:X")
+    monkeypatch.setattr(compose, "image_id", lambda ref: "sha256:X")
+    monkeypatch.setattr(compose, "compose_services_running", lambda f, *, profile=None: {"greffer": True})
+    return update.health_gate(
+        f, greffer_id="g1", target="0.3.4", services=["greffer"],
+        profile=None, timeout=10.0, poll_interval=0.0, sleep=lambda _s: None,
+    )
+
+
+def test_health_gate_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    outcome = _gate_with_readyz(
+        monkeypatch, tmp_path,
+        {"id": "g1", "status": "fatal", "reasons": ["docker_unreachable"]},
+    )
+    assert outcome == update.GATE_FATAL
+
+
+def test_health_gate_wrong_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    outcome = _gate_with_readyz(
+        monkeypatch, tmp_path,
+        {"id": "someone-else", "status": "ready", "reasons": []},
+    )
+    assert outcome == update.GATE_WRONG_ID
+
+
+def test_health_gate_degraded_other_reason(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # a degraded reason outside the tolerated set fails (not registration_pending)
+    outcome = _gate_with_readyz(
+        monkeypatch, tmp_path,
+        {"id": "g1", "status": "degraded", "reasons": ["disk_full"]},
+    )
+    assert outcome == update.GATE_DEGRADED_OTHER
+
+
+def test_health_gate_degraded_mixed_reasons_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # registration_pending alone is tolerated, but paired with another reason
+    # the gate must still fail (set-membership, not exact-list equality).
+    outcome = _gate_with_readyz(
+        monkeypatch, tmp_path,
+        {"id": "g1", "status": "degraded", "reasons": ["registration_pending", "disk_full"]},
+    )
+    assert outcome == update.GATE_DEGRADED_OTHER
+
+
+def test_health_gate_crash_loop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_COMPOSE, encoding="utf-8")
+    # never live, so the gate falls through to the crash-loop check
+    monkeypatch.setattr(compose, "exec_in_greffer_healthz", lambda f: _fail())
+    monkeypatch.setattr(compose, "service_container_id", lambda f, s: "cid")
+    counts = iter([0, 2, 2, 2])  # baseline 0, then climbed by 2 -> crash-loop
+    monkeypatch.setattr(compose, "docker_inspect_restart_count", lambda c: next(counts))
+    outcome = update.health_gate(
+        f, greffer_id="g1", target="0.3.4", services=["greffer"],
+        profile=None, timeout=10.0, poll_interval=0.0, sleep=lambda _s: None,
+    )
+    assert outcome == update.GATE_CRASH_LOOP
+
+
+def test_health_gate_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_COMPOSE, encoding="utf-8")
+    # drive the monotonic clock: deadline then one in-window tick, then past it
+    times = iter([0.0, 0.0, 100.0])
+    monkeypatch.setattr(update.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(compose, "exec_in_greffer_healthz", lambda f: _fail())
+    monkeypatch.setattr(compose, "service_container_id", lambda f, s: "cid")
+    monkeypatch.setattr(compose, "docker_inspect_restart_count", lambda c: 0)
+    outcome = update.health_gate(
+        f, greffer_id="g1", target="0.3.4", services=["greffer"],
+        profile=None, timeout=5.0, poll_interval=0.0, sleep=lambda _s: None,
+    )
+    assert outcome == update.GATE_TIMEOUT
+
+
+# --- rollback that itself fails (EXIT_FAILED_ROLLBACK_FAILED) ---------
+
+def test_rollback_compose_up_fails_exits_2(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeDocker().install(monkeypatch)
+    # gate sees fatal -> rollback; the rollback `up` (2nd compose_up) fails
+    monkeypatch.setattr(
+        compose, "exec_in_greffer_readyz",
+        lambda f: _ok(json.dumps({"id": "g1", "status": "fatal", "reasons": ["docker_unreachable"]})),
+    )
+    calls = {"n": 0}
+
+    def up(f, *, profile=None):
+        calls["n"] += 1
+        return _ok() if calls["n"] == 1 else _fail()  # forward ok, rollback fails
+
+    monkeypatch.setattr(compose, "compose_up", up)
+    assert _run(cfg, target="0.3.4") == update.EXIT_FAILED_ROLLBACK_FAILED
+
+
+def test_rollback_health_never_ready_exits_2(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeDocker().install(monkeypatch)
+    # gate fatal -> rollback recreate succeeds but never reaches /readyz ready
+    monkeypatch.setattr(
+        compose, "exec_in_greffer_readyz",
+        lambda f: _ok(json.dumps({"id": "g1", "status": "fatal", "reasons": ["docker_unreachable"]})),
+    )
+    monkeypatch.setattr(update, "_rollback_health", lambda *a, **k: False)
+    assert _run(cfg, target="0.3.4") == update.EXIT_FAILED_ROLLBACK_FAILED
+
+
+# --- mode resolution + id pre-flight ---------------------------------
+
+def test_resolve_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from greffer_cli import env_file
+    f = tmp_path / "docker-compose.yml"
+    f.write_text(_COMPOSE, encoding="utf-8")
+    # explicit GREFFER_MODE always wins, no detection
+    env = env_file.EnvFile.from_text('GREFFER_MODE="proxy"\n')
+    assert update._resolve_mode(env, f) == "proxy"
+    # missing -> detect tunnel when the sidecar has a container
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda cf, *, profile=None: {"greffer": True, "tunnel-sidecar": True},
+    )
+    assert update._resolve_mode(env_file.EnvFile.from_text('GREFFER_ID="g1"\n'), f) == "tunnel"
+    # missing -> proxy when no sidecar container is present
+    monkeypatch.setattr(
+        compose, "compose_services_running",
+        lambda cf, *, profile=None: {"greffer": True, "nginx": True},
+    )
+    assert update._resolve_mode(env_file.EnvFile.from_text('GREFFER_ID="g1"\n'), f) == "proxy"
+
+
+def test_preflight_refuses_without_greffer_id(cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (cfg / "env.env").write_text('GREFFER_MODE="proxy"\n', encoding="utf-8")  # no GREFFER_ID
+    FakeDocker().install(monkeypatch)
+    assert _run(cfg, target="0.3.4") == update.EXIT_PREFLIGHT_REFUSED

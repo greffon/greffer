@@ -58,6 +58,12 @@ GATE_NOT_APPLIED = "not_applied"
 GATE_DEGRADED_OTHER = "degraded_other"
 GATE_CRASH_LOOP = "crash_loop"
 
+# Degraded /readyz reasons the gate waits through rather than failing on
+# (the greffer is mid-re-registration, which a recreate always triggers).
+# A set so the gate stays correct if the app ever reports several reasons
+# at once; any reason outside this set fails the gate.
+TOLERABLE_DEGRADED_REASONS = {"registration_pending"}
+
 
 # --- Version manifest ------------------------------------------------
 
@@ -167,6 +173,24 @@ def profile_for_mode(mode: str) -> str | None:
     return "tunnel" if mode == "tunnel" else None
 
 
+def _resolve_mode(env: env_file.EnvFile, compose_file: Path) -> str:
+    """Deployment mode for the running node.
+
+    Prefer the persisted ``GREFFER_MODE`` (``greffer up`` always writes it).
+    If it's absent (a hand-edited or pre-``GREFFER_MODE`` env.env), detect
+    it from the running node rather than guessing a static default: the
+    tunnel-sidecar only has a container under ``--profile tunnel``, so its
+    presence means tunnel mode. Falls back to proxy (the smaller service
+    set) when nothing is running to inspect, an edge that ``greffer up``
+    (which always stamps the field) prevents in practice.
+    """
+    persisted = env.get("GREFFER_MODE")
+    if persisted:
+        return persisted
+    running = compose.compose_services_running(compose_file, profile="tunnel")
+    return "tunnel" if "tunnel-sidecar" in running else "proxy"
+
+
 def _version_applied(compose_file: Path, target: str) -> bool:
     """Did the recreate actually advance the greffer to the pulled target?
 
@@ -204,7 +228,9 @@ def health_gate(
                     return GATE_WRONG_ID
                 if r.status == "fatal":
                     return GATE_FATAL
-                if r.status == "degraded" and r.reasons != ["registration_pending"]:
+                if r.status == "degraded" and any(
+                    reason not in TOLERABLE_DEGRADED_REASONS for reason in r.reasons
+                ):
                     return GATE_DEGRADED_OTHER
                 if r.status == "ready":
                     if not _version_applied(compose_file, target):
@@ -281,7 +307,7 @@ def run_update(
     compose_file = paths.docker_compose_yml_path(cfg)
     env = env_file.EnvFile.read(paths.env_env_path(cfg))
     greffer_id = env.get("GREFFER_ID")
-    mode = env.get("GREFFER_MODE") or "tunnel"
+    mode = _resolve_mode(env, compose_file)
     profile = profile_for_mode(mode)
     services = active_services(mode)
 
@@ -305,6 +331,13 @@ def run_update(
         return EXIT_OK
 
     # ---- 2. Pre-flight (abort before any pull) -----------------------
+    if not greffer_id:
+        # The post-recreate gate confirms the node still answers as this
+        # greffer; with no known id it can't, so refuse rather than update
+        # blind. `greffer up` always stamps GREFFER_ID, so a missing one
+        # means a hand-corrupted env.env.
+        print(strings.UPDATE_PREFLIGHT_NO_ID, file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
     if not compose.data_volume_is_named(compose_file):
         print(strings.UPDATE_PREFLIGHT_NO_DATA_VOLUME, file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED

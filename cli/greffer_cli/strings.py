@@ -301,6 +301,13 @@ UPDATE_PREFLIGHT_NO_DATA_VOLUME = (
     "  docker-compose.yml /data mount (or re-run `greffer up`) and try again."
 )
 
+UPDATE_PREFLIGHT_NO_ID = (
+    "✗ Refusing to update: GREFFER_ID is missing from env.env.\n"
+    "  The post-recreate health check verifies the node still answers as\n"
+    "  this greffer; without a known id it can't, so updating would be blind.\n"
+    "  Restore GREFFER_ID (or re-run `greffer up`) and try again."
+)
+
 UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
     "✗ Rollback safety for {current} → {target} can't be confirmed "
     "(the release is flagged no-in-place-rollback, or the version manifest is "
@@ -318,7 +325,7 @@ UPDATE_PULL_FAILED = (
 UPDATE_OK = "✓ Updated to {target}. The greffer re-registered and is ready."
 
 UPDATE_GATE_FAILED = (
-    "✗ The {reason} check failed after recreate — rolling back to the previous "
+    "✗ The {reason} check failed after recreate. Rolling back to the previous "
     "version."
 )
 

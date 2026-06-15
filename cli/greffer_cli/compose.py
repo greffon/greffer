@@ -293,7 +293,7 @@ def compose_pull(
 _IMAGE_LINE_RE = re.compile(
     r"^(?P<indent>\s*image:\s*)"
     r"(?P<repo>greffon/[A-Za-z0-9._-]+)"
-    r"(?::[^\s@]+|@sha256:[0-9a-fA-F]+)?"
+    r"(?::[^\s@]+|@sha256:[0-9a-fA-F]{64})?"
     r"(?P<trail>\s*)$"
 )
 
@@ -315,8 +315,9 @@ def _rewrite_image_lines(text: str, resolve) -> tuple[str, dict[str, str]]:
             out.append(line)
             continue
         repo = m.group("repo")
-        old_full = m.group("indent").strip() and line.strip()[len("image:"):].strip()
-        old_refs[repo] = old_full or repo
+        # The regex guarantees the repo is present, so the ref after
+        # "image:" is always non-empty, so extract it directly.
+        old_refs[repo] = line.strip()[len("image:"):].strip()
         new_ref = resolve(repo, old_refs[repo])
         if new_ref is None:
             out.append(line)
@@ -329,7 +330,15 @@ def _atomic_write(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.tmp.")
     tmp_path = Path(tmp)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # If fdopen raises it does NOT take ownership of the descriptor,
+        # so close the raw fd ourselves to avoid leaking it. On success
+        # the `with` owns and closes it.
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
             f.write(text)
         os.replace(tmp_path, path)
     except Exception:
