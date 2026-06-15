@@ -463,16 +463,45 @@ def image_id(ref: str) -> str | None:
     return out or None
 
 
-def container_image_id(compose_file: Path, service: str) -> str | None:
-    """Return the image ID the named compose service's container is running."""
+def service_container_id(compose_file: Path, service: str) -> str | None:
+    """Return the running container id for a compose service, or None."""
     cid = _run(
         ["docker", "compose", "-f", str(compose_file), "ps", "-q", service],
         timeout=10,
     )
-    if not cid.ok or not cid.stdout.strip():
+    if not cid.ok:
+        return None
+    out = cid.stdout.strip()
+    return out or None
+
+
+def container_image_id(compose_file: Path, service: str) -> str | None:
+    """Return the image ID the named compose service's container is running."""
+    cid = service_container_id(compose_file, service)
+    if not cid:
         return None
     result = _run(
-        ["docker", "inspect", cid.stdout.strip(), "--format", "{{.Image}}"],
+        ["docker", "inspect", cid, "--format", "{{.Image}}"], timeout=10,
+    )
+    if not result.ok:
+        return None
+    out = result.stdout.strip()
+    return out or None
+
+
+def exec_greffer_version(compose_file: Path) -> str | None:
+    """Read the running greffer's ``app.__version__`` via ``docker exec``.
+
+    This is the value the greffer reports to the manager as
+    ``Greffer.version`` (see app/settings.py), so it is what the update's
+    "did the version actually advance" check and the ``no_rollback_from``
+    current->target pair compare against.
+    """
+    result = _run(
+        [
+            "docker", "compose", "-f", str(compose_file), "exec", "-T", "greffer",
+            "python", "-c", "import app; print(app.__version__)",
+        ],
         timeout=10,
     )
     if not result.ok:

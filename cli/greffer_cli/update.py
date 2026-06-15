@@ -1,0 +1,358 @@
+"""``greffer update`` — update a running greffer node to a newer image.
+
+Five-step engine (design: greffon docs/features/greffer-self-update,
+merged greffon#165):
+
+  1. resolve the target tag (--to > manifest latest)
+  2. pre-flight (persistent /data volume, rollback-safety gate)
+  3. rewrite every greffon/* image line -> target, pull, recreate
+  4. health-gate (/healthz live -> /readyz ready + id + version applied
+     + all active services running; restart-count fail-fast)
+  5. roll back to the prior refs on any failure (the authority)
+
+Mirrors up.py's structure. The compose layer (compose.py) is called
+directly so tests monkeypatch it; ``sleep`` is injected so the polling
+loop is testable without real waits. No Docker is needed for the unit
+tests.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Callable
+
+from . import compose, env_file, paths, strings
+
+# The published node images this engine retags, pulls, and recreates
+# together. greffer-cli pins all three to the same <TAG> in the rendered
+# compose, so a node update moves the whole node.
+GREFFER_REPO = "greffon/greffer"
+NGINX_REPO = "greffon/greffer-nginx"
+SIDECAR_REPO = "greffon/tunnel-sidecar"
+SERVICE_REPO = {
+    "greffer": GREFFER_REPO,
+    "nginx": NGINX_REPO,
+    "tunnel-sidecar": SIDECAR_REPO,
+}
+
+DEFAULT_MANIFEST_URL = "https://greffon.io/greffer-version.json"
+
+# Exit codes (subcommand-specific; see HLD § "v1 CLI surface").
+EXIT_OK = 0                      # success or no-op
+EXIT_FAILED_ROLLED_BACK = 1      # update failed, rolled back cleanly
+EXIT_FAILED_ROLLBACK_FAILED = 2  # update failed AND rollback failed
+EXIT_PREFLIGHT_REFUSED = 3       # refused before any pull
+
+# Health-gate outcomes.
+GATE_READY = "ready"
+GATE_TIMEOUT = "timeout"
+GATE_FATAL = "fatal"
+GATE_WRONG_ID = "wrong_id"
+GATE_NOT_APPLIED = "not_applied"
+GATE_DEGRADED_OTHER = "degraded_other"
+GATE_CRASH_LOOP = "crash_loop"
+
+
+# --- Version manifest ------------------------------------------------
+
+@dataclasses.dataclass
+class Manifest:
+    latest: str | None = None
+    min_supported: str | None = None
+    no_rollback_from: list[str] = dataclasses.field(default_factory=list)
+
+
+def fetch_manifest(
+    url: str = DEFAULT_MANIFEST_URL, *, timeout: float = 10.0,
+) -> Manifest | None:
+    """GET the version manifest over HTTPS. Returns ``None`` if unreachable
+    or malformed — the caller treats that as "unknown", not a hard error."""
+    if not url.startswith("https://"):
+        # The manifest carries update targets; never fetch it over plaintext.
+        return None
+    try:
+        # https-only is enforced by the guard above.
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read().decode("utf-8")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    nrf = data.get("no_rollback_from") or []
+    if not isinstance(nrf, list):
+        nrf = []
+    return Manifest(
+        latest=data.get("latest"),
+        min_supported=data.get("min_supported"),
+        no_rollback_from=[str(x) for x in nrf],
+    )
+
+
+def resolve_target(
+    *, explicit_to: str | None, manifest: Manifest | None,
+) -> str | None:
+    """Resolve the target tag. ``--to`` wins; else the manifest's latest;
+    else ``None`` (auto-latest with an unreachable manifest -> abort)."""
+    if explicit_to:
+        return explicit_to
+    if manifest and manifest.latest:
+        return manifest.latest
+    return None
+
+
+def no_rollback_blocked(
+    manifest: Manifest | None, current: str | None, target: str,
+) -> bool | None:
+    """Is current->target flagged "no in-place rollback"?
+
+    ``True``  = the pair is listed (blocked; needs --confirm-no-rollback).
+    ``False`` = manifest reachable and the pair is absent => rollback-safe.
+    ``None``  = unknown (manifest unreachable, or current version unknown).
+    """
+    if manifest is None or current is None:
+        return None
+    return f"{current}->{target}" in manifest.no_rollback_from
+
+
+# --- /readyz parsing -------------------------------------------------
+
+@dataclasses.dataclass
+class Readiness:
+    ok: bool                 # got an HTTP response with a JSON body
+    id: str | None
+    status: str | None       # "ready" | "degraded" | "fatal"
+    reasons: list[str]
+
+
+def parse_readyz(result: compose.CommandResult) -> Readiness:
+    if not result.ok:
+        return Readiness(ok=False, id=None, status=None, reasons=[])
+    try:
+        data = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        return Readiness(ok=False, id=None, status=None, reasons=[])
+    if not isinstance(data, dict):
+        return Readiness(ok=False, id=None, status=None, reasons=[])
+    reasons = data.get("reasons") or []
+    if not isinstance(reasons, list):
+        reasons = []
+    return Readiness(
+        ok=True, id=data.get("id"), status=data.get("status"),
+        reasons=[str(r) for r in reasons],
+    )
+
+
+def active_services(mode: str) -> list[str]:
+    """Control-plane services the rendered compose runs for the mode.
+
+    nginx runs in both modes; the tunnel-sidecar only under --profile tunnel.
+    """
+    svcs = ["greffer", "nginx"]
+    if mode == "tunnel":
+        svcs.append("tunnel-sidecar")
+    return svcs
+
+
+def profile_for_mode(mode: str) -> str | None:
+    return "tunnel" if mode == "tunnel" else None
+
+
+def _version_applied(compose_file: Path, target: str) -> bool:
+    """Did the recreate actually advance the greffer to the pulled target?
+
+    Compares the running greffer container's image id to the pulled
+    ``greffon/greffer:<target>`` image id. A mispublished/moved tag or an
+    unbumped image leaves the old image running and fails this.
+    """
+    running = compose.container_image_id(compose_file, "greffer")
+    target_id = compose.image_id(f"{GREFFER_REPO}:{target}")
+    return bool(running and target_id and running == target_id)
+
+
+def health_gate(
+    compose_file: Path, *, greffer_id: str | None, target: str,
+    services: list[str], profile: str | None,
+    timeout: float, poll_interval: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Poll until the recreated node is healthy or a failure is decided.
+
+    Success (``GATE_READY``) requires all of: ``/healthz`` live, ``/readyz``
+    ``ready`` with matching ``id``, the greffer version actually applied,
+    and every active service running. ``degraded: registration_pending`` is
+    awaited (the greffer is re-registering). A non-matching id, a ``fatal``,
+    any other ``degraded`` reason, a crash-loop, or the timeout fail.
+    """
+    deadline = time.monotonic() + timeout
+    cid = compose.service_container_id(compose_file, "greffer")
+    base_restarts = compose.docker_inspect_restart_count(cid) if cid else 0
+    while time.monotonic() < deadline:
+        if compose.exec_in_greffer_healthz(compose_file).ok:
+            r = parse_readyz(compose.exec_in_greffer_readyz(compose_file))
+            if r.ok:
+                if greffer_id and r.id and r.id != greffer_id:
+                    return GATE_WRONG_ID
+                if r.status == "fatal":
+                    return GATE_FATAL
+                if r.status == "degraded" and r.reasons != ["registration_pending"]:
+                    return GATE_DEGRADED_OTHER
+                if r.status == "ready":
+                    if not _version_applied(compose_file, target):
+                        return GATE_NOT_APPLIED
+                    svcs = compose.compose_services_running(
+                        compose_file, profile=profile,
+                    )
+                    if svcs and all(svcs.get(s, False) for s in services):
+                        return GATE_READY
+                    # greffer ready but a retagged sibling (nginx / sidecar)
+                    # is not up yet; keep polling, the timeout is the backstop.
+        # Supplementary fail-fast: a climbing restart count past the
+        # post-recreate baseline means the new image is crash-looping.
+        if cid and compose.docker_inspect_restart_count(cid) - base_restarts > 1:
+            return GATE_CRASH_LOOP
+        sleep(poll_interval)
+    return GATE_TIMEOUT
+
+
+def _rollback(
+    compose_file: Path, *, profile: str | None, services: list[str],
+    old_refs: dict[str, str], greffer_id: str | None,
+    timeout: float, sleep: Callable[[float], None],
+) -> int:
+    """Restore the prior image refs and recreate. The prior images are still
+    cached locally (we only pulled the target tag, never re-pulled the prior),
+    so restoring the refs + ``up`` (no pull) brings the exact prior node back.
+
+    Returns ``EXIT_FAILED_ROLLED_BACK`` if the rolled-back node is healthy,
+    else ``EXIT_FAILED_ROLLBACK_FAILED`` (no loop, manual recovery)."""
+    compose.set_image_refs(compose_file, old_refs)
+    up = compose.compose_up(compose_file, profile=profile)
+    if up.ok and _rollback_health(
+        compose_file, services=services, profile=profile,
+        greffer_id=greffer_id, timeout=min(timeout, 120.0), sleep=sleep,
+    ):
+        print(strings.UPDATE_ROLLED_BACK, file=sys.stderr)
+        return EXIT_FAILED_ROLLED_BACK
+    print(strings.UPDATE_ROLLBACK_FAILED.format(compose_path=compose_file), file=sys.stderr)
+    return EXIT_FAILED_ROLLBACK_FAILED
+
+
+def _rollback_health(
+    compose_file: Path, *, services: list[str], profile: str | None,
+    greffer_id: str | None, timeout: float,
+    sleep: Callable[[float], None],
+) -> bool:
+    """Confirm the rolled-back node reaches /readyz ready + all services up.
+    No version check (rollback restores the prior version, not the target)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if compose.exec_in_greffer_healthz(compose_file).ok:
+            r = parse_readyz(compose.exec_in_greffer_readyz(compose_file))
+            if r.ok and r.status == "ready" and not (
+                greffer_id and r.id and r.id != greffer_id
+            ):
+                svcs = compose.compose_services_running(compose_file, profile=profile)
+                if svcs and all(svcs.get(s, False) for s in services):
+                    return True
+        sleep(2.0)
+    return False
+
+
+def run_update(
+    cfg: Path, *,
+    target: str | None = None,
+    manifest_url: str = DEFAULT_MANIFEST_URL,
+    timeout: float = 600.0,
+    confirm_no_rollback: bool = False,
+    check_only: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Drive the update. Returns one of the EXIT_* codes."""
+    compose_file = paths.docker_compose_yml_path(cfg)
+    env = env_file.EnvFile.read(paths.env_env_path(cfg))
+    greffer_id = env.get("GREFFER_ID")
+    mode = env.get("GREFFER_MODE") or "tunnel"
+    profile = profile_for_mode(mode)
+    services = active_services(mode)
+
+    # ---- 1. Resolve target -------------------------------------------
+    manifest = fetch_manifest(manifest_url)
+    resolved = resolve_target(explicit_to=target, manifest=manifest)
+    current_version = compose.exec_greffer_version(compose_file)
+    if resolved is None:
+        print(strings.UPDATE_NO_TARGET, file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+
+    if check_only:
+        behind = (
+            current_version is not None
+            and resolved != current_version
+        )
+        print(strings.UPDATE_CHECK.format(
+            current=current_version or "unknown", target=resolved,
+            available=("yes" if behind else "no/unknown"),
+        ))
+        return EXIT_OK
+
+    # ---- 2. Pre-flight (abort before any pull) -----------------------
+    if not compose.data_volume_is_named(compose_file):
+        print(strings.UPDATE_PREFLIGHT_NO_DATA_VOLUME, file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+
+    blocked = no_rollback_blocked(manifest, current_version, resolved)
+    if blocked is not False and not confirm_no_rollback:
+        # listed (True) or unknown (None) -> require explicit confirmation
+        print(strings.UPDATE_NEEDS_CONFIRM_NO_ROLLBACK.format(
+            current=current_version or "unknown", target=resolved,
+        ), file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+
+    # Idempotency: already running the target image? (digest compare, so it
+    # holds even if a prior rollback left the compose digest-pinned.)
+    running_id = compose.container_image_id(compose_file, "greffer")
+    target_id = compose.image_id(f"{GREFFER_REPO}:{resolved}")
+    if running_id and target_id and running_id == target_id:
+        print(strings.UPDATE_ALREADY.format(target=resolved))
+        return EXIT_OK
+
+    # ---- 3. Rewrite + pull + recreate --------------------------------
+    old_refs = compose.set_image_tag(compose_file, resolved)
+    pull = compose.compose_pull(compose_file, profile=profile, services=services)
+    if not pull.ok:
+        # No recreate happened; restore the prior refs so a later `up`
+        # can't recreate into the unvalidated target. Old containers run on.
+        compose.set_image_refs(compose_file, old_refs)
+        print(strings.UPDATE_PULL_FAILED.format(target=resolved), file=sys.stderr)
+        return EXIT_FAILED_ROLLED_BACK
+    up = compose.compose_up(compose_file, profile=profile)
+    if not up.ok:
+        return _rollback(
+            compose_file, profile=profile, services=services,
+            old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
+        )
+
+    # ---- 4. Health-gate ----------------------------------------------
+    outcome = health_gate(
+        compose_file, greffer_id=greffer_id, target=resolved,
+        services=services, profile=profile, timeout=timeout, sleep=sleep,
+    )
+    if outcome == GATE_READY:
+        print(strings.UPDATE_OK.format(target=resolved))
+        return EXIT_OK
+
+    # ---- 5. Rollback (the authority) ---------------------------------
+    print(strings.UPDATE_GATE_FAILED.format(reason=outcome), file=sys.stderr)
+    return _rollback(
+        compose_file, profile=profile, services=services,
+        old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep,
+    )

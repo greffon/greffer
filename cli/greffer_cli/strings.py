@@ -277,3 +277,58 @@ REACHABILITY_BAD_STATUS = (
     "⚠ reachable but greffer is not responding cleanly; "
     "try `docker compose logs greffer`."
 )
+
+
+# --- greffer update --------------------------------------------------
+
+UPDATE_NO_TARGET = (
+    "✗ Can't determine the latest greffer version (the version manifest is "
+    "unreachable).\n  → re-run with an explicit target: `greffer update --to <version>`"
+)
+
+UPDATE_CHECK = """\
+greffer update --check
+  current:   {current}
+  target:    {target}
+  available: {available}
+(no changes made)
+"""
+
+UPDATE_PREFLIGHT_NO_DATA_VOLUME = (
+    "✗ Refusing to update: /data is not a persistent named volume.\n"
+    "  An update recreates the container; without a named /data volume the\n"
+    "  greffer would lose its identity and fail to re-register. Fix the\n"
+    "  docker-compose.yml /data mount (or re-run `greffer up`) and try again."
+)
+
+UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
+    "✗ Rollback safety for {current} → {target} can't be confirmed "
+    "(the release is flagged no-in-place-rollback, or the version manifest is "
+    "unreachable).\n  → re-run with `--confirm-no-rollback` to proceed anyway."
+)
+
+UPDATE_ALREADY = "✓ Already up to date (running {target}). Nothing to do."
+
+UPDATE_PULL_FAILED = (
+    "✗ Couldn't pull the {target} images. The compose file was restored and "
+    "the greffer is still running its previous version. Check connectivity to "
+    "the image registry and retry."
+)
+
+UPDATE_OK = "✓ Updated to {target}. The greffer re-registered and is ready."
+
+UPDATE_GATE_FAILED = (
+    "✗ The {reason} check failed after recreate — rolling back to the previous "
+    "version."
+)
+
+UPDATE_ROLLED_BACK = (
+    "✓ Rolled back to the previous version, which is healthy. The update did "
+    "not apply; see the logs above for why."
+)
+
+UPDATE_ROLLBACK_FAILED = (
+    "✗ The update failed AND the rollback did not come back healthy. Manual "
+    "recovery needed: inspect `docker compose -f {compose_path} ps` and logs, "
+    "then re-run `greffer up` once the cause is fixed."
+)
