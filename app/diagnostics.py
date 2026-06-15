@@ -20,5 +20,15 @@ logger = logging.getLogger("greffer")
 def diag(event: str, *, level: int = logging.INFO, **fields) -> None:
     """Emit a structured diagnostic event. ``fields`` must use names that are not
     LogRecord-internal (op/outcome/duration_ms/status_code/...); the formatter
-    already protects its own output keys."""
-    logger.log(level, event, extra={"event": event, **fields})
+    already protects its own output keys.
+
+    The fields are ALSO folded into the human message (``event k=v k=v``), so the
+    ``text`` log-format escape hatch — which emits only ``%(message)s`` and would
+    otherwise show a bare ``heartbeat`` / ``status_callback`` — still carries the
+    status code and ids on the failure paths (codex P2 on greffer#75). In JSON
+    they additionally ride as structured keys for precise filtering."""
+    message = (
+        event + " " + " ".join(f"{k}={v}" for k, v in fields.items())
+        if fields else event
+    )
+    logger.log(level, message, extra={"event": event, **fields})

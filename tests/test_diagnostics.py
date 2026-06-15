@@ -36,12 +36,19 @@ def cap():
 def test_diag_emits_event_as_message_and_fields(cap):
     diag("compose_op", op="start", outcome="ok", duration_ms=12)
     rec = cap.records[-1]
-    assert rec.getMessage() == "compose_op"
-    assert rec.event == "compose_op"  # also a field, for field-based filtering
+    # Fields fold into the message (so text-mode keeps them) AND ride as
+    # structured attributes (so JSON can filter on them).
+    assert rec.getMessage() == "compose_op op=start outcome=ok duration_ms=12"
+    assert rec.event == "compose_op"  # stable field for field-based filtering
     assert rec.op == "start"
     assert rec.outcome == "ok"
     assert rec.duration_ms == 12
     assert rec.levelno == logging.INFO
+
+
+def test_diag_without_fields_is_bare_event(cap):
+    diag("registration")
+    assert cap.records[-1].getMessage() == "registration"
 
 
 def test_diag_respects_explicit_level(cap):
