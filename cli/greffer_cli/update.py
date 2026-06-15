@@ -75,6 +75,32 @@ class Manifest:
     no_rollback_from: list[str] = dataclasses.field(default_factory=list)
 
 
+# A tiny JSON manifest; cap the read so a hostile endpoint can't stream an
+# unbounded body into the operator's process.
+_MAX_MANIFEST_BYTES = 256 * 1024
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that would downgrade the manifest fetch to plaintext.
+
+    The default handler follows an https->http 302 transparently, which would
+    defeat the first-hop https guard in fetch_manifest. Re-check the scheme on
+    every hop and raise an HTTPError (a URLError subclass, so fetch_manifest's
+    ``except`` turns it into a fail-closed ``None``) on any non-https target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            raise urllib.error.HTTPError(
+                newurl, code, "refusing redirect off https for the manifest",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_MANIFEST_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+
+
 def fetch_manifest(
     url: str = DEFAULT_MANIFEST_URL, *, timeout: float = 10.0,
 ) -> Manifest | None:
@@ -84,11 +110,16 @@ def fetch_manifest(
         # The manifest carries update targets; never fetch it over plaintext.
         return None
     try:
-        # https-only is enforced by the guard above.
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            body = r.read().decode("utf-8")
+        # _MANIFEST_OPENER re-checks the scheme on every redirect hop, so an
+        # https->http downgrade is refused rather than silently followed. The
+        # read is bounded (see _MAX_MANIFEST_BYTES).
+        with _MANIFEST_OPENER.open(url, timeout=timeout) as r:
+            raw = r.read(_MAX_MANIFEST_BYTES + 1)
+        body = raw.decode("utf-8")
     except (urllib.error.URLError, OSError, ValueError):
         return None
+    if len(raw) > _MAX_MANIFEST_BYTES:
+        return None  # oversized -> treat as malformed/unreachable (fail-closed)
     try:
         data = json.loads(body)
     except json.JSONDecodeError:

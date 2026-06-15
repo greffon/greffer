@@ -438,8 +438,8 @@ class _FakeResp:
     def __init__(self, body: str) -> None:
         self._body = body.encode("utf-8")
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int = -1) -> bytes:
+        return self._body if n < 0 else self._body[:n]
 
     def __enter__(self) -> "_FakeResp":
         return self
@@ -451,7 +451,7 @@ class _FakeResp:
 def test_fetch_manifest_coerces_and_tolerates_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     holder: dict[str, str] = {}
     monkeypatch.setattr(
-        update.urllib.request, "urlopen",
+        update._MANIFEST_OPENER, "open",
         lambda url, timeout=None: _FakeResp(holder["body"]),
     )
     # non-string latest (a list) is coerced to None, not stringified into a ref
@@ -467,6 +467,31 @@ def test_fetch_manifest_coerces_and_tolerates_malformed(monkeypatch: pytest.Monk
     holder["body"] = json.dumps({"latest": "0.3.5", "no_rollback_from": ["a->b"]})
     m = update.fetch_manifest("https://x/m.json")
     assert m.latest == "0.3.5" and m.no_rollback_from == ["a->b"]
+
+
+def test_manifest_opener_refuses_https_downgrade() -> None:
+    # a 302 to http:// must raise (caught upstream -> fail-closed None), so the
+    # default urllib https->http downgrade can't reach a plaintext manifest
+    h = update._HttpsOnlyRedirectHandler()
+    with pytest.raises(update.urllib.error.HTTPError):
+        h.redirect_request(
+            req=update.urllib.request.Request("https://greffon.io/m.json"),
+            fp=None, code=302, msg="Found", headers={}, newurl="http://evil/m.json",
+        )
+    # an https->https redirect is still allowed
+    new = h.redirect_request(
+        req=update.urllib.request.Request("https://greffon.io/m.json"),
+        fp=None, code=302, msg="Found", headers={}, newurl="https://greffon.io/v2.json",
+    )
+    assert new is not None
+
+
+def test_fetch_manifest_rejects_oversized_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    big = "x" * (update._MAX_MANIFEST_BYTES + 10)
+    monkeypatch.setattr(
+        update._MANIFEST_OPENER, "open", lambda url, timeout=None: _FakeResp(big),
+    )
+    assert update.fetch_manifest("https://x/m.json") is None
 
 
 def test_parse_readyz_defensive_shapes() -> None:
