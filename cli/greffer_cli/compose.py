@@ -9,8 +9,11 @@ with "the input device is not a TTY".
 from __future__ import annotations
 
 import json
+import os
+import re
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -254,6 +257,228 @@ def docker_inspect_restart_count(container_id: str) -> int:
         return int(result.stdout.strip())
     except ValueError:
         return 0
+
+
+# --- Update engine: pull, image-ref rewrite, readiness, digests -----
+
+def compose_pull(
+    compose_file: Path, *, profile: str | None = None,
+    services: list[str] | None = None,
+) -> CommandResult:
+    """``docker compose pull`` the node images before a recreate.
+
+    A plain ``up`` reuses the locally-cached image when only the tag
+    changed in the compose file, so an explicit pull is required to
+    actually fetch the target. Pass explicit ``services`` to pull (and
+    thereby validate) even profile-gated ones (the ``tunnel-sidecar`` in
+    proxy mode): an update rewrites its image line too, so a missing or
+    bad target tag must be caught here rather than silently leaving an
+    inactive service pointed at an unpullable image.
+    """
+    args = ["docker", "compose", "-f", str(compose_file)]
+    if profile:
+        args.extend(["--profile", profile])
+    args.append("pull")
+    if services:
+        args.extend(services)
+    return _run(args, timeout=300)
+
+
+# An ``image:`` line for one of our published node images. Matches a
+# bare repo, a tagged ref, or a digest-pinned ref (a prior rollback may
+# have left ``greffon/greffer@sha256:...``). The compose template keeps
+# each image on its own line with no trailing inline comment, so a
+# line-oriented rewrite is safe and avoids a YAML round-trip that would
+# reorder keys / strip comments.
+_IMAGE_LINE_RE = re.compile(
+    r"^(?P<indent>\s*image:\s*)"
+    r"(?P<repo>greffon/[A-Za-z0-9._-]+)"
+    r"(?::[^\s@]+|@sha256:[0-9a-fA-F]+)?"
+    r"(?P<trail>\s*)$"
+)
+
+
+def _rewrite_image_lines(text: str, resolve) -> tuple[str, dict[str, str]]:
+    """Rewrite every ``greffon/*`` image line via ``resolve(repo, old_ref)``.
+
+    ``resolve`` returns the new full ref (e.g. ``greffon/greffer:0.3.4``
+    or ``greffon/greffer@sha256:...``) or ``None`` to leave the line
+    unchanged. Returns ``(new_text, old_refs)`` where ``old_refs`` maps
+    repo -> the full ref that was there before (for rollback).
+    """
+    out: list[str] = []
+    old_refs: dict[str, str] = {}
+    for line in text.splitlines(keepends=True):
+        nl = "\n" if line.endswith("\n") else ""
+        m = _IMAGE_LINE_RE.match(line.rstrip("\n"))
+        if not m:
+            out.append(line)
+            continue
+        repo = m.group("repo")
+        old_full = m.group("indent").strip() and line.strip()[len("image:"):].strip()
+        old_refs[repo] = old_full or repo
+        new_ref = resolve(repo, old_refs[repo])
+        if new_ref is None:
+            out.append(line)
+        else:
+            out.append(f"{m.group('indent')}{new_ref}{nl}")
+    return "".join(out), old_refs
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.tmp.")
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def set_image_tag(compose_file: Path, target: str) -> dict[str, str]:
+    """Rewrite **every** ``greffon/*`` image line to ``<repo>:<target>``.
+
+    Covers greffer + greffer-nginx + the profile-gated tunnel-sidecar:
+    the set is derived from the file, not a hard-coded count, so a node
+    update retags the whole node whatever the mode renders. Returns the
+    map of repo -> prior full ref, so a rollback can restore the exact
+    refs that were there before (`set_image_refs`).
+    """
+    text = compose_file.read_text(encoding="utf-8")
+    new_text, old_refs = _rewrite_image_lines(
+        text, lambda repo, _old: f"{repo}:{target}",
+    )
+    _atomic_write(compose_file, new_text)
+    return old_refs
+
+
+def set_image_refs(compose_file: Path, refs: dict[str, str]) -> None:
+    """Rewrite ``greffon/*`` image lines to the given full refs.
+
+    ``refs`` maps repo -> full image ref (tag or digest). Lines whose
+    repo is absent from ``refs`` are left untouched. Used by rollback to
+    restore captured prior refs, pinning active services to their
+    captured running digest where a moved tag would otherwise resolve
+    to the bad image.
+    """
+    text = compose_file.read_text(encoding="utf-8")
+    new_text, _ = _rewrite_image_lines(
+        text, lambda repo, _old: refs.get(repo),
+    )
+    _atomic_write(compose_file, new_text)
+
+
+# A compose short-syntax volume mount onto /data: ``- <source>:/data[:opts]``.
+_DATA_MOUNT_RE = re.compile(r"^\s*-\s*(?P<src>[^\s:]+):/data(?::[a-zA-Z,]+)?\s*$")
+
+
+def data_volume_is_named(compose_file: Path) -> bool:
+    """Pre-flight: is /data backed by a NAMED volume (not a bind / nothing)?
+
+    A named volume (``greffon-data:/data``) survives a container recreate,
+    which is what keeps the persisted token / TLS key / migration ledger
+    and so the greffer's identity. A bind mount (``/host/path:/data``) or
+    no /data mount at all fails this check: an update that recreates the
+    container would otherwise drop identity and `409` on re-register.
+
+    The discriminator without a YAML dependency: a named-volume source is
+    a bare name (no path separator, not relative/absolute/home), whereas a
+    bind-mount source is a path. The CLI always renders the short syntax,
+    so a line match is sufficient and avoids a YAML round-trip.
+    """
+    try:
+        text = compose_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        m = _DATA_MOUNT_RE.match(line)
+        if m:
+            src = m.group("src")
+            return "/" not in src and not src.startswith((".", "~"))
+    return False
+
+
+def exec_in_greffer_readyz(compose_file: Path) -> CommandResult:
+    """Probe ``/readyz`` from inside the greffer container, returning its body.
+
+    Unlike ``exec_in_greffer_healthz`` (which only maps a 200 to exit 0),
+    this returns the parsed-able JSON body on stdout so the caller can
+    read ``id`` / ``status`` / ``reasons``. ``/readyz`` is authed, so the
+    probe resolves ``X-GREFFON-TOKEN`` the way the service does (env
+    ``GREFFER_TOKEN`` then the persisted ``/data/.greffer-token``) and
+    sends it. The token never leaves the container: the CLI only reads
+    the response body. Exit 0 on any HTTP response (200 or 503 — both
+    carry a JSON body the caller inspects); non-zero on a connection
+    error so the caller keeps polling.
+    """
+    probe = (
+        "import sys, os, urllib.request, urllib.error\n"
+        "tok = os.environ.get('GREFFER_TOKEN')\n"
+        "if not tok:\n"
+        "    try:\n"
+        "        tok = open('/data/.greffer-token', encoding='utf-8').read().strip()\n"
+        "    except OSError:\n"
+        "        tok = ''\n"
+        "req = urllib.request.Request(\n"
+        "    'http://localhost:8000/readyz',\n"
+        "    headers={'X-GREFFON-TOKEN': tok},\n"
+        ")\n"
+        "try:\n"
+        "    r = urllib.request.urlopen(req, timeout=5)\n"
+        "    sys.stdout.write(r.read().decode()); sys.exit(0)\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    sys.stdout.write(e.read().decode()); sys.exit(0)\n"
+        "except urllib.error.URLError:\n"
+        "    sys.exit(1)\n"
+    )
+    return _run(
+        [
+            "docker", "compose", "-f", str(compose_file),
+            "exec", "-T", "greffer",
+            "python", "-c", probe,
+        ],
+        timeout=15,
+    )
+
+
+def image_id(ref: str) -> str | None:
+    """Return the content image ID (``sha256:...``) of an image ref, or None.
+
+    Used to (a) verify the recreate actually advanced to the pulled
+    target — the running greffer's image ID must equal the target ref's
+    image ID — and (b) detect a no-op recreate (image ID unchanged from
+    the captured prior).
+    """
+    result = _run(
+        ["docker", "image", "inspect", ref, "--format", "{{.Id}}"], timeout=10,
+    )
+    if not result.ok:
+        return None
+    out = result.stdout.strip()
+    return out or None
+
+
+def container_image_id(compose_file: Path, service: str) -> str | None:
+    """Return the image ID the named compose service's container is running."""
+    cid = _run(
+        ["docker", "compose", "-f", str(compose_file), "ps", "-q", service],
+        timeout=10,
+    )
+    if not cid.ok or not cid.stdout.strip():
+        return None
+    result = _run(
+        ["docker", "inspect", cid.stdout.strip(), "--format", "{{.Image}}"],
+        timeout=10,
+    )
+    if not result.ok:
+        return None
+    out = result.stdout.strip()
+    return out or None
 
 
 def host_port_free(port: int) -> bool:
