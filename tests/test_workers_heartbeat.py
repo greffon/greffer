@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import pytest
 
@@ -15,7 +15,10 @@ from app.main import create_app
 from app.settings import Settings
 from app.workers.heartbeat import (
     _collect_or_reuse,
+    _host_cpu_pct,
     _one_heartbeat,
+    _read_cpu_sample,
+    _read_meminfo,
     heartbeat_worker,
 )
 
@@ -204,6 +207,175 @@ def test_disk_free_bytes_returns_none_on_oserror(settings: Settings) -> None:
     with patch("app.workers.heartbeat.shutil.disk_usage",
                side_effect=OSError("nope")):
         assert _disk_free_bytes(settings) is None
+
+
+# --- Host vitals (resource-monitoring epic, Feature 1) -------------------
+
+_MEMINFO = (
+    "MemTotal:       16384 kB\n"
+    "MemFree:         1000 kB\n"
+    "MemAvailable:    4096 kB\n"
+    "Buffers:          200 kB\n"
+)
+
+
+def test_read_meminfo_parses_used_and_total() -> None:
+    with patch("builtins.open", mock_open(read_data=_MEMINFO)):
+        used, total = _read_meminfo()
+    assert total == 16384 * 1024
+    # used = MemTotal - MemAvailable
+    assert used == (16384 - 4096) * 1024
+
+
+def test_read_meminfo_none_when_memavailable_absent() -> None:
+    data = "MemTotal:       16384 kB\nMemFree:         1000 kB\n"
+    with patch("builtins.open", mock_open(read_data=data)):
+        assert _read_meminfo() == (None, None)
+
+
+def test_read_meminfo_none_on_oserror() -> None:
+    with patch("builtins.open", side_effect=OSError("no /proc")):
+        assert _read_meminfo() == (None, None)
+
+
+def test_read_meminfo_clamps_negative_used_to_zero() -> None:
+    # MemAvailable can momentarily exceed MemTotal accounting; never report
+    # a negative used.
+    data = "MemTotal:       1000 kB\nMemAvailable:    2000 kB\n"
+    with patch("builtins.open", mock_open(read_data=data)):
+        used, total = _read_meminfo()
+    assert used == 0
+    assert total == 1000 * 1024
+
+
+def test_read_cpu_sample_parses_total_and_idle() -> None:
+    data = "cpu  100 200 300 400 50 0 0 0 0 0\ncpu0 1 2 3 4 5\n"
+    with patch("builtins.open", mock_open(read_data=data)):
+        sample = _read_cpu_sample()
+    assert sample == (1050, 450)  # total = sum, idle = idle(400) + iowait(50)
+
+
+def test_read_cpu_sample_none_on_bad_line() -> None:
+    with patch("builtins.open", mock_open(read_data="garbage line\n")):
+        assert _read_cpu_sample() is None
+
+
+def test_read_cpu_sample_none_on_oserror() -> None:
+    with patch("builtins.open", side_effect=OSError("no /proc")):
+        assert _read_cpu_sample() is None
+
+
+def test_read_cpu_sample_none_on_short_line() -> None:
+    # Fewer than idle+iowait columns (old 2.4 kernels): reject rather than
+    # index past the end. Locks the len(parts) < 6 guard.
+    with patch("builtins.open", mock_open(read_data="cpu 1 2 3\n")):
+        assert _read_cpu_sample() is None
+
+
+def test_host_cpu_pct_first_beat_seeds_then_computes_delta(
+    settings: Settings,
+) -> None:
+    app = create_app(token="t", settings=settings)
+    with patch(
+        "app.workers.heartbeat._read_cpu_sample",
+        side_effect=[(1000, 800), (2000, 1000)],
+    ):
+        first = _host_cpu_pct(app)
+        second = _host_cpu_pct(app)
+    assert first is None  # no prior sample: seeds baseline, reports nothing
+    # delta_total=1000, delta_idle=200 -> busy = 80.0%
+    assert second == 80.0
+
+
+def test_host_cpu_pct_none_on_no_elapsed_jiffies(settings: Settings) -> None:
+    app = create_app(token="t", settings=settings)
+    with patch(
+        "app.workers.heartbeat._read_cpu_sample",
+        side_effect=[(1000, 800), (1000, 800)],
+    ):
+        _host_cpu_pct(app)
+        second = _host_cpu_pct(app)
+    assert second is None  # delta_total == 0
+
+
+def test_host_cpu_pct_clamps_on_counter_regression(settings: Settings) -> None:
+    # If idle grows more than total between samples (a counter reset/reboot
+    # mid-run), busy would go negative; the clamp must floor it at 0.0, never
+    # emit a negative the manager would reject.
+    app = create_app(token="t", settings=settings)
+    with patch(
+        "app.workers.heartbeat._read_cpu_sample",
+        side_effect=[(2000, 1000), (2100, 1500)],  # total +100, idle +500
+    ):
+        _host_cpu_pct(app)
+        second = _host_cpu_pct(app)
+    assert second == 0.0
+
+
+def test_host_cpu_pct_none_when_proc_unreadable(settings: Settings) -> None:
+    app = create_app(token="t", settings=settings)
+    with patch("app.workers.heartbeat._read_cpu_sample", return_value=None):
+        assert _host_cpu_pct(app) is None
+
+
+def test_one_heartbeat_includes_host_vitals(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {"map": {}, "at": time.monotonic()}
+    with patch("app.workers.heartbeat._read_meminfo",
+               return_value=(2_000_000, 8_000_000)), \
+            patch("app.workers.heartbeat._host_cpu_pct", return_value=42.0), \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["cpu_pct"] == 42.0
+    assert body["mem_used_bytes"] == 2_000_000
+    assert body["mem_total_bytes"] == 8_000_000
+
+
+def test_one_heartbeat_degraded_still_sends_host_vitals(
+    settings: Settings, tmp_path
+) -> None:
+    # Host vitals come from /proc, independent of the docker collection that
+    # sets degraded, so a degraded beat still carries them.
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = None
+    with patch("app.workers.heartbeat.collect_status_map",
+               side_effect=RuntimeError("boom")), \
+            patch("app.workers.heartbeat._read_meminfo",
+                  return_value=(3_000_000, 8_000_000)), \
+            patch("app.workers.heartbeat._host_cpu_pct", return_value=55.0), \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["degraded"] is True
+    assert body["cpu_pct"] == 55.0
+    assert body["mem_used_bytes"] == 3_000_000
+    assert body["mem_total_bytes"] == 8_000_000
+
+
+def test_one_heartbeat_host_vitals_null_when_unreadable(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="t", settings=settings)
+    app.state.status_map = {"map": {}, "at": time.monotonic()}
+    with patch("app.workers.heartbeat._read_meminfo",
+               return_value=(None, None)), \
+            patch("app.workers.heartbeat._read_cpu_sample",
+                  return_value=None), \
+            patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["cpu_pct"] is None
+    assert body["mem_used_bytes"] is None
+    assert body["mem_total_bytes"] is None
 
 
 def test_one_heartbeat_healthy_payload_fields(

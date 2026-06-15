@@ -105,6 +105,87 @@ def _disk_free_bytes(settings: Settings) -> int | None:
         return None
 
 
+def _read_meminfo() -> tuple[int | None, int | None]:
+    """Host memory ``(used, total)`` in bytes from ``/proc/meminfo``, or
+    ``(None, None)``.
+
+    ``/proc`` is host-wide in a container by default (not cgroup-virtualised),
+    so this reports the physical machine with no mount or privileged flag.
+    ``used = MemTotal - MemAvailable`` (MemAvailable is the kernel's own
+    free-plus-reclaimable estimate, the right "used" for a host gauge). Returns
+    the pair only when BOTH are present (the manager writes them paired); any
+    read/parse failure, or a kernel too old to report MemAvailable, degrades to
+    ``(None, None)``. resource-monitoring epic, Feature 1."""
+    try:
+        fields: dict[str, int] = {}
+        # errors="replace" so a stray non-ASCII byte degrades to a parse
+        # failure (None) rather than escaping as UnicodeDecodeError.
+        with open("/proc/meminfo", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    fields[key] = int(rest.split()[0]) * 1024  # kB -> bytes
+                    if len(fields) == 2:
+                        break
+    except (OSError, ValueError, IndexError):
+        return None, None
+    total = fields.get("MemTotal")
+    available = fields.get("MemAvailable")
+    if total is None or available is None:
+        return None, None
+    used = total - available
+    return (used if used >= 0 else 0), total
+
+
+def _read_cpu_sample() -> tuple[int, int] | None:
+    """``(total_jiffies, idle_jiffies)`` from the aggregate ``cpu`` line of
+    ``/proc/stat`` (host-wide), or ``None`` on failure. ``total`` is the sum of
+    ALL fields (busy plus idle), which is what the busy-percent delta needs;
+    ``idle`` folds in iowait. These are monotonic cumulative counters; a busy
+    percent needs the delta between two samples (see ``_host_cpu_pct``)."""
+    try:
+        # errors="replace": a stray non-ASCII byte degrades to None below
+        # rather than escaping as UnicodeDecodeError.
+        with open("/proc/stat", encoding="ascii", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    parts = first.split()
+    # Need "cpu" + at least 5 fields (through idle[3] and iowait[4]); the index
+    # access below is outside the try, so this guard is what keeps it safe.
+    if len(parts) < 6 or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(v) for v in parts[1:]]
+    except ValueError:
+        return None
+    total = sum(values)
+    idle = values[3] + values[4]  # idle + iowait
+    return total, idle
+
+
+def _host_cpu_pct(app: FastAPI) -> float | None:
+    """Host-wide busy CPU percent (0..100), as the delta against the previous
+    beat's ``/proc/stat`` sample held on ``app.state.cpu_sample``.
+
+    The first beat has no prior sample, so it seeds the baseline and returns
+    None (the manager preserves null); subsequent beats compute the delta. The
+    heartbeat worker is the only writer and beats run one at a time, so the
+    unguarded ``app.state`` read/write is safe. Clamped to 0..100 (the manager
+    validates that range). resource-monitoring epic, Feature 1."""
+    prev = getattr(app.state, "cpu_sample", None)
+    cur = _read_cpu_sample()
+    app.state.cpu_sample = cur
+    if prev is None or cur is None:
+        return None
+    delta_total = cur[0] - prev[0]
+    delta_idle = cur[1] - prev[1]
+    if delta_total <= 0:  # no elapsed jiffies, or a counter reset
+        return None
+    busy = (delta_total - delta_idle) / delta_total * 100.0
+    return round(max(0.0, min(100.0, busy)), 1)
+
+
 def _one_heartbeat(app: FastAPI, seq: int) -> int:
     """Build and POST one heartbeat. Returns the HTTP status code; network
     errors propagate to the worker loop."""
@@ -122,6 +203,14 @@ def _one_heartbeat(app: FastAPI, seq: int) -> int:
         "disk_free_bytes": _disk_free_bytes(settings),
         "instances": status_map,
     }
+    # Host vitals (resource-monitoring epic, Feature 1). Read from /proc,
+    # independent of the docker status collection above, so they ride even a
+    # degraded beat. Any read failure sends null and the manager preserves the
+    # last good value.
+    mem_used, mem_total = _read_meminfo()
+    payload["cpu_pct"] = _host_cpu_pct(app)
+    payload["mem_used_bytes"] = mem_used
+    payload["mem_total_bytes"] = mem_total
     res = requests.post(
         f"{settings.greffon_base_server}/api/greffer/{settings.greffer_id}/heartbeat/",
         json=payload,
