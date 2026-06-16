@@ -22,10 +22,11 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       -
-        # The build steps below use the Git context ({{defaultContext}}), so the
-        # repo is not otherwise checked out; this step puts app/__init__.py on
-        # the runner for the version read.
-        name: Checkout (for version extraction)
+        # The node-image build steps below use the Git context
+        # ({{defaultContext}}), so the repo is not otherwise checked out; this
+        # step puts app/__init__.py + the updater build context (cli/,
+        # Dockerfile.updater, min_supported_baseline) on the runner.
+        name: Checkout
         uses: actions/checkout@v4
       -
         name: Extract greffer node version
@@ -46,6 +47,44 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Publishing greffer-node images at :latest and :$version"
       -
+        name: Assert signed set covers shipped greffon/* images
+        # Set-closure (v2 trust model): every greffon/* image the shipped compose
+        # template renders MUST be in the enumerated signed set below, so a future
+        # service can never ship unsigned and brick the fail-closed verify. Runs
+        # unconditionally (a pure guard, no cosign needed). greffer-updater is
+        # signed too but is spawned standalone, not part of the rendered stack.
+        run: |
+          set -euo pipefail
+          tmpl="cli/greffer_cli/templates/compose.yml"
+          signed="greffon/greffer greffon/greffer-nginx greffon/tunnel-sidecar greffon/greffer-updater"
+          rendered="$(grep -oE 'greffon/[A-Za-z0-9._-]+' "$tmpl" | sort -u)"
+          for repo in $rendered; do
+            case " $signed " in
+              *" $repo "*) ;;
+              *) echo "::error::$repo is rendered by $tmpl but is not in the signed set" >&2; exit 1 ;;
+            esac
+          done
+          echo "signed set covers all greffon/* images in $tmpl"
+      -
+        name: Detect cosign configuration
+        id: cosign_cfg
+        # Signing + the greffer-updater image are gated on the managed-key
+        # material being provisioned (COSIGN_PRIVATE_KEY secret + COSIGN_PUBLIC_KEY
+        # variable). Until ops sets them, the node images still publish (unsigned),
+        # so this workflow never turns main red for lack of a key. Comparing the
+        # secret to '' yields a boolean, never the secret value, so echoing is safe.
+        env:
+          HAS_PRIV: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+          HAS_PUB: ${{ vars.COSIGN_PUBLIC_KEY != '' }}
+        run: |
+          if [ "$HAS_PRIV" = "true" ] && [ "$HAS_PUB" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "cosign signing enabled"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::cosign signing disabled (set the COSIGN_PRIVATE_KEY secret + COSIGN_PUBLIC_KEY variable); publishing UNSIGNED node images and skipping greffon/greffer-updater"
+          fi
+      -
         name: Build and push Greffer Nginx
         uses: docker/build-push-action@v3
         with:
@@ -54,6 +93,11 @@ jobs:
           tags: |
             greffon/greffer-nginx:latest
             greffon/greffer-nginx:${{ steps.version.outputs.version }}
+          # OCI version label the v2 updater reads (docker inspect) to get each
+          # verified image's real version for the min_supported floor + cohesion
+          # check, without trusting the tag.
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. Base is nginx:1.20.2-alpine-perl
           # (multi-arch manifest, no per-arch downloads), so arm64 is a
           # pure rebuild. Without this the image is amd64-only and the
@@ -69,6 +113,8 @@ jobs:
           tags: |
             greffon/greffer:latest
             greffon/greffer:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. Base is python:3.11-alpine
           # (multi-arch manifest, no per-arch downloads), so arm64 is a
           # pure rebuild. Pairs with the greffer-nginx step above — both
@@ -84,6 +130,8 @@ jobs:
           tags: |
             greffon/tunnel-sidecar:latest
             greffon/tunnel-sidecar:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
           # Multi-arch: amd64 + arm64. The tunnel-sidecar Dockerfile
           # downloads the correct rathole binary per TARGETARCH; the
           # smoke-test on greffon/greffon root confirmed Debian-slim
@@ -96,9 +144,83 @@ jobs:
           context: "{{defaultContext}}:rathole-server"
           push: true
           tags: greffon/rathole-server:latest
+          # Not a greffer-node image (it is the manager-side relay), so it is
+          # outside the v2 updater verify set: no version label, not signed.
           # Multi-arch wraps rapiz1/rathole's published Linux artefacts
           # (amd64 gnu, arm64 musl). Replaces direct use of
           # rapiz1/rathole:v0.5.0 in greffon/greffon root compose, which
           # only ships an amd64 manifest and forces emulation on
           # ARM hosts (Apple Silicon, Graviton, Pi).
           platforms: linux/amd64,linux/arm64
+      -
+        name: Build and push Greffer Updater
+        # The detached, signed container the greffer spawns for a remote update
+        # (self-update v2). Built from the runner checkout (context: .) so it can
+        # COPY cli/ + the baseline; cosign.pub is delivered as a build secret from
+        # the COSIGN_PUBLIC_KEY variable and baked in (a public key, persisted on
+        # purpose). Gated: an updater without its verify key is useless, so it only
+        # builds once the managed key is provisioned.
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: Dockerfile.updater
+          push: true
+          tags: |
+            greffon/greffer-updater:latest
+            greffon/greffer-updater:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          secrets: |
+            cosign_pub=${{ vars.COSIGN_PUBLIC_KEY }}
+      -
+        name: Install cosign
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        uses: sigstore/cosign-installer@v3
+      -
+        name: Sign + smoke-verify images (managed key, no tlog)
+        # Sign every greffon/* image by DIGEST with a per-repo annotation, exactly
+        # what the updater's offline verify requires (managed key, --tlog-upload
+        # =false to match the verify side's --insecure-ignore-tlog). Each sign is
+        # immediately round-tripped with the greffer's EXACT verify command, so a
+        # cosign flag/behaviour drift fails the release here instead of silently
+        # bricking updates in production.
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          printf '%s' "$COSIGN_PUBLIC_KEY" > cosign.pub
+          # Public key, but tidy up unconditionally even if a verify aborts the loop.
+          trap 'rm -f cosign.pub' EXIT
+          for repo in greffon/greffer greffon/greffer-nginx greffon/tunnel-sidecar greffon/greffer-updater; do
+            # digest is re-derived per $repo, so a signature can only ever carry
+            # the repo annotation of the image it actually belongs to (the
+            # repo-binding the updater verify depends on). Keep this in the loop.
+            digest="$(docker buildx imagetools inspect "$repo:$version" --format '{{.Manifest.Digest}}')"
+            case "$digest" in
+              sha256:*) ;;
+              *) echo "::error::could not resolve a sha256 digest for $repo:$version (got '$digest')" >&2; exit 1 ;;
+            esac
+            ref="$repo@$digest"
+            echo "::group::sign $ref"
+            cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
+              --tlog-upload=false -a "repo=$repo" "$ref"
+            # Round-trip 1: the updater's EXACT signature verify
+            # (provenance.cosign_verify) so a cosign flag/behaviour drift fails here.
+            cosign verify --key cosign.pub \
+              -a "repo=$repo" --insecure-ignore-tlog=true "$ref"
+            # Round-trip 2: the version-label read the floor + cohesion check
+            # depend on (provenance.image_version): pull the SIGNED digest and
+            # assert the OCI label is present + correct, so "signature verifies"
+            # also guarantees "the updater can read this image's version".
+            docker pull "$ref" >/dev/null
+            got="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$ref")"
+            [ "$got" = "$version" ] || { echo "::error::$repo version label is '$got', expected '$version'" >&2; exit 1; }
+            echo "::endgroup::"
+          done
+          echo "signed + verified (signature + version label) all 4 greffon/* images at $version"

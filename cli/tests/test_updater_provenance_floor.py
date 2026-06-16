@@ -47,8 +47,12 @@ def test_cosign_verify_binds_repo_annotation(monkeypatch):
     a = seen["args"]
     assert a[:2] == ["cosign", "verify"]
     assert a[a.index("--key") + 1] == "/k"
-    # the repo binding is what stops a same-key cross-image signature swap
-    assert a[a.index("--annotation") + 1] == "repo=greffon/greffer-nginx"
+    # the repo binding is what stops a same-key cross-image signature swap;
+    # short -a (== --annotations) matches what the publish CI signs with
+    assert a[a.index("-a") + 1] == "repo=greffon/greffer-nginx"
+    # offline managed-key model (no Rekor): verify must not require a tlog entry,
+    # mirroring the publish CI's --tlog-upload=false
+    assert "--insecure-ignore-tlog=true" in a
     assert a[-1] == f"greffon/greffer-nginx@{digest}"
 
 
@@ -107,6 +111,17 @@ def _patch_opener(monkeypatch, bodies: dict) -> None:
     def opn(url, timeout=None):
         return _Resp(bodies[".sig" if url.endswith(".sig") else ""])
     monkeypatch.setattr(update._MANIFEST_OPENER, "open", opn)
+
+
+def test_verify_blob_ignores_tlog(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (seen.update(args=a), _ok())[1])
+    assert floor.verify_blob(b"manifest", b"sig", cosign_pub="/k") is True
+    a = seen["args"]
+    assert a[:2] == ["cosign", "verify-blob"]
+    assert a[a.index("--key") + 1] == "/k"
+    # offline managed-key: no Rekor entry, so verify must not require a tlog
+    assert "--insecure-ignore-tlog=true" in a
 
 
 def test_signed_min_supported_happy(monkeypatch):
