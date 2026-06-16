@@ -15,6 +15,7 @@ does not bound WHAT the greffer returns for that id.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import threading
@@ -45,6 +46,58 @@ _DF_TTL_SECONDS = 60.0
 
 _DOCKER_ERRORS = (docker.errors.DockerException, OSError,
                   requests.exceptions.RequestException)
+
+# A single ``stats(stream=False)`` blocks in the daemon for ~one collection
+# cycle (roughly 1-2s) EACH, so digesting a multi-container greffon serially
+# costs the SUM of those waits and overruns the manager proxy read timeout
+# (``GREFFER_PROXY_TIMEOUT_SECONDS``, default 5s). The reads are I/O-bound on
+# the daemon, so a thread pool collapses the wall time to about one call.
+#
+# The pool is shared (not per-request) and bounded so it cannot fan out into an
+# unbounded burst of daemon connections. It is sized ABOVE the outer metrics
+# concurrency cap (``greffer_metrics_concurrency``, default 8) so a single
+# multi-container read still gets full parallelism, and several concurrent
+# reads still get meaningful (not 1-worker-each) parallelism, while staying
+# under the daemon connection pool (compose.client max_pool_size=32) so the
+# fan-out never churns sockets.
+_STATS_FANOUT = 16
+# Per-request wall-clock ceiling for the whole digest. A container whose daemon
+# read has not completed within this budget is reported with its known state
+# and null metrics rather than holding the response open past the proxy
+# timeout. Kept below GREFFER_PROXY_TIMEOUT_SECONDS's default so the greffer
+# returns a partial 200 before the manager abandons the read. The docker client
+# itself still has its own 60s socket timeout as the ultimate backstop.
+_STATS_DEADLINE_SECONDS = 4.0
+_stats_pool_lock = threading.Lock()
+_stats_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_stats_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily build the shared, bounded stats thread pool (double-checked)."""
+    global _stats_pool
+    if _stats_pool is None:
+        with _stats_pool_lock:
+            if _stats_pool is None:
+                _stats_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_STATS_FANOUT,
+                    thread_name_prefix="greffer-stats")
+    return _stats_pool
+
+
+def shutdown_stats_pool() -> None:
+    """Tear down the shared stats pool WITHOUT waiting on in-flight reads.
+
+    A ``container.stats()`` hung in the daemon occupies a pool worker until the
+    docker client's 60s socket timeout; those workers are non-daemon threads,
+    so the interpreter-exit join would otherwise stall process exit (and a
+    watchdog-triggered restart, the case where a read is most likely hung) by
+    up to that 60s. ``wait=False`` + ``cancel_futures`` drops the queue and
+    lets exit proceed. Idempotent; called from the lifespan teardown."""
+    global _stats_pool
+    with _stats_pool_lock:
+        pool, _stats_pool = _stats_pool, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 _METRIC_KEYS = (
     "cpu_percent", "mem_used_bytes", "mem_limit_bytes",
@@ -214,6 +267,44 @@ def _digest_container(container) -> dict:
     return entry
 
 
+def _timed_out_entry(container) -> dict:
+    """A container whose stats read did not finish within the digest deadline:
+    its already-known state (from enumeration, no daemon call) plus null
+    metrics. Same shape as a stats-read failure, so a slow container degrades
+    to a 200 with null metrics, never blocks the whole response."""
+    service = (container.labels or {}).get(
+        "com.docker.compose.service") or container.name
+    return {"service": service, "name": container.name,
+            "state": container.status, **_null_metrics()}
+
+
+def _digest_all(containers: list) -> list[dict]:
+    """Digest every container concurrently, bounded by ``_STATS_DEADLINE_SECONDS``.
+
+    Each ``container.stats()`` blocks ~1-2s in the daemon, so the reads run on
+    the shared stats pool and the whole digest waits at most the deadline: any
+    container not finished by then is reported with null metrics (its queued
+    future is cancelled; an already-running one frees itself within the docker
+    client socket timeout). Order is preserved to match enumeration."""
+    if not containers:
+        return []
+    pool = _get_stats_pool()
+    futures = [pool.submit(_digest_container, c) for c in containers]
+    concurrent.futures.wait(futures, timeout=_STATS_DEADLINE_SECONDS)
+    out = []
+    for fut, container in zip(futures, containers):
+        if fut.done() and not fut.cancelled():
+            # ``_digest_container`` swallows ``_DOCKER_ERRORS`` into null
+            # metrics itself; ``.result()`` here only re-raises a programming
+            # error, which is the same (rare) 500 the serial path would raise.
+            out.append(fut.result())
+        else:
+            fut.cancel()  # no-op if already running; drops it if still queued
+            logger.warning("stats_digest_timeout name=%s", container.name)
+            out.append(_timed_out_entry(container))
+    return out
+
+
 def instance_stats(instance_id: str) -> dict | None:
     """Digested one-shot per-container stats, or ``None`` when the instance is
     not deployed (the caller maps that to missing-on-greffer 404). A
@@ -221,12 +312,11 @@ def instance_stats(instance_id: str) -> dict | None:
     metrics."""
     if not instance_is_deployed(instance_id):
         return None
-    containers = [_digest_container(c)
-                  for c in list_instance_containers(instance_id)]
+    containers = list_instance_containers(instance_id)
     return {
         "instance_id": instance_id,
         "captured_at": _now_iso(),
-        "containers": containers,
+        "containers": _digest_all(containers),
     }
 
 

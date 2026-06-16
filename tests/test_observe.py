@@ -178,6 +178,86 @@ def test_instance_stats_stats_failure_yields_null_not_500(tmp_path,
     assert body["containers"][0]["cpu_percent"] is None
 
 
+def test_instance_stats_preserves_container_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    names = [f"i1_svc{i}_1" for i in range(6)]
+    containers = [_container(name=n, service=f"svc{i}",
+                             stats=_running_stats())
+                  for i, n in enumerate(names)]
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        body = observe.instance_stats("i1")
+    # The parallel fan-out must keep results aligned to enumeration order.
+    assert [c["name"] for c in body["containers"]] == names
+
+
+def test_instance_stats_reads_containers_concurrently(tmp_path, monkeypatch):
+    """The per-container daemon reads must run in PARALLEL. A barrier that only
+    releases once N threads are simultaneously inside ``stats()`` proves it
+    deterministically: a serial read would deadlock the barrier (only ever one
+    thread inside) and raise BrokenBarrierError on timeout."""
+    import threading
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    n = 6
+    barrier = threading.Barrier(n, timeout=5)
+
+    def _concurrent_stats(*_a, **_k):
+        barrier.wait()  # blocks until all N threads are inside at once
+        return _running_stats()
+
+    containers = []
+    for i in range(n):
+        c = _container(name=f"i1_svc{i}_1", service=f"svc{i}")
+        c.stats.side_effect = _concurrent_stats
+        containers.append(c)
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        body = observe.instance_stats("i1")
+    # All N digested with real metrics (barrier released => true concurrency).
+    assert len(body["containers"]) == n
+    assert all(c["cpu_percent"] == 20.0 for c in body["containers"])
+
+
+def test_instance_stats_slow_container_times_out_to_null(tmp_path, monkeypatch):
+    """A container whose read exceeds the digest deadline degrades to null
+    metrics (state preserved) without holding back the fast containers."""
+    import time
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    monkeypatch.setattr(observe, "_STATS_DEADLINE_SECONDS", 0.2)
+    _deploy(tmp_path)
+    fast = _container(name="i1_web_1", service="web", stats=_running_stats())
+    slow = _container(name="i1_db_1", service="db")
+    slow.stats.side_effect = lambda *_a, **_k: (time.sleep(1.0)
+                                                or _running_stats())
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = [fast, slow]
+        start = time.monotonic()
+        body = observe.instance_stats("i1")
+        elapsed = time.monotonic() - start
+    web = next(c for c in body["containers"] if c["service"] == "web")
+    db = next(c for c in body["containers"] if c["service"] == "db")
+    assert web["cpu_percent"] == 20.0          # fast one digested
+    assert db["state"] == "running"            # state preserved (enumeration)
+    assert db["cpu_percent"] is None           # slow one degraded to null
+    assert elapsed < 1.0                        # returned at the deadline
+
+
+def test_shutdown_stats_pool_is_idempotent_and_resets():
+    # Build the pool, tear it down without waiting, and confirm a later read
+    # transparently rebuilds a fresh one.
+    pool = observe._get_stats_pool()
+    assert pool is not None
+    observe.shutdown_stats_pool()
+    assert observe._stats_pool is None
+    observe.shutdown_stats_pool()  # second call is a no-op, never raises
+    try:
+        assert observe._get_stats_pool() is not pool
+    finally:
+        observe.shutdown_stats_pool()  # don't leak a live pool into other tests
+
+
 # --- disk digest --------------------------------------------------------
 
 def test_instance_disk_filters_by_anchored_prefix(tmp_path, monkeypatch):
