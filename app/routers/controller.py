@@ -15,6 +15,7 @@ import logging
 import time
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth import require_token
@@ -26,6 +27,8 @@ from app.models.controller import (
     GreffonStatusResponse,
     GreffonStopRequest,
     GreffonStopResponse,
+    InstanceDiskResponse,
+    InstanceStatsResponse,
     TunnelConfigPushRequest,
     TunnelConfigPushResponse,
 )
@@ -36,7 +39,7 @@ from app.tunnel_config import (
 )
 
 # Framework-agnostic shared code imported directly — no rewrite.
-from apps.utils.docker import compose
+from apps.utils.docker import compose, observe
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 
@@ -282,6 +285,49 @@ def greffon_status(greffon_id: UUID) -> GreffonStatusResponse:
     # as part of the port; see hld-api-parity.md § Latent bug.
     result = compose.get_status(str(greffon_id))
     return GreffonStatusResponse(**result)
+
+
+@router.get("/greffon/{greffon_id}/stats/")
+async def greffon_stats(
+    greffon_id: UUID, request: Request
+) -> InstanceStatsResponse:
+    """One-shot digested per-container stats (resource-monitoring epic,
+    Feature 2). The blocking Docker fan-out is offloaded to the threadpool
+    under the dedicated metrics limiter so it never starves start/stop. A
+    not-deployed instance is 404 ``missing_on_greffer``; a deployed-but-stopped
+    instance is a 200 with null metrics. ``greffon_id: UUID`` rejects a crafted
+    id before any handler body runs (the greffer maps the resulting
+    RequestValidationError to 400, see app/errors.py).
+
+    Id contract: the manager sends lowercase-canonical UUIDs (Django
+    ``UUIDField``); ``str(greffon_id)`` emits that same canonical form, which
+    matches the ``-p <id>`` project name ``compose.start`` pins. A
+    non-canonical/uppercase id would normalise here and not match the
+    enumeration label, but the manager never sends one."""
+    body = await anyio.to_thread.run_sync(
+        observe.cached_instance_stats, str(greffon_id),
+        limiter=request.app.state.metrics_limiter,
+    )
+    if body is None:
+        raise HTTPException(status_code=404, detail="missing_on_greffer")
+    return InstanceStatsResponse(**body)
+
+
+@router.get("/greffon/{greffon_id}/disk/")
+async def greffon_disk(
+    greffon_id: UUID, request: Request
+) -> InstanceDiskResponse:
+    """Lazy, TTL-cached per-instance disk usage (resource-monitoring epic,
+    Feature 2): bind app-dir size plus the instance's volumes sliced from one
+    shared host-wide ``df`` snapshot. Offloaded under the metrics limiter; a
+    not-deployed instance is 404 ``missing_on_greffer``."""
+    body = await anyio.to_thread.run_sync(
+        observe.cached_instance_disk, str(greffon_id),
+        limiter=request.app.state.metrics_limiter,
+    )
+    if body is None:
+        raise HTTPException(status_code=404, detail="missing_on_greffer")
+    return InstanceDiskResponse(**body)
 
 
 @router.post("/tunnel-config/")
