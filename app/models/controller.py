@@ -159,6 +159,24 @@ class InstanceDiskResponse(BaseModel):
     volumes: list[InstanceVolume]
 
 
+# Bounded per-instance logs (resource-monitoring epic, Feature 2, logs slice).
+class LogLine(BaseModel):
+    service: str
+    ts: str | None = None  # container streams carry an RFC3339 ts; deploy null
+    msg: str
+
+
+class InstanceLogsResponse(BaseModel):
+    instance_id: str
+    stream: str
+    captured_at: str
+    lines: list[LogLine]
+    # Opaque server-minted cursor; the client echoes it as `since` to follow.
+    next_cursor: str | None = None
+    rotated: bool = False
+    truncated: bool = False
+
+
 class TunnelConfigPushRequest(BaseModel):
     """v3 manager-pushed rathole client.toml — second-phase push for
     start/stop flows.

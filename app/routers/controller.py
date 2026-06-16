@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Literal
 from uuid import UUID
 
 import anyio
@@ -28,6 +29,7 @@ from app.models.controller import (
     GreffonStopRequest,
     GreffonStopResponse,
     InstanceDiskResponse,
+    InstanceLogsResponse,
     InstanceStatsResponse,
     TunnelConfigPushRequest,
     TunnelConfigPushResponse,
@@ -39,7 +41,7 @@ from app.tunnel_config import (
 )
 
 # Framework-agnostic shared code imported directly — no rewrite.
-from apps.utils.docker import compose, observe
+from apps.utils.docker import compose, instance_logs, observe
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 
@@ -328,6 +330,38 @@ async def greffon_disk(
     if body is None:
         raise HTTPException(status_code=404, detail="missing_on_greffer")
     return InstanceDiskResponse(**body)
+
+
+@router.get("/greffon/{greffon_id}/logs/")
+async def greffon_logs(
+    greffon_id: UUID,
+    request: Request,
+    stream: Literal["container", "all", "deploy"] = "all",
+    tail: int = instance_logs.LOG_TAIL_DEFAULT,
+    since: str | None = None,
+) -> InstanceLogsResponse:
+    """Bounded per-instance log read (resource-monitoring epic, Feature 2, logs
+    slice). ``stream`` selects container stdout/stderr (``container``/``all``)
+    or the captured ``deploy`` log; ``tail`` bounds the window (clamped to
+    LOG_TAIL_MAX) and ``since`` is the opaque cursor for de-duplicating follow
+    polls.
+
+    Gated by ``GREFFER_LOG_SURFACING_ENABLED`` (default off): when off this
+    endpoint 404s at the SOURCE, so logs stay off even if a manager is
+    misconfigured. A not-deployed instance with no deploy log is 404
+    ``missing_on_greffer``; a malformed cursor is 400."""
+    if not request.app.state.settings.greffer_log_surfacing_enabled:
+        raise HTTPException(status_code=404, detail="log_surfacing_disabled")
+    try:
+        body = await anyio.to_thread.run_sync(
+            instance_logs.instance_logs, str(greffon_id), stream, tail, since,
+            limiter=request.app.state.metrics_limiter,
+        )
+    except instance_logs.BadCursor:
+        raise HTTPException(status_code=400, detail="bad_cursor")
+    if body is None:
+        raise HTTPException(status_code=404, detail="missing_on_greffer")
+    return InstanceLogsResponse(**body)
 
 
 @router.post("/tunnel-config/")
