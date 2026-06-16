@@ -190,9 +190,10 @@ class RemoteUpdateRequest(BaseModel):
 
     The pattern mirrors the v1 CLI's ``is_valid_image_tag`` Docker tag grammar
     (leading alphanumeric/underscore, then alphanumeric/underscore/dot/dash, up
-    to 128 chars). A tag that fails it is a 422 before any handler body runs, so
-    a tampered manifest value can name only a tag in the known repo, never inject
-    a newline or a different image.
+    to 128 chars). A tag that fails it is rejected before any handler body runs;
+    the greffer maps the resulting RequestValidationError to 400 (app/errors.py),
+    so a tampered manifest value can name only a tag in the known repo, never
+    inject a newline or a different image.
     """
     target_tag: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 

@@ -123,9 +123,13 @@ def run_remote_update(
             compose_file, profile=profile, services=services,
             old_refs=old_refs, greffer_id=greffer_id, timeout=timeout, sleep=sleep)
 
+    # v2 pins/pulls by digest, so the local ``greffon/greffer:<tag>`` tag never
+    # exists; tell the gate to verify "version applied" against the VERIFIED
+    # greffer digest instead, or it reads None and rolls back every success.
     outcome = update.health_gate(
         compose_file, greffer_id=greffer_id, target=target_tag,
-        services=services, profile=profile, timeout=timeout, sleep=sleep)
+        services=services, profile=profile, timeout=timeout, sleep=sleep,
+        applied_ref=verified.get(update.GREFFER_REPO))
     if outcome == update.GATE_READY:
         logger.info("remote update applied: %s", target_tag)
         return EXIT_OK

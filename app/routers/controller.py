@@ -317,6 +317,17 @@ def remote_update(
             status_code=503,
             detail="updater_image_not_configured",
         )
+    if not updater_spawn.is_digest_pinned(settings.greffer_updater_image):
+        # The most privileged container in the flow (docker.sock = host root)
+        # must be pinned by digest so a registry-side tag move can't swap it.
+        # Operator misconfiguration -> 503, fail-closed, nothing spawned.
+        logger.error(
+            "greffer_updater_image is not digest-pinned (%s); refusing",
+            settings.greffer_updater_image)
+        raise HTTPException(
+            status_code=503,
+            detail="updater_image_not_digest_pinned",
+        )
 
     instance_id_var.set(None)  # node-level op, not tied to a greffon instance
     try:

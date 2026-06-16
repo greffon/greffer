@@ -77,6 +77,31 @@ async def test_update_happy_spawns_and_returns_202(monkeypatch, tmp_path) -> Non
     assert kw["manifest_url"] == "https://x/m.json"
     assert kw["greffer_id"] == "g1"
     assert kw["data_dest"] == str(tmp_path)
+    assert kw["mode"] == "proxy"  # GREFFER_MODE unset -> default proxy
+
+
+@pytest.mark.asyncio
+async def test_update_passes_tunnel_mode(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("GREFFER_MODE", "tunnel")
+    settings = _settings(monkeypatch, tmp_path)
+    with patch.object(updater_spawn, "spawn_updater", return_value="cid") as spawn:
+        async with _client(settings) as ac:
+            r = await ac.post("/api/controller/update/", json={"target_tag": "0.3.6"},
+                              headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 202
+    assert spawn.call_args.kwargs["mode"] == "tunnel"
+
+
+@pytest.mark.asyncio
+async def test_update_unpinned_image_returns_503(monkeypatch, tmp_path) -> None:
+    settings = _settings(monkeypatch, tmp_path, image="greffon/greffer-updater:latest")
+    with patch.object(updater_spawn, "spawn_updater") as spawn:
+        async with _client(settings) as ac:
+            r = await ac.post("/api/controller/update/", json={"target_tag": "0.3.6"},
+                              headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 503
+    assert r.json()["detail"] == "updater_image_not_digest_pinned"
+    spawn.assert_not_called()
 
 
 @pytest.mark.asyncio

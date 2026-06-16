@@ -2,10 +2,16 @@
 
 ``python -m greffer_cli.updater <target_tag>`` (the rest of the config comes
 from the environment the greffer sets when it spawns the updater). It takes the
-``/data`` update lock so a remote update and a host ``greffer update`` are
-mutually exclusive (HLD "Concurrency"), runs the v2 verify -> pin -> recreate
-engine, and exits with its code. The lock lives on the ``/data`` volume because
-that is the only filesystem the updater and the recreated greffer share.
+update lock so a remote update and a host ``greffer update`` are mutually
+exclusive (HLD "Concurrency"), runs the v2 verify -> pin -> recreate engine, and
+exits with its code.
+
+The lock file is ``/work/.update.lock``. ``/work`` is the host compose dir
+bind-mounted into the updater, which is exactly the dir a host ``greffer
+update`` locks (``<config_dir>/.update.lock`` in greffer_cli.update). Both sides
+must lock the SAME host inode for ``flock`` to actually serialize them; locking
+``/data`` instead would be a different inode and the two updaters could run
+concurrently and corrupt the shared compose file.
 """
 
 from __future__ import annotations
@@ -21,7 +27,10 @@ from . import engine
 # min_supported baseline into /etc/greffer at build time.
 DEFAULT_COMPOSE = Path("/work/docker-compose.yml")
 DEFAULT_RATCHET = Path("/data/.greffer-update-floor")
-DEFAULT_LOCK = Path("/data/.greffer-update.lock")
+# Same host inode a host ``greffer update`` locks (its ``<config_dir>/
+# .update.lock``); /work IS that config dir bind-mounted in. Must match the v1
+# filename ``.update.lock`` or the two locks miss each other (P1).
+DEFAULT_LOCK = Path("/work/.update.lock")
 DEFAULT_COSIGN_PUB = "/etc/greffer/cosign.pub"
 DEFAULT_BASELINE_FILE = Path("/etc/greffer/min_supported_baseline")
 

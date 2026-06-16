@@ -19,6 +19,15 @@ _ENV = {
 }
 
 
+def test_lock_path_matches_v1_inode():
+    # Must lock /work/.update.lock — /work is the host compose dir bind-mount,
+    # the same inode a host `greffer update` locks (.update.lock). A /data lock
+    # would be a different inode and miss the v1 lock (P1).
+    from greffer_cli import update
+    assert entry.DEFAULT_LOCK == Path("/work/.update.lock")
+    assert entry.DEFAULT_LOCK.name == update._update_lock_path(Path("/work")).name
+
+
 def test_config_from_env_maps_fields():
     cfg = entry._config_from_env("0.3.6", dict(_ENV))
     assert cfg["target_tag"] == "0.3.6"

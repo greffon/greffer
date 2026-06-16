@@ -24,12 +24,25 @@ Fail-closed: any missing mount, unknown self-container, or docker error raises
 from __future__ import annotations
 
 import logging
+import re
 import socket
 
 import docker
 from docker.types import Mount
 
 logger = logging.getLogger("greffer")
+
+# The updater image MUST be digest-pinned: it is the one root-equivalent,
+# socket-mounted container that recreates the greffer, and it is NOT itself run
+# through the cosign/floor verification it performs on the target. A mutable tag
+# (``:latest``) could be repointed registry-side to swap it. Require an explicit
+# ``@sha256:<64 hex>`` so a tag move can never change what runs.
+_DIGEST_PINNED_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+def is_digest_pinned(ref: object) -> bool:
+    """True iff ``ref`` is an image reference pinned by a sha256 digest."""
+    return isinstance(ref, str) and _DIGEST_PINNED_RE.search(ref) is not None
 
 # The greffer mounts its compose dir at /app (``./:/app``) and uses
 # ``$GREFFON_PATH`` (default /data) for persistent state. The updater image
@@ -90,6 +103,11 @@ def spawn_updater(
     verification all happen inside the container before any recreate."""
     if not image:
         raise UpdaterSpawnError("no updater image configured")
+    if not is_digest_pinned(image):
+        # Defense-in-depth: the route also rejects this, but enforce it here so
+        # the contract holds for any caller of spawn_updater.
+        raise UpdaterSpawnError(
+            f"updater image must be digest-pinned (got {image!r})")
     client = client or docker.from_env()
     self_attrs = _self_container(client).attrs
 

@@ -116,6 +116,25 @@ def test_cohesion_mismatch_refuses(cf, monkeypatch):
     assert _run(cf, monkeypatch) == engine.EXIT_REFUSED
 
 
+def test_digest_unresolvable_refuses(cf, monkeypatch):
+    _patch_verify(monkeypatch, digest_ok=False)  # registry can't resolve a digest
+    monkeypatch.setattr(compose, "set_image_refs", lambda *a, **k: pytest.fail("recreated"))
+    assert _run(cf, monkeypatch) == engine.EXIT_REFUSED
+
+
+def test_pull_failure_refuses(cf, monkeypatch):
+    _patch_verify(monkeypatch, pull_ok=False)  # docker pull by digest fails
+    monkeypatch.setattr(compose, "set_image_refs", lambda *a, **k: pytest.fail("recreated"))
+    assert _run(cf, monkeypatch) == engine.EXIT_REFUSED
+
+
+def test_empty_compose_refuses(cf, monkeypatch):
+    cf.write_text("services: {}\n", encoding="utf-8")  # no greffon/* images
+    _patch_verify(monkeypatch)
+    monkeypatch.setattr(compose, "set_image_refs", lambda *a, **k: pytest.fail("recreated"))
+    assert _run(cf, monkeypatch) == engine.EXIT_REFUSED
+
+
 # --- run_remote_update recreate + rollback --------------------------
 
 def test_happy_pins_digests_and_recreates(cf, monkeypatch):
@@ -137,3 +156,30 @@ def test_gate_failure_rolls_back(cf, monkeypatch):
     monkeypatch.setattr(update, "health_gate", lambda *a, **k: update.GATE_FATAL)
     monkeypatch.setattr(update, "_rollback", lambda *a, **k: update.EXIT_FAILED_ROLLED_BACK)
     assert _run(cf, monkeypatch) == engine.EXIT_FAILED_ROLLED_BACK
+
+
+def test_compose_up_failure_rolls_back_without_gate(cf, monkeypatch):
+    # A failed `compose up` rolls back immediately and never reaches the gate.
+    _patch_verify(monkeypatch)
+    monkeypatch.setattr(compose, "set_image_refs", lambda f, refs: None)
+    monkeypatch.setattr(compose, "compose_up",
+                        lambda f, **k: compose.CommandResult(1, "", "up failed"))
+    monkeypatch.setattr(update, "health_gate",
+                        lambda *a, **k: pytest.fail("gate reached after up failure"))
+    monkeypatch.setattr(update, "_rollback", lambda *a, **k: update.EXIT_FAILED_ROLLED_BACK)
+    assert _run(cf, monkeypatch) == engine.EXIT_FAILED_ROLLED_BACK
+
+
+def test_gate_gets_verified_greffer_digest_not_tag(cf, monkeypatch):
+    # v2 pins by digest, so the gate must verify "version applied" against the
+    # verified greffon/greffer digest, never the (absent) local tag.
+    _patch_verify(monkeypatch)
+    monkeypatch.setattr(compose, "set_image_refs", lambda f, refs: None)
+    monkeypatch.setattr(compose, "compose_up", lambda f, **k: _ok())
+    seen = {}
+    def fake_gate(*a, applied_ref=None, **k):
+        seen["applied_ref"] = applied_ref
+        return update.GATE_READY
+    monkeypatch.setattr(update, "health_gate", fake_gate)
+    assert _run(cf, monkeypatch) == engine.EXIT_OK
+    assert seen["applied_ref"] == f"greffon/greffer@sha256:{'a' * 64}"
