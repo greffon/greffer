@@ -123,15 +123,24 @@ def _read_one_container(container, since_ts: str | None, tail: int):
     """Return ``(lines, next_ts, truncated)`` for one container, where ``lines``
     is ``[{service, ts, msg}]`` strictly after ``since_ts``.
 
-    Initial load (no ``since_ts``): the last ``tail`` lines. Follow poll: lines
-    after the cursor, clamped to ``tail`` as a size safety (the OLDEST ``tail``
-    new lines, so ``next_ts`` lands on the truncation boundary and the next poll
-    resumes with no gap)."""
+    Initial load (no ``since_ts``): the last ``tail`` lines. Follow poll: the
+    read is bounded AT THE DAEMON (``since`` + ``tail``) so a chatty container
+    cannot return its entire backlog (unbounded latency + memory) on each poll
+    -- ``container.logs(since=...)`` with no tail returns EVERYTHING since the
+    cursor (measured: 50k lines / 159ms, a firehose 334k / 1.9s). When MORE than
+    ``tail`` new lines exist we keep the NEWEST ``tail``, jump ``next_ts`` to the
+    newest, and flag ``truncated`` (a gap): a live viewer stays near-live
+    instead of paging slowly through the backlog and falling ever further
+    behind. For <= ``tail`` new lines this is gap-free and identical to a plain
+    since read."""
     service = (container.labels or {}).get(
         "com.docker.compose.service") or container.name
     kwargs = {"stdout": True, "stderr": True, "timestamps": True}
     if since_ts:
         kwargs["since"] = _ts_to_unix(since_ts)
+        # Fetch one MORE than tail: caps the daemon read at the newest tail+1
+        # lines AND lets us detect that older new lines were skipped.
+        kwargs["tail"] = tail + 1
     else:
         kwargs["tail"] = tail
     try:
@@ -144,9 +153,20 @@ def _read_one_container(container, since_ts: str | None, tail: int):
         # Strict de-dup: drop anything at-or-before the cursor (the coarse
         # int `since` can re-include the boundary second).
         parsed = [(ts, msg) for ts, msg in parsed if ts > since_ts]
+    # Order by timestamp (RFC3339 sorts chronologically) so "newest tail" and
+    # the resumed cursor are correct even when the daemon interleaved
+    # stdout/stderr slightly out of order; stable sort keeps same-ts daemon
+    # order.
+    parsed.sort(key=lambda p: p[0])
     truncated = False
-    if len(parsed) > tail:
-        parsed = parsed[:tail]
+    if since_ts and len(parsed) > tail:
+        # > tail survivors can ONLY happen when the daemon's tail+1 cap dropped
+        # genuinely-new (post-cursor) lines: a boundary-second duplicate is
+        # OLDER than every new line, and the daemon returns the NEWEST tail+1,
+        # so it drops duplicates before new lines. Hence a surviving count of
+        # tail+1 means new lines were clamped = a real gap. Keep the NEWEST tail
+        # and jump the cursor to the newest (bounded, stays near-live).
+        parsed = parsed[-tail:]
         truncated = True
     next_ts = parsed[-1][0] if parsed else since_ts
     lines = [{"service": service, "ts": ts, "msg": msg}
