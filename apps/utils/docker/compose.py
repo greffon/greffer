@@ -640,6 +640,31 @@ def apply_configuration(greffon_info, compose):
     return greffon_info
 
 
+# docker-compose `${VAR}` interpolation resolves against the launching
+# process's environment. The greffer process env holds its manager token
+# (GREFFER_TOKEN) and other greffer-only config; the catalog is community-
+# extensible and assumed hostile (see the sandboxed Jinja note above), so a
+# malicious catalog compose with a literal ``${GREFFER_TOKEN}`` could otherwise
+# exfiltrate the greffer's token into a tenant container. We therefore launch
+# docker-compose with a SCRUBBED env: only what the CLI needs to find its
+# binaries and reach the Docker daemon. Tenant config values are baked into the
+# rendered compose by Jinja (create_compose), NOT via docker-compose ${}
+# interpolation, so nothing legitimate depends on the greffer env here.
+_COMPOSE_ENV_ALLOWLIST = (
+    'PATH', 'HOME',
+    # Daemon reachability (a socket-mounted greffer needs none of these, but a
+    # TLS/remote daemon does, so pass them through when present).
+    'DOCKER_HOST', 'DOCKER_CONFIG', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY',
+)
+
+
+def _compose_env():
+    """Minimal env for the docker-compose child: structurally prevents
+    ``${GREFFER_TOKEN}`` (or any other greffer-only secret) from being
+    interpolated by a hostile catalog compose."""
+    return {k: v for k, v in os.environ.items() if k in _COMPOSE_ENV_ALLOWLIST}
+
+
 def start(greffon_info):
     """Bring the instance up (resource-monitoring epic, Feature 2 changes).
 
@@ -672,6 +697,7 @@ def start(greffon_info):
             ['docker-compose', '-p', greffon_info['id'], '-f', compose_file,
              'up', '-d'],
             stdout=deploy_log, stderr=subprocess.STDOUT,
+            env=_compose_env(),
         )
     finally:
         deploy_log.close()
@@ -681,7 +707,8 @@ def stop(greffon_info):
     return subprocess.Popen(
         ['docker-compose', '-p', greffon_info['id'], '-f',
          os.path.join(get_greffon_path(greffon_info), 'docker-compose.yml'),
-         'stop'])
+         'stop'],
+        env=_compose_env())
 
 
 # Label a catalog service carries to declare it a one-shot lifecycle helper
