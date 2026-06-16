@@ -31,6 +31,8 @@ from app.models.controller import (
     InstanceDiskResponse,
     InstanceLogsResponse,
     InstanceStatsResponse,
+    RemoteUpdateRequest,
+    RemoteUpdateResponse,
     TunnelConfigPushRequest,
     TunnelConfigPushResponse,
 )
@@ -42,6 +44,7 @@ from app.tunnel_config import (
 
 # Framework-agnostic shared code imported directly — no rewrite.
 from apps.utils.docker import compose, instance_logs, observe
+from apps.utils.docker import updater as updater_spawn
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 
@@ -277,6 +280,73 @@ def _write_pushed_client_toml(
         logger.debug("tunnel_client_toml_pushed_for_id=%s",
                      getattr(payload, "id", "?"))
     return "ok"
+
+
+@router.post("/update/", status_code=202)
+def remote_update(
+    payload: RemoteUpdateRequest, request: Request
+) -> RemoteUpdateResponse:
+    """Spawn the detached v2 updater container (greffer self-update v2).
+
+    Fail-closed gating, in order:
+      * ``greffer_remote_update_enabled`` is the operator-sovereign switch. OFF
+        (default) -> 403 at the SOURCE, so remote update stays off even if a
+        manager is misconfigured to offer it. The flag is also advertised in the
+        register payload so a correct manager never shows the button when off.
+      * ``greffer_updater_image`` must be a configured, digest-pinned ref;
+        unset -> 503, never a silent ``:latest`` pull of the one container that
+        recreates the greffer.
+
+    The handler does NOT verify provenance or recreate anything itself: it spawns
+    the signed updater, which takes the ``/work`` lock and runs the full verify
+    -> pin -> recreate -> health-gate -> rollback flow, then returns 202 with the
+    spawned container id. The target tag is already validated by the model and is
+    passed to the updater as a list arg (no shell)."""
+    settings = _settings(request)
+    if not settings.greffer_remote_update_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="remote_update_disabled",
+        )
+    if not settings.greffer_updater_image:
+        # Flag on but image unwired: operator misconfiguration. 503 (not 500)
+        # so the manager reports a retry-after-config condition, not a bug.
+        logger.error(
+            "remote_update_enabled but greffer_updater_image is unset; refusing")
+        raise HTTPException(
+            status_code=503,
+            detail="updater_image_not_configured",
+        )
+    if not updater_spawn.is_digest_pinned(settings.greffer_updater_image):
+        # The most privileged container in the flow (docker.sock = host root)
+        # must be pinned by digest so a registry-side tag move can't swap it.
+        # Operator misconfiguration -> 503, fail-closed, nothing spawned.
+        logger.error(
+            "greffer_updater_image is not digest-pinned (%s); refusing",
+            settings.greffer_updater_image)
+        raise HTTPException(
+            status_code=503,
+            detail="updater_image_not_digest_pinned",
+        )
+
+    instance_id_var.set(None)  # node-level op, not tied to a greffon instance
+    try:
+        updater_id = updater_spawn.spawn_updater(
+            image=settings.greffer_updater_image,
+            target_tag=payload.target_tag,
+            manifest_url=settings.greffer_version_manifest_url,
+            greffer_id=settings.greffer_id,
+            mode=settings.greffer_mode or "proxy",
+            data_dest=str(settings.greffon_path),
+        )
+    except updater_spawn.UpdaterSpawnError as exc:
+        logger.error("remote_update_spawn_failed target=%s err=%s",
+                     payload.target_tag, exc)
+        raise HTTPException(status_code=500, detail="updater_spawn_failed") from exc
+
+    logger.info("remote_update_accepted target=%s updater=%s",
+                payload.target_tag, updater_id[:12])
+    return RemoteUpdateResponse(updater_id=updater_id)
 
 
 @router.get("/greffon/{greffon_id}/")

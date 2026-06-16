@@ -318,6 +318,11 @@ def _post_register(settings: Settings, address: str, token: str) -> None:
         # without this field leaves Greffer.version null -> treated as below any
         # floor (fail-safe deny).
         "version": settings.greffer_version,
+        # Remote-update opt-in (greffer self-update v2), operator-sovereign and
+        # default off. Advertised every (re-)register so the manager knows
+        # whether to offer the remote "Update" button; the manager mirrors it
+        # for UI only and is never the authority.
+        "remote_update_enabled": settings.greffer_remote_update_enabled,
     }
     # Include greffer_mode in the register payload only when the operator
     # has set it explicitly. The manager's register endpoint accepts an

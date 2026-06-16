@@ -177,6 +177,36 @@ class InstanceLogsResponse(BaseModel):
     truncated: bool = False
 
 
+class RemoteUpdateRequest(BaseModel):
+    """Manager-triggered remote update (greffer self-update v2).
+
+    ``target_tag`` is the version the operator picked in the manager UI (e.g.
+    ``"0.3.6"``). It is NOT trusted: the controller re-validates the tag grammar
+    and the spawned updater re-validates it again and runs the full provenance +
+    ``min_supported`` floor verification before any recreate. The tag is passed
+    to the updater as a list arg (no shell), so it can never be a command
+    injection vector; the grammar check is defense-in-depth against a malformed
+    ref reaching ``docker``.
+
+    The pattern mirrors the v1 CLI's ``is_valid_image_tag`` Docker tag grammar
+    (leading alphanumeric/underscore, then alphanumeric/underscore/dot/dash, up
+    to 128 chars). A tag that fails it is rejected before any handler body runs;
+    the greffer maps the resulting RequestValidationError to 400 (app/errors.py),
+    so a tampered manifest value can name only a tag in the known repo, never
+    inject a newline or a different image.
+    """
+    target_tag: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+class RemoteUpdateResponse(BaseModel):
+    """202 ack: the updater container was spawned. The actual update runs
+    detached and reports its outcome out-of-band (the recreated greffer
+    re-registers / heartbeats at the new version). ``updater_id`` is the spawned
+    container id, for operator log correlation."""
+    status: Literal["accepted"] = "accepted"
+    updater_id: str
+
+
 class TunnelConfigPushRequest(BaseModel):
     """v3 manager-pushed rathole client.toml — second-phase push for
     start/stop flows.

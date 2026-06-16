@@ -49,11 +49,26 @@ def test_post_register_passes_correct_payload(settings: Settings) -> None:
     # version is always sent so the manager can stamp Greffer.version and
     # enforce the per-greffon min_greffer_version compatibility gate.
     assert kwargs["json"]["version"] == settings.greffer_version
+    # remote-update opt-in is advertised every register (default off) so the
+    # manager knows whether to offer the v2 remote "Update" button.
+    assert kwargs["json"]["remote_update_enabled"] is False
     assert kwargs["verify"] == settings.greffer_ssl_verify
     # mode is omitted when settings.greffer_mode is unset — preserves the
     # pre-tunnel-feature behaviour for proxy greffers (manager treats a
     # missing mode as MODE_PROXY default).
     assert "mode" not in kwargs["json"]
+
+
+def test_post_register_advertises_remote_update_opt_in(settings: Settings) -> None:
+    """The operator-sovereign GREFFER_REMOTE_UPDATE_ENABLED flag is advertised in
+    the register payload (default off) so the manager can mirror it for the UI;
+    when the operator enables it, the True value flows into the payload."""
+    settings.greffer_remote_update_enabled = True  # type: ignore[misc]
+    with patch("app.workers.register.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _post_register(settings, "10.0.0.1", "tok")
+    kwargs = mock_requests.post.call_args.kwargs
+    assert kwargs["json"]["remote_update_enabled"] is True
 
 
 def test_post_register_version_defaults_to_app_version(settings: Settings) -> None:

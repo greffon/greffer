@@ -139,6 +139,29 @@ class Settings(BaseSettings):
     # bug Codex caught before merge (greffon/greffer#17 review).
     greffer_workers_enabled: bool = False
 
+    # Remote update opt-in (greffer self-update v2). Default OFF: a
+    # manager-triggered remote update is root-equivalent on the operator's host,
+    # so the authoritative switch is greffer-side and operator-sovereign. The
+    # value is advertised in the register payload so the manager knows whether to
+    # offer the button; the controller update route (a later v2 increment) is a
+    # clear no-op unless this is true. Carries the ``greffer_`` prefix to bind
+    # GREFFER_REMOTE_UPDATE_ENABLED (the prefix pitfall noted above).
+    greffer_remote_update_enabled: bool = False
+
+    # Remote-update wiring (greffer self-update v2), only consulted when
+    # ``greffer_remote_update_enabled`` is true. ``greffer_updater_image`` is the
+    # DIGEST-PINNED signed updater image the controller spawns
+    # (``greffon/greffer-updater@sha256:...``); pinning by digest is what stops a
+    # moved-tag swap of the one container that recreates the greffer. Left empty
+    # by default so an operator who flips the flag without wiring the image gets a
+    # clear refusal from the route (not a silent ``:latest`` pull).
+    # ``greffer_version_manifest_url`` is the signed version manifest the updater
+    # fetches to compute the ``min_supported`` floor; the same default the v1 CLI
+    # uses. Both carry the ``greffer_`` prefix to bind GREFFER_UPDATER_IMAGE /
+    # GREFFER_VERSION_MANIFEST_URL (the prefix pitfall noted above).
+    greffer_updater_image: str = ""
+    greffer_version_manifest_url: str = "https://greffon.io/greffer-version.json"
+
     # Self-health watchdog (greffer-observability epic, Feature #3). The
     # watchdog evaluates /readyz's FATAL conditions and, when one is sustained
     # past the grace window, exits the uvicorn process so ``restart:

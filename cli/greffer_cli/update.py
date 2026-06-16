@@ -237,15 +237,22 @@ def _resolve_mode(env: env_file.EnvFile, compose_file: Path) -> str:
     return "tunnel" if "tunnel-sidecar" in running else "proxy"
 
 
-def _version_applied(compose_file: Path, target: str) -> bool:
-    """Did the recreate actually advance the greffer to the pulled target?
+def _version_applied(
+    compose_file: Path, target: str, *, applied_ref: str | None = None
+) -> bool:
+    """Did the recreate actually advance the greffer to the intended image?
 
-    Compares the running greffer container's image id to the pulled
-    ``greffon/greffer:<target>`` image id. A mispublished/moved tag or an
-    unbumped image leaves the old image running and fails this.
+    Compares the running greffer container's image id to the intended image id.
+    ``applied_ref`` overrides the lookup ref when the recreate pinned a DIGEST
+    rather than a tag (the v2 remote-update path: it pulls/pins
+    ``greffon/greffer@sha256:...`` and never creates the local
+    ``greffon/greffer:<target>`` tag, so a tag lookup would spuriously read None
+    and fail the gate). When unset (the v1 tag path) it falls back to the
+    ``greffon/greffer:<target>`` tag. A mispublished/moved tag or an unbumped
+    image leaves the old image running and fails this.
     """
     running = compose.container_image_id(compose_file, "greffer")
-    target_id = compose.image_id(f"{GREFFER_REPO}:{target}")
+    target_id = compose.image_id(applied_ref or f"{GREFFER_REPO}:{target}")
     return bool(running and target_id and running == target_id)
 
 
@@ -254,6 +261,7 @@ def health_gate(
     services: list[str], profile: str | None,
     timeout: float, poll_interval: float = 2.0,
     sleep: Callable[[float], None] = time.sleep,
+    applied_ref: str | None = None,
 ) -> str:
     """Poll until the recreated node is healthy or a failure is decided.
 
@@ -279,7 +287,9 @@ def health_gate(
                 ):
                     return GATE_DEGRADED_OTHER
                 if r.status == "ready":
-                    if not _version_applied(compose_file, target):
+                    if not _version_applied(
+                        compose_file, target, applied_ref=applied_ref
+                    ):
                         return GATE_NOT_APPLIED
                     svcs = compose.compose_services_running(
                         compose_file, profile=profile,
