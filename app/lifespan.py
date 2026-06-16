@@ -7,6 +7,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from app.workers import start_workers, stop_workers
+from apps.utils.docker.observe import shutdown_stats_pool
 
 logger = logging.getLogger("greffer")
 
@@ -29,17 +30,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     accidentally spawn real workers. Production sets
     ``GREFFER_WORKERS_ENABLED=true`` in docker-compose.yml.
     """
-    if not app.state.settings.greffer_workers_enabled:
-        logger.info("workers disabled (GREFFER_WORKERS_ENABLED unset)")
-        yield
-        return
-    tasks = start_workers(app)
-    # Expose the task handles by name so /readyz and the watchdog can tell a
-    # live long-lived worker from a crashed one (Feature #3). Set synchronously
-    # before the first ``yield``, so it is populated before any task runs.
-    app.state.worker_tasks = {t.get_name(): t for t in tasks}
-    logger.info("started %d background workers", len(tasks))
+    # Tear the shared stats pool down on the way out regardless of which path
+    # we take below, so a daemon-hung ``container.stats()`` worker never stalls
+    # process exit / a watchdog restart (see shutdown_stats_pool).
     try:
-        yield
+        if not app.state.settings.greffer_workers_enabled:
+            logger.info("workers disabled (GREFFER_WORKERS_ENABLED unset)")
+            yield
+            return
+        tasks = start_workers(app)
+        # Expose the task handles by name so /readyz and the watchdog can tell
+        # a live long-lived worker from a crashed one (Feature #3). Set
+        # synchronously before the first ``yield``, so it is populated before
+        # any task runs.
+        app.state.worker_tasks = {t.get_name(): t for t in tasks}
+        logger.info("started %d background workers", len(tasks))
+        try:
+            yield
+        finally:
+            await stop_workers(tasks)
     finally:
-        await stop_workers(tasks)
+        shutdown_stats_pool()

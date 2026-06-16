@@ -244,6 +244,20 @@ def test_instance_stats_slow_container_times_out_to_null(tmp_path, monkeypatch):
     assert elapsed < 1.0                        # returned at the deadline
 
 
+def test_shutdown_stats_pool_is_idempotent_and_resets():
+    # Build the pool, tear it down without waiting, and confirm a later read
+    # transparently rebuilds a fresh one.
+    pool = observe._get_stats_pool()
+    assert pool is not None
+    observe.shutdown_stats_pool()
+    assert observe._stats_pool is None
+    observe.shutdown_stats_pool()  # second call is a no-op, never raises
+    try:
+        assert observe._get_stats_pool() is not pool
+    finally:
+        observe.shutdown_stats_pool()  # don't leak a live pool into other tests
+
+
 # --- disk digest --------------------------------------------------------
 
 def test_instance_disk_filters_by_anchored_prefix(tmp_path, monkeypatch):

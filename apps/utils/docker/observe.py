@@ -83,6 +83,22 @@ def _get_stats_pool() -> concurrent.futures.ThreadPoolExecutor:
                     thread_name_prefix="greffer-stats")
     return _stats_pool
 
+
+def shutdown_stats_pool() -> None:
+    """Tear down the shared stats pool WITHOUT waiting on in-flight reads.
+
+    A ``container.stats()`` hung in the daemon occupies a pool worker until the
+    docker client's 60s socket timeout; those workers are non-daemon threads,
+    so the interpreter-exit join would otherwise stall process exit (and a
+    watchdog-triggered restart, the case where a read is most likely hung) by
+    up to that 60s. ``wait=False`` + ``cancel_futures`` drops the queue and
+    lets exit proceed. Idempotent; called from the lifespan teardown."""
+    global _stats_pool
+    with _stats_pool_lock:
+        pool, _stats_pool = _stats_pool, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
 _METRIC_KEYS = (
     "cpu_percent", "mem_used_bytes", "mem_limit_bytes",
     "net_rx_bytes", "net_tx_bytes", "blk_read_bytes", "blk_write_bytes",
