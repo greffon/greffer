@@ -112,3 +112,28 @@ async def test_logs_invalid_stream_is_400(settings) -> None:
             f"/api/controller/greffon/{_IID}/logs/?stream=evil",
             headers={TOKEN_HEADER: "test-token"})
     assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_logs_forwards_service_selector(settings) -> None:
+    # The endpoint forwards ?service=<name> to the reader (per-container
+    # selector). Stub the reader to capture the args it receives.
+    from unittest.mock import patch
+
+    captured = {}
+
+    def _stub(instance_id, stream, tail, since, service=None):
+        captured.update(stream=stream, service=service)
+        return {"instance_id": instance_id, "stream": stream,
+                "captured_at": "t", "lines": [], "next_cursor": None,
+                "rotated": False, "truncated": False}
+
+    async with await _client(settings, surfacing=True) as ac:
+        with patch("apps.utils.docker.instance_logs.instance_logs", _stub):
+            r = await ac.get(
+                f"/api/controller/greffon/{_IID}/logs/"
+                f"?stream=container&service=web",
+                headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 200
+    assert captured["stream"] == "container"
+    assert captured["service"] == "web"

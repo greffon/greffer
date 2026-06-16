@@ -188,12 +188,15 @@ def _read_deploy(instance_id: str, since_off, tail: int):
     return lines, next_off, rotated, truncated
 
 
-def instance_logs(instance_id: str, stream: str, tail, since: str | None):
+def instance_logs(instance_id: str, stream: str, tail, since: str | None,
+                  service: str | None = None):
     """Digested bounded log read, or ``None`` when the instance is not deployed
     AND has no deploy log (the caller maps that to missing-on-greffer 404).
 
     ``stream``: ``container``/``all`` (merged container stdout/stderr) or
-    ``deploy`` (the captured deploy log)."""
+    ``deploy`` (the captured deploy log). ``service`` narrows a container read
+    to a single compose service (the per-container selector); ``None`` keeps the
+    merged view. Ignored for ``deploy``."""
     tail = clamp_tail(tail)
     cursor = decode_cursor(since)
     deployed = instance_is_deployed(instance_id)
@@ -219,11 +222,18 @@ def instance_logs(instance_id: str, stream: str, tail, since: str | None):
     # streams use the SAME per-container position map: a scalar watermark across
     # interleaved containers would drop a lagging container's genuinely-new
     # lines (the exact hazard the per-container map exists to prevent), so the
-    # ``container`` stream must not collapse to one ts. v1 ``container`` is thus
-    # the merged view; a future ``service=`` selector narrows it to one source.
+    # ``container`` stream must not collapse to one ts. Without ``service`` this
+    # is the merged view; with ``service`` it narrows to that one container
+    # (the per-container selector) while reusing the same per-container cursor.
     if not deployed:
         return None
     containers = list_instance_containers(instance_id)
+    if service is not None:
+        containers = [
+            c for c in containers
+            if ((c.labels or {}).get("com.docker.compose.service") or c.name)
+            == service
+        ]
     positions = (cursor or {}).get("positions") or {}
     all_lines = []
     # Built fresh from the CURRENT containers, so a service that disappeared
@@ -231,14 +241,14 @@ def instance_logs(instance_id: str, stream: str, tail, since: str | None):
     new_positions = {}
     truncated = False
     for c in containers:
-        service = (c.labels or {}).get(
+        svc = (c.labels or {}).get(
             "com.docker.compose.service") or c.name
         lines, next_ts, trunc = _read_one_container(
-            c, positions.get(service), tail)
+            c, positions.get(svc), tail)
         all_lines.extend(lines)
         truncated = truncated or trunc
         if next_ts:
-            new_positions[service] = next_ts
+            new_positions[svc] = next_ts
     # Merge by timestamp (RFC3339 sorts chronologically); None-safe.
     all_lines.sort(key=lambda r: r["ts"] or "")
     next_cursor = _encode_cursor({"v": 1, "positions": new_positions}) \

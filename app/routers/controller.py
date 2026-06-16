@@ -339,23 +339,25 @@ async def greffon_logs(
     stream: Literal["container", "all", "deploy"] = "all",
     tail: int = instance_logs.LOG_TAIL_DEFAULT,
     since: str | None = None,
+    service: str | None = None,
 ) -> InstanceLogsResponse:
     """Bounded per-instance log read (resource-monitoring epic, Feature 2, logs
     slice). ``stream`` selects container stdout/stderr (``container``/``all``)
-    or the captured ``deploy`` log; ``tail`` bounds the window (clamped to
-    LOG_TAIL_MAX) and ``since`` is the opaque cursor for de-duplicating follow
-    polls.
+    or the captured ``deploy`` log; ``service`` narrows a container read to one
+    compose service (the per-container selector, ignored for ``deploy``);
+    ``tail`` bounds the window (clamped to LOG_TAIL_MAX) and ``since`` is the
+    opaque cursor for de-duplicating follow polls.
 
-    Gated by ``GREFFER_LOG_SURFACING_ENABLED`` (default off): when off this
-    endpoint 404s at the SOURCE, so logs stay off even if a manager is
-    misconfigured. A not-deployed instance with no deploy log is 404
-    ``missing_on_greffer``; a malformed cursor is 400."""
+    Gated by ``GREFFER_LOG_SURFACING_ENABLED``: when off this endpoint 404s at
+    the SOURCE, so logs stay off even if a manager is misconfigured. A
+    not-deployed instance with no deploy log is 404 ``missing_on_greffer``; a
+    malformed cursor is 400."""
     if not request.app.state.settings.greffer_log_surfacing_enabled:
         raise HTTPException(status_code=404, detail="log_surfacing_disabled")
     try:
         body = await anyio.to_thread.run_sync(
             instance_logs.instance_logs, str(greffon_id), stream, tail, since,
-            limiter=request.app.state.metrics_limiter,
+            service, limiter=request.app.state.metrics_limiter,
         )
     except instance_logs.BadCursor:
         raise HTTPException(status_code=400, detail="bad_cursor")

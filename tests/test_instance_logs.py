@@ -192,6 +192,34 @@ def test_multi_container_stream_container_no_line_loss(tmp_path, monkeypatch):
     assert "d-old" not in msgs   # db had nothing new
 
 
+def test_service_selector_narrows_to_one_container(tmp_path, monkeypatch):
+    # ?service=web returns ONLY the web container's lines, not the merged view.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    web = _container("web", "i1_web_1",
+                     b"2026-06-15T14:03:05.000000000Z w1\n")
+    db = _container("db", "i1_db_1",
+                    b"2026-06-15T14:03:06.000000000Z d1\n")
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers",
+                         return_value=[web, db]):
+        body = il.instance_logs("i1", "container", 100, None, service="web")
+    assert [ln["msg"] for ln in body["lines"]] == ["w1"]
+    assert all(ln["service"] == "web" for ln in body["lines"])
+    db.logs.assert_not_called()  # the unselected container is never read
+
+
+def test_service_selector_unknown_service_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    web = _container("web", "i1_web_1",
+                     b"2026-06-15T14:03:05.000000000Z w1\n")
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers", return_value=[web]):
+        body = il.instance_logs("i1", "container", 100, None, service="nope")
+    assert body["lines"] == []  # no matching container -> empty, not an error
+
+
 def test_container_missing_when_not_deployed(tmp_path, monkeypatch):
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
     with patch.object(il, "instance_is_deployed", return_value=False):
