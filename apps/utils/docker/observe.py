@@ -15,6 +15,7 @@ does not bound WHAT the greffer returns for that id.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import threading
@@ -45,6 +46,30 @@ _DF_TTL_SECONDS = 60.0
 
 _DOCKER_ERRORS = (docker.errors.DockerException, OSError,
                   requests.exceptions.RequestException)
+
+# A single ``stats(stream=False)`` blocks in the daemon for ~one collection
+# cycle (roughly 1-2s) EACH, so digesting a multi-container greffon serially
+# costs the SUM of those waits and overruns the manager proxy read timeout
+# (``GREFFER_PROXY_TIMEOUT_SECONDS``). The reads are I/O-bound on the daemon,
+# so a small thread pool collapses the wall time to about one call. The pool is
+# shared (not per-request) and bounded so the outer metrics concurrency cap
+# cannot multiply into an unbounded burst of daemon connections; tasks beyond
+# the bound queue rather than fan out further.
+_STATS_FANOUT = 8
+_stats_pool_lock = threading.Lock()
+_stats_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_stats_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily build the shared, bounded stats thread pool (double-checked)."""
+    global _stats_pool
+    if _stats_pool is None:
+        with _stats_pool_lock:
+            if _stats_pool is None:
+                _stats_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_STATS_FANOUT,
+                    thread_name_prefix="greffer-stats")
+    return _stats_pool
 
 _METRIC_KEYS = (
     "cpu_percent", "mem_used_bytes", "mem_limit_bytes",
@@ -221,12 +246,17 @@ def instance_stats(instance_id: str) -> dict | None:
     metrics."""
     if not instance_is_deployed(instance_id):
         return None
-    containers = [_digest_container(c)
-                  for c in list_instance_containers(instance_id)]
+    containers = list_instance_containers(instance_id)
+    # Read every container's stats concurrently (each blocks ~1-2s in the
+    # daemon). ``map`` preserves enumeration order and re-raises nothing new:
+    # ``_digest_container`` already swallows ``_DOCKER_ERRORS`` into null
+    # metrics, so a single slow/failed container never fails the whole read.
+    pool = _get_stats_pool()
+    digested = list(pool.map(_digest_container, containers))
     return {
         "instance_id": instance_id,
         "captured_at": _now_iso(),
-        "containers": containers,
+        "containers": digested,
     }
 
 

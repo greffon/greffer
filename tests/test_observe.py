@@ -178,6 +178,48 @@ def test_instance_stats_stats_failure_yields_null_not_500(tmp_path,
     assert body["containers"][0]["cpu_percent"] is None
 
 
+def test_instance_stats_preserves_container_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    names = [f"i1_svc{i}_1" for i in range(6)]
+    containers = [_container(name=n, service=f"svc{i}",
+                             stats=_running_stats())
+                  for i, n in enumerate(names)]
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        body = observe.instance_stats("i1")
+    # The parallel fan-out must keep results aligned to enumeration order.
+    assert [c["name"] for c in body["containers"]] == names
+
+
+def test_instance_stats_reads_containers_concurrently(tmp_path, monkeypatch):
+    """The per-container daemon reads must run in parallel: a serial read of N
+    slow containers would cost N*delay, the parallel fan-out costs ~one."""
+    import time
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    delay = 0.3
+    n = 6
+
+    def _slow_stats(*_a, **_k):
+        time.sleep(delay)
+        return _running_stats()
+
+    containers = []
+    for i in range(n):
+        c = _container(name=f"i1_svc{i}_1", service=f"svc{i}")
+        c.stats.side_effect = _slow_stats
+        containers.append(c)
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        start = time.monotonic()
+        body = observe.instance_stats("i1")
+        elapsed = time.monotonic() - start
+    assert len(body["containers"]) == n
+    # Serial would be n*delay (1.8s); parallel is ~delay. Generous ceiling.
+    assert elapsed < (n * delay) / 2
+
+
 # --- disk digest --------------------------------------------------------
 
 def test_instance_disk_filters_by_anchored_prefix(tmp_path, monkeypatch):
