@@ -20,7 +20,7 @@ _ENV = {
 
 
 def test_lock_path_matches_v1_inode():
-    # Must lock /work/.update.lock — /work is the host compose dir bind-mount,
+    # Must lock /work/.update.lock. /work is the host compose dir bind-mount,
     # the same inode a host `greffer update` locks (.update.lock). A /data lock
     # would be a different inode and miss the v1 lock (P1).
     from greffer_cli import update

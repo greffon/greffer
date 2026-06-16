@@ -95,10 +95,15 @@ def test_spawn_unpinned_image_refuses():
 
 def test_is_digest_pinned():
     assert updater.is_digest_pinned("r@sha256:" + "a" * 64) is True
+    assert updater.is_digest_pinned("greffon/greffer-updater@sha256:" + "0" * 64) is True
     assert updater.is_digest_pinned("r:latest") is False
     assert updater.is_digest_pinned("r@sha256:" + "a" * 63) is False
     assert updater.is_digest_pinned("r@sha256:" + "g" * 64) is False
     assert updater.is_digest_pinned(None) is False
+    # fullmatch: a double-digest or trailing junk cannot slip past
+    assert updater.is_digest_pinned(
+        "a@sha256:" + "a" * 64 + "@sha256:" + "b" * 64) is False
+    assert updater.is_digest_pinned("r@sha256:" + "a" * 64 + " evil") is False
 
 
 def test_spawn_bind_data_preserves_host_path():

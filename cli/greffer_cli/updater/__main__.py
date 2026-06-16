@@ -66,7 +66,7 @@ def _config_from_env(target_tag: str, env: dict) -> dict:
 
 
 def acquire_lock(lock_path: Path = DEFAULT_LOCK):
-    """Exclusive flock on the /data update lock. Returns a handle to release, or
+    """Exclusive flock on the /work update lock. Returns a handle to release, or
     None if another actor already holds it (the caller refuses), or the
     ``_NO_LOCK`` sentinel on a platform without fcntl."""
     try:

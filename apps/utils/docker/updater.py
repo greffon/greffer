@@ -36,13 +36,16 @@ logger = logging.getLogger("greffer")
 # socket-mounted container that recreates the greffer, and it is NOT itself run
 # through the cosign/floor verification it performs on the target. A mutable tag
 # (``:latest``) could be repointed registry-side to swap it. Require an explicit
-# ``@sha256:<64 hex>`` so a tag move can never change what runs.
-_DIGEST_PINNED_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+# ``@sha256:<64 hex>`` so a tag move can never change what runs. Anchored with
+# fullmatch (repo segment, then exactly one ``@sha256:<64 hex>``, nothing
+# trailing) so a pathological ref like ``a@sha256:<64hex>@sha256:<64hex>`` or
+# trailing junk cannot slip past.
+_DIGEST_PINNED_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 
 
 def is_digest_pinned(ref: object) -> bool:
     """True iff ``ref`` is an image reference pinned by a sha256 digest."""
-    return isinstance(ref, str) and _DIGEST_PINNED_RE.search(ref) is not None
+    return isinstance(ref, str) and _DIGEST_PINNED_RE.fullmatch(ref) is not None
 
 # The greffer mounts its compose dir at /app (``./:/app``) and uses
 # ``$GREFFON_PATH`` (default /data) for persistent state. The updater image
