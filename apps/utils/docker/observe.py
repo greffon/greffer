@@ -47,6 +47,66 @@ _DF_TTL_SECONDS = 60.0
 _DOCKER_ERRORS = (docker.errors.DockerException, OSError,
                   requests.exceptions.RequestException)
 
+# One-shot stats read (no docker-py upgrade). The daemon's one-shot stats
+# (Docker API >= 1.41) returns a SINGLE snapshot immediately instead of
+# blocking ~1.8s for a full collection cycle. Pinned docker-py 5.0.3 does not
+# expose the flag (``container.stats`` hardcodes the query params), so we issue
+# the low-level GET ourselves. Under one-shot ``precpu_stats`` comes back
+# zeroed, so CPU% is derived from a greffer-held PREVIOUS sample (see
+# _cpu_percent_from_prev), exactly like the host-CPU heartbeat. Falls back to
+# the blocking read on a daemon too old for one-shot.
+_ONESHOT_MIN_API = (1, 41)
+_oneshot_supported: bool | None = None
+
+
+def _api_supports_oneshot() -> bool:
+    """Whether the negotiated daemon API version supports one-shot stats.
+    Computed once and cached; any parse failure disables one-shot (the safe,
+    slower blocking path)."""
+    global _oneshot_supported
+    if _oneshot_supported is None:
+        ver = None
+        try:
+            ver = client.api.api_version
+            parts = tuple(int(x) for x in ver.split(".")[:2])
+            _oneshot_supported = parts >= _ONESHOT_MIN_API
+        except (AttributeError, ValueError, TypeError):
+            _oneshot_supported = False
+        # Log the decision ONCE so an operator can confirm from the logs which
+        # stats path is live: the fast one-shot read, or the ~1.8s/container
+        # blocking fallback (old daemon, or a pinned DOCKER_API_VERSION). This
+        # is the signal that tells you the prod latency fix is actually active.
+        if _oneshot_supported:
+            logger.info("stats_oneshot enabled (daemon api_version=%s)", ver)
+        else:
+            logger.warning(
+                "stats_oneshot disabled; using blocking stats reads "
+                "(daemon api_version=%s)", ver)
+    return _oneshot_supported
+
+
+def _read_stats(container) -> dict:
+    """One snapshot of a container's stats. Uses the daemon one-shot path
+    (instant) when supported, else the blocking ``stats(stream=False)``. The
+    low-level call mirrors what ``container.stats(stream=False)`` does, plus the
+    ``one-shot`` query param the pinned SDK will not pass."""
+    if not _api_supports_oneshot():
+        return container.stats(stream=False)
+    api = client.api
+    url = api._url("/containers/{0}/stats", container.id)
+    return api._result(
+        api._get(url, params={"stream": False, "one-shot": True},
+                 stream=False),
+        json=True)
+
+# Per-container previous CPU sample for the one-shot delta (precpu is zeroed
+# under one-shot). Keyed by container id. Lock-free like the stats cache: dict
+# ops are atomic under the GIL, and a rare racing overwrite only skews ONE
+# delta. Pruned by age so a removed/renamed container drops out and the dict
+# stays bounded.
+_CPU_PREV_TTL_SECONDS = 30.0
+_cpu_prev: dict[str, tuple[int, int, int, float]] = {}
+
 # A single ``stats(stream=False)`` blocks in the daemon for ~one collection
 # cycle (roughly 1-2s) EACH, so digesting a multi-container greffon serially
 # costs the SUM of those waits and overruns the manager proxy read timeout
@@ -157,28 +217,53 @@ def list_instance_containers(instance_id: str) -> list:
     ]
 
 
-def _cpu_percent(stats: dict) -> float:
-    """Host-relative busy percent from a single ``stats(stream=False)`` read.
-
-    The daemon carries ``precpu_stats`` in the one snapshot, so the delta needs
-    no 1s sleep. Multiplied by ``online_cpus`` so a fully-busy 4-core container
-    reads ~400 (NOT clamped to 100: per-container CPU is multi-core, unlike the
-    host-aggregate heartbeat figure). A cold-start read (no usable precpu delta)
-    returns the sentinel ``0.0`` rather than erroring."""
+def _cpu_sample(stats: dict) -> tuple[int, int, int] | None:
+    """``(total_usage, system_cpu_usage, online_cpus)`` from a snapshot, or
+    None when the daemon did not report a usable cpu block. This is the raw
+    counter triple the percent delta is computed from across two reads."""
     try:
         cpu = stats["cpu_stats"]
-        pre = stats["precpu_stats"]
-        cpu_delta = (cpu["cpu_usage"]["total_usage"]
-                     - pre["cpu_usage"]["total_usage"])
-        sys_delta = cpu["system_cpu_usage"] - pre["system_cpu_usage"]
+        total = cpu["cpu_usage"]["total_usage"]
+        system = cpu["system_cpu_usage"]
         online = (cpu.get("online_cpus")
                   or len(cpu["cpu_usage"].get("percpu_usage") or [])
                   or 1)
+        return int(total), int(system), int(online)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _cpu_percent_from_prev(prev: tuple[int, int, int] | None,
+                           cur: tuple[int, int, int] | None) -> float | None:
+    """Host-relative busy percent from the delta between the PREVIOUS and
+    current sample (so no precpu, and no in-request sleep). The window is the
+    inter-poll gap (~3s), giving a number as smooth as ``docker stats``.
+
+    Returns None when there is no usable prior sample (a cold first read; the
+    caller seeds the sample and CPU populates on the next poll), and 0.0 for an
+    idle container (no positive delta). Multiplied by ``online_cpus`` so a
+    fully-busy 4-core container reads ~400 (NOT clamped: per-container CPU is
+    multi-core, unlike the host-aggregate heartbeat figure)."""
+    if prev is None or cur is None:
+        return None
+    try:
+        cpu_delta = cur[0] - prev[0]
+        sys_delta = cur[1] - prev[1]
+        online = cur[2] or 1
         if sys_delta > 0 and cpu_delta > 0:
             return round((cpu_delta / sys_delta) * online * 100.0, 1)
         return 0.0
-    except (KeyError, TypeError, ZeroDivisionError):
-        return 0.0
+    except (TypeError, ZeroDivisionError):
+        return None
+
+
+def _prune_cpu_prev(now: float) -> None:
+    """Drop prev-CPU samples not refreshed within the TTL so a removed/renamed
+    container's entry cannot accumulate (bounds the dict)."""
+    stale = [cid for cid, s in list(_cpu_prev.items())
+             if now - s[3] > _CPU_PREV_TTL_SECONDS]
+    for cid in stale:
+        _cpu_prev.pop(cid, None)
 
 
 def _mem(stats: dict) -> tuple[int | None, int | None]:
@@ -247,16 +332,26 @@ def _digest_container(container) -> dict:
         entry.update(_null_metrics())
         return entry
     try:
-        raw = container.stats(stream=False)
+        raw = _read_stats(container)
     except _DOCKER_ERRORS as exc:
         logger.warning("stats_read_failed name=%s err=%s", container.name, exc)
         entry.update(_null_metrics())
         return entry
+    # CPU% is a delta vs THIS greffer's previous sample for the container, used
+    # uniformly for both read paths: the one-shot snapshot carries no precpu,
+    # and the blocking fallback's precpu is ignored so there is one CPU code
+    # path. Cold first read -> None, seeds the sample, populates next poll.
+    # mem/net/blk are gauges/counters, immediate on a single read.
+    cur = _cpu_sample(raw)
+    prev = _cpu_prev.get(container.id)
+    cpu = _cpu_percent_from_prev(prev[:3] if prev else None, cur)
+    if cur is not None:
+        _cpu_prev[container.id] = (cur[0], cur[1], cur[2], time.monotonic())
     used, limit = _mem(raw)
     rx, tx = _net(raw)
     read, write = _blk(raw)
     entry.update(
-        cpu_percent=_cpu_percent(raw),
+        cpu_percent=cpu,
         mem_used_bytes=used,
         mem_limit_bytes=limit,
         net_rx_bytes=rx,
@@ -288,6 +383,7 @@ def _digest_all(containers: list) -> list[dict]:
     client socket timeout). Order is preserved to match enumeration."""
     if not containers:
         return []
+    _prune_cpu_prev(time.monotonic())
     pool = _get_stats_pool()
     futures = [pool.submit(_digest_container, c) for c in containers]
     concurrent.futures.wait(futures, timeout=_STATS_DEADLINE_SECONDS)
