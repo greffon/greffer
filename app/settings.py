@@ -139,6 +139,15 @@ class Settings(BaseSettings):
     # bug Codex caught before merge (greffon/greffer#17 review).
     greffer_workers_enabled: bool = False
 
+    # Remote update opt-in (greffer self-update v2). Default OFF: a
+    # manager-triggered remote update is root-equivalent on the operator's host,
+    # so the authoritative switch is greffer-side and operator-sovereign. The
+    # value is advertised in the register payload so the manager knows whether to
+    # offer the button; the controller update route (a later v2 increment) is a
+    # clear no-op unless this is true. Carries the ``greffer_`` prefix to bind
+    # GREFFER_REMOTE_UPDATE_ENABLED (the prefix pitfall noted above).
+    greffer_remote_update_enabled: bool = False
+
     # Self-health watchdog (greffer-observability epic, Feature #3). The
     # watchdog evaluates /readyz's FATAL conditions and, when one is sustained
     # past the grace window, exits the uvicorn process so ``restart:
