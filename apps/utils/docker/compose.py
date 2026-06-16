@@ -10,7 +10,14 @@ import docker
 import subprocess
 import os
 from urllib.parse import urlparse
-client = docker.from_env()
+# Per-instance stats reads fan multiple concurrent ``container.stats()`` calls
+# at the daemon (see observe._digest_all). docker-py's default connection pool
+# (DEFAULT_MAX_POOL_SIZE=10) would force those concurrent calls to contend for
+# a handful of sockets and churn connections, so we raise the ceiling well
+# above the stats fan-out. This is a pool CAP (lazily filled), not a
+# preallocation, so it costs nothing when idle and is shared by all daemon
+# calls.
+client = docker.from_env(max_pool_size=32)
 
 from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create_volume, docker_is_volume_exist
 
