@@ -202,13 +202,14 @@ class Settings(BaseSettings):
             return 8
 
     # Log surfacing (resource-monitoring epic, Feature 2, logs slice). Default
-    # OFF (fail-closed): container output and especially the captured deploy.log
-    # can echo tenant secrets / registry credentials / pull errors, so the logs
-    # endpoint 404s at the SOURCE until an operator opts in, even if a manager is
-    # misconfigured. The manager has its own LOG_SURFACING_ENABLED gate. Field
-    # name carries the ``greffer_`` prefix to bind GREFFER_LOG_SURFACING_ENABLED
-    # (the prefix pitfall documented on greffer_workers_enabled).
-    greffer_log_surfacing_enabled: bool = False
+    # ON as of the rollout: the security review cleared the streams (only the
+    # owner's own container/deploy output is surfaced, and the docker-compose
+    # env is scrubbed of greffer secrets so a hostile catalog can't exfiltrate
+    # the token). When off, the logs endpoint 404s at the SOURCE. An operator
+    # who does not want logs surfaced sets GREFFER_LOG_SURFACING_ENABLED=false.
+    # Field name carries the ``greffer_`` prefix to bind
+    # GREFFER_LOG_SURFACING_ENABLED (the prefix pitfall on greffer_workers_enabled).
+    greffer_log_surfacing_enabled: bool = True
 
     logger_name: str = "greffer"
 
