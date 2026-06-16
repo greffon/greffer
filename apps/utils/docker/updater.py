@@ -5,7 +5,7 @@ updater recreates the greffer's OWN container, so it has to outlive the process
 it replaces. The controller therefore spawns a SEPARATE, short-lived container
 from the signed, digest-pinned updater image, mounting the docker socket plus
 the same host paths the greffer itself uses, and returns 202 right away. The
-updater then takes the ``/data`` lock, verifies provenance, and recreates the
+updater then takes the ``/work`` lock, verifies provenance, and recreates the
 stack (see ``greffer_cli.updater``).
 
 Host-path discovery: inside a container the bind sources visible on ``/proc``

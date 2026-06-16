@@ -93,7 +93,7 @@ def release_lock(handle) -> None:
 
 def main(argv=None, *, env=None, run=engine.run_remote_update,
          lock_acquire=acquire_lock, lock_release=release_lock) -> int:
-    """Resolve config, take the /data lock, run the engine. ``run`` /
+    """Resolve config, take the /work lock, run the engine. ``run`` /
     ``lock_acquire`` are injectable for tests."""
     argv = sys.argv[1:] if argv is None else argv
     env = os.environ if env is None else env
@@ -108,7 +108,7 @@ def main(argv=None, *, env=None, run=engine.run_remote_update,
 
     handle = lock_acquire()
     if handle is None:
-        print("another update is in progress (/data lock held)", file=sys.stderr)
+        print("another update is in progress (/work lock held)", file=sys.stderr)
         return engine.EXIT_REFUSED
     try:
         return run(**cfg)

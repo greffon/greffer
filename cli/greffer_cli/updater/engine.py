@@ -8,7 +8,7 @@ for recreate -> ``/readyz`` health-gate -> rollback. Fail-closed at every step:
 any verification or floor failure aborts before the node is recreated.
 
 Concurrency: the caller (the updater entrypoint) holds the
-``/data/.greffer-update.lock`` across this call so the recreated controller and a
+``/work/.update.lock`` across this call so the recreated controller and a
 host ``greffer update`` are mutually exclusive (HLD "Concurrency"). The lock is
 out of this module's scope so the verify/recreate logic stays unit-testable.
 """

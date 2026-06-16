@@ -298,7 +298,7 @@ def remote_update(
         recreates the greffer.
 
     The handler does NOT verify provenance or recreate anything itself: it spawns
-    the signed updater, which takes the ``/data`` lock and runs the full verify
+    the signed updater, which takes the ``/work`` lock and runs the full verify
     -> pin -> recreate -> health-gate -> rollback flow, then returns 202 with the
     spawned container id. The target tag is already validated by the model and is
     passed to the updater as a list arg (no shell)."""
