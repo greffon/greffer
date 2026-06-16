@@ -677,7 +677,11 @@ class StartStopTests(TestCase):
         from apps.utils.docker.compose import start
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
+            # Seed a greffer-only secret + PATH so we can assert the child env
+            # is scrubbed of the secret but keeps what the CLI needs.
+            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir,
+                                         'GREFFER_TOKEN': 'super-secret',
+                                         'PATH': '/usr/bin'}):
                 greffon_info = {'id': 'test-start'}
                 os.makedirs(os.path.join(tmpdir, 'test-start'), exist_ok=True)
 
@@ -701,6 +705,10 @@ class StartStopTests(TestCase):
                 # The deploy.log file was created on disk.
                 self.assertTrue(os.path.isfile(
                     os.path.join(tmpdir, 'test-start', 'deploy.log')))
+                # Env is scrubbed: the greffer's token is NOT available for
+                # docker-compose ${} interpolation; PATH is preserved.
+                self.assertNotIn('GREFFER_TOKEN', kwargs['env'])
+                self.assertEqual(kwargs['env'].get('PATH'), '/usr/bin')
 
     @patch('apps.utils.docker.compose.client')
     @patch('apps.utils.docker.compose.subprocess')
@@ -709,7 +717,8 @@ class StartStopTests(TestCase):
         from apps.utils.docker.compose import stop
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
+            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir,
+                                         'GREFFER_TOKEN': 'super-secret'}):
                 greffon_info = {'id': 'test-stop'}
                 os.makedirs(os.path.join(tmpdir, 'test-stop'), exist_ok=True)
 
@@ -723,6 +732,28 @@ class StartStopTests(TestCase):
                 self.assertEqual(call_args[3], '-f')
                 self.assertIn('docker-compose.yml', call_args[4])
                 self.assertEqual(call_args[5], 'stop')
+                # stop is scrubbed symmetrically with start.
+                self.assertNotIn(
+                    'GREFFER_TOKEN', mock_subprocess.Popen.call_args.kwargs['env'])
+
+    def test_compose_env_allowlists_only_safe_vars(self):
+        """_compose_env passes only the CLI/daemon vars, never greffer secrets,
+        so a hostile catalog compose cannot interpolate ${GREFFER_TOKEN}."""
+        from apps.utils.docker.compose import _compose_env
+        with patch.dict(os.environ, {
+            'GREFFER_TOKEN': 'super-secret',
+            'GREFFON_BASE_SERVER': 'https://manager',
+            'GREFFER_ID': 'abc',
+            'PATH': '/usr/bin:/bin',
+            'HOME': '/root',
+            'DOCKER_HOST': 'unix:///var/run/docker.sock',
+        }, clear=True):
+            env = _compose_env()
+        self.assertEqual(env.get('PATH'), '/usr/bin:/bin')
+        self.assertEqual(env.get('HOME'), '/root')
+        self.assertEqual(env.get('DOCKER_HOST'), 'unix:///var/run/docker.sock')
+        for secret in ('GREFFER_TOKEN', 'GREFFON_BASE_SERVER', 'GREFFER_ID'):
+            self.assertNotIn(secret, env)
 
 
 class GetStatusTests(TestCase):
