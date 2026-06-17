@@ -1,9 +1,12 @@
+import logging
 import requests
 import os
 import yaml
-from apps.utils.os.network import (
-    get_free_ports, is_port_free, allocate_ports_in_range)
+from apps.utils.os.network import get_free_ports
 from apps.utils.greffon import sticky_ports
+from apps.utils.docker import l4_ports
+
+logger = logging.getLogger("greffer")
 
 def get_compose_file_from_repository(greffon):
     r = requests.get(greffon['repository_url'])
@@ -41,49 +44,67 @@ def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
         for idx, host_port in zip(idxs, free):
             ports[idx]['port_host'] = host_port
 
-    # L4 (Tier-C) ports: STICKY. The host:port IS the user-facing endpoint
-    # (baked into client configs and persisted inside the app), so reuse the
-    # previously-allocated port when it's still free; otherwise take a fresh one
-    # from the dedicated L4 range (outside the OS ephemeral range, so a stopped
-    # instance's port can't be transiently stolen as a connection source port).
-    # All L4 ports are sticky (same_port and plain alike): this is reuse-if-free,
-    # not a hard reservation — a stopped instance's port is free for others, and
-    # the live bind-probe below rotates this instance off a taken port on the
-    # next start, so persisting does NOT deplete the pool. Probe + allocate on
-    # the SAME interface the port will publish on (l4_bind_host), so the free
-    # check matches what docker-compose will actually bind.
+    # L4 (Tier-C) ports: STICKY + cross-instance, decided against the docker
+    # daemon. The host:port IS the user-facing endpoint (baked into client
+    # configs and persisted inside the app), so reuse the previously-allocated
+    # port when it is still free; otherwise take the lowest free one from the
+    # dedicated L4 range. "Free" is what the daemon publishes for RUNNING
+    # containers, NOT a socket.bind probe: the greffer runs in its own container
+    # network namespace and is blind to host bindings, so a probe reads a
+    # host-occupied port as free and hands the same number to two instances.
+    # See apps/utils/docker/l4_ports.py.
     l4 = [i for i, p in enumerate(ports) if p.get('exposure_tier') == 'l4']
     if l4:
         range_start = int(os.getenv('GREFFER_L4_PORT_RANGE_START', '20000'))
         range_end = int(os.getenv('GREFFER_L4_PORT_RANGE_END', '29999'))
         sticky = sticky_ports.load(greffon_path, instance_id)
-        new_sticky = {}
-        l4_by_proto = {}
-        for i in l4:
-            l4_by_proto.setdefault(ports[i].get('protocol', 'tcp'), []).append(i)
-        for proto, idxs in l4_by_proto.items():
-            assigned = {}   # port index -> host port
-            used = set()    # host ports taken in this protocol batch
-            fresh_needed = []
-            for i in idxs:
-                prev = sticky.get(ports[i]['port_name'])
-                if (prev is not None and prev not in used
-                        and is_port_free(l4_bind_host, prev, proto)):
-                    assigned[i] = prev
-                    used.add(prev)
+        is_tunnel = l4_bind_host == '127.0.0.1'
+        # Serialise the enumerate -> pick -> reserve decision across concurrent
+        # in-process starts (FastAPI runs sync handlers in a threadpool, so two
+        # different instances starting at once are real threads). The lock is
+        # released before docker-compose up (the compose run is NOT serialised);
+        # the pending set bridges the gap until the chosen port's container is
+        # daemon-visible. See apps/utils/docker/l4_ports.py.
+        with l4_ports.allocation_lock():
+            # Ports held right now by every OTHER instance on this host, per
+            # protocol. Excludes this instance's own compose project so a
+            # re-deploy keeps its current ports. Raises L4PortsUnavailable
+            # (-> a clean 503 in the controller) rather than degrading to
+            # "nothing reserved".
+            occupied = l4_ports.published_l4_ports(
+                range_start, range_end, exclude_project=instance_id)
+            pending = l4_ports.pending_and_prune(
+                occupied, exclude_instance=instance_id)
+            batch = {}        # proto -> host ports already assigned this call
+            new_sticky = {}
+            for i in l4:
+                proto = ports[i].get('protocol', 'tcp')
+                name = ports[i]['port_name']
+                prev = sticky.get(name)
+                taken = (occupied.get(proto, set()) | pending.get(proto, set())
+                         | batch.get(proto, set()))
+                if prev is not None and prev not in taken:
+                    host_port = prev                  # sticky reuse: still free
+                elif bool(ports[i].get('same_port')) and not is_tunnel \
+                        and prev is not None:
+                    # Proxy same_port: the pinned advertised port is taken and
+                    # must NOT be rotated (clients baked it in). Fail loudly.
+                    raise l4_ports.L4SamePortConflict(port_name=name, port=prev)
                 else:
-                    fresh_needed.append(i)
-            if fresh_needed:
-                fresh = allocate_ports_in_range(
-                    l4_bind_host, len(fresh_needed), range_start, range_end,
-                    protocol=proto, reserved=used)
-                for i, host_port in zip(fresh_needed, fresh):
-                    assigned[i] = host_port
-                    used.add(host_port)
-            for i in idxs:
-                ports[i]['port_host'] = assigned[i]
-                new_sticky[ports[i]['port_name']] = assigned[i]
-        sticky_ports.save(greffon_path, instance_id, new_sticky)
+                    host_port = l4_ports.lowest_free_port(
+                        range_start, range_end, taken)
+                    if host_port is None:
+                        raise l4_ports.L4PortRangeExhausted(
+                            range_start, range_end)
+                    if prev is not None and prev != host_port:
+                        logger.info(
+                            "l4_port_rotation instance_id=%s port_name=%s "
+                            "old=%s new=%s", instance_id, name, prev, host_port)
+                l4_ports.mark_pending(instance_id, proto, host_port)
+                batch.setdefault(proto, set()).add(host_port)
+                ports[i]['port_host'] = host_port
+                new_sticky[name] = host_port
+            sticky_ports.save(greffon_path, instance_id, new_sticky)
     return greffon_info
 
 
