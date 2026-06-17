@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
@@ -71,6 +72,18 @@ def _settings(request: Request):
     return request.app.state.settings
 
 
+def _refuse_if_updating(settings) -> None:
+    """409 if a self-update is recreating the stack (HLD section 10): a manager
+    start/stop/update must not race the updater, which during a recreate stops/
+    rms/recreates containers and is about to certify the stack on the gate. A
+    non-blocking probe of the ``/data`` update lock; held -> fail fast so the
+    manager retries. No-op where there is no lock to probe (the probe returns
+    False if fcntl or the lock file is unavailable)."""
+    lock_path = Path(settings.greffon_path) / ".update.lock"
+    if updater_spawn.update_in_progress(lock_path):
+        raise HTTPException(status_code=409, detail="update_in_progress")
+
+
 @router.post("/start/")
 def start_greffon(
     payload: GreffonStartRequest, request: Request
@@ -86,6 +99,7 @@ def start_greffon(
     # ``model_dump()`` also includes ``tunnel_client_toml`` — but the
     # downstream compose / repository code only reads keys it knows
     # about, so the extra field is harmless to pass through.
+    _refuse_if_updating(_settings(request))
     greffon = payload.model_dump()
     compose_file = repository.get_compose_file_from_repository(greffon)
     # L4 (Tier-C) ports are published directly on their service. The bind
@@ -208,6 +222,7 @@ def start_greffon(
 def stop_greffon(
     payload: GreffonStopRequest, request: Request
 ) -> GreffonStopResponse:
+    _refuse_if_updating(_settings(request))
     greffon = payload.model_dump()
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
     _t0 = time.monotonic()
@@ -310,10 +325,10 @@ def remote_update(
         recreates the greffer.
 
     The handler does NOT verify provenance or recreate anything itself: it spawns
-    the signed updater, which takes the ``/work`` lock and runs the full verify
-    -> pin -> recreate -> health-gate -> rollback flow, then returns 202 with the
-    spawned container id. The target tag is already validated by the model and is
-    passed to the updater as a list arg (no shell)."""
+    the signed updater, which takes the ``/data`` lock and runs the full
+    verify-then-pull -> recreate -> health-gate -> rollback flow, then returns 202
+    with the spawned container id. The target tag is validated by the model and
+    passed to the updater via ``GREFFER_UPDATER_TARGET_TAG`` (no shell)."""
     settings = _settings(request)
     if not settings.greffer_remote_update_enabled:
         raise HTTPException(
@@ -341,14 +356,16 @@ def remote_update(
             detail="updater_image_not_digest_pinned",
         )
 
+    # Refuse if an update is already recreating the stack (HLD section 10): avoid
+    # spawning a second updater that would only fail to take the /data lock.
+    _refuse_if_updating(settings)
+
     instance_id_var.set(None)  # node-level op, not tied to a greffon instance
     try:
         updater_id = updater_spawn.spawn_updater(
             image=settings.greffer_updater_image,
             target_tag=payload.target_tag,
-            manifest_url=settings.greffer_version_manifest_url,
             greffer_id=settings.greffer_id,
-            mode=settings.greffer_mode or "proxy",
             data_dest=str(settings.greffon_path),
         )
     except updater_spawn.UpdaterSpawnError as exc:

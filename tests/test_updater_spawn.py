@@ -1,8 +1,9 @@
 """Tests for the v2 updater spawn module (apps/utils/docker/updater.py).
 
-The docker SDK client is faked, so no real daemon. Focus: host-path discovery
-off the greffer's own container record (compose dir -> /work, /data preserved by
-mount Type), the docker-socket mount, the run args, and the fail-closed errors.
+The docker SDK client is faked, so no real daemon. Focus: socket-only wiring
+(/data preserved by mount Type + the docker socket, NO compose dir), target_tag
+passed via env, the run args, the digest-pin contract, the fail-closed errors,
+and the update_in_progress lock probe (HLD section 10).
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import pytest
 from apps.utils.docker import updater
 
 _IMG = "greffon/greffer-updater@sha256:" + "0" * 64
-_BIND_APP = {"Type": "bind", "Source": "/host/greffer", "Destination": "/app"}
 _VOL_DATA = {"Type": "volume", "Name": "greffer-data", "Source": "/var/lib/docker/x",
              "Destination": "/data"}
 
@@ -54,43 +54,45 @@ def _by_target(mounts):
     return {m["Target"]: m for m in mounts}
 
 
-def test_spawn_happy_wires_mounts_env_and_command():
-    client = _client([_BIND_APP, _VOL_DATA])
+def test_spawn_happy_socket_only_with_target_tag_env():
+    client = _client([_VOL_DATA])
     cid = updater.spawn_updater(
         image="greffon/greffer-updater@sha256:" + "a" * 64,
-        target_tag="0.3.6", manifest_url="https://x/m.json",
-        greffer_id="g1", mode="tunnel", client=client)
+        target_tag="0.3.6", greffer_id="g1", client=client)
     assert cid == "cid0123456789"
     call = client.containers.run_calls[0]
-    assert call["command"] == ["python", "-m", "greffer_cli.updater", "0.3.6"]
+    # no positional target_tag arg (it goes via env now)
+    assert call["command"] == ["python", "-m", "greffer_cli.updater"]
     assert call["detach"] is True
     assert call["remove"] is True  # one-shot: don't litter the host
-    assert call["environment"]["GREFFER_VERSION_MANIFEST_URL"] == "https://x/m.json"
     assert call["environment"]["GREFFER_ID"] == "g1"
-    assert call["environment"]["GREFFER_MODE"] == "tunnel"
+    assert call["environment"]["GREFFER_UPDATER_TARGET_TAG"] == "0.3.6"
+    # the socket model drops the manifest + mode env entirely
+    assert "GREFFER_VERSION_MANIFEST_URL" not in call["environment"]
+    assert "GREFFER_MODE" not in call["environment"]
     mounts = _by_target(call["mounts"])
-    # compose dir host source -> /work
-    assert mounts["/work"]["Source"] == "/host/greffer"
-    assert mounts["/work"]["Type"] == "bind"
-    # /data preserved as a NAMED VOLUME (source = volume name, not host path)
-    assert mounts["/data"]["Source"] == "greffer-data"
+    # socket-only: ONLY /data + the docker socket, NO /work compose dir
+    assert set(mounts) == {"/data", "/var/run/docker.sock"}
+    assert mounts["/data"]["Source"] == "greffer-data"  # named volume preserved
     assert mounts["/data"]["Type"] == "volume"
-    # docker socket, bind-mounted
-    assert mounts["/var/run/docker.sock"]["Source"] == "/var/run/docker.sock"
     assert mounts["/var/run/docker.sock"]["Type"] == "bind"
 
 
+def test_spawn_no_target_tag_omits_env():
+    # latest (None) -> no GREFFER_UPDATER_TARGET_TAG; the updater defaults to latest
+    client = _client([_VOL_DATA])
+    updater.spawn_updater(image=_IMG, target_tag=None, greffer_id="g1", client=client)
+    assert "GREFFER_UPDATER_TARGET_TAG" not in client.containers.run_calls[0]["environment"]
+
+
 def test_spawn_unpinned_image_refuses():
-    # The most privileged container must be digest-pinned; a mutable tag is
-    # refused fail-closed (nothing spawned).
-    client = _client([_BIND_APP, _VOL_DATA])
+    client = _client([_VOL_DATA])
     for bad in ("greffon/greffer-updater:latest", "greffon/greffer-updater",
                 "greffon/greffer-updater@sha256:tooshort"):
         with pytest.raises(updater.UpdaterSpawnError):
-            updater.spawn_updater(
-                image=bad, target_tag="0.3.6", manifest_url="https://x",
-                greffer_id="g1", mode="proxy", client=client)
-    assert client.containers.run_calls == []
+            updater.spawn_updater(image=bad, target_tag="0.3.6", greffer_id="g1",
+                                  client=client)
+    assert client.containers.run_calls == []  # never spawned
 
 
 def test_is_digest_pinned():
@@ -108,10 +110,8 @@ def test_is_digest_pinned():
 
 def test_spawn_bind_data_preserves_host_path():
     bind_data = {"Type": "bind", "Source": "/host/data", "Destination": "/data"}
-    client = _client([_BIND_APP, bind_data])
-    updater.spawn_updater(
-        image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-        greffer_id="g1", mode="proxy", client=client)
+    client = _client([bind_data])
+    updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1", client=client)
     mounts = _by_target(client.containers.run_calls[0]["mounts"])
     assert mounts["/data"]["Source"] == "/host/data"
     assert mounts["/data"]["Type"] == "bind"
@@ -119,68 +119,69 @@ def test_spawn_bind_data_preserves_host_path():
 
 def test_spawn_custom_data_dest():
     custom = {"Type": "volume", "Name": "v", "Destination": "/srv/state"}
-    client = _client([_BIND_APP, custom])
-    updater.spawn_updater(
-        image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-        greffer_id="g1", mode="proxy", data_dest="/srv/state", client=client)
-    mounts = _by_target(client.containers.run_calls[0]["mounts"])
-    assert mounts["/data"]["Source"] == "v"
+    client = _client([custom])
+    updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1",
+                          data_dest="/srv/state", client=client)
+    assert _by_target(client.containers.run_calls[0]["mounts"])["/data"]["Source"] == "v"
 
 
 def test_spawn_empty_image_refuses():
     with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image="", target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=_client([_BIND_APP, _VOL_DATA]))
+        updater.spawn_updater(image="", target_tag="0.3.6", greffer_id="g1",
+                              client=_client([_VOL_DATA]))
 
 
 def test_spawn_missing_data_mount_refuses():
-    client = _client([_BIND_APP])  # no /data
+    client = _client([])  # no /data
     with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=client)
+        updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1", client=client)
     assert client.containers.run_calls == []  # never spawned
-
-
-def test_spawn_missing_compose_mount_refuses():
-    client = _client([_VOL_DATA])  # no /app
-    with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=client)
 
 
 def test_spawn_volume_without_source_refuses():
     bad = {"Type": "volume", "Destination": "/data"}  # no Name/Source
-    client = _client([_BIND_APP, bad])
+    client = _client([bad])
     with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=client)
+        updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1", client=client)
 
 
 def test_spawn_self_not_found_refuses():
-    containers = _FakeContainers({"Mounts": [_BIND_APP, _VOL_DATA]})
+    containers = _FakeContainers({"Mounts": [_VOL_DATA]})
     containers.get = MagicMock(side_effect=docker.errors.NotFound("nope"))
     with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=_FakeClient(containers))
+        updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1",
+                              client=_FakeClient(containers))
 
 
 def test_spawn_run_api_error_refuses():
-    client = _client([_BIND_APP, _VOL_DATA],
-                     run_exc=docker.errors.APIError("daemon boom"))
+    client = _client([_VOL_DATA], run_exc=docker.errors.APIError("daemon boom"))
     with pytest.raises(updater.UpdaterSpawnError):
-        updater.spawn_updater(
-            image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-            greffer_id="g1", mode="proxy", client=client)
+        updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id="g1", client=client)
 
 
 def test_spawn_none_greffer_id_becomes_empty_env():
-    client = _client([_BIND_APP, _VOL_DATA])
-    updater.spawn_updater(
-        image=_IMG, target_tag="0.3.6", manifest_url="https://x",
-        greffer_id=None, mode="proxy", client=client)
+    client = _client([_VOL_DATA])
+    updater.spawn_updater(image=_IMG, target_tag="0.3.6", greffer_id=None, client=client)
     assert client.containers.run_calls[0]["environment"]["GREFFER_ID"] == ""
+
+
+# --- update_in_progress lock probe (HLD section 10) -----------------
+
+def test_update_in_progress_false_when_unlocked(tmp_path):
+    assert updater.update_in_progress(tmp_path / ".update.lock") is False
+
+
+def test_update_in_progress_true_when_held(tmp_path):
+    import fcntl
+    lock = tmp_path / ".update.lock"
+    fh = open(lock, "w", encoding="utf-8")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # another actor holds it
+    try:
+        assert updater.update_in_progress(lock) is True
+    finally:
+        fh.close()
+
+
+def test_update_in_progress_false_when_unopenable(tmp_path):
+    # a path under a missing dir can't be opened -> can't tell -> do not block
+    assert updater.update_in_progress(tmp_path / "missing" / ".update.lock") is False
