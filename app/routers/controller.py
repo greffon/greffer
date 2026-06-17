@@ -43,7 +43,7 @@ from app.tunnel_config import (
 )
 
 # Framework-agnostic shared code imported directly — no rewrite.
-from apps.utils.docker import compose, instance_logs, observe
+from apps.utils.docker import compose, instance_logs, l4_ports, observe
 from apps.utils.docker import updater as updater_spawn
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
@@ -99,8 +99,20 @@ def start_greffon(
         if _settings(request).greffer_mode == 'tunnel'
         else '0.0.0.0'
     )
-    greffon_info = repository.get_greffon_info(
-        compose_file, greffon, l4_bind_host=l4_bind_host)
+    # L4 host-port allocation can fail in three ways the operator must see as a
+    # clean start error rather than an opaque 500 or a silent crash-looping
+    # container: a proxy same_port endpoint whose pinned port a neighbour took
+    # (409), an exhausted L4 range (409), or an unreachable docker daemon (503).
+    try:
+        greffon_info = repository.get_greffon_info(
+            compose_file, greffon, l4_bind_host=l4_bind_host)
+    except l4_ports.L4SamePortConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except l4_ports.L4PortRangeExhausted as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except l4_ports.L4PortsUnavailable as exc:
+        logger.warning("%s", exc)  # exc message already carries the machine code
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     # Tag this request's logs with the instance id (Feature #4), so the compose
     # run correlates with the manager action by both request_id and instance_id.
     instance_id_var.set(greffon_info["id"])

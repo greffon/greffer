@@ -108,6 +108,60 @@ async def test_start_success(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_same_port_conflict_returns_409(client: AsyncClient) -> None:
+    """A proxy same_port endpoint whose pinned port a neighbour holds surfaces
+    as a clean 409 with the machine code, not a 500 or a crash-looping container."""
+    from apps.utils.docker.l4_ports import L4SamePortConflict
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4SamePortConflict(
+            port_name="wireguard_51820", port=20000
+        )
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 409
+    assert "l4_same_port_conflict" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_range_exhausted_returns_409(client: AsyncClient) -> None:
+    from apps.utils.docker.l4_ports import L4PortRangeExhausted
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4PortRangeExhausted(20000, 29999)
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 409
+    assert "l4_port_range_exhausted" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_daemon_unavailable_returns_503(client: AsyncClient) -> None:
+    from apps.utils.docker.l4_ports import L4PortsUnavailable
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4PortsUnavailable(
+            "l4_port_enumeration_failed: boom"
+        )
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 503
+    assert "l4_port_enumeration_failed" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_start_rejects_missing_fields(client: AsyncClient) -> None:
     r = await client.post(
         "/api/controller/start/",

@@ -245,13 +245,13 @@ class GetGreffonInfoMixedProtocolTests(TestCase):
         return get_greffon_info(compose, greffon)
 
     @patch('apps.utils.greffon.repository.sticky_ports')
-    @patch('apps.utils.greffon.repository.allocate_ports_in_range')
+    @patch('apps.utils.docker.l4_ports.published_l4_ports', return_value={})
     @patch('apps.utils.greffon.repository.get_free_ports')
     def test_allocates_port_host_for_tcp_and_udp(
-            self, mock_get_free_ports, mock_alloc_range, mock_sticky):
+            self, mock_get_free_ports, _occ, mock_sticky):
         """A compose with one Tier-A TCP and one L4 UDP port: the Tier-A port
-        gets an ephemeral host port (get_free_ports), the L4 port a sticky one
-        from the dedicated L4 range (allocate_ports_in_range)."""
+        gets an ephemeral host port (get_free_ports), the L4 port the lowest
+        free one from the dedicated L4 range (daemon-checked, then persisted)."""
         compose = {
             'version': '3',
             'services': {
@@ -271,22 +271,19 @@ class GetGreffonInfoMixedProtocolTests(TestCase):
         mock_sticky.load.return_value = {}  # no prior allocation
         mock_get_free_ports.side_effect = (
             lambda numbers, protocol='tcp': [30000 + i for i in range(numbers)])
-        mock_alloc_range.return_value = [40000]
 
         result = self._call(compose, greffon)
 
         self.assertTrue(all('port_host' in p for p in result['ports']))
         tcp_port = next(p for p in result['ports'] if p['exposure_tier'] != 'l4')
         udp_port = next(p for p in result['ports'] if p['exposure_tier'] == 'l4')
-        self.assertEqual(tcp_port['port_host'], 30000)  # ephemeral
-        self.assertEqual(udp_port['port_host'], 40000)  # L4 range
+        self.assertEqual(tcp_port['port_host'], 30000)   # ephemeral
+        self.assertEqual(udp_port['port_host'], 20000)   # lowest free in L4 range
 
-        # Tier-A went through get_free_ports (tcp only); L4 went through the
-        # range allocator (udp), and the result was persisted as sticky.
+        # Tier-A went through get_free_ports (tcp only); the L4 port was picked
+        # from the daemon view and persisted as sticky.
         self.assertEqual(
             [c.kwargs['protocol'] for c in mock_get_free_ports.call_args_list], ['tcp'])
-        mock_alloc_range.assert_called_once()
-        self.assertEqual(mock_alloc_range.call_args.kwargs['protocol'], 'udp')
         mock_sticky.save.assert_called_once()
 
     @patch('apps.utils.greffon.repository.get_free_ports')
