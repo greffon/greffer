@@ -27,11 +27,13 @@ def _setup(monkeypatch, *, forward_gate=update.GATE_READY, rollback_ok=True,
            verify_raises=False, inspect_none=False, stack=None):
     """Wire a happy stack; knobs flip individual failures. Returns a `calls`
     dict recording which primitives ran (for assertions)."""
-    calls: dict = {"recreate": [], "rollback": [], "retag": [], "prune": 0, "tag_previous": []}
+    calls: dict = {"recreate": [], "rollback": [], "retag": [], "prune": 0,
+                   "tag_previous": [], "tags": []}
     monkeypatch.setattr(recreate, "discover_stack",
                         lambda: list(_STACK if stack is None else stack))
 
     def verify(repo, **k):
+        calls["tags"].append(k.get("tag"))
         if verify_raises:
             raise recreate.VerifyError(f"boom {repo}")
         return _DIGEST
@@ -67,9 +69,10 @@ def _setup(monkeypatch, *, forward_gate=update.GATE_READY, rollback_ok=True,
     return calls
 
 
-def _run():
+def _run(target_tag=None):
     return engine.run_remote_update(
-        cosign_pub="/k", greffer_id="g1", sleep=lambda _s: None, now=lambda: 0.0)
+        cosign_pub="/k", greffer_id="g1", target_tag=target_tag,
+        sleep=lambda _s: None, now=lambda: 0.0)
 
 
 def test_happy_path_recreates_all_and_prunes(monkeypatch):
@@ -146,5 +149,42 @@ def test_is_downgrade_helper():
     assert engine._is_downgrade("0.3.4", "0.3.5") is True
     assert engine._is_downgrade("0.3.5", "0.3.4") is False
     assert engine._is_downgrade("0.3.5", "0.3.5") is False
+    assert engine._is_downgrade("0.3.10", "0.3.9") is False  # dotted-numeric, not string
     assert engine._is_downgrade("latest", "0.3.5") is False  # non-numeric -> not a downgrade
     assert engine._is_downgrade(None, "0.3.5") is False
+
+
+# --- target_tag threading + pre-run downgrade refusal ---------------
+
+def test_default_tag_is_latest(monkeypatch):
+    calls = _setup(monkeypatch)
+    assert _run() == engine.EXIT_OK
+    assert calls["tags"] == ["latest", "latest", "latest"]  # one per image
+
+
+def test_target_tag_is_threaded_to_verify(monkeypatch):
+    calls = _setup(monkeypatch, old_version="0.3.4", new_version="0.3.6")
+    assert _run(target_tag="0.3.6") == engine.EXIT_OK
+    assert calls["tags"] == ["0.3.6", "0.3.6", "0.3.6"]  # same version for all -> cohesive
+
+
+def test_pre_run_downgrade_refused_before_pull(monkeypatch):
+    calls = _setup(monkeypatch, old_version="0.3.5")
+    assert _run(target_tag="0.3.4") == engine.EXIT_REFUSED
+    # refused BEFORE phase 1: nothing verified, pulled, or recreated
+    assert calls["tags"] == [] and calls["recreate"] == [] and calls["rollback"] == []
+
+
+def test_non_numeric_target_skips_pre_run_check(monkeypatch):
+    # "latest" is not comparable, so the pre-run check is skipped and the update
+    # proceeds (the post-gate guard is the backstop)
+    calls = _setup(monkeypatch, old_version="0.3.5", new_version="0.3.6")
+    assert _run(target_tag="latest") == engine.EXIT_OK
+    assert calls["tags"] == ["latest", "latest", "latest"]
+
+
+def test_equal_target_is_not_a_downgrade(monkeypatch):
+    # target == current passes (idempotent re-recreate), not refused
+    calls = _setup(monkeypatch, old_version="0.3.5", new_version="0.3.5")
+    assert _run(target_tag="0.3.5") == engine.EXIT_OK
+    assert calls["recreate"] == ["nginx", "greffer", "tunnel-sidecar"]

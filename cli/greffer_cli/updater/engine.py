@@ -82,12 +82,14 @@ def _rollback(done: list, *, greffer_name: str, greffer_id: str | None,
 
 
 def run_remote_update(
-    *, cosign_pub: str, greffer_id: str | None, timeout: float = 600.0,
+    *, cosign_pub: str, greffer_id: str | None, target_tag: str | None = None,
+    timeout: float = 600.0,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Run the socket-only ``:latest`` update. Returns an ``EXIT_*`` code.
-    Nothing is recreated unless every image verifies."""
+    """Run the socket-only update. ``target_tag`` is the server-resolved version
+    to pull (default ``latest``). Returns an ``EXIT_*`` code. Nothing is recreated
+    unless every image verifies."""
     stack = recreate.discover_stack()
     if not stack:
         logger.error("remote update refused: could not discover the greffon stack")
@@ -97,16 +99,28 @@ def run_remote_update(
         logger.error("remote update refused: greffer not in the discovered stack")
         return EXIT_REFUSED
 
-    # Phase 1: verify + pull every image by digest, fail-closed. No :latest is
-    # moved and nothing is recreated, so a failure here is a clean no-op refusal.
+    old_version = recreate.exec_version(greffer.container_id)
+
+    # Pre-run no-downgrade refusal (HLD section 11): a numeric target_tag lower
+    # than the currently-running version is a downgrade, so refuse BEFORE pulling
+    # and the old image never runs. A non-numeric target (latest) is not
+    # comparable (_is_downgrade returns False) and falls through to the post-gate
+    # guard. The running version is read from the still-trusted current image.
+    if target_tag and _is_downgrade(target_tag, old_version):
+        logger.error("remote update refused: target %s is below the running %s",
+                     target_tag, old_version)
+        return EXIT_REFUSED
+
+    tag = target_tag or "latest"
+    # Phase 1: verify + pull every image at <tag> by digest, fail-closed. No
+    # :latest is moved and nothing is recreated, so a failure here is a clean
+    # no-op refusal (this also covers a partial publish: a missing tag aborts).
     try:
-        verified = {c.repo: recreate.verify_and_pull(c.repo, cosign_pub=cosign_pub)
+        verified = {c.repo: recreate.verify_and_pull(c.repo, cosign_pub=cosign_pub, tag=tag)
                     for c in stack}
     except recreate.VerifyError as exc:
         logger.error("remote update refused, no recreate: %s", exc)
         return EXIT_REFUSED
-
-    old_version = recreate.exec_version(greffer.container_id)
 
     # Phase 2a: snapshot every container BEFORE mutating anything (so a failed
     # inspect is a clean refusal, and rollback can reuse the pre-update inspect).

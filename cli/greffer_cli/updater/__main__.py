@@ -31,11 +31,13 @@ _NO_LOCK = object()
 
 
 def _config_from_env(env: dict) -> dict:
-    """The socket-model config: no target_tag (update to latest), no manifest /
+    """The socket-model config: a server-resolved ``target_tag`` (the controller
+    sets ``GREFFER_UPDATER_TARGET_TAG``; absent -> ``latest``), no manifest /
     floor / compose path. All keys have defaults, so this never raises."""
     return {
         "cosign_pub": env.get("GREFFER_COSIGN_PUB", DEFAULT_COSIGN_PUB),
         "greffer_id": env.get("GREFFER_ID"),
+        "target_tag": env.get("GREFFER_UPDATER_TARGET_TAG") or None,
         "timeout": float(env.get("GREFFER_UPDATER_TIMEOUT", "600")),
     }
 

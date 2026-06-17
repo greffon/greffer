@@ -135,13 +135,14 @@ def current_image_id(repo: str) -> str | None:
     return res.stdout.strip() if res.ok and res.stdout.strip() else None
 
 
-def verify_and_pull(repo: str, *, cosign_pub: str) -> str:
-    """Resolve ``<repo>:latest`` to its index digest ``D``, cosign-verify ``D``
-    bound to ``repo``, and ``docker pull`` by ``@D`` (only the verified bytes are
-    ever fetched, closing the tag-moved TOCTOU). Returns ``D``. Does NOT move the
-    local ``:latest`` tag, so the engine can verify the WHOLE stack fail-closed
-    before any tag moves or any container is recreated. Raises ``VerifyError``."""
-    ref = f"{repo}:latest"
+def verify_and_pull(repo: str, *, cosign_pub: str, tag: str = "latest") -> str:
+    """Resolve ``<repo>:<tag>`` (the server-resolved ``target_tag``, default
+    ``latest``) to its index digest ``D``, cosign-verify ``D`` bound to ``repo``,
+    and ``docker pull`` by ``@D`` (only the verified bytes are ever fetched,
+    closing the tag-moved TOCTOU). Returns ``D``. Does NOT move the local
+    ``:latest`` tag, so the engine can verify the WHOLE stack fail-closed before
+    any tag moves or any container is recreated. Raises ``VerifyError``."""
+    ref = f"{repo}:{tag}"
     digest = provenance.resolve_digest(ref)
     if not digest:
         raise VerifyError(f"cannot resolve digest for {ref}")
@@ -162,10 +163,10 @@ def retag_latest(repo: str, digest: str) -> bool:
     return _run(["tag", f"{repo}@{digest}", f"{repo}:latest"], timeout=30).ok
 
 
-def verify_then_pull(repo: str, *, cosign_pub: str) -> str:
+def verify_then_pull(repo: str, *, cosign_pub: str, tag: str = "latest") -> str:
     """``verify_and_pull`` then ``retag_latest`` for one repo (HLD sections 3 +
     13). Raises ``VerifyError`` fail-closed; recreates nothing."""
-    digest = verify_and_pull(repo, cosign_pub=cosign_pub)
+    digest = verify_and_pull(repo, cosign_pub=cosign_pub, tag=tag)
     if not retag_latest(repo, digest):
         raise VerifyError(f"retag {repo}@{digest} -> {repo}:latest failed")
     return digest

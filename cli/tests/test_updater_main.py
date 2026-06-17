@@ -17,13 +17,22 @@ def test_config_from_env_defaults():
     cfg = entry._config_from_env({})
     assert cfg["cosign_pub"] == entry.DEFAULT_COSIGN_PUB
     assert cfg["greffer_id"] is None
+    assert cfg["target_tag"] is None  # absent -> the engine defaults to latest
     assert cfg["timeout"] == 600.0
 
 
 def test_config_from_env_overrides():
     cfg = entry._config_from_env(
-        {"GREFFER_COSIGN_PUB": "/x", "GREFFER_ID": "g9", "GREFFER_UPDATER_TIMEOUT": "120"})
-    assert cfg == {"cosign_pub": "/x", "greffer_id": "g9", "timeout": 120.0}
+        {"GREFFER_COSIGN_PUB": "/x", "GREFFER_ID": "g9",
+         "GREFFER_UPDATER_TARGET_TAG": "0.3.6", "GREFFER_UPDATER_TIMEOUT": "120"})
+    assert cfg == {"cosign_pub": "/x", "greffer_id": "g9",
+                   "target_tag": "0.3.6", "timeout": 120.0}
+
+
+def test_config_blank_target_tag_is_none():
+    # an empty GREFFER_UPDATER_TARGET_TAG must normalize to None (-> latest),
+    # not the empty string (which would build an invalid `<repo>:` ref)
+    assert entry._config_from_env({"GREFFER_UPDATER_TARGET_TAG": ""})["target_tag"] is None
 
 
 def test_main_takes_lock_runs_engine_releases():

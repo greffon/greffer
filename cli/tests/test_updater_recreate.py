@@ -446,6 +446,16 @@ def test_verify_and_pull_pull_failure_raises(monkeypatch):
         recreate.verify_and_pull("greffon/greffer", cosign_pub="/k")
 
 
+def test_verify_and_pull_resolves_the_target_tag(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(provenance, "resolve_digest",
+                        lambda ref: (seen.update(ref=ref), _D)[1])
+    monkeypatch.setattr(provenance, "cosign_verify", lambda repo, d, **k: True)
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok())
+    recreate.verify_and_pull("greffon/greffer", cosign_pub="/k", tag="0.3.6")
+    assert seen["ref"] == "greffon/greffer:0.3.6"  # resolves the target tag, not :latest
+
+
 def test_retag_latest_points_latest_at_digest(monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(compose, "_run", lambda a, **k: (calls.append(a[1:]), _ok())[1])
