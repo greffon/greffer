@@ -442,44 +442,48 @@ def data_volume_is_named(compose_file: Path) -> bool:
     return False
 
 
+# The /readyz probe body, shared so the compose path (this module) and the v2
+# socket path (greffer_cli.updater) run the IDENTICAL probe and cannot drift.
+# Resolves X-GREFFON-TOKEN the way the service does (env GREFFER_TOKEN then the
+# persisted /data/.greffer-token); the token never leaves the container, the
+# caller only reads the response body. Exit 0 on any HTTP response (200 or 503,
+# both carry a JSON body the caller inspects), non-zero on a connection error so
+# the caller keeps polling.
+GREFFER_READYZ_PROBE = (
+    "import sys, os, urllib.request, urllib.error\n"
+    "tok = os.environ.get('GREFFER_TOKEN')\n"
+    "if not tok:\n"
+    "    try:\n"
+    "        tok = open('/data/.greffer-token', encoding='utf-8').read().strip()\n"
+    "    except OSError:\n"
+    "        tok = ''\n"
+    "req = urllib.request.Request(\n"
+    "    'http://localhost:8000/readyz',\n"
+    "    headers={'X-GREFFON-TOKEN': tok},\n"
+    ")\n"
+    "try:\n"
+    "    r = urllib.request.urlopen(req, timeout=5)\n"
+    "    sys.stdout.write(r.read().decode()); sys.exit(0)\n"
+    "except urllib.error.HTTPError as e:\n"
+    "    sys.stdout.write(e.read().decode()); sys.exit(0)\n"
+    "except urllib.error.URLError:\n"
+    "    sys.exit(1)\n"
+)
+
+
 def exec_in_greffer_readyz(compose_file: Path) -> CommandResult:
     """Probe ``/readyz`` from inside the greffer container, returning its body.
 
     Unlike ``exec_in_greffer_healthz`` (which only maps a 200 to exit 0),
     this returns the parsed-able JSON body on stdout so the caller can
-    read ``id`` / ``status`` / ``reasons``. ``/readyz`` is authed, so the
-    probe resolves ``X-GREFFON-TOKEN`` the way the service does (env
-    ``GREFFER_TOKEN`` then the persisted ``/data/.greffer-token``) and
-    sends it. The token never leaves the container: the CLI only reads
-    the response body. Exit 0 on any HTTP response (200 or 503 — both
-    carry a JSON body the caller inspects); non-zero on a connection
-    error so the caller keeps polling.
+    read ``id`` / ``status`` / ``reasons``. Uses the shared
+    ``GREFFER_READYZ_PROBE`` so the socket-path updater probes identically.
     """
-    probe = (
-        "import sys, os, urllib.request, urllib.error\n"
-        "tok = os.environ.get('GREFFER_TOKEN')\n"
-        "if not tok:\n"
-        "    try:\n"
-        "        tok = open('/data/.greffer-token', encoding='utf-8').read().strip()\n"
-        "    except OSError:\n"
-        "        tok = ''\n"
-        "req = urllib.request.Request(\n"
-        "    'http://localhost:8000/readyz',\n"
-        "    headers={'X-GREFFON-TOKEN': tok},\n"
-        ")\n"
-        "try:\n"
-        "    r = urllib.request.urlopen(req, timeout=5)\n"
-        "    sys.stdout.write(r.read().decode()); sys.exit(0)\n"
-        "except urllib.error.HTTPError as e:\n"
-        "    sys.stdout.write(e.read().decode()); sys.exit(0)\n"
-        "except urllib.error.URLError:\n"
-        "    sys.exit(1)\n"
-    )
     return _run(
         [
             "docker", "compose", "-f", str(compose_file),
             "exec", "-T", "greffer",
-            "python", "-c", probe,
+            "python", "-c", GREFFER_READYZ_PROBE,
         ],
         timeout=15,
     )

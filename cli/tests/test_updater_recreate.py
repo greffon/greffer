@@ -414,3 +414,94 @@ def test_recreate_one_start_failure_is_reported(monkeypatch):
     c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
     assert recreate.recreate_one(
         c, image_ref="x:latest", old_image_id="sha256:old") is False
+
+
+def test_recreate_one_uses_passed_inspect_without_reinspecting(monkeypatch):
+    monkeypatch.setattr(recreate, "inspect_container",
+                        lambda cid: pytest.fail("should not re-inspect when inspect is passed"))
+    monkeypatch.setattr(recreate, "image_config", lambda ref: {})
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok())
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="greffon/greffer:latest", old_image_id="sha256:old",
+        inspected=_greffer_inspect()) is True
+
+
+# --- verify_and_pull / retag_latest split (fail-closed before any tag moves) ---
+
+def test_verify_and_pull_does_not_retag(monkeypatch):
+    _patch_provenance(monkeypatch)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (calls.append(a[1:]), _ok())[1])
+    assert recreate.verify_and_pull("greffon/greffer", cosign_pub="/k") == _D
+    assert ["pull", f"greffon/greffer@{_D}"] in calls
+    assert not any(c and c[0] == "tag" for c in calls)  # no :latest move
+
+
+def test_verify_and_pull_pull_failure_raises(monkeypatch):
+    _patch_provenance(monkeypatch)
+    monkeypatch.setattr(compose, "_run",
+                        lambda a, **k: _fail() if a[1] == "pull" else _ok())
+    with pytest.raises(recreate.VerifyError):
+        recreate.verify_and_pull("greffon/greffer", cosign_pub="/k")
+
+
+def test_retag_latest_points_latest_at_digest(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (calls.append(a[1:]), _ok())[1])
+    assert recreate.retag_latest("greffon/greffer", _D) is True
+    assert ["tag", f"greffon/greffer@{_D}", "greffon/greffer:latest"] in calls
+
+
+# --- rollback_one (recreate from the OLD image id, by NAME) ----------
+
+def test_rollback_one_recreates_from_old_image_by_name(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(recreate, "image_config", lambda ref: {})
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (calls.append(a[1:]), _ok())[1])
+    c = recreate.StackContainer("greffer", "new-cid-after-recreate", "greffon/greffer")
+    inspected = {"Name": "/greffer-greffer-1", "Config": {}, "HostConfig": {}, "Mounts": []}
+    assert recreate.rollback_one(c, inspected, "sha256:oldimg") is True
+    assert [x[0] for x in calls] == ["stop", "rm", "create", "start"]
+    create = next(x for x in calls if x[0] == "create")
+    assert create[-1] == "sha256:oldimg"            # recreated FROM the old image
+    # targets by NAME (the forward recreate changed the id), not the stale cid
+    assert ["stop", "-t", "30", "greffer-greffer-1"] == calls[0]
+    assert "new-cid-after-recreate" not in [tok for c2 in calls for tok in c2]
+
+
+# --- socket probes for the gate -------------------------------------
+
+def test_exec_readyz_uses_shared_probe(monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (seen.update(args=a), _ok("{}"))[1])
+    recreate.exec_readyz("greffer-greffer-1")
+    assert seen["args"][:4] == ["docker", "exec", "greffer-greffer-1", "python"]
+    assert compose.GREFFER_READYZ_PROBE in seen["args"]  # shared, cannot drift
+
+
+def test_exec_version_reads_stdout(monkeypatch):
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("0.3.5\n"))
+    assert recreate.exec_version("greffer-greffer-1") == "0.3.5"
+
+
+def test_container_running(monkeypatch):
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("true\n"))
+    assert recreate.container_running("x") is True
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("false\n"))
+    assert recreate.container_running("x") is False
+
+
+def test_container_image_id_by_name(monkeypatch):
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("sha256:img\n"))
+    assert recreate.container_image_id_by_name("x") == "sha256:img"
+
+
+def test_restart_count_parses_int(monkeypatch):
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("3\n"))
+    assert recreate.restart_count("x") == 3
+
+
+def test_restart_count_unparseable_is_zero(monkeypatch):
+    monkeypatch.setattr(compose, "_run", lambda a, **k: _ok("nope"))
+    assert recreate.restart_count("x") == 0

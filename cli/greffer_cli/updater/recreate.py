@@ -135,16 +135,12 @@ def current_image_id(repo: str) -> str | None:
     return res.stdout.strip() if res.ok and res.stdout.strip() else None
 
 
-def verify_then_pull(repo: str, *, cosign_pub: str) -> str:
-    """Verify-then-pull for one repo (HLD sections 3 + 13). Resolve ``:latest``
-    to its index digest ``D``, cosign-verify ``D`` bound to ``repo``, ``docker
-    pull`` by ``@D`` (so only the verified bytes are ever fetched), then retag
-    local ``:latest`` to ``D``. Returns ``D``. Raises ``VerifyError``
-    fail-closed; recreates nothing.
-
-    Pulling by digest then retagging (not pulling by tag) is what closes the
-    tag-moved TOCTOU AND satisfies section 3's no-downgrade invariant (local
-    ``:latest`` ends up on the verified digest)."""
+def verify_and_pull(repo: str, *, cosign_pub: str) -> str:
+    """Resolve ``<repo>:latest`` to its index digest ``D``, cosign-verify ``D``
+    bound to ``repo``, and ``docker pull`` by ``@D`` (only the verified bytes are
+    ever fetched, closing the tag-moved TOCTOU). Returns ``D``. Does NOT move the
+    local ``:latest`` tag, so the engine can verify the WHOLE stack fail-closed
+    before any tag moves or any container is recreated. Raises ``VerifyError``."""
     ref = f"{repo}:latest"
     digest = provenance.resolve_digest(ref)
     if not digest:
@@ -154,10 +150,24 @@ def verify_then_pull(repo: str, *, cosign_pub: str) -> str:
     by_digest = f"{repo}@{digest}"
     if not _run(["pull", by_digest], timeout=600).ok:
         raise VerifyError(f"pull failed for {by_digest}")
-    # Refresh local :latest -> D. WITHOUT this, :latest stays on the old image
-    # and the next `docker compose up` downgrades (section 3 anti-pattern).
-    if not _run(["tag", by_digest, ref], timeout=30).ok:
-        raise VerifyError(f"retag {by_digest} -> {ref} failed")
+    return digest
+
+
+def retag_latest(repo: str, digest: str) -> bool:
+    """Point local ``<repo>:latest`` at the verified digest (HLD section 3 form
+    (b)). Done right before recreate, so ``:latest`` resolves to exactly the
+    bytes we recreate from and a fail-closed verify abort never leaves ``:latest``
+    moved. WITHOUT this retag, ``:latest`` stays on the old image and the next
+    ``docker compose up`` would downgrade (the section 3 anti-pattern)."""
+    return _run(["tag", f"{repo}@{digest}", f"{repo}:latest"], timeout=30).ok
+
+
+def verify_then_pull(repo: str, *, cosign_pub: str) -> str:
+    """``verify_and_pull`` then ``retag_latest`` for one repo (HLD sections 3 +
+    13). Raises ``VerifyError`` fail-closed; recreates nothing."""
+    digest = verify_and_pull(repo, cosign_pub=cosign_pub)
+    if not retag_latest(repo, digest):
+        raise VerifyError(f"retag {repo}@{digest} -> {repo}:latest failed")
     return digest
 
 
@@ -424,38 +434,104 @@ def build_create_argv(container: dict, old_image_config: dict, *,
     return argv
 
 
-def recreate_one(container: StackContainer, *, image_ref: str,
-                 old_image_id: str | None, stop_timeout: float = 30.0) -> bool:
-    """Recreate one stack container from ``image_ref``, carrying its config per
-    section 8. inspect -> stop -> rm -> create (same name) -> start. Returns
-    True on success. ``old_image_id`` (captured before the pull moved
-    ``:latest``) supplies the vs-OLD delta baseline and is still present."""
-    inspected = inspect_container(container.container_id)
-    if not inspected:
-        logger.error("recreate %s: cannot inspect %s", container.service, container.container_id)
-        return False
-    old_cfg = image_config(old_image_id) if old_image_id else {}
+def _do_recreate(inspected: dict, *, image_ref: str, baseline_image_id: str | None,
+                 service: str, container_ref: str, stop_timeout: float = 30.0) -> bool:
+    """Shared recreate core: build the argv (vs-``baseline_image_id`` delta), then
+    stop -> rm -> create (same name) -> start the container. ``container_ref`` is
+    the id (forward) or name (rollback, the forward recreate changed the id).
+    Fail-closed at each step."""
+    old_cfg = image_config(baseline_image_id) if baseline_image_id else {}
     if not old_cfg:
         logger.warning(
-            "recreate %s: old image config unreadable, carrying container config "
-            "verbatim (may pin a baked default the new image changed)", container.service)
-    argv = build_create_argv(
-        inspected, old_cfg, image_ref=image_ref, service=container.service)
+            "recreate %s: baseline image config unreadable, carrying container "
+            "config verbatim (may pin a baked default the new image changed)", service)
     name = (inspected.get("Name") or "").lstrip("/")
     if not name:
-        logger.error("recreate %s: container has no name", container.service)
+        logger.error("recreate %s: container has no name", service)
         return False
+    argv = build_create_argv(inspected, old_cfg, image_ref=image_ref, service=service)
 
-    _run(["stop", "-t", str(int(stop_timeout)), container.container_id],
-         timeout=stop_timeout + 10)
-    if not _run(["rm", "-f", container.container_id], timeout=60).ok:
-        logger.error("recreate %s: removing old container failed", container.service)
+    _run(["stop", "-t", str(int(stop_timeout)), container_ref], timeout=stop_timeout + 10)
+    if not _run(["rm", "-f", container_ref], timeout=60).ok:
+        logger.error("recreate %s: removing old container failed", service)
         return False
     if not _run(argv, timeout=120).ok:
-        logger.error("recreate %s: docker create failed", container.service)
+        logger.error("recreate %s: docker create failed", service)
         return False
     if not _run(["start", name], timeout=60).ok:
-        logger.error("recreate %s: docker start failed", container.service)
+        logger.error("recreate %s: docker start failed", service)
         return False
-    logger.info("recreated %s from %s", container.service, image_ref)
+    logger.info("recreated %s from %s", service, image_ref)
     return True
+
+
+def recreate_one(container: StackContainer, *, image_ref: str,
+                 old_image_id: str | None, inspected: dict | None = None,
+                 stop_timeout: float = 30.0) -> bool:
+    """Forward recreate of one stack container from ``image_ref`` (``:latest``,
+    now the verified new digest), carrying its config per section 8.
+    ``old_image_id`` supplies the vs-OLD delta baseline and is still present.
+    The engine passes a pre-captured ``inspected`` (so it can reuse the same
+    pre-update snapshot for rollback); otherwise this inspects the container."""
+    if inspected is None:
+        inspected = inspect_container(container.container_id)
+        if not inspected:
+            logger.error("recreate %s: cannot inspect %s",
+                         container.service, container.container_id)
+            return False
+    return _do_recreate(
+        inspected, image_ref=image_ref, baseline_image_id=old_image_id,
+        service=container.service, container_ref=container.container_id,
+        stop_timeout=stop_timeout)
+
+
+def rollback_one(container: StackContainer, inspected: dict, old_image_id: str, *,
+                 stop_timeout: float = 30.0) -> bool:
+    """Roll one container back to ``old_image_id`` (HLD section 9), recreating
+    from the captured PRE-update inspect so the compose overlay is re-applied on
+    the old image (baseline = the old image, so the delta is that same overlay).
+    Targets the container by NAME, since the failed forward recreate gave it a
+    new id. The old image is still local (we prune only after the gate passes)."""
+    return _do_recreate(
+        inspected, image_ref=old_image_id, baseline_image_id=old_image_id,
+        service=container.service, container_ref=(inspected.get("Name") or "").lstrip("/"),
+        stop_timeout=stop_timeout)
+
+
+# --- socket-only probes for the /readyz gate (HLD section 9) --------
+# `docker exec <ref>` instead of the compose path's `docker compose exec`; the
+# readyz probe body is shared (compose.GREFFER_READYZ_PROBE) so they can't drift.
+
+def exec_readyz(container_ref: str) -> compose.CommandResult:
+    """Probe `/readyz` inside the greffer container over the socket."""
+    return _run(["exec", container_ref, "python", "-c", compose.GREFFER_READYZ_PROBE],
+                timeout=15)
+
+
+def exec_version(container_ref: str) -> str | None:
+    """Read the running greffer's `app.__version__` (the anti-downgrade guard,
+    HLD section 13). Attacker-forgeable, so only an honest-CI accident guard."""
+    res = _run(["exec", container_ref, "python", "-c", "import app; print(app.__version__)"],
+               timeout=10)
+    return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+
+def container_running(container_ref: str) -> bool:
+    res = _run(["inspect", "--format", "{{.State.Running}}", container_ref], timeout=10)
+    return res.ok and res.stdout.strip() == "true"
+
+
+def container_image_id_by_name(container_ref: str) -> str | None:
+    """The image id a (named) container is running, for the version-applied gate."""
+    res = _run(["inspect", "--format", "{{.Image}}", container_ref], timeout=10)
+    return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+
+def restart_count(container_ref: str) -> int:
+    res = _run(["inspect", "--format", "{{.RestartCount}}", container_ref], timeout=10)
+    if not res.ok:
+        return 0
+    try:
+        return int(res.stdout.strip())
+    except ValueError:
+        return 0
