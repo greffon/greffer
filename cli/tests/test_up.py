@@ -79,6 +79,9 @@ def test_write_config_writes_both_files(tmp_path: Path) -> None:
     env = env_file.EnvFile.read(tmp_path / "env.env")
     assert env.get("GREFFER_ID") == "abc"
     assert env.get("GREFFER_MODE") == "tunnel"
+    # The host config dir is recorded so remote update can mount it into the
+    # updater; the greffer can't discover this host path on its own.
+    assert env.get("GREFFER_HOST_CONFIG_DIR") == str(tmp_path.resolve())
 
 
 def test_write_config_interpolates_image_tag(tmp_path: Path) -> None:

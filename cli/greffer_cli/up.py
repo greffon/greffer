@@ -86,8 +86,15 @@ def write_config(
     compose_path = paths.docker_compose_yml_path(config_dir)
     compose_path.write_text(compose_text, encoding="utf-8")
 
-    # Write env.env atomically + 0600.
-    env = env_file.EnvFile(values=dict(env_values))
+    # Record the host config dir so a manager-triggered remote update can mount
+    # it into the spawned updater (GREFFER_HOST_CONFIG_DIR -> /work) and run
+    # docker-compose against the real stack. The greffer can't discover this host
+    # path itself: the dir isn't bind-mounted into the container (the image bakes
+    # the app), so only the CLI (which renders here) knows the absolute path.
+    env = env_file.EnvFile(values={
+        **env_values,
+        "GREFFER_HOST_CONFIG_DIR": str(config_dir.resolve()),
+    })
     env.write_atomic(paths.env_env_path(config_dir))
 
 
