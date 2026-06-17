@@ -29,8 +29,9 @@ def _client(settings) -> AsyncClient:
 def _settings(monkeypatch, tmp_path, *, enabled=True, image=_PINNED):
     monkeypatch.setenv("GREFFER_ID", "g1")
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
-    if enabled:
-        monkeypatch.setenv("GREFFER_REMOTE_UPDATE_ENABLED", "true")
+    # Set explicitly both ways: the flag now defaults ON, so the disabled case
+    # must actively set it false rather than rely on an absent env var.
+    monkeypatch.setenv("GREFFER_REMOTE_UPDATE_ENABLED", "true" if enabled else "false")
     monkeypatch.setenv("GREFFER_UPDATER_IMAGE", image)
     monkeypatch.setenv("GREFFER_VERSION_MANIFEST_URL", "https://x/m.json")
     return get_settings()

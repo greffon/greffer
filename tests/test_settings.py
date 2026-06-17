@@ -74,6 +74,10 @@ def test_defaults_apply_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.crl_sync_interval == 300
     assert s.monitor_interval == 5
     assert s.logger_name == "greffer"
+    # Security-relevant default (self-update v2): remote update is ON by default;
+    # the cryptographic gates (digest-pinned updater image + cosign/floor) are the
+    # real guard. Pin it here so a flip back to off is a deliberate, visible change.
+    assert s.greffer_remote_update_enabled is True
 
 
 def test_env_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

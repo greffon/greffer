@@ -139,14 +139,19 @@ class Settings(BaseSettings):
     # bug Codex caught before merge (greffon/greffer#17 review).
     greffer_workers_enabled: bool = False
 
-    # Remote update opt-in (greffer self-update v2). Default OFF: a
-    # manager-triggered remote update is root-equivalent on the operator's host,
-    # so the authoritative switch is greffer-side and operator-sovereign. The
+    # Remote update toggle (greffer self-update v2). Default ON (product
+    # decision 2026-06-17): the manager may trigger this greffer to update
+    # itself. A manager-triggered update is root-equivalent, but the REAL gate is
+    # cryptographic, not this flag: the controller route refuses unless
+    # ``greffer_updater_image`` is a digest-pinned ref, and the updater only
+    # recreates cosign-signed images at/above the ``min_supported`` floor,
+    # fail-closed. So default-on means "auto-accept signed Greffon releases the
+    # manager triggers", never "run arbitrary code". An operator who wants the
+    # node to refuse remote updates sets GREFFER_REMOTE_UPDATE_ENABLED=false. The
     # value is advertised in the register payload so the manager knows whether to
-    # offer the button; the controller update route (a later v2 increment) is a
-    # clear no-op unless this is true. Carries the ``greffer_`` prefix to bind
+    # offer the button. Carries the ``greffer_`` prefix to bind
     # GREFFER_REMOTE_UPDATE_ENABLED (the prefix pitfall noted above).
-    greffer_remote_update_enabled: bool = False
+    greffer_remote_update_enabled: bool = True
 
     # Remote-update wiring (greffer self-update v2), only consulted when
     # ``greffer_remote_update_enabled`` is true. ``greffer_updater_image`` is the
