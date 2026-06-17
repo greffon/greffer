@@ -4,18 +4,18 @@
 # a manager-triggered remote update (self-update v2). It holds the v2 updater
 # engine (greffer_cli.updater) plus everything that engine shells out to:
 #   - docker-cli            : talk to the host daemon over the mounted socket
-#                             (pull by digest, inspect the OCI version label,
-#                             recreate via compose)
+#                             (pull by digest, inspect, create/start/stop/rm,
+#                             tag, image prune for the per-container recreate)
 #   - docker-cli-buildx     : `docker buildx imagetools inspect` to resolve a
 #                             tag -> digest at the registry without a pull
-#   - docker-cli-compose    : `docker compose` recreate of the greffer stack
-#   - cosign                : verify image signatures + the signed version
-#                             manifest, offline, against the baked public key
+#   - cosign                : verify image signatures, offline, against the
+#                             baked public key
 #
-# It runs detached with the docker socket + the greffer's /work (compose dir) and
-# /data (ratchet/lock) mounted. The greffer invokes it as
-# `python -m greffer_cli.updater <target_tag>` (the spawn supplies the full
-# command), so this image sets NO entrypoint that would duplicate it.
+# It runs detached with ONLY the docker socket + the greffer's /data volume
+# (the update lock) mounted; NO compose file (socket-only per-container
+# recreate). The greffer invokes it as `python -m greffer_cli.updater` with the
+# target version in GREFFER_UPDATER_TARGET_TAG, so this image sets NO entrypoint
+# that would duplicate the command.
 
 # --- build the greffer_cli wheel + its deps into a venv ---------------------
 FROM python:3.11-alpine AS builder
@@ -35,10 +35,9 @@ RUN python -m venv /opt/venv \
 FROM python:3.11-alpine
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# docker-cli (host daemon via socket) + buildx (imagetools inspect) + compose.
-RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose \
-      && ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
-      && docker-compose version \
+# docker-cli (host daemon via socket) + buildx (imagetools inspect). No compose:
+# the socket-only model recreates each container directly via the Docker API.
+RUN apk add --no-cache docker-cli docker-cli-buildx \
       && docker buildx version
 
 # cosign from the official, multi-arch ko image (pinned), so no checksum dance

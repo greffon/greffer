@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "greffer"
-version = "0.3.4"
+version = "0.3.5"
 description = ""
 authors = ["Greffon <admin@greffon.io>"]
 license = "AGPL-3.0-only"

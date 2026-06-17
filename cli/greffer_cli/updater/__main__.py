@@ -1,17 +1,16 @@
-"""Entrypoint for the signed ``greffon/greffer-updater`` image.
+"""Entrypoint for the signed ``greffon/greffer-updater`` image (v2 ``:latest``).
 
-``python -m greffer_cli.updater <target_tag>`` (the rest of the config comes
-from the environment the greffer sets when it spawns the updater). It takes the
-update lock so a remote update and a host ``greffer update`` are mutually
-exclusive (HLD "Concurrency"), runs the v2 verify -> pin -> recreate engine, and
-exits with its code.
+``python -m greffer_cli.updater`` (no positional args: the model is "update to
+latest"; the rest comes from the env the greffer sets when it spawns the
+updater). It takes the ``/data`` update lock so a remote update and a host
+``greffer update`` are mutually exclusive (HLD section 10), runs the
+verify-then-pull -> recreate -> ``/readyz`` gate engine, and exits with its code.
 
-The lock file is ``/work/.update.lock``. ``/work`` is the host compose dir
-bind-mounted into the updater, which is exactly the dir a host ``greffer
-update`` locks (``<config_dir>/.update.lock`` in greffer_cli.update). Both sides
-must lock the SAME host inode for ``flock`` to actually serialize them; locking
-``/data`` instead would be a different inode and the two updaters could run
-concurrently and corrupt the shared compose file.
+The lock is ``/data/.update.lock`` on the greffer's persistent ``/data`` volume,
+the same host inode a host ``greffer update`` flocks via the volume mountpoint.
+``/data`` is the only host path mounted into the updater (socket-only, no compose
+dir), and the filename matches v1's (``.update.lock``) so the two actually
+contend (HLD section 10).
 """
 
 from __future__ import annotations
@@ -22,53 +21,31 @@ from pathlib import Path
 
 from . import engine
 
-# Paths inside the updater container: the greffer mounts the host config dir at
-# /work, the greffer's /data volume at /data, and bakes cosign.pub + the
-# min_supported baseline into /etc/greffer at build time.
-DEFAULT_COMPOSE = Path("/work/docker-compose.yml")
-DEFAULT_RATCHET = Path("/data/.greffer-update-floor")
-# Same host inode a host ``greffer update`` locks (its ``<config_dir>/
-# .update.lock``); /work IS that config dir bind-mounted in. Must match the v1
-# filename ``.update.lock`` or the two locks miss each other (P1).
-DEFAULT_LOCK = Path("/work/.update.lock")
+# Paths inside the updater container: the greffer mounts the docker socket and
+# its /data volume; cosign.pub is baked into /etc/greffer at build time.
+DEFAULT_LOCK = Path("/data/.update.lock")
 DEFAULT_COSIGN_PUB = "/etc/greffer/cosign.pub"
-DEFAULT_BASELINE_FILE = Path("/etc/greffer/min_supported_baseline")
 
-# Sentinel: no fcntl (non-POSIX); proceed without a host lock.
+# Sentinel: no fcntl (non-POSIX) -> proceed without a host lock.
 _NO_LOCK = object()
 
 
-def _baked_baseline(env: dict) -> str | None:
-    """The build-time min_supported baseline, from an env override or the file
-    baked into the image. None if neither is present (the floor then rests on
-    the signed manifest + ratchet)."""
-    v = env.get("GREFFER_MIN_SUPPORTED_BASELINE")
-    if v and v.strip():
-        return v.strip()
-    try:
-        return DEFAULT_BASELINE_FILE.read_text(encoding="utf-8").strip() or None
-    except OSError:
-        return None
-
-
-def _config_from_env(target_tag: str, env: dict) -> dict:
+def _config_from_env(env: dict) -> dict:
+    """The socket-model config: a server-resolved ``target_tag`` (the controller
+    sets ``GREFFER_UPDATER_TARGET_TAG``; absent -> ``latest``), no manifest /
+    floor / compose path. All keys have defaults, so this never raises."""
     return {
-        "compose_file": Path(env.get("GREFFER_UPDATER_COMPOSE", str(DEFAULT_COMPOSE))),
-        "target_tag": target_tag,
-        "manifest_url": env["GREFFER_VERSION_MANIFEST_URL"],
         "cosign_pub": env.get("GREFFER_COSIGN_PUB", DEFAULT_COSIGN_PUB),
-        "baked_baseline": _baked_baseline(env),
-        "ratchet_path": Path(env.get("GREFFER_UPDATER_RATCHET", str(DEFAULT_RATCHET))),
         "greffer_id": env.get("GREFFER_ID"),
-        "mode": env.get("GREFFER_MODE") or "proxy",
+        "target_tag": env.get("GREFFER_UPDATER_TARGET_TAG") or None,
         "timeout": float(env.get("GREFFER_UPDATER_TIMEOUT", "600")),
     }
 
 
 def acquire_lock(lock_path: Path = DEFAULT_LOCK):
-    """Exclusive flock on the /work update lock. Returns a handle to release, or
-    None if another actor already holds it (the caller refuses), or the
-    ``_NO_LOCK`` sentinel on a platform without fcntl."""
+    """Exclusive flock on ``/data/.update.lock``. Returns a handle to release, or
+    None if another actor holds it (the caller refuses), or ``_NO_LOCK`` on a
+    platform without fcntl."""
     try:
         import fcntl
     except ImportError:
@@ -93,22 +70,14 @@ def release_lock(handle) -> None:
 
 def main(argv=None, *, env=None, run=engine.run_remote_update,
          lock_acquire=acquire_lock, lock_release=release_lock) -> int:
-    """Resolve config, take the /work lock, run the engine. ``run`` /
-    ``lock_acquire`` are injectable for tests."""
-    argv = sys.argv[1:] if argv is None else argv
+    """Resolve config, take the ``/data`` lock, run the engine. ``run`` /
+    ``lock_acquire`` are injectable for tests. ``argv`` is ignored (no
+    positional args in the ``:latest`` model)."""
     env = os.environ if env is None else env
-    if len(argv) != 1 or not argv[0]:
-        print("usage: python -m greffer_cli.updater <target_tag>", file=sys.stderr)
-        return engine.EXIT_REFUSED
-    try:
-        cfg = _config_from_env(argv[0], env)
-    except KeyError as exc:
-        print(f"missing required updater env: {exc}", file=sys.stderr)
-        return engine.EXIT_REFUSED
-
+    cfg = _config_from_env(env)
     handle = lock_acquire()
     if handle is None:
-        print("another update is in progress (/work lock held)", file=sys.stderr)
+        print("another update is in progress (/data lock held)", file=sys.stderr)
         return engine.EXIT_REFUSED
     try:
         return run(**cfg)
