@@ -442,6 +442,47 @@ def data_volume_is_named(compose_file: Path) -> bool:
     return False
 
 
+def _compose_project_name(text: str) -> str | None:
+    """The compose project name from a top-level ``name:`` line (the CLI template
+    pins ``name: greffer``); docker prefixes volume names with it."""
+    for line in text.splitlines():
+        m = re.match(r"name:\s*(\S+)\s*$", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def data_volume_mountpoint(compose_file: Path) -> str | None:
+    """Resolve the host mountpoint of the /data NAMED volume, so a host
+    ``greffer update`` can flock the SAME inode the in-container updater locks at
+    ``/data/.update.lock`` (HLD section 10 rendezvous). Returns None if /data is
+    not a named volume, the project/volume name can't be determined, or docker
+    can't inspect the volume (the caller then falls back to a local lock)."""
+    try:
+        text = compose_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    project = _compose_project_name(text)
+    volume = None
+    for line in text.splitlines():
+        m = _DATA_MOUNT_RE.match(line)
+        if m:
+            src = m.group("src")
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", src):
+                volume = src
+            break
+    if not project or not volume:
+        return None
+    res = _run(
+        ["docker", "volume", "inspect", f"{project}_{volume}",
+         "--format", "{{.Mountpoint}}"],
+        timeout=10,
+    )
+    if not res.ok:
+        return None
+    return res.stdout.strip() or None
+
+
 # The /readyz probe body, shared so the compose path (this module) and the v2
 # socket path (greffer_cli.updater) run the IDENTICAL probe and cannot drift.
 # Resolves X-GREFFON-TOKEN the way the service does (env GREFFER_TOKEN then the

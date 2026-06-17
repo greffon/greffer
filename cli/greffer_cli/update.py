@@ -357,7 +357,14 @@ _NO_HOST_LOCK = object()
 
 
 def _update_lock_path(cfg: Path) -> Path:
-    return cfg / ".update.lock"
+    """The host update lock. Prefer the ``/data`` volume mountpoint so a host
+    ``greffer update`` and the in-container remote updater flock the SAME inode
+    (HLD section 10: the updater locks ``/data/.update.lock``, which IS this
+    mountpoint inside its container). Fall back to the config dir if the volume
+    can't be resolved (degraded: still serializes two host runs, just not
+    host-vs-remote). Filename ``.update.lock`` matches on both sides."""
+    mountpoint = compose.data_volume_mountpoint(paths.docker_compose_yml_path(cfg))
+    return (Path(mountpoint) if mountpoint else cfg) / ".update.lock"
 
 
 def _acquire_update_lock(cfg: Path):
@@ -374,7 +381,14 @@ def _acquire_update_lock(cfg: Path):
         import fcntl
     except ImportError:
         return _NO_HOST_LOCK
-    fh = open(_update_lock_path(cfg), "w", encoding="utf-8")
+    try:
+        fh = open(_update_lock_path(cfg), "w", encoding="utf-8")
+    except OSError:
+        # The resolved /data volume mountpoint isn't present/writable (e.g. the
+        # volume was never created). Fall back to the config dir so a host update
+        # still serializes against another host run, rather than crashing
+        # (degraded: it won't contend with the in-container remote updater).
+        fh = open(cfg / ".update.lock", "w", encoding="utf-8")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

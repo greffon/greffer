@@ -229,6 +229,39 @@ def test_data_volume_absent(tmp_path: Path) -> None:
     assert compose.data_volume_is_named(f) is False
 
 
+def test_data_volume_mountpoint_resolves_named_volume(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_SAMPLE_COMPOSE, encoding="utf-8")
+    seen: dict = {}
+
+    def fake_run(args, **k):
+        seen["args"] = args
+        return compose.CommandResult(
+            0, "/var/lib/docker/volumes/greffer_greffon-data/_data\n", "")
+    monkeypatch.setattr(compose, "_run", fake_run)
+    mp = compose.data_volume_mountpoint(f)
+    assert mp == "/var/lib/docker/volumes/greffer_greffon-data/_data"
+    # inspects <project>_<volume> from the compose `name:` + the /data named volume
+    assert "greffer_greffon-data" in seen["args"]
+
+
+def test_data_volume_mountpoint_none_for_bind(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_SAMPLE_COMPOSE.replace("- greffon-data:/data", "- /host/data:/data"),
+                 encoding="utf-8")
+    monkeypatch.setattr(compose, "_run",
+                        lambda *a, **k: pytest.fail("no docker call for a bind /data"))
+    assert compose.data_volume_mountpoint(f) is None  # not a named volume
+
+
+def test_data_volume_mountpoint_none_when_docker_fails(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "c.yml"
+    f.write_text(_SAMPLE_COMPOSE, encoding="utf-8")
+    monkeypatch.setattr(compose, "_run",
+                        lambda *a, **k: compose.CommandResult(1, "", "no such volume"))
+    assert compose.data_volume_mountpoint(f) is None
+
+
 @pytest.mark.parametrize(
     "tag, ok",
     [
