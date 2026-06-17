@@ -446,6 +446,18 @@ def test_verify_and_pull_pull_failure_raises(monkeypatch):
         recreate.verify_and_pull("greffon/greffer", cosign_pub="/k")
 
 
+def test_verify_and_pull_cosign_before_pull(monkeypatch):
+    # the TOCTOU-closing order: cosign MUST verify before the pull fetches bytes.
+    # A reorder to pull-then-verify would reopen the hole and this test would fail.
+    order: list[str] = []
+    monkeypatch.setattr(provenance, "resolve_digest", lambda ref: _D)
+    monkeypatch.setattr(provenance, "cosign_verify",
+                        lambda repo, d, **k: (order.append("cosign"), True)[1])
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (order.append(a[1]), _ok())[1])
+    recreate.verify_and_pull("greffon/greffer", cosign_pub="/k")
+    assert order == ["cosign", "pull"]
+
+
 def test_verify_and_pull_resolves_the_target_tag(monkeypatch):
     seen = {}
     monkeypatch.setattr(provenance, "resolve_digest",

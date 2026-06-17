@@ -163,6 +163,16 @@ def retag_latest(repo: str, digest: str) -> bool:
     return _run(["tag", f"{repo}@{digest}", f"{repo}:latest"], timeout=30).ok
 
 
+def restore_latest(repo: str, image_id: str) -> bool:
+    """Point local ``<repo>:latest`` back at a local image id (rollback). Without
+    this, rollback recreates the container from the old image but leaves
+    ``:latest`` on the rejected new digest, so a later ``docker compose up``
+    re-applies it (the section 3 anti-pattern, on the rollback path). Best-effort."""
+    if not image_id:
+        return False
+    return _run(["tag", image_id, f"{repo}:latest"], timeout=30).ok
+
+
 def verify_then_pull(repo: str, *, cosign_pub: str, tag: str = "latest") -> str:
     """``verify_and_pull`` then ``retag_latest`` for one repo (HLD sections 3 +
     13). Raises ``VerifyError`` fail-closed; recreates nothing."""
@@ -415,6 +425,19 @@ def build_create_argv(container: dict, old_image_config: dict, *,
 
     argv: list[str] = ["create", "--name", name]
     argv += _network_args(host, service)
+    # No silent drops: the CLI template puts greffer/nginx on ONE network
+    # (`internal`) and the sidecar on host, with no tmpfs. If a container is ever
+    # on >1 network or uses tmpfs (a hand-edited / future-template config), this
+    # socket recreate reattaches only the primary network and carries no tmpfs;
+    # warn so the dropped config is visible rather than lost silently.
+    nets = (container.get("NetworkSettings") or {}).get("Networks") or {}
+    if len(nets) > 1:
+        logger.warning(
+            "recreate %s: container is on %d networks; only the primary (%s) is "
+            "reattached (others dropped)", service, len(nets), host.get("NetworkMode"))
+    if host.get("Tmpfs"):
+        logger.warning("recreate %s: tmpfs mounts are not carried: %s",
+                       service, list(host["Tmpfs"]))
     argv += _restart_args(host)
     argv += _log_args(host)
     for h in host.get("ExtraHosts") or []:

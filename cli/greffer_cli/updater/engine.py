@@ -51,6 +51,11 @@ def _is_downgrade(new: str | None, old: str | None) -> bool:
     pn, po = parse(new), parse(old)
     if pn is None or po is None:
         return False
+    # Pad to equal length so 0.3 and 0.3.0 compare EQUAL (not 0.3 < 0.3.0, which
+    # would wrongly refuse 0.3 as a downgrade from a running 0.3.0).
+    width = max(len(pn), len(po))
+    pn += (0,) * (width - len(pn))
+    po += (0,) * (width - len(po))
     return pn < po
 
 
@@ -70,8 +75,16 @@ def _rollback(done: list, *, greffer_name: str, greffer_id: str | None,
             continue
         if not recreate.rollback_one(container, inspected, old_image_id):
             all_ok = False
+        # Repoint :latest at the old image too: rollback_one recreates the
+        # CONTAINER from the old image, but if :latest still points at the
+        # rejected new digest a later `docker compose up` re-applies it (the
+        # section 3 anti-pattern on the rollback path). Best-effort: a failed
+        # retag does not mean the running rollback failed.
+        if not recreate.restore_latest(container.repo, old_image_id):
+            logger.warning("rollback %s: could not restore :latest to the old image",
+                           container.service)
     if all_ok and greffer_name and gate.health_gate(
-        greffer_name, greffer_id=greffer_id, applied_image_id=None,
+        greffer_name, greffer_id=greffer_id, applied_image_ids={},
         check_version=False, service_names=service_names,
         timeout=min(timeout, 120.0), sleep=sleep, now=now,
     ) == update.GATE_READY:
@@ -137,37 +150,49 @@ def run_remote_update(
     service_names = [name for _, _, name, _ in snaps]
     greffer_name = next((name for c, _, name, _ in snaps if c.service == GREFFER_SERVICE), "")
 
-    # Phase 2b: name :previous, point :latest at the verified digest, recreate.
+    # Phase 2b + 3: mutate, then gate. ANY failure or unexpected exception in
+    # this window rolls the whole stack back to the captured prior images, so a
+    # raise mid-recreate can never leave the stack half-updated without rollback.
     done: list[tuple] = []  # (container, inspected, old_image_id)
-    for c, inspected, name, old_image_id in snaps:
-        recreate.tag_previous(c.repo, old_image_id)
-        if not recreate.retag_latest(c.repo, verified[c.repo]):
-            logger.error("remote update: retag :latest failed for %s, rolling back", c.repo)
-            return _rollback(done, greffer_name=greffer_name, greffer_id=greffer_id,
-                             service_names=service_names, timeout=timeout, sleep=sleep, now=now)
-        ok = recreate.recreate_one(
-            c, image_ref=f"{c.repo}:latest", old_image_id=old_image_id, inspected=inspected)
-        done.append((c, inspected, old_image_id))
-        if not ok:
-            logger.error("remote update: recreate %s failed, rolling back", c.service)
-            return _rollback(done, greffer_name=greffer_name, greffer_id=greffer_id,
-                             service_names=service_names, timeout=timeout, sleep=sleep, now=now)
 
-    # Phase 3: gate the recreated stack on /readyz.
-    applied = compose.image_id(f"{greffer.repo}@{verified[greffer.repo]}")
-    outcome = gate.health_gate(
-        greffer_name, greffer_id=greffer_id, applied_image_id=applied,
-        service_names=service_names, timeout=timeout, sleep=sleep, now=now)
-    if outcome == update.GATE_READY:
-        if _is_downgrade(recreate.exec_version(greffer_name), old_version):
-            logger.error("remote update: version went backward from %s, rolling back",
-                         old_version)
-            return _rollback(done, greffer_name=greffer_name, greffer_id=greffer_id,
-                             service_names=service_names, timeout=timeout, sleep=sleep, now=now)
-        recreate.dangling_prune()
-        logger.info("remote update applied")
-        return EXIT_OK
+    def _rb() -> int:
+        return _rollback(done, greffer_name=greffer_name, greffer_id=greffer_id,
+                         service_names=service_names, timeout=timeout, sleep=sleep, now=now)
 
-    logger.error("remote update: health gate failed (%s), rolling back", outcome)
-    return _rollback(done, greffer_name=greffer_name, greffer_id=greffer_id,
-                     service_names=service_names, timeout=timeout, sleep=sleep, now=now)
+    try:
+        # Phase 2b: name :previous, point :latest at the verified digest, recreate.
+        for c, inspected, name, old_image_id in snaps:
+            recreate.tag_previous(c.repo, old_image_id)
+            if not recreate.retag_latest(c.repo, verified[c.repo]):
+                logger.error("remote update: retag :latest failed for %s, rolling back", c.repo)
+                return _rb()
+            ok = recreate.recreate_one(
+                c, image_ref=f"{c.repo}:latest", old_image_id=old_image_id, inspected=inspected)
+            done.append((c, inspected, old_image_id))
+            if not ok:
+                logger.error("remote update: recreate %s failed, rolling back", c.service)
+                return _rb()
+
+        # Phase 3: gate. Verify EVERY container is on its new image (not just the
+        # greffer), so a sibling that came up on the old image cannot pass.
+        applied_image_ids = {
+            name: compose.image_id(f"{c.repo}@{verified[c.repo]}")
+            for c, _, name, _ in snaps
+        }
+        outcome = gate.health_gate(
+            greffer_name, greffer_id=greffer_id, applied_image_ids=applied_image_ids,
+            service_names=service_names, timeout=timeout, sleep=sleep, now=now)
+        if outcome == update.GATE_READY:
+            if _is_downgrade(recreate.exec_version(greffer_name), old_version):
+                logger.error("remote update: version went backward from %s, rolling back",
+                             old_version)
+                return _rb()
+            recreate.dangling_prune()
+            logger.info("remote update applied")
+            return EXIT_OK
+
+        logger.error("remote update: health gate failed (%s), rolling back", outcome)
+        return _rb()
+    except Exception as exc:  # mutating window: any unexpected error must roll back
+        logger.exception("remote update: unexpected error, rolling back: %s", exc)
+        return _rb()

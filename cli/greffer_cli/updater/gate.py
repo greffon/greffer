@@ -22,7 +22,8 @@ logger = logging.getLogger("greffer-updater")
 
 
 def health_gate(
-    greffer_name: str, *, greffer_id: str | None, applied_image_id: str | None,
+    greffer_name: str, *, greffer_id: str | None,
+    applied_image_ids: dict[str, str | None],
     service_names: list[str], timeout: float, poll_interval: float = 2.0,
     check_version: bool = True,
     sleep: Callable[[float], None] = time.sleep,
@@ -30,13 +31,17 @@ def health_gate(
 ) -> str:
     """Poll `/readyz` until the recreated stack is healthy or a failure is
     decided. ``GATE_READY`` requires all of: `/readyz` ``ready`` with a matching
-    ``id``, the running greffer image == ``applied_image_id`` (the verified new
-    digest actually applied), and every stack container running.
-    ``degraded: registration_pending`` is awaited; a wrong id, ``fatal``, any
-    other ``degraded`` reason, a crash-loop, or the timeout fail.
+    ``id``, EVERY container running its expected new image (``applied_image_ids``
+    maps container name -> the verified new image id; a name whose expected id is
+    None is not checked), and every stack container running. ``degraded:
+    registration_pending`` is awaited; a wrong id, ``fatal``, any other
+    ``degraded`` reason, a crash-loop, or the timeout fail.
 
-    ``check_version=False`` (rollback) skips the applied-image check: rollback
-    restores the prior image, so any ready + matching id + all-running passes.
+    Checking ALL containers (not just the greffer) is what stops a sibling that
+    came up on the OLD image from passing the gate as a half-updated stack.
+    ``check_version=False`` (rollback) skips the applied-image check entirely:
+    rollback restores the prior images, so any ready + matching id + all-running
+    passes.
     """
     deadline = now() + timeout
     base_restarts = recreate.restart_count(greffer_name)
@@ -53,8 +58,13 @@ def health_gate(
                 return update.GATE_DEGRADED_OTHER
             if r.status == "ready":
                 if check_version:
-                    running = recreate.container_image_id_by_name(greffer_name)
-                    if not (running and applied_image_id and running == applied_image_id):
+                    applied = True
+                    for n in service_names:
+                        expected = applied_image_ids.get(n)
+                        if expected and recreate.container_image_id_by_name(n) != expected:
+                            applied = False  # a container is NOT on its new image
+                            break
+                    if not applied:
                         return update.GATE_NOT_APPLIED
                 if all(recreate.container_running(n) for n in service_names):
                     return update.GATE_READY

@@ -381,14 +381,27 @@ def _acquire_update_lock(cfg: Path):
         import fcntl
     except ImportError:
         return _NO_HOST_LOCK
+    cfg_lock = cfg / ".update.lock"
+    lock_path = _update_lock_path(cfg)
+    # Degraded if we couldn't use the /data rendezvous: either the volume
+    # mountpoint was unresolvable (_update_lock_path returned the cfg path) or the
+    # resolved mountpoint dir isn't present/writable (open below fails).
+    degraded = lock_path == cfg_lock
     try:
-        fh = open(_update_lock_path(cfg), "w", encoding="utf-8")
+        fh = open(lock_path, "w", encoding="utf-8")
     except OSError:
-        # The resolved /data volume mountpoint isn't present/writable (e.g. the
-        # volume was never created). Fall back to the config dir so a host update
-        # still serializes against another host run, rather than crashing
-        # (degraded: it won't contend with the in-container remote updater).
-        fh = open(cfg / ".update.lock", "w", encoding="utf-8")
+        degraded = True
+        fh = open(cfg_lock, "w", encoding="utf-8")
+    if degraded:
+        # Not silent: the operator should know a concurrent in-container remote
+        # update may not be detected (it locks the /data volume inode, this run
+        # locks the config dir). v1 is operator-run, so this is a warning, not a
+        # refusal; it still serializes two host runs.
+        print(
+            "warning: could not lock on the /data volume; locking in the config "
+            "dir instead, so a concurrent remote update may not be detected.",
+            file=sys.stderr,
+        )
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

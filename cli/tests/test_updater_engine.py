@@ -24,11 +24,11 @@ _DIGEST = "sha256:" + "d" * 64
 
 def _setup(monkeypatch, *, forward_gate=update.GATE_READY, rollback_ok=True,
            old_version="0.3.4", new_version="0.3.5", recreate_fail_on=None,
-           verify_raises=False, inspect_none=False, stack=None):
+           recreate_raises_on=None, verify_raises=False, inspect_none=False, stack=None):
     """Wire a happy stack; knobs flip individual failures. Returns a `calls`
     dict recording which primitives ran (for assertions)."""
     calls: dict = {"recreate": [], "rollback": [], "retag": [], "prune": 0,
-                   "tag_previous": [], "tags": []}
+                   "tag_previous": [], "tags": [], "restore_latest": []}
     monkeypatch.setattr(recreate, "discover_stack",
                         lambda: list(_STACK if stack is None else stack))
 
@@ -48,6 +48,8 @@ def _setup(monkeypatch, *, forward_gate=update.GATE_READY, rollback_ok=True,
 
     def do_recreate(c, **k):
         calls["recreate"].append(c.service)
+        if recreate_raises_on and c.service == recreate_raises_on:
+            raise RuntimeError(f"boom recreating {c.service}")
         return not (recreate_fail_on and c.service == recreate_fail_on)
     monkeypatch.setattr(recreate, "recreate_one", do_recreate)
 
@@ -55,6 +57,8 @@ def _setup(monkeypatch, *, forward_gate=update.GATE_READY, rollback_ok=True,
         calls["rollback"].append(c.service)
         return rollback_ok
     monkeypatch.setattr(recreate, "rollback_one", do_rollback)
+    monkeypatch.setattr(recreate, "restore_latest",
+                        lambda repo, iid: (calls["restore_latest"].append(repo), True)[1])
     monkeypatch.setattr(recreate, "dangling_prune",
                         lambda: calls.__setitem__("prune", calls["prune"] + 1))
     monkeypatch.setattr(recreate, "exec_version",
@@ -150,6 +154,8 @@ def test_is_downgrade_helper():
     assert engine._is_downgrade("0.3.5", "0.3.4") is False
     assert engine._is_downgrade("0.3.5", "0.3.5") is False
     assert engine._is_downgrade("0.3.10", "0.3.9") is False  # dotted-numeric, not string
+    assert engine._is_downgrade("0.3", "0.3.0") is False     # length-padded -> equal
+    assert engine._is_downgrade("0.2", "0.3.0") is True      # length-padded -> 0.2.0 < 0.3.0
     assert engine._is_downgrade("latest", "0.3.5") is False  # non-numeric -> not a downgrade
     assert engine._is_downgrade(None, "0.3.5") is False
 
@@ -188,3 +194,23 @@ def test_equal_target_is_not_a_downgrade(monkeypatch):
     calls = _setup(monkeypatch, old_version="0.3.5", new_version="0.3.5")
     assert _run(target_tag="0.3.5") == engine.EXIT_OK
     assert calls["recreate"] == ["nginx", "greffer", "tunnel-sidecar"]
+
+
+def test_rollback_restores_latest_to_old_image(monkeypatch):
+    # on rollback, :latest is repointed at the old image (not just the container
+    # recreated), so a later `docker compose up` cannot re-apply the rejected image
+    calls = _setup(monkeypatch, forward_gate=update.GATE_FATAL)
+    assert _run() == engine.EXIT_FAILED_ROLLED_BACK
+    assert calls["restore_latest"] == [
+        "greffon/tunnel-sidecar", "greffon/greffer", "greffon/greffer-nginx"]  # reverse
+
+
+def test_unexpected_exception_in_mutating_window_rolls_back(monkeypatch):
+    # a RAISE mid-recreate (not just a False return) must still roll back, never
+    # escape run_remote_update leaving the stack half-updated
+    calls = _setup(monkeypatch, recreate_raises_on="greffer")
+    assert _run() == engine.EXIT_FAILED_ROLLED_BACK
+    assert calls["recreate"][:2] == ["nginx", "greffer"]
+    # only nginx reached `done` before greffer raised -> only nginx rolled back
+    assert calls["rollback"] == ["nginx"]
+    assert calls["prune"] == 0

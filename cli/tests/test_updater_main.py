@@ -72,3 +72,11 @@ def test_main_proceeds_without_fcntl_sentinel():
 def test_release_lock_tolerates_sentinels():
     entry.release_lock(None)
     entry.release_lock(entry._NO_LOCK)  # must not raise
+
+
+def test_default_lock_is_data_update_lock():
+    # the in-container updater must flock the SAME filename on /data that the host
+    # v1 `greffer update` resolves on the volume mountpoint, else they never
+    # contend (HLD §10). A change to either side's filename is caught by a test.
+    assert str(entry.DEFAULT_LOCK) == "/data/.update.lock"
+    assert entry.DEFAULT_LOCK.name == ".update.lock"

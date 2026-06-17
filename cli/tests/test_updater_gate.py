@@ -46,10 +46,14 @@ def _wire(monkeypatch, *, readyz, running=True, image_id="applied-id", restarts=
         monkeypatch.setattr(recreate, "restart_count", lambda name: restarts)
 
 
+_NAMES = ["greffer-greffer-1", "greffer-nginx-1"]
+
+
 def _gate(*, check_version=True, applied="applied-id", timeout=100.0):
     return gate.health_gate(
-        "greffer-greffer-1", greffer_id="g1", applied_image_id=applied,
-        service_names=["greffer-greffer-1", "greffer-nginx-1"], timeout=timeout,
+        "greffer-greffer-1", greffer_id="g1",
+        applied_image_ids={n: applied for n in _NAMES},
+        service_names=_NAMES, timeout=timeout,
         check_version=check_version, sleep=lambda _s: None, now=_clock())
 
 
