@@ -78,5 +78,7 @@ def test_default_lock_is_data_update_lock():
     # the in-container updater must flock the SAME filename on /data that the host
     # v1 `greffer update` resolves on the volume mountpoint, else they never
     # contend (HLD §10). A change to either side's filename is caught by a test.
-    assert str(entry.DEFAULT_LOCK) == "/data/.update.lock"
+    # as_posix() so the assertion is OS-independent (this test also runs on the
+    # Windows CI build, where str(Path) uses backslashes).
+    assert entry.DEFAULT_LOCK.as_posix() == "/data/.update.lock"
     assert entry.DEFAULT_LOCK.name == ".update.lock"
