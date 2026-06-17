@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+#
+# greffon/greffer-updater: the detached, signed container the greffer spawns for
+# a manager-triggered remote update (self-update v2). It holds the v2 updater
+# engine (greffer_cli.updater) plus everything that engine shells out to:
+#   - docker-cli            : talk to the host daemon over the mounted socket
+#                             (pull by digest, inspect the OCI version label,
+#                             recreate via compose)
+#   - docker-cli-buildx     : `docker buildx imagetools inspect` to resolve a
+#                             tag -> digest at the registry without a pull
+#   - docker-cli-compose    : `docker compose` recreate of the greffer stack
+#   - cosign                : verify image signatures + the signed version
+#                             manifest, offline, against the baked public key
+#
+# It runs detached with the docker socket + the greffer's /work (compose dir) and
+# /data (ratchet/lock) mounted. The greffer invokes it as
+# `python -m greffer_cli.updater <target_tag>` (the spawn supplies the full
+# command), so this image sets NO entrypoint that would duplicate it.
+
+# --- build the greffer_cli wheel + its deps into a venv ---------------------
+FROM python:3.11-alpine AS builder
+RUN apk add --no-cache build-base libffi-dev \
+      && pip install --no-cache-dir "poetry==1.8.5"
+WORKDIR /src
+COPY cli/ /src/
+# Build a wheel and pip-install it (non-editable) so the runtime stage carries a
+# clean greffer_cli install with typer/httpx/rich/click resolved, no source tree.
+RUN python -m venv /opt/venv \
+      && /opt/venv/bin/pip install --no-cache-dir poetry-core \
+      && poetry build -f wheel \
+      && /opt/venv/bin/pip install --no-cache-dir dist/*.whl \
+      && /opt/venv/bin/python -c "import greffer_cli.updater.engine"
+
+# --- runtime ----------------------------------------------------------------
+FROM python:3.11-alpine
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# docker-cli (host daemon via socket) + buildx (imagetools inspect) + compose.
+RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose \
+      && ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
+      && docker-compose version \
+      && docker buildx version
+
+# cosign from the official, multi-arch ko image (pinned), so no checksum dance
+# and buildx selects the right arch per platform.
+COPY --from=ghcr.io/sigstore/cosign/cosign:v2.4.3 /ko-app/cosign /usr/local/bin/cosign
+
+COPY --from=builder /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Baked trust material the engine reads (provenance.DEFAULT_COSIGN_PUB +
+# __main__.DEFAULT_BASELINE_FILE):
+#   - min_supported_baseline: public floor, committed; backstops manifest replay
+#     and survives a wiped /data.
+#   - cosign.pub: the PUBLIC verify key, delivered as a build secret from CI's
+#     COSIGN_PUBLIC_KEY variable and persisted into the layer on purpose (a public
+#     key is not sensitive). required=true so a misconfigured build can never ship
+#     an updater that cannot verify anything.
+COPY min_supported_baseline /etc/greffer/min_supported_baseline
+RUN --mount=type=secret,id=cosign_pub,required=true \
+      install -D -m 0644 /run/secrets/cosign_pub /etc/greffer/cosign.pub \
+      && cosign version
+
+# No ENTRYPOINT: the greffer spawns `python -m greffer_cli.updater <tag>` as the
+# full command. The CMD here is only a sensible default for a bare manual run.
+CMD ["python", "-m", "greffer_cli.updater"]

@@ -49,9 +49,21 @@ def cosign_verify(repo: str, digest: str, *, pubkey: str = DEFAULT_COSIGN_PUB) -
     required so a signature lifted from another Greffon image (an old below-floor
     nginx, or the updater) cannot pass in this slot. Fail-closed on any error."""
     ref = f"{repo}@{digest}"
+    # ``--insecure-ignore-tlog=true``: the trust model is an offline managed key
+    # (cosign verify --key), NOT keyless+Rekor (see the v2 trust-model doc,
+    # "Signing mechanism"). The publish CI signs with ``--tlog-upload=false``, so
+    # there is no transparency-log entry; without this flag cosign v2 defaults to
+    # REQUIRING one and the verify fails closed on every genuine image. The repo
+    # annotation, not a tlog identity, binds the signature to its slot.
+    # ``-a repo=<repo>`` (short for ``--annotations``) requires the signature to
+    # carry that annotation; the publish CI signs each image with the same flag.
+    # Short form on BOTH sides avoids the invalid singular ``--annotation`` (cosign
+    # only defines ``-a`` / ``--annotations``), and the release pipeline runs this
+    # exact verify as a sign->verify smoke test so a flag drift fails CI, not prod.
     res = compose._run(
         ["cosign", "verify", "--key", pubkey,
-         "--annotation", f"repo={repo}", ref],
+         "-a", f"repo={repo}",
+         "--insecure-ignore-tlog=true", ref],
         timeout=120,
     )
     return res.ok

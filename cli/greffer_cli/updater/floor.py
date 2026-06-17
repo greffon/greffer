@@ -75,9 +75,15 @@ def verify_blob(manifest_bytes: bytes, sig_bytes: bytes, *, cosign_pub: str) -> 
         spath = Path(d) / "manifest.sig"
         mpath.write_bytes(manifest_bytes)
         spath.write_bytes(sig_bytes)
+        # ``--insecure-ignore-tlog=true``: offline managed-key model, no Rekor.
+        # The manifest is sign-blob'd with ``--tlog-upload=false``, so there is no
+        # transparency-log entry; cosign v2 would otherwise require one and fail
+        # the floor closed on a genuine, correctly-signed manifest. Matches
+        # ``provenance.cosign_verify``.
         res = compose._run(
             ["cosign", "verify-blob", "--key", cosign_pub,
-             "--signature", str(spath), str(mpath)],
+             "--signature", str(spath),
+             "--insecure-ignore-tlog=true", str(mpath)],
             timeout=120,
         )
     return res.ok
