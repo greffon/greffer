@@ -185,3 +185,232 @@ def test_dangling_prune_is_dangling_only(monkeypatch):
     # never -a (that would reap the tagged :previous / unused images) and never rmi
     assert not any("-a" in c for c in calls)
     assert not any(c and c[0] == "rmi" for c in calls)
+
+
+# --- fidelity recreate: build_create_argv (HLD section 8, vs-OLD delta) ----
+
+def _greffer_inspect() -> dict:
+    return {
+        "Name": "/greffer-greffer-1",
+        "Config": {
+            "Env": [
+                "PATH=/opt/venv/bin:/usr/bin",
+                "VIRTUAL_ENV=/opt/venv",
+                "GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:OLD",
+                "GREFFER_ID=g1",
+                "GREFFON_BASE_SERVER=https://api",
+            ],
+            "Labels": {
+                "com.docker.compose.project": "greffer",
+                "com.docker.compose.service": "greffer",
+                "org.opencontainers.image.version": "0.3.4",
+            },
+            "Cmd": ["uvicorn"], "Entrypoint": None, "Healthcheck": None,
+        },
+        "HostConfig": {
+            "NetworkMode": "greffer_internal",
+            "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+            "PortBindings": {},
+            "LogConfig": {"Type": "json-file", "Config": {"max-size": "10m", "max-file": "3"}},
+            "ExtraHosts": ["host.docker.internal:host-gateway"],
+        },
+        "Mounts": [
+            {"Type": "bind", "Source": "/var/run/docker.sock",
+             "Destination": "/var/run/docker.sock", "RW": True},
+            {"Type": "volume", "Name": "greffer_greffon-data",
+             "Destination": "/data", "RW": True},
+        ],
+    }
+
+
+def _old_greffer_image_config() -> dict:
+    # The OLD image baked PATH/VIRTUAL_ENV and the OLD updater digest; no GREFFER_ID.
+    return {
+        "Env": [
+            "PATH=/opt/venv/bin:/usr/bin",
+            "VIRTUAL_ENV=/opt/venv",
+            "GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:OLD",
+        ],
+        "Labels": {"org.opencontainers.image.version": "0.3.4"},
+        "Cmd": ["uvicorn"], "Entrypoint": None, "Healthcheck": None,
+    }
+
+
+def test_build_argv_env_delta_drops_baked_keeps_runtime():
+    argv = recreate.build_create_argv(
+        _greffer_inspect(), _old_greffer_image_config(),
+        image_ref="greffon/greffer:latest", service="greffer")
+    # baked vars equal to the OLD image are NOT carried -> the NEW image wins
+    # (this is the whole point of vs-OLD: a relocated venv or a new updater
+    # digest in the new image must not be clobbered by the old value).
+    assert not any(a.startswith("VIRTUAL_ENV=") for a in argv)
+    assert not any(a.startswith("PATH=") for a in argv)
+    assert not any(a.startswith("GREFFER_UPDATER_IMAGE=") for a in argv)
+    # runtime (compose-set) env IS carried
+    assert "GREFFER_ID=g1" in argv
+    assert "GREFFON_BASE_SERVER=https://api" in argv
+
+
+def test_build_argv_operator_pinned_updater_image_is_carried():
+    cont = _greffer_inspect()
+    cont["Config"]["Env"] = [
+        e for e in cont["Config"]["Env"] if not e.startswith("GREFFER_UPDATER_IMAGE=")
+    ] + ["GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:PIN"]
+    argv = recreate.build_create_argv(
+        cont, _old_greffer_image_config(),
+        image_ref="greffon/greffer:latest", service="greffer")
+    # an env.env pin differs from the old image's bake -> carried (pin wins)
+    assert "GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:PIN" in argv
+
+
+def test_build_argv_carries_compose_labels_not_image_label():
+    argv = recreate.build_create_argv(
+        _greffer_inspect(), _old_greffer_image_config(),
+        image_ref="greffon/greffer:latest", service="greffer")
+    assert "com.docker.compose.service=greffer" in argv
+    assert "com.docker.compose.project=greffer" in argv
+    # the version label matches the old image -> not carried (new image supplies it)
+    assert not any(a.startswith("org.opencontainers.image.version=") for a in argv)
+
+
+def test_build_argv_greffer_infra_fields_and_image_last():
+    argv = recreate.build_create_argv(
+        _greffer_inspect(), _old_greffer_image_config(),
+        image_ref="greffon/greffer:latest", service="greffer")
+    i = argv.index("--network")
+    assert argv[i + 1] == "greffer_internal"
+    assert "--network-alias" in argv and "greffer" in argv
+    assert "--restart" in argv and "unless-stopped" in argv
+    assert "--name" in argv and "greffer-greffer-1" in argv
+    assert "/var/run/docker.sock:/var/run/docker.sock" in argv  # bind mount
+    assert "greffer_greffon-data:/data" in argv                 # named volume
+    assert "host.docker.internal:host-gateway" in argv          # extra host
+    assert "--log-opt" in argv and "max-size=10m" in argv
+    # cmd override is empty (matches old image) -> the image ref is last
+    assert argv[-1] == "greffon/greffer:latest"
+
+
+def test_build_argv_sidecar_host_network_ro_mount_healthcheck():
+    sidecar = {
+        "Name": "/greffer-tunnel-sidecar-1",
+        "Config": {
+            "Env": ["PATH=/usr/bin"],
+            "Labels": {"com.docker.compose.service": "tunnel-sidecar",
+                       "com.docker.compose.project": "greffer"},
+            "Cmd": None, "Entrypoint": None,
+            "Healthcheck": {"Test": ["CMD-SHELL", "pgrep rathole"],
+                            "Interval": 30000000000, "Timeout": 5000000000, "Retries": 3},
+        },
+        "HostConfig": {
+            "NetworkMode": "host",
+            "RestartPolicy": {"Name": "unless-stopped"},
+            "PortBindings": {}, "LogConfig": {"Type": "json-file", "Config": {}},
+        },
+        "Mounts": [{"Type": "volume", "Name": "greffer_rathole-client-config",
+                    "Destination": "/config", "RW": False}],
+    }
+    old_img = {"Env": ["PATH=/usr/bin"], "Labels": {}, "Healthcheck": None}
+    argv = recreate.build_create_argv(
+        sidecar, old_img, image_ref="greffon/tunnel-sidecar:latest",
+        service="tunnel-sidecar")
+    j = argv.index("--network")
+    assert argv[j + 1] == "host"
+    assert "--network-alias" not in argv          # host network takes no alias
+    assert "greffer_rathole-client-config:/config:ro" in argv  # :ro is load-bearing
+    assert "--health-cmd" in argv and "pgrep rathole" in argv  # compose-set healthcheck
+    assert "--health-interval" in argv and "30s" in argv
+    assert "--health-retries" in argv and "3" in argv
+
+
+def test_build_argv_nginx_port_binding():
+    nginx = {
+        "Name": "/greffer-nginx-1",
+        "Config": {"Env": [], "Labels": {"com.docker.compose.service": "nginx"},
+                   "Cmd": None, "Entrypoint": None, "Healthcheck": None},
+        "HostConfig": {
+            "NetworkMode": "greffer_internal",
+            "RestartPolicy": {"Name": "unless-stopped"},
+            "PortBindings": {"443/tcp": [{"HostIp": "", "HostPort": "8001"}]},
+            "LogConfig": {"Type": "json-file", "Config": {}},
+        },
+        "Mounts": [],
+    }
+    argv = recreate.build_create_argv(
+        nginx, {"Env": [], "Labels": {}}, image_ref="greffon/greffer-nginx:latest",
+        service="nginx")
+    assert "-p" in argv and "8001:443" in argv
+
+
+def test_build_argv_unreadable_old_image_carries_env_verbatim():
+    # fail-open: empty old-image config -> everything differs -> carried (we would
+    # rather over-carry runtime env than drop GREFFER_ID; logged by recreate_one).
+    argv = recreate.build_create_argv(
+        _greffer_inspect(), {}, image_ref="greffon/greffer:latest", service="greffer")
+    assert "GREFFER_ID=g1" in argv
+    assert any(a.startswith("VIRTUAL_ENV=") for a in argv)
+
+
+# --- recreate_one (inspect -> stop -> rm -> create -> start) ---------
+
+def test_recreate_one_happy_orders_calls(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(recreate, "inspect_container", lambda cid: _greffer_inspect())
+    monkeypatch.setattr(recreate, "image_config", lambda ref: _old_greffer_image_config())
+    monkeypatch.setattr(compose, "_run", lambda a, **k: (calls.append(a[1:]), _ok())[1])
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="greffon/greffer:latest", old_image_id="sha256:old") is True
+    assert [x[0] for x in calls] == ["stop", "rm", "create", "start"]
+    create = next(x for x in calls if x[0] == "create")
+    assert create[-1] == "greffon/greffer:latest"  # creates from the new image
+
+
+def test_recreate_one_inspect_failure_does_not_touch_docker(monkeypatch):
+    monkeypatch.setattr(recreate, "inspect_container", lambda cid: None)
+    monkeypatch.setattr(compose, "_run",
+                        lambda a, **k: pytest.fail("no docker mutation when inspect fails"))
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="x:latest", old_image_id="sha256:old") is False
+
+
+def test_recreate_one_rm_failure_aborts_before_create(monkeypatch):
+    monkeypatch.setattr(recreate, "inspect_container", lambda cid: _greffer_inspect())
+    monkeypatch.setattr(recreate, "image_config", lambda ref: {})
+
+    def fake(a, **k):
+        if a[1] == "rm":
+            return _fail()
+        if a[1] in ("create", "start"):
+            pytest.fail("reached create/start after a failed rm")
+        return _ok()
+    monkeypatch.setattr(compose, "_run", fake)
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="x:latest", old_image_id="sha256:old") is False
+
+
+def test_recreate_one_create_failure_aborts_before_start(monkeypatch):
+    monkeypatch.setattr(recreate, "inspect_container", lambda cid: _greffer_inspect())
+    monkeypatch.setattr(recreate, "image_config", lambda ref: {})
+
+    def fake(a, **k):
+        if a[1] == "create":
+            return _fail()
+        if a[1] == "start":
+            pytest.fail("reached start after a failed create")
+        return _ok()
+    monkeypatch.setattr(compose, "_run", fake)
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="x:latest", old_image_id="sha256:old") is False
+
+
+def test_recreate_one_start_failure_is_reported(monkeypatch):
+    monkeypatch.setattr(recreate, "inspect_container", lambda cid: _greffer_inspect())
+    monkeypatch.setattr(recreate, "image_config", lambda ref: {})
+    monkeypatch.setattr(compose, "_run",
+                        lambda a, **k: _fail() if a[1] == "start" else _ok())
+    c = recreate.StackContainer("greffer", "cid1", "greffon/greffer")
+    assert recreate.recreate_one(
+        c, image_ref="x:latest", old_image_id="sha256:old") is False
