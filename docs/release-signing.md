@@ -35,21 +35,28 @@ cosign drift). That round-trip is also what enforces that `COSIGN_PUBLIC_KEY`
 actually pairs with `COSIGN_PRIVATE_KEY`: a mismatched pair signs but fails the
 verify, so a paste error is caught at release time, not on a host.
 
-## Per host: opt in and pin the updater digest
+## Per host: nothing to do on 0.3.4+ (on by default)
 
-Remote update is operator-sovereign and **off by default**. On each greffer host
-that should accept manager-triggered updates, set in `env.env`:
+Remote update is **on by default** (`GREFFER_REMOTE_UPDATE_ENABLED=true`), and a
+0.3.4+ greffer image has its matching `GREFFER_UPDATER_IMAGE` digest **baked in**
+at build time (see `docker-publish.yml`). So a current greffer accepts
+manager-triggered updates with **zero per-host config**. The cryptographic gate,
+not a per-host flag, is what keeps this safe: the updater only recreates
+cosign-signed images at/above the `min_supported` floor, fail-closed.
+
+To make a host **refuse** remote updates, set in `env.env`:
 
 ```sh
-GREFFER_REMOTE_UPDATE_ENABLED=true
-# Pin the updater by DIGEST (never a mutable tag): it is the one root-equivalent,
-# socket-mounted container, so a moved tag must not be able to swap it.
-GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:<digest>
+GREFFER_REMOTE_UPDATE_ENABLED=false
 ```
 
-Resolve the digest for a published version with:
+Pre-0.3.4 hosts only: the updater digest was not baked yet, so also pin it
+(by DIGEST, never a mutable tag, since it is the one root-equivalent
+socket-mounted container):
 
 ```sh
+GREFFER_UPDATER_IMAGE=greffon/greffer-updater@sha256:<digest>
+# resolve a published version's digest with:
 docker buildx imagetools inspect greffon/greffer-updater:<version> \
   --format '{{.Manifest.Digest}}'
 ```

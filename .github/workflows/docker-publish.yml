@@ -106,6 +106,42 @@ jobs:
           # with "no matching manifest for linux/arm64/v8".
           platforms: linux/amd64,linux/arm64
       -
+        name: Build and push Greffer Updater
+        # The detached, signed container the greffer spawns for a remote update
+        # (self-update v2). Built from the runner checkout (context: .) so it can
+        # COPY cli/ + the baseline; cosign.pub is delivered as a build secret from
+        # the COSIGN_PUBLIC_KEY variable and baked in (a public key, persisted on
+        # purpose). Gated: an updater without its verify key is useless, so it only
+        # builds once the managed key is provisioned. Built BEFORE the greffer
+        # image so its digest can be baked into it (next two steps).
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: Dockerfile.updater
+          push: true
+          tags: |
+            greffon/greffer-updater:latest
+            greffon/greffer-updater:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          secrets: |
+            cosign_pub=${{ vars.COSIGN_PUBLIC_KEY }}
+      -
+        name: Resolve greffer-updater digest
+        # Pin the updater by its published index digest so the greffer image can
+        # bake GREFFER_UPDATER_IMAGE (operators never copy a digest per host).
+        # Skipped (empty output) in unsigned builds, where the greffer bakes no
+        # default and the operator sets GREFFER_UPDATER_IMAGE explicitly.
+        id: updater
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          d="$(docker buildx imagetools inspect greffon/greffer-updater:${{ steps.version.outputs.version }} --format '{{.Manifest.Digest}}')"
+          case "$d" in sha256:*) ;; *) echo "::error::could not resolve updater digest (got '$d')" >&2; exit 1 ;; esac
+          echo "ref=greffon/greffer-updater@$d" >> "$GITHUB_OUTPUT"
+      -
         name: Build and push Greffer
         uses: docker/build-push-action@v3
         with:
@@ -115,6 +151,13 @@ jobs:
             greffon/greffer:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          # Bake the matching updater digest so a deployed greffer spawns it
+          # digest-pinned with no per-host config (v2 trust model: "pin the updater
+          # digest into the greffer build"). Empty in unsigned builds (no updater
+          # published) and overridable via env.env. The empty-string default keeps
+          # the ARG valid when the resolve step was skipped.
+          build-args: |
+            GREFFER_UPDATER_IMAGE=${{ steps.updater.outputs.ref }}
           # Multi-arch: amd64 + arm64. Base is python:3.11-alpine
           # (multi-arch manifest, no per-arch downloads), so arm64 is a
           # pure rebuild. Pairs with the greffer-nginx step above — both
@@ -152,28 +195,6 @@ jobs:
           # only ships an amd64 manifest and forces emulation on
           # ARM hosts (Apple Silicon, Graviton, Pi).
           platforms: linux/amd64,linux/arm64
-      -
-        name: Build and push Greffer Updater
-        # The detached, signed container the greffer spawns for a remote update
-        # (self-update v2). Built from the runner checkout (context: .) so it can
-        # COPY cli/ + the baseline; cosign.pub is delivered as a build secret from
-        # the COSIGN_PUBLIC_KEY variable and baked in (a public key, persisted on
-        # purpose). Gated: an updater without its verify key is useless, so it only
-        # builds once the managed key is provisioned.
-        if: steps.cosign_cfg.outputs.enabled == 'true'
-        uses: docker/build-push-action@v3
-        with:
-          context: .
-          file: Dockerfile.updater
-          push: true
-          tags: |
-            greffon/greffer-updater:latest
-            greffon/greffer-updater:${{ steps.version.outputs.version }}
-          labels: |
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-          platforms: linux/amd64,linux/arm64
-          secrets: |
-            cosign_pub=${{ vars.COSIGN_PUBLIC_KEY }}
       -
         name: Install cosign
         if: steps.cosign_cfg.outputs.enabled == 'true'
