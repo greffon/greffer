@@ -144,11 +144,38 @@ def test_spawn_missing_data_mount_refuses():
 
 
 def test_spawn_missing_compose_mount_refuses():
+    # No /app bind AND no GREFFER_HOST_CONFIG_DIR -> can't locate the host
+    # compose dir; the error points the operator at the env var.
     client = _client([_VOL_DATA])  # no /app
-    with pytest.raises(updater.UpdaterSpawnError):
+    with pytest.raises(updater.UpdaterSpawnError, match="GREFFER_HOST_CONFIG_DIR"):
         updater.spawn_updater(
             image=_IMG, target_tag="0.3.6", manifest_url="https://x",
             greffer_id="g1", mode="proxy", client=client)
+
+
+def test_spawn_uses_host_config_dir_when_no_app_mount():
+    # Production: the app is baked into the image (no /app bind mount), so the
+    # host compose dir comes from GREFFER_HOST_CONFIG_DIR, not mount discovery.
+    client = _client([_VOL_DATA])  # only /data (named volume); NO /app
+    updater.spawn_updater(
+        image=_IMG, target_tag="0.3.6", manifest_url="https://x",
+        greffer_id="g1", mode="proxy", host_config_dir="/root/.greffer",
+        client=client)
+    mounts = _by_target(client.containers.run_calls[0]["mounts"])
+    assert mounts["/work"]["Source"] == "/root/.greffer"
+    assert mounts["/work"]["Type"] == "bind"
+    assert mounts["/data"]["Source"] == "greffer-data"  # still discovered (volume)
+
+
+def test_spawn_host_config_dir_overrides_app_mount():
+    # When set, GREFFER_HOST_CONFIG_DIR wins over a present /app bind (so dev and
+    # prod don't disagree if both happen to exist).
+    client = _client([_BIND_APP, _VOL_DATA])
+    updater.spawn_updater(
+        image=_IMG, target_tag="0.3.6", manifest_url="https://x",
+        greffer_id="g1", mode="proxy", host_config_dir="/srv/greffer", client=client)
+    mounts = _by_target(client.containers.run_calls[0]["mounts"])
+    assert mounts["/work"]["Source"] == "/srv/greffer"
 
 
 def test_spawn_volume_without_source_refuses():

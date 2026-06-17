@@ -167,6 +167,16 @@ class Settings(BaseSettings):
     greffer_updater_image: str = ""
     greffer_version_manifest_url: str = "https://greffon.io/greffer-version.json"
 
+    # Host path of the greffer's compose dir (the dir holding docker-compose.yml,
+    # e.g. /root/.greffer). The remote-update controller mounts it into the
+    # spawned updater at /work so the updater runs docker-compose against the
+    # REAL host stack. Required in production: the image bakes the app at /app
+    # (no bind mount), so the host path can't be discovered from the container's
+    # mounts and must be given here. Empty in dev, where it's discovered off the
+    # ``./:/app`` bind. Carries the ``greffer_`` prefix to bind
+    # GREFFER_HOST_CONFIG_DIR (the prefix pitfall noted above).
+    greffer_host_config_dir: str = ""
+
     # Self-health watchdog (greffer-observability epic, Feature #3). The
     # watchdog evaluates /readyz's FATAL conditions and, when one is sustained
     # past the grace window, exits the uvicorn process so ``restart:

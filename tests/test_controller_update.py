@@ -34,6 +34,7 @@ def _settings(monkeypatch, tmp_path, *, enabled=True, image=_PINNED):
     monkeypatch.setenv("GREFFER_REMOTE_UPDATE_ENABLED", "true" if enabled else "false")
     monkeypatch.setenv("GREFFER_UPDATER_IMAGE", image)
     monkeypatch.setenv("GREFFER_VERSION_MANIFEST_URL", "https://x/m.json")
+    monkeypatch.setenv("GREFFER_HOST_CONFIG_DIR", "/root/.greffer")
     return get_settings()
 
 
@@ -79,6 +80,8 @@ async def test_update_happy_spawns_and_returns_202(monkeypatch, tmp_path) -> Non
     assert kw["greffer_id"] == "g1"
     assert kw["data_dest"] == str(tmp_path)
     assert kw["mode"] == "proxy"  # GREFFER_MODE unset -> default proxy
+    # the route must pass the host compose dir through (the prod-update bug fix)
+    assert kw["host_config_dir"] == "/root/.greffer"
 
 
 @pytest.mark.asyncio

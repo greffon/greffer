@@ -35,14 +35,24 @@ cosign drift). That round-trip is also what enforces that `COSIGN_PUBLIC_KEY`
 actually pairs with `COSIGN_PRIVATE_KEY`: a mismatched pair signs but fails the
 verify, so a paste error is caught at release time, not on a host.
 
-## Per host: nothing to do on 0.3.4+ (on by default)
+## Per host: one required setting on 0.3.4+
 
 Remote update is **on by default** (`GREFFER_REMOTE_UPDATE_ENABLED=true`), and a
 0.3.4+ greffer image has its matching `GREFFER_UPDATER_IMAGE` digest **baked in**
-at build time (see `docker-publish.yml`). So a current greffer accepts
-manager-triggered updates with **zero per-host config**. The cryptographic gate,
-not a per-host flag, is what keeps this safe: the updater only recreates
-cosign-signed images at/above the `min_supported` floor, fail-closed.
+at build time (see `docker-publish.yml`). The cryptographic gate, not a per-host
+flag, is what keeps this safe: the updater only recreates cosign-signed images
+at/above the `min_supported` floor, fail-closed.
+
+The one thing an operator MUST set is the **host path of the greffer's compose
+dir**, so the spawned updater can run docker-compose against the real host stack
+(the image bakes the app at `/app`, so the path can't be discovered from inside
+the container). In `env.env`:
+
+```sh
+GREFFER_HOST_CONFIG_DIR=/root/.greffer   # the dir that holds docker-compose.yml
+```
+Without it, the controller returns 500 `updater_spawn_failed` with
+"set GREFFER_HOST_CONFIG_DIR …".
 
 To make a host **refuse** remote updates, set in `env.env`:
 

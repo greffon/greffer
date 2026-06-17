@@ -47,9 +47,11 @@ def is_digest_pinned(ref: object) -> bool:
     """True iff ``ref`` is an image reference pinned by a sha256 digest."""
     return isinstance(ref, str) and _DIGEST_PINNED_RE.fullmatch(ref) is not None
 
-# The greffer mounts its compose dir at /app (``./:/app``) and uses
-# ``$GREFFON_PATH`` (default /data) for persistent state. The updater image
-# expects the compose dir at /work and the shared state at /data.
+# In dev the greffer bind-mounts its compose dir at /app (``./:/app``); prod
+# bakes the app there instead and supplies the host compose dir via
+# GREFFER_HOST_CONFIG_DIR (see _work_mount). Persistent state is ``$GREFFON_PATH``
+# (default /data). The updater image expects the compose dir at /work + state at
+# /data.
 SELF_COMPOSE_DEST = "/app"
 UPDATER_COMPOSE_DEST = "/work"
 DOCKER_SOCK = "/var/run/docker.sock"
@@ -93,17 +95,39 @@ def _mount_for(self_attrs: dict, destination: str, *, target: str) -> Mount:
         f"greffer has no mount at {destination}; cannot wire the updater")
 
 
+def _work_mount(self_attrs: dict, host_config_dir: str) -> Mount:
+    """The host compose dir (where docker-compose.yml lives) mounted at /work.
+
+    Production greffers bake the app into the image (``COPY . /app``, no /app
+    BIND mount), so the host compose-dir path cannot be discovered from the
+    container's mounts; it is supplied via ``GREFFER_HOST_CONFIG_DIR`` (the host
+    path of e.g. ~/.greffer). Dev (``./:/app``) leaves that env unset and we fall
+    back to discovering the path off the /app bind mount. A container can never
+    discover a host path that isn't mounted into it, hence the env for prod."""
+    if host_config_dir:
+        return Mount(target=UPDATER_COMPOSE_DEST, source=host_config_dir,
+                     type="bind", read_only=False)
+    try:
+        return _mount_for(self_attrs, SELF_COMPOSE_DEST, target=UPDATER_COMPOSE_DEST)
+    except UpdaterSpawnError as exc:
+        raise UpdaterSpawnError(
+            "cannot locate the host compose dir: set GREFFER_HOST_CONFIG_DIR to "
+            "the host path of the greffer's compose dir (e.g. /root/.greffer) "
+            f"[{exc}]") from exc
+
+
 def spawn_updater(
     *, image: str, target_tag: str, manifest_url: str, greffer_id: str | None,
-    mode: str, data_dest: str = "/data", client=None,
+    mode: str, data_dest: str = "/data", host_config_dir: str = "", client=None,
 ) -> str:
     """Spawn the detached updater container and return its id.
 
     ``image`` MUST be a digest-pinned ref (caller's responsibility / settings
-    contract). Mounts: the greffer's compose dir -> /work, its ``data_dest``
-    (default /data) -> /data, and the docker socket. The target tag is passed as
-    a list arg (no shell), and the updater re-validates it; provenance/floor
-    verification all happen inside the container before any recreate."""
+    contract). Mounts: the host compose dir -> /work (from ``host_config_dir``,
+    i.e. GREFFER_HOST_CONFIG_DIR, or discovered off the /app bind in dev), its
+    ``data_dest`` (default /data) -> /data, and the docker socket. The target tag
+    is passed as a list arg (no shell), and the updater re-validates it;
+    provenance/floor verification all happen inside the container before recreate."""
     if not image:
         raise UpdaterSpawnError("no updater image configured")
     if not is_digest_pinned(image):
@@ -115,7 +139,7 @@ def spawn_updater(
     self_attrs = _self_container(client).attrs
 
     mounts = [
-        _mount_for(self_attrs, SELF_COMPOSE_DEST, target=UPDATER_COMPOSE_DEST),
+        _work_mount(self_attrs, host_config_dir),
         _mount_for(self_attrs, data_dest, target="/data"),
         Mount(target=DOCKER_SOCK, source=DOCKER_SOCK, type="bind"),
     ]

@@ -350,6 +350,7 @@ def remote_update(
             greffer_id=settings.greffer_id,
             mode=settings.greffer_mode or "proxy",
             data_dest=str(settings.greffon_path),
+            host_config_dir=settings.greffer_host_config_dir,
         )
     except updater_spawn.UpdaterSpawnError as exc:
         logger.error("remote_update_spawn_failed target=%s err=%s",
