@@ -85,6 +85,19 @@ jobs:
             echo "::warning::cosign signing disabled (set the COSIGN_PRIVATE_KEY secret + COSIGN_PUBLIC_KEY variable); publishing UNSIGNED node images and skipping greffon/greffer-updater"
           fi
       -
+        name: Stage cosign public key for the updater build
+        # Deliver cosign.pub to the updater build as a FILE, not an inline secret.
+        # docker/build-push-action's `secrets:` input is newline-delimited
+        # `id=value`, so a multi-line PEM passed inline (cosign_pub=${{ ... }}) is
+        # truncated to its FIRST line and the baked /etc/greffer/cosign.pub is an
+        # unusable 26-byte stub ("PEM decoding failed" -> every remote update fails
+        # cosign verify). Writing it to a file + `secret-files:` preserves the full
+        # key. printf '%s' (no added newline) matches the sign step's key handling.
+        if: steps.cosign_cfg.outputs.enabled == 'true'
+        env:
+          COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
+        run: printf '%s' "$COSIGN_PUBLIC_KEY" > "${{ runner.temp }}/cosign.pub"
+      -
         name: Build and push Greffer Nginx
         uses: docker/build-push-action@v3
         with:
@@ -126,8 +139,10 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
           platforms: linux/amd64,linux/arm64
-          secrets: |
-            cosign_pub=${{ vars.COSIGN_PUBLIC_KEY }}
+          # File, not inline (see "Stage cosign public key"): inline `secrets:`
+          # truncates the multi-line PEM to its first line.
+          secret-files: |
+            cosign_pub=${{ runner.temp }}/cosign.pub
       -
         name: Resolve greffer-updater digest
         # Pin the updater by its published index digest so the greffer image can
