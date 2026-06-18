@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import engine
@@ -42,21 +43,35 @@ def _config_from_env(env: dict) -> dict:
     }
 
 
-def acquire_lock(lock_path: Path = DEFAULT_LOCK):
+def acquire_lock(lock_path: Path = DEFAULT_LOCK, *,
+                 attempts: int = 20, retry_sleep_s: float = 0.05,
+                 _sleep=time.sleep):
     """Exclusive flock on ``/data/.update.lock``. Returns a handle to release, or
-    None if another actor holds it (the caller refuses), or ``_NO_LOCK`` on a
-    platform without fcntl."""
+    None if another actor genuinely holds it (the caller refuses), or ``_NO_LOCK``
+    on a platform without fcntl.
+
+    Retries briefly (``attempts`` x ``retry_sleep_s``, ~1s) before giving up. The
+    lock is also PROBED, non-blocking, acquire-then-immediately-release, by the
+    controller's start/stop/update guard and by every heartbeat
+    (``apps.utils.docker.updater.update_in_progress``). Those probes hold LOCK_EX
+    for only microseconds, but a one-shot acquire here could still land inside that
+    window and refuse a perfectly valid update. A genuine concurrent update holds
+    the lock for its whole run (minutes), so it still refuses after the short
+    retry; a transient probe hold is absorbed."""
     try:
         import fcntl
     except ImportError:
         return _NO_LOCK
     fh = open(lock_path, "w", encoding="utf-8")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh
+    for attempt in range(attempts):
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if attempt < attempts - 1:
+                _sleep(retry_sleep_s)
+    fh.close()
+    return None
 
 
 def release_lock(handle) -> None:

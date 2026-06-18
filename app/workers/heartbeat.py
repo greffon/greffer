@@ -105,6 +105,23 @@ def _disk_free_bytes(settings: Settings) -> int | None:
         return None
 
 
+def _update_in_progress(settings: Settings) -> bool:
+    """Whether a self-update currently holds the ``/data`` update lock.
+
+    Reports the SAME non-blocking lock probe the controller uses to 409
+    start/stop/update (HLD section 10), at the SAME path
+    (``$GREFFON_PATH/.update.lock``). The manager reads this to clear its
+    transient ``updating`` flag once an update finishes OR fails without
+    restarting the node (the updater dying mid-verify releases the lock but never
+    recreates the greffer, so no re-register fires). The probe itself fails safe
+    to False (cannot tell -> do not claim updating)."""
+    from pathlib import Path
+
+    from apps.utils.docker import updater
+
+    return updater.update_in_progress(Path(settings.greffon_path) / ".update.lock")
+
+
 def _read_meminfo() -> tuple[int | None, int | None]:
     """Host memory ``(used, total)`` in bytes from ``/proc/meminfo``, or
     ``(None, None)``.
@@ -202,6 +219,10 @@ def _one_heartbeat(app: FastAPI, seq: int) -> int:
         "reasons": reasons,
         "disk_free_bytes": _disk_free_bytes(settings),
         "instances": status_map,
+        # Lets the manager clear its transient "updating" flag the moment a
+        # self-update finishes or fails (lock released), instead of waiting out
+        # its grace window (covers a failed update that never restarts the node).
+        "update_in_progress": _update_in_progress(settings),
     }
     # Host vitals (resource-monitoring epic, Feature 1). Read from /proc,
     # independent of the docker status collection above, so they ride even a

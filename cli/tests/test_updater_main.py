@@ -74,6 +74,38 @@ def test_release_lock_tolerates_sentinels():
     entry.release_lock(entry._NO_LOCK)  # must not raise
 
 
+def test_acquire_lock_retries_through_transient_probe_hold(tmp_path):
+    # A heartbeat/controller probe holds LOCK_EX for only microseconds; a one-shot
+    # acquire could land in that window and wrongly refuse. acquire_lock retries,
+    # so a hold released during the backoff is absorbed and the update proceeds.
+    fcntl = pytest.importorskip("fcntl")
+    lock = tmp_path / ".update.lock"
+    holder = open(lock, "w", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Release the "probe" hold during the first backoff sleep (no real sleeping).
+    handle = entry.acquire_lock(
+        lock, attempts=5,
+        _sleep=lambda _s: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
+    assert handle is not None
+    entry.release_lock(handle)
+    holder.close()
+
+
+def test_acquire_lock_gives_up_on_persistent_hold(tmp_path):
+    # A genuine concurrent update holds the lock for its whole run, so acquire_lock
+    # still refuses after the bounded retry (it does not block forever).
+    fcntl = pytest.importorskip("fcntl")
+    lock = tmp_path / ".update.lock"
+    holder = open(lock, "w", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    sleeps = {"n": 0}
+    handle = entry.acquire_lock(
+        lock, attempts=3, _sleep=lambda _s: sleeps.__setitem__("n", sleeps["n"] + 1))
+    assert handle is None
+    assert sleeps["n"] == 2  # slept between attempts, not after the last
+    holder.close()
+
+
 def test_default_lock_is_data_update_lock():
     # the in-container updater must flock the SAME filename on /data that the host
     # v1 `greffer update` resolves on the volume mountpoint, else they never

@@ -49,6 +49,29 @@ def test_one_heartbeat_posts_payload_with_token(
     assert body["degraded"] is False
     assert body["interval"] == settings.heartbeat_interval
     assert "captured_at" in body and "uptime_s" in body
+    # No update lock held under a fresh tmp greffon_path -> reports not-updating.
+    assert body["update_in_progress"] is False
+
+
+def test_one_heartbeat_reports_update_in_progress(
+    settings: Settings, tmp_path
+) -> None:
+    """When a self-update holds the /data lock, the beat reports it so the manager
+    can keep ``updating`` true (and later clear it when this flips back to False)."""
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="hb-tok", settings=settings)
+    app.state.status_map = {"map": {}, "at": time.monotonic()}
+
+    with patch("app.workers.heartbeat.requests") as mock_requests, \
+            patch("apps.utils.docker.updater.update_in_progress",
+                  return_value=True) as probe:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["update_in_progress"] is True
+    # Probes the SAME path the controller 409s on (HLD section 10).
+    assert probe.call_args.args[0] == tmp_path / ".update.lock"
 
 
 def test_collect_or_reuse_uses_fresh_cache(settings: Settings) -> None:

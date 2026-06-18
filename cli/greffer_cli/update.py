@@ -367,7 +367,8 @@ def _update_lock_path(cfg: Path) -> Path:
     return (Path(mountpoint) if mountpoint else cfg) / ".update.lock"
 
 
-def _acquire_update_lock(cfg: Path):
+def _acquire_update_lock(cfg: Path, *, attempts: int = 20,
+                         retry_sleep_s: float = 0.05, _sleep=time.sleep):
     """Take an exclusive host lock so two concurrent ``greffer update`` runs
     can't interleave the compose rewrite and rollback-baseline capture (run B
     reading the file after run A already retagged it would record A's
@@ -376,7 +377,15 @@ def _acquire_update_lock(cfg: Path):
     Returns an open handle to release later, ``None`` if another run already
     holds the lock, or ``_NO_HOST_LOCK`` on a platform without ``fcntl``
     (Windows) where we proceed unlocked; concurrent runs there are the
-    operator's responsibility (v1 is operator-run)."""
+    operator's responsibility (v1 is operator-run).
+
+    Retries briefly (~1s) before giving up: the same ``/data/.update.lock`` is
+    PROBED, non-blocking acquire-then-release, by the greffer's per-heartbeat
+    update_in_progress check and its controller start/stop/update guard. Those
+    holds are microseconds, but a one-shot acquire here could land inside one and
+    spuriously refuse a valid manual update. A genuine concurrent run (host or the
+    in-container updater) holds the lock for its whole run, so it still refuses
+    after the retry. Mirrors the in-container updater's acquire_lock."""
     try:
         import fcntl
     except ImportError:
@@ -402,12 +411,15 @@ def _acquire_update_lock(cfg: Path):
             "dir instead, so a concurrent remote update may not be detected.",
             file=sys.stderr,
         )
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh
+    for attempt in range(attempts):
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if attempt < attempts - 1:
+                _sleep(retry_sleep_s)
+    fh.close()
+    return None
 
 
 def _release_update_lock(handle) -> None:
