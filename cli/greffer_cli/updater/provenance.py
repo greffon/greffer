@@ -13,6 +13,8 @@ monkeypatch the subprocess layer without a real registry.
 
 from __future__ import annotations
 
+import json
+
 from .. import compose
 
 # Baked into the greffer-updater image at build time (the publish CI commits
@@ -25,17 +27,31 @@ VERSION_LABEL = "org.opencontainers.image.version"
 
 
 def resolve_digest(ref: str) -> str | None:
-    """Resolve ``greffon/<repo>:<tag>`` to its content digest (``sha256:<64hex>``),
-    or None. Uses ``docker buildx imagetools inspect`` so it needs no pull."""
+    """Resolve ``greffon/<repo>:<tag>`` to its image-INDEX digest
+    (``sha256:<64hex>``, the manifest-list digest CI cosign-signs), or None.
+    Uses ``docker buildx imagetools inspect`` so it needs no pull.
+
+    Parses ``--format '{{json .Manifest}}'`` and reads its ``digest`` rather than
+    ``--format '{{.Manifest.Digest}}'``: the latter is buildx-version-fragile (on
+    buildx >= ~0.35 it silently falls back to the verbose listing instead of
+    emitting the bare digest, so the whole verify-then-pull would refuse). The
+    JSON form is stable across the buildx versions tested (the updater's 0.34.1
+    and newer)."""
     res = compose._run(
         ["docker", "buildx", "imagetools", "inspect", ref,
-         "--format", "{{.Manifest.Digest}}"],
+         "--format", "{{json .Manifest}}"],
         timeout=60,
     )
     if not res.ok:
         return None
-    digest = res.stdout.strip()
-    if not digest.startswith("sha256:"):
+    try:
+        manifest = json.loads(res.stdout)
+    except (json.JSONDecodeError, ValueError):
+        # A buildx that ignored --format and printed the verbose listing, or any
+        # non-JSON: fail closed rather than misread a digest.
+        return None
+    digest = manifest.get("digest") if isinstance(manifest, dict) else None
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
         return None
     hexpart = digest[len("sha256:"):]
     return digest if len(hexpart) == 64 and all(
