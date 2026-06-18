@@ -26,6 +26,40 @@ def _split_proto(raw):
     return raw, None
 
 
+# Catalog authors set this label on a service whose app streams responses
+# (Server-Sent Events, long-poll, chunked) so the generated nginx proxy stops
+# buffering them. Without it nginx's default response buffering holds the
+# stream and the app's live updates never reach the browser. The nginx
+# template also emits `X-Accel-Buffering: no` for these ports so any *outer*
+# proxy (the manager edge nginx) disables buffering for the response too,
+# without needing per-greffon knowledge of its own.
+PROXY_STREAMING_LABEL = 'com.greffon.proxy.streaming'
+_STREAMING_TRUTHY = {'true', '1', 'yes', 'on'}
+
+
+def _service_streaming(service):
+    """Read the streaming label off a parsed compose service.
+
+    Compose accepts labels as a mapping (`key: value`) or a list of
+    `key=value` strings; handle both, and tolerate a malformed labels block
+    (a bare string, a non-string list item) by treating it as "no label"
+    rather than crashing the whole start flow. Returns True only for an
+    explicit truthy value so the default stays buffered for every other
+    greffon. Truthy spellings mirror docker/YAML (`true`, `1`, `yes`, `on`);
+    YAML also pre-coerces bare `true`/`yes`/`on` to a bool, which str()s back
+    into this set.
+    """
+    labels = (service or {}).get('labels', {}) or {}
+    if isinstance(labels, list):
+        labels = dict(
+            item.split('=', 1) if '=' in item else (item, '')
+            for item in labels if isinstance(item, str)
+        )
+    elif not isinstance(labels, dict):
+        return False
+    return str(labels.get(PROXY_STREAMING_LABEL, '')).strip().lower() in _STREAMING_TRUTHY
+
+
 def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
     greffon_info = create_greffon_info(compose, greffon)
     ports = greffon_info['ports']
@@ -207,6 +241,7 @@ def create_greffon_info(compose, greffon):
                     # container port) so the app advertises exactly what it
                     # binds. Manager-declared (L4 only); default off.
                     'same_port': bool(manager_port.get('same_port', False)),
+                    'streaming': _service_streaming(service),
                 })
         else:
             greffon_info['ports'].setdefault(name, {})
@@ -222,6 +257,7 @@ def create_greffon_info(compose, greffon):
                 'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
                 'exposure_tier': manager_port.get('exposure_tier', 'http'),
                 'same_port': bool(manager_port.get('same_port', False)),
+                'streaming': _service_streaming(service),
             })
         volumes = service.get('volumes', [])
         if type(volumes) == list:
