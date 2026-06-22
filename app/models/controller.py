@@ -121,6 +121,29 @@ class GreffonStatusResponse(BaseModel):
     containers: list[dict[str, Any]]
 
 
+class GreffonBackupRequest(BaseModel):
+    id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
+    backup_id: str = Field(min_length=1, max_length=64)
+
+
+class GreffonRestoreRequest(BaseModel):
+    id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
+    restic_snapshot_id: str = Field(min_length=1, max_length=64)
+    restore_id: str = Field(min_length=1, max_length=64)
+    # R15 greffer-half: the manager passes the backup-time compose digest so the
+    # greffer can refuse a same-version-but-rewritten-compose restore.
+    compose_digest: str | None = None
+    allow_drift: bool = False
+
+
+class GreffonBackupResponse(BaseModel):
+    backup_id: str
+
+
+class GreffonRestoreResponse(BaseModel):
+    restore_id: str
+
+
 # Per-greffon observability digests (resource-monitoring epic, Feature 2).
 # Every metric is nullable: a non-running container, or a metric the daemon
 # did not report, is null rather than an error, so a stopped/partial instance

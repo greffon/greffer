@@ -23,7 +23,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.auth import require_token
 from app.diagnostics import diag
 from app.log_context import instance_id_var
+from app import backup
 from app.models.controller import (
+    GreffonBackupRequest,
+    GreffonBackupResponse,
+    GreffonRestoreRequest,
+    GreffonRestoreResponse,
     GreffonStartRequest,
     GreffonStartResponse,
     GreffonStatusResponse,
@@ -307,6 +312,39 @@ def _write_pushed_client_toml(
         logger.debug("tunnel_client_toml_pushed_for_id=%s",
                      getattr(payload, "id", "?"))
     return "ok"
+
+
+@router.post("/backup/", status_code=202)
+def backup_greffon(
+    payload: GreffonBackupRequest, request: Request
+) -> GreffonBackupResponse:
+    """Cold backup: 202 + background thread (HLD section 4). The in-process
+    per-instance lock 409s a concurrent op; the manager-supplied backup_id is
+    echoed in the backup-result callback."""
+    _refuse_if_updating(_settings(request))
+    try:
+        backup.spawn_backup(_settings(request), payload.id, payload.backup_id)
+    except backup.BusyError:
+        raise HTTPException(status_code=409, detail="instance_busy")
+    return GreffonBackupResponse(backup_id=payload.backup_id)
+
+
+@router.post("/restore/", status_code=202)
+def restore_greffon(
+    payload: GreffonRestoreRequest, request: Request
+) -> GreffonRestoreResponse:
+    """Restore-in-place: 202 + background thread. The greffer restores by
+    restic_snapshot_id (it cannot map the manager UUID) and finalizes via the
+    restore-result callback carrying the safety snapshot id."""
+    _refuse_if_updating(_settings(request))
+    try:
+        backup.spawn_restore(
+            _settings(request), payload.id, payload.restic_snapshot_id,
+            payload.restore_id,
+        )
+    except backup.BusyError:
+        raise HTTPException(status_code=409, detail="instance_busy")
+    return GreffonRestoreResponse(restore_id=payload.restore_id)
 
 
 @router.post("/update/", status_code=202)
