@@ -24,6 +24,7 @@ enum -- raw restic stderr is never sent.
 """
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import threading
@@ -107,19 +108,30 @@ def _classify(stderr: str) -> str:
     return "snapshot_failed"
 
 
-def _run_restic(settings, args: list[str], mounts: list[str], *, read_only: bool) -> tuple[int, str, str]:
-    """Run the digest-pinned restic sidecar with the data volumes mounted under
+def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
+                read_only: bool) -> tuple[int, str, str]:
+    """Run the digest-pinned restic sidecar with ``(source, dest)`` mounts under
     ``/data`` and the repo creds in env. Returns (rc, stdout, stderr)."""
     docker_args = ["docker", "run", "--rm"]
     for key, value in restic_env(settings).items():
         docker_args += ["-e", f"{key}={value}"]
     suffix = ":ro" if read_only else ""
-    for vol in mounts:
-        # strip the "<id>_" prefix for a stable, collision-free mount path
-        docker_args += ["-v", f"{vol}:/data/{vol}{suffix}"]
+    for source, dest in mounts:
+        docker_args += ["-v", f"{source}:{dest}{suffix}"]
     docker_args += ["--entrypoint", "restic", settings.restic_sidecar_image, *args]
     proc = subprocess.run(docker_args, capture_output=True, text=True, timeout=3600)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _backup_mounts(settings, instance_id: str) -> list[tuple[str, str]]:
+    """The data volumes (``<id>_*`` excl. nginx) mounted at ``/data/<vol>``, plus
+    ``l4_ports.json`` for L4 greffons -- the one non-regenerable instance-dir file
+    (HLD section 1). Everything else in the instance dir is regenerated on start."""
+    mounts = [(vol, f"/data/{vol}") for vol in _data_volumes(instance_id)]
+    l4 = Path(settings.greffon_path) / instance_id / "l4_ports.json"
+    if l4.exists():
+        mounts.append((str(l4), "/data/_l4_ports.json"))
+    return mounts
 
 
 def _wait_stopped(instance_id: str, timeout: int) -> bool:
@@ -141,19 +153,92 @@ def _restart(settings, instance_id: str) -> None:
     )
 
 
-def _post_callback(settings, instance_id: str, action: str, payload: dict) -> None:
-    """POST the result to the manager (``X-Greffer-Token``); never raises (a lost
-    callback is recovered by the manager reaper / boot reconciliation)."""
+def _post_callback(settings, instance_id: str, action: str, payload: dict) -> bool:
+    """POST the result to the manager (``X-Greffer-Token``); returns True iff the
+    manager acked (2xx). Never raises -- a lost callback is recovered by the
+    manager reaper / greffer boot reconciliation."""
     try:
-        requests.post(
+        resp = requests.post(
             f"{settings.greffon_base_server}/api/greffer/instances/{instance_id}/{action}/",
             json=payload,
             headers={"X-Greffer-Token": settings.greffer_token or ""},
             verify=settings.greffer_ssl_verify,
             timeout=_HTTP_TIMEOUT,
         )
+        return 200 <= resp.status_code < 300
     except requests.RequestException:
         logger.warning("backup_callback_failed instance=%s action=%s", instance_id, action)
+        return False
+
+
+def _instance_dir(settings, instance_id: str) -> Path:
+    return Path(settings.greffon_path) / instance_id
+
+
+def _backup_marker(settings, instance_id: str) -> Path:
+    return _instance_dir(settings, instance_id) / ".backup_inprogress"
+
+
+def _restore_state_path(settings, instance_id: str, restore_id: str) -> Path:
+    return _instance_dir(settings, instance_id) / f".restore_{restore_id}.json"
+
+
+def _write_json(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+    except OSError:
+        logger.warning("backup_state_write_failed name=%s", path.name)
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def restore_status(settings, instance_id: str, restore_id: str) -> dict:
+    """The DURABLE outcome of a restore, for the manager's reconciler (a stuck
+    RestoreRun is never blind-failed -- its volumes may be overwritten). Returns
+    the persisted payload, or ``{'status': 'unknown'}`` once acked / never-ran."""
+    path = _restore_state_path(settings, instance_id, restore_id)
+    if not path.exists():
+        return {"status": "unknown"}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"status": "unknown"}
+
+
+def reconcile_on_boot(settings) -> None:
+    """Greffer boot recovery (HLD section 7): restart instances left stopped
+    mid-backup (a crash between stop and restart) and re-post un-acked restore
+    callbacks so a manager-restart-lost POST doesn't strand the instance.
+    Best-effort; never raises. (Orphan restic sidecars are ``--rm`` and so
+    auto-clean in the normal case.)"""
+    root = Path(settings.greffon_path)
+    if not root.exists():
+        return
+    for inst_dir in root.iterdir():
+        if not inst_dir.is_dir():
+            continue
+        instance_id = inst_dir.name
+        marker = inst_dir / ".backup_inprogress"
+        if marker.exists():
+            try:
+                if compose.get_status(instance_id).get("status") == "stopped":
+                    _restart(settings, instance_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("boot_reconcile_restart_failed instance=%s", instance_id)
+            _remove(marker)
+        for state_file in inst_dir.glob(".restore_*.json"):
+            try:
+                payload = json.loads(state_file.read_text())
+            except (OSError, ValueError):
+                continue
+            if _post_callback(settings, instance_id, "restore-result", payload):
+                _remove(state_file)
 
 
 def backup_instance(settings, instance_id: str, backup_id: str) -> None:
@@ -165,16 +250,19 @@ def backup_instance(settings, instance_id: str, backup_id: str) -> None:
             payload["error_code"] = "instance_missing"
             return
         if was_running:
+            # Durable marker (boot reconciliation restarts a mid-backup-stopped
+            # instance if a crash skips the finally restart).
+            _write_json(_backup_marker(settings, instance_id), {"backup_id": backup_id})
             compose.stop({"id": instance_id})
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return  # do NOT snapshot a non-quiescent instance
-        volumes = _data_volumes(instance_id)
+        mounts = _backup_mounts(settings, instance_id)
         rc, out, err = _run_restic(
             settings,
             ["backup", "/data", "--json", "--tag", f"instance:{instance_id}",
              "--host", settings.greffer_id],
-            volumes, read_only=True,
+            mounts, read_only=True,
         )
         if rc != 0:
             payload["error_code"] = _classify(err)
@@ -193,6 +281,7 @@ def backup_instance(settings, instance_id: str, backup_id: str) -> None:
                 _restart(settings, instance_id)
             except Exception:  # noqa: BLE001
                 logger.exception("backup_restart_failed instance=%s", instance_id)
+        _remove(_backup_marker(settings, instance_id))
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
@@ -209,13 +298,13 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return
-        volumes = _data_volumes(instance_id)
+        mounts = _backup_mounts(settings, instance_id)
         # SAFETY snapshot of the now-stopped instance (the reversibility net).
         rc, out, err = _run_restic(
             settings,
             ["backup", "/data", "--json", "--tag", f"safety:{instance_id}",
              "--host", settings.greffer_id],
-            volumes, read_only=True,
+            mounts, read_only=True,
         )
         if rc != 0:
             payload["error_code"] = "safety_snapshot_failed"
@@ -226,7 +315,7 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
             settings,
             ["restore", restic_snapshot_id, "--target", "/", "--include", "/data",
              "--delete"],
-            volumes, read_only=False,
+            mounts, read_only=False,
         )
         if rc != 0:
             payload = {"restore_id": restore_id, "status": "failed",
@@ -250,7 +339,12 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 _restart(settings, instance_id)
             except Exception:  # noqa: BLE001
                 logger.exception("restore_abort_restart_failed instance=%s", instance_id)
-        _post_callback(settings, instance_id, "restore-result", payload)
+        # Durable restore-state, kept until the manager acks (boot reconciliation
+        # re-posts a lost callback so an overwritten instance is never stranded).
+        state_path = _restore_state_path(settings, instance_id, restore_id)
+        _write_json(state_path, payload)
+        if _post_callback(settings, instance_id, "restore-result", payload):
+            _remove(state_path)
 
 
 def _restore_classify(stderr: str) -> str:
@@ -259,7 +353,6 @@ def _restore_classify(stderr: str) -> str:
 
 
 def _parse_summary(stdout: str) -> tuple[str, int | None]:
-    import json
     snapshot_id, bytes_added = "", None
     for line in (stdout or "").splitlines():
         line = line.strip()

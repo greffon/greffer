@@ -347,6 +347,13 @@ def restore_greffon(
     return GreffonRestoreResponse(restore_id=payload.restore_id)
 
 
+@router.get("/restore-status/")
+def get_restore_status(id: str, restore_id: str, request: Request) -> dict:
+    """Durable restore outcome for the manager's reconciler -- a stuck RestoreRun
+    is never blind-failed (its volumes may already be overwritten)."""
+    return backup.restore_status(_settings(request), id, restore_id)
+
+
 @router.post("/update/", status_code=202)
 def remote_update(
     payload: RemoteUpdateRequest, request: Request

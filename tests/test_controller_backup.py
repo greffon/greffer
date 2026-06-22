@@ -183,3 +183,59 @@ def test_spawn_backup_busy_raises(monkeypatch):
             backup.spawn_backup(_settings(), "busy-i", "b1")
     finally:
         lock.release()
+
+
+# ---- callback ack + crash recovery ----------------------------------------
+
+def test_post_callback_returns_ack(monkeypatch):
+    s = _settings()
+    monkeypatch.setattr(backup.requests, "post",
+                        lambda *a, **k: mock.Mock(status_code=200))
+    assert backup._post_callback(s, "i", "backup-result", {}) is True
+    monkeypatch.setattr(backup.requests, "post",
+                        lambda *a, **k: mock.Mock(status_code=500))
+    assert backup._post_callback(s, "i", "backup-result", {}) is False
+
+    def _raise(*a, **k):
+        raise backup.requests.ConnectionError()
+    monkeypatch.setattr(backup.requests, "post", _raise)
+    assert backup._post_callback(s, "i", "backup-result", {}) is False
+
+
+def test_restore_status_reads_durable_state(tmp_path):
+    s = _settings(greffon_path=str(tmp_path))
+    inst = tmp_path / "i"
+    inst.mkdir()
+    (inst / ".restore_r1.json").write_text(
+        '{"status": "success", "safety_restic_snapshot_id": "SAFE"}')
+    out = backup.restore_status(s, "i", "r1")
+    assert out["status"] == "success"
+    assert out["safety_restic_snapshot_id"] == "SAFE"
+    assert backup.restore_status(s, "i", "missing")["status"] == "unknown"
+
+
+def test_reconcile_restarts_mid_backup_stopped(tmp_path, monkeypatch):
+    s = _settings(greffon_path=str(tmp_path))
+    inst = tmp_path / "i"
+    inst.mkdir()
+    (inst / ".backup_inprogress").write_text('{"backup_id": "b1"}')
+    monkeypatch.setattr(backup.compose, "get_status", lambda _id: {"status": "stopped"})
+    restart = mock.Mock()
+    monkeypatch.setattr(backup, "_restart", restart)
+    backup.reconcile_on_boot(s)
+    restart.assert_called_once()
+    assert not (inst / ".backup_inprogress").exists()  # marker cleared
+
+
+def test_reconcile_reposts_lost_restore_callback(tmp_path, monkeypatch):
+    s = _settings(greffon_path=str(tmp_path))
+    inst = tmp_path / "i"
+    inst.mkdir()
+    (inst / ".restore_r1.json").write_text('{"restore_id": "r1", "status": "success"}')
+    posts = []
+    monkeypatch.setattr(
+        backup, "_post_callback",
+        lambda settings, iid, action, payload: posts.append(action) or True)
+    backup.reconcile_on_boot(s)
+    assert posts == ["restore-result"]
+    assert not (inst / ".restore_r1.json").exists()  # removed on ack

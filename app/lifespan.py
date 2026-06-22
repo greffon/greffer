@@ -38,6 +38,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("workers disabled (GREFFER_WORKERS_ENABLED unset)")
             yield
             return
+        # Crash recovery: restart mid-backup-stopped instances + re-post lost
+        # restore callbacks before the monitor reports status (HLD section 7).
+        from app import backup
+        try:
+            backup.reconcile_on_boot(app.state.settings)
+        except Exception:  # noqa: BLE001 -- best-effort boot recovery
+            logger.exception("backup_boot_reconcile_failed")
         tasks = start_workers(app)
         # Expose the task handles by name so /readyz and the watchdog can tell
         # a live long-lived worker from a crashed one (Feature #3). Set
