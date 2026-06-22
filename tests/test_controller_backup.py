@@ -16,6 +16,8 @@ def _settings(**kw):
         restic_password_file=None, aws_access_key_id=None,
         aws_secret_access_key=None, restic_sidecar_image="restic/restic:0.16.4",
         backup_stop_timeout_seconds=5,
+        backup_keep_daily=7, backup_keep_weekly=4, backup_keep_monthly=6,
+        backup_safety_keep_last=3,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -121,7 +123,7 @@ def test_restore_takes_safety_before_overwrite(monkeypatch):
     _patch_common(monkeypatch)
     order = []
 
-    def _run(settings, args, mounts, *, read_only):
+    def _run(settings, args, mounts, *, read_only, timeout=3600):
         order.append(args[0])
         if args[0] == "backup":   # the safety snapshot
             return (0, '{"message_type":"summary","snapshot_id":"SAFE"}', "")
@@ -134,7 +136,9 @@ def test_restore_takes_safety_before_overwrite(monkeypatch):
 
     backup.restore_instance(_settings(), "i", "snap-1", "r1")
 
-    assert order == ["backup", "restore"]   # safety FIRST
+    # safety snapshot FIRST, then the overwrite, then retention (off the
+    # pre-overwrite critical path)
+    assert order == ["backup", "restore", "forget"]
     payload = cb.call_args.args[3]
     assert cb.call_args.args[2] == "restore-result"
     assert payload["status"] == "success"
@@ -159,7 +163,7 @@ def test_restore_safety_failure_aborts_and_restarts(monkeypatch):
 def test_restore_overwrite_failure_keeps_safety_pointer(monkeypatch):
     _patch_common(monkeypatch)
 
-    def _run(settings, args, mounts, *, read_only):
+    def _run(settings, args, mounts, *, read_only, timeout=3600):
         if args[0] == "backup":
             return (0, '{"message_type":"summary","snapshot_id":"SAFE"}', "")
         return (1, "", "disk full")   # the restore overwrite fails
@@ -249,7 +253,7 @@ def test_run_restic_no_secret_in_argv(monkeypatch):
 def test_ensure_repo_inits_when_missing(monkeypatch):
     calls = []
 
-    def _run(settings, args, mounts, *, read_only):
+    def _run(settings, args, mounts, *, read_only, timeout=3600):
         calls.append(args[0])
         if args[0] == "cat":
             return (1, "", "unable to open config")  # repo missing
