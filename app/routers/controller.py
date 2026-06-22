@@ -11,6 +11,7 @@ runs sync handlers in a threadpool automatically.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from pathlib import Path
@@ -89,7 +90,26 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
+def _serialize_instance_op(handler):
+    """Hold the in-process per-instance lock for a start/stop's whole duration so
+    it serializes against a concurrent backup/restore in the single greffer
+    process (HLD section 3: the in-process lock -- NOT a file lock -- is the real
+    serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
+    preserves the signature so FastAPI still parses the body + response_model."""
+    @functools.wraps(handler)
+    def wrapper(payload, request, *args, **kwargs):
+        lock = backup._instance_lock(payload.id)
+        if not lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="instance_busy")
+        try:
+            return handler(payload, request, *args, **kwargs)
+        finally:
+            lock.release()
+    return wrapper
+
+
 @router.post("/start/")
+@_serialize_instance_op
 def start_greffon(
     payload: GreffonStartRequest, request: Request
 ) -> GreffonStartResponse:
@@ -224,6 +244,7 @@ def start_greffon(
 
 
 @router.post("/stop/")
+@_serialize_instance_op
 def stop_greffon(
     payload: GreffonStopRequest, request: Request
 ) -> GreffonStopResponse:

@@ -91,7 +91,7 @@ def _data_volumes(instance_id: str) -> list[str]:
     vols = compose.client.volumes.list(filters={"name": instance_id})
     return sorted(
         v.name for v in vols
-        if v.name.startswith(instance_id) and not v.name.endswith(_NGINX_VOLUME_SUFFIX)
+        if v.name.startswith(f"{instance_id}_") and not v.name.endswith(_NGINX_VOLUME_SUFFIX)
     )
 
 
@@ -111,16 +111,36 @@ def _classify(stderr: str) -> str:
 def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
                 read_only: bool) -> tuple[int, str, str]:
     """Run the digest-pinned restic sidecar with ``(source, dest)`` mounts under
-    ``/data`` and the repo creds in env. Returns (rc, stdout, stderr)."""
+    ``/data``. Secrets reach the container via ``--env KEY`` (NAME-only) +
+    ``subprocess env=`` -- NEVER ``--env KEY=VALUE``, which would put the repo
+    URL / password / S3 secret in the ``docker run`` ARGV (readable via
+    ``ps``/``/proc/<pid>/cmdline``). Returns (rc, stdout, stderr)."""
+    env = restic_env(settings)
     docker_args = ["docker", "run", "--rm"]
-    for key, value in restic_env(settings).items():
-        docker_args += ["-e", f"{key}={value}"]
+    for key in env:
+        if key in ("PATH", "HOME"):
+            continue  # for the launcher's own process, not forwarded
+        docker_args += ["--env", key]  # name-only: value comes from env= below
     suffix = ":ro" if read_only else ""
     for source, dest in mounts:
         docker_args += ["-v", f"{source}:{dest}{suffix}"]
     docker_args += ["--entrypoint", "restic", settings.restic_sidecar_image, *args]
-    proc = subprocess.run(docker_args, capture_output=True, text=True, timeout=3600)
+    proc = subprocess.run(
+        docker_args, capture_output=True, text=True, timeout=3600, env=env)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def ensure_repo(settings) -> None:
+    """First-use ``restic init`` (HLD section 4.1): a missing repo is initialized
+    rather than failing every backup with ``repo_uninitialized``. Also clears a
+    stale lock from a crashed prior sidecar (best-effort; the repo is per-greffer
+    and this greffer is single-process)."""
+    rc, _out, _err = _run_restic(settings, ["cat", "config"], [], read_only=True)
+    if rc != 0:
+        init_rc, _o, init_err = _run_restic(settings, ["init"], [], read_only=True)
+        if init_rc != 0:
+            raise BackupError(_classify(init_err))
+    _run_restic(settings, ["unlock"], [], read_only=True)
 
 
 def _backup_mounts(settings, instance_id: str) -> list[tuple[str, str]]:
@@ -257,6 +277,7 @@ def backup_instance(settings, instance_id: str, backup_id: str) -> None:
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return  # do NOT snapshot a non-quiescent instance
+        ensure_repo(settings)
         mounts = _backup_mounts(settings, instance_id)
         rc, out, err = _run_restic(
             settings,
@@ -292,12 +313,14 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
     payload = {"restore_id": restore_id, "status": "failed", "error_code": "restore_failed"}
     started_stopped = compose.get_status(instance_id).get("status") == "running"
     safety_id = ""
+    overwrite_started = False
     try:
         if started_stopped:
             compose.stop({"id": instance_id})
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return
+        ensure_repo(settings)
         mounts = _backup_mounts(settings, instance_id)
         # SAFETY snapshot of the now-stopped instance (the reversibility net).
         rc, out, err = _run_restic(
@@ -310,6 +333,14 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
             payload["error_code"] = "safety_snapshot_failed"
             return  # nothing overwritten; manager re-starts via callback failure
         safety_id, _ = _parse_summary(out)
+        # Durable rollback pointer written BEFORE the destructive overwrite: a
+        # crash between the overwrite and the finally must not lose safety_id
+        # (boot reconcile / restore-status then still surface it).
+        _write_json(
+            _restore_state_path(settings, instance_id, restore_id),
+            {"restore_id": restore_id, "status": "overwriting",
+             "safety_restic_snapshot_id": safety_id})
+        overwrite_started = True
         # Overwrite the volumes from the requested snapshot.
         rc, out, err = _run_restic(
             settings,
@@ -333,8 +364,12 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
     finally:
         # On a PRE-overwrite failure the instance was stopped -> restart it to
         # restore service (the manager only starts on success).
-        if started_stopped and payload.get("status") != "success" \
-                and payload.get("error_code") in ("stop_timeout", "safety_snapshot_failed"):
+        # Restart only if the instance was stopped AND nothing was overwritten
+        # (a pre-overwrite failure of ANY kind -- rc!=0 OR an exception/timeout)
+        # -> restore service. Once the overwrite began, leave it stopped (the
+        # manager runs the start on the success callback).
+        if started_stopped and not overwrite_started \
+                and payload.get("status") != "success":
             try:
                 _restart(settings, instance_id)
             except Exception:  # noqa: BLE001

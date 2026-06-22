@@ -40,9 +40,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             return
         # Crash recovery: restart mid-backup-stopped instances + re-post lost
         # restore callbacks before the monitor reports status (HLD section 7).
+        import anyio
+
         from app import backup
         try:
-            backup.reconcile_on_boot(app.state.settings)
+            # Off the event loop -- reconcile does blocking docker + HTTP calls.
+            await anyio.to_thread.run_sync(
+                backup.reconcile_on_boot, app.state.settings)
         except Exception:  # noqa: BLE001 -- best-effort boot recovery
             logger.exception("backup_boot_reconcile_failed")
         tasks = start_workers(app)

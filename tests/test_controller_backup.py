@@ -59,6 +59,9 @@ def _patch_common(monkeypatch, status="running", wait=True, volumes=("i_db",)):
     monkeypatch.setattr(backup.compose, "stop", mock.Mock())
     monkeypatch.setattr(backup, "_wait_stopped", lambda *a: wait)
     monkeypatch.setattr(backup, "_data_volumes", lambda _id: list(volumes))
+    # ensure_repo (init/unlock) is separately tested; no-op it here so it does
+    # not pollute the mocked _run_restic call sequences.
+    monkeypatch.setattr(backup, "ensure_repo", lambda s: None)
 
 
 def test_backup_happy_restarts_and_reports_success(monkeypatch):
@@ -225,6 +228,36 @@ def test_reconcile_restarts_mid_backup_stopped(tmp_path, monkeypatch):
     backup.reconcile_on_boot(s)
     restart.assert_called_once()
     assert not (inst / ".backup_inprogress").exists()  # marker cleared
+
+
+def test_run_restic_no_secret_in_argv(monkeypatch):
+    captured = {}
+
+    def _run(argv, **kw):
+        captured["argv"], captured["env"] = argv, kw.get("env", {})
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(backup.subprocess, "run", _run)
+    s = _settings(restic_password="SEKRET", aws_secret_access_key="AWSSEKRET")
+    backup._run_restic(s, ["backup", "/data"], [("v", "/data/v")], read_only=True)
+    joined = " ".join(captured["argv"])
+    assert "SEKRET" not in joined and "AWSSEKRET" not in joined   # NOT in argv
+    assert captured["env"]["RESTIC_PASSWORD"] == "SEKRET"          # in env
+    assert "--env" in captured["argv"] and "RESTIC_PASSWORD" in captured["argv"]
+
+
+def test_ensure_repo_inits_when_missing(monkeypatch):
+    calls = []
+
+    def _run(settings, args, mounts, *, read_only):
+        calls.append(args[0])
+        if args[0] == "cat":
+            return (1, "", "unable to open config")  # repo missing
+        return (0, "", "")
+
+    monkeypatch.setattr(backup, "_run_restic", _run)
+    backup.ensure_repo(_settings())
+    assert "cat" in calls and "init" in calls   # init'd the missing repo
 
 
 def test_reconcile_reposts_lost_restore_callback(tmp_path, monkeypatch):
