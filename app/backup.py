@@ -64,6 +64,12 @@ def _instance_lock(instance_id: str) -> threading.Lock:
         return lock
 
 
+# A single process-wide lock serializing repo-WIDE ops (prune / check) so two
+# triggers never spawn redundant sidecars. restic's own exclusive repo lock is the
+# CROSS-PROCESS guarantee against a running backup sidecar; this only dedupes ours.
+_REPO_OP_LOCK = threading.Lock()
+
+
 def restic_env(settings) -> dict:
     """Repo + password + S3 creds reach restic via env ONLY (never argv/logged)."""
     if not settings.greffer_backup_repo:
@@ -476,3 +482,73 @@ def _locked_job(lock: threading.Lock, fn, *args) -> None:
         fn(*args)
     finally:
         lock.release()
+
+
+def _repo_op_error_code(stderr: str) -> str:
+    """A concurrent backup sidecar holds restic's exclusive repo lock, so a
+    prune/check can report the repo locked -- a clean retry-next-cadence, not a
+    hard failure. Match the LOCK-CONFLICT phrasing specifically, NOT a bare
+    'locked' substring -- a future object-lock / governance-mode write rejection
+    (managed-tier B2 Object Lock) could carry 'locked' and must NOT be swallowed
+    as a benign retry."""
+    s = (stderr or '').lower()
+    if 'already locked' in s or 'unable to create lock' in s:
+        return 'repo_busy'
+    return _classify(stderr)
+
+
+def prune_repo(settings) -> dict:
+    """Repo-wide ``restic prune`` -- the SPACE half of retention (per-instance
+    ``forget`` drops snapshot references after each backup; prune reclaims the data
+    no snapshot references). EXCLUSIVE + repo-wide, hence a SEPARATE cadence from
+    backup. Best-effort, detached (no callback): the manager triggers it and reads
+    nothing back; a repo-busy result simply retries next cadence."""
+    try:
+        ensure_repo(settings)
+        rc, _out, err = _run_restic(
+            settings, ['prune'], [], read_only=True,
+            timeout=getattr(settings, 'backup_prune_timeout_seconds', 7200))
+        if rc != 0:
+            code = _repo_op_error_code(err)
+            logger.warning('restic_prune_failed code=%s', code)
+            return {'status': 'failed', 'error_code': code}
+        return {'status': 'success'}
+    except Exception:  # noqa: BLE001 -- prune is best-effort, never fatal
+        logger.exception('prune_repo_failed')
+        return {'status': 'failed', 'error_code': 'prune_failed'}
+
+
+def check_repo(settings) -> dict:
+    """Periodic ``restic check`` -- repo integrity verification (epic R27).
+    Detached, best-effort; read-only so it can run alongside a backup."""
+    try:
+        ensure_repo(settings)
+        rc, _out, err = _run_restic(
+            settings, ['check'], [], read_only=True,
+            timeout=getattr(settings, 'backup_check_timeout_seconds', 7200))
+        if rc != 0:
+            code = _repo_op_error_code(err)
+            logger.warning('restic_check_failed code=%s', code)
+            return {'status': 'failed', 'error_code': code}
+        return {'status': 'success'}
+    except Exception:  # noqa: BLE001
+        logger.exception('check_repo_failed')
+        return {'status': 'failed', 'error_code': 'check_failed'}
+
+
+def spawn_repo_op(settings, op: str) -> None:
+    """Run a repo-wide op (``prune`` | ``check``) in a background thread under the
+    single non-blocking repo-op lock. Raises BusyError (-> 409) if a repo op is
+    already running, so the manager retries next cadence rather than stacking
+    redundant sidecars."""
+    if not _REPO_OP_LOCK.acquire(blocking=False):
+        raise BusyError(op)
+    fn = prune_repo if op == 'prune' else check_repo
+    try:
+        threading.Thread(
+            target=_locked_job, args=(_REPO_OP_LOCK, fn, settings),
+            daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001 -- if the thread can't start (e.g. thread
+        _REPO_OP_LOCK.release()  # exhaustion), never leak the PROCESS-WIDE lock
+        raise                    # (it would 409 every future prune AND check).
