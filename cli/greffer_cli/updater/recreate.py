@@ -1,0 +1,561 @@
+"""Socket-only per-container recreate primitives for the v2 ``:latest`` updater.
+
+No compose file: the updater talks to the Docker API (via the ``docker`` CLI,
+mockable through ``greffer_cli.compose._run``) to update the running stack in
+place. Per the HLD (``docs/features/greffer-self-update/
+hld-v2-per-container-recreate.md``):
+
+- discover the stack by compose **service label**, never the image name, which
+  after a prior recreate shows as a bare digest with no ``greffon/<repo>`` tag
+  (section 4);
+- **verify-then-pull**: resolve ``:latest`` to its index digest ``D``,
+  cosign-verify ``D`` bound to the repo, ``docker pull`` by ``@D`` (only the
+  verified bytes), then retag local ``:latest`` to ``D`` so a later
+  ``docker compose up`` cannot downgrade (sections 3 + 13, closes the tag-moved
+  TOCTOU);
+- tag the outgoing image ``:previous`` for a named rollback target (section 9);
+- dangling-ONLY image prune on success (section 5).
+
+Fail-closed: verification raises ``VerifyError`` before anything is recreated.
+This module holds the Docker-API primitives only; ``engine`` orchestrates them
+(recreate order, fidelity carry-over, the ``/readyz`` gate, rollback).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+
+from .. import compose, update
+from . import provenance
+
+logger = logging.getLogger("greffer-updater")
+
+# Recreate order (HLD section 6): nginx first (a pure TLS proxy, safe to bounce);
+# then greffer, whose recreate kills the FastAPI process that SPAWNED the updater
+# (safe, the updater is a detached container and outlives its parent); then the
+# tunnel-sidecar last.
+RECREATE_ORDER: tuple[str, ...] = ("nginx", "greffer", "tunnel-sidecar")
+
+
+class VerifyError(Exception):
+    """A provenance check failed. Fail-closed: refuse before any recreate."""
+
+
+@dataclasses.dataclass(frozen=True)
+class StackContainer:
+    """One container in the running greffon stack, keyed by its compose service
+    label. ``repo`` is resolved from the service (``update.SERVICE_REPO``), NOT
+    the image name, which may be a bare digest after a prior recreate."""
+
+    service: str
+    container_id: str
+    repo: str
+
+
+def _run(args: list[str], *, timeout: float = 60.0) -> compose.CommandResult:
+    """Run ``docker <args>`` through the mockable subprocess layer."""
+    return compose._run(["docker", *args], timeout=timeout)
+
+
+def _greffer_container_id() -> str | None:
+    """The greffer container id, found by its compose service label (section 4
+    step 1). ``--all`` so a stopped greffer is still found."""
+    res = _run(
+        ["ps", "--all", "--filter", "label=com.docker.compose.service=greffer",
+         "--format", "{{.ID}}"],
+        timeout=30,
+    )
+    if not res.ok:
+        return None
+    ids = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    return ids[0] if ids else None
+
+
+def _project_of(container_id: str) -> str | None:
+    """The ``com.docker.compose.project`` of a container (section 4 step 2)."""
+    res = _run(
+        ["inspect", "--format",
+         '{{index .Config.Labels "com.docker.compose.project"}}', container_id],
+        timeout=30,
+    )
+    if not res.ok:
+        return None
+    return res.stdout.strip() or None
+
+
+def discover_stack() -> list[StackContainer]:
+    """Discover the running greffon stack by compose labels (HLD section 4) and
+    return the update set ordered per ``RECREATE_ORDER``. Empty list if the
+    greffer container or its project cannot be found (the caller refuses).
+
+    Selection is by the ``com.docker.compose.service`` label being one of
+    ``update.SERVICE_REPO`` (greffer / nginx / tunnel-sidecar); the repo is
+    mapped from that label, never read off the (possibly bare-digest) image."""
+    greffer_id = _greffer_container_id()
+    if not greffer_id:
+        logger.error("stack discovery: no greffer container (compose service label)")
+        return []
+    project = _project_of(greffer_id)
+    if not project:
+        logger.error("stack discovery: greffer container has no compose project label")
+        return []
+
+    res = _run(
+        ["ps", "--all",
+         "--filter", f"label=com.docker.compose.project={project}",
+         "--format", '{{.ID}}\t{{.Label "com.docker.compose.service"}}'],
+        timeout=30,
+    )
+    if not res.ok:
+        logger.error("stack discovery: listing project %s failed", project)
+        return []
+
+    found: dict[str, StackContainer] = {}
+    for line in res.stdout.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) != 2:
+            continue
+        container_id, service = parts[0].strip(), parts[1].strip()
+        repo = update.SERVICE_REPO.get(service)
+        if not container_id or not repo or service in found:
+            continue
+        found[service] = StackContainer(
+            service=service, container_id=container_id, repo=repo)
+
+    return [found[svc] for svc in RECREATE_ORDER if svc in found]
+
+
+def current_image_id(repo: str) -> str | None:
+    """The local image id ``<repo>:latest`` currently resolves to (the OUTGOING
+    image). Captured BEFORE ``verify_then_pull`` moves the tag, so it can be
+    named ``:previous`` and used as the in-flight rollback target (section 9)."""
+    res = _run(["image", "inspect", "--format", "{{.Id}}", f"{repo}:latest"], timeout=30)
+    return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+
+def verify_and_pull(repo: str, *, cosign_pub: str, tag: str = "latest") -> str:
+    """Resolve ``<repo>:<tag>`` (the server-resolved ``target_tag``, default
+    ``latest``) to its index digest ``D``, cosign-verify ``D`` bound to ``repo``,
+    and ``docker pull`` by ``@D`` (only the verified bytes are ever fetched,
+    closing the tag-moved TOCTOU). Returns ``D``. Does NOT move the local
+    ``:latest`` tag, so the engine can verify the WHOLE stack fail-closed before
+    any tag moves or any container is recreated. Raises ``VerifyError``."""
+    ref = f"{repo}:{tag}"
+    digest = provenance.resolve_digest(ref)
+    if not digest:
+        raise VerifyError(f"cannot resolve digest for {ref}")
+    if not provenance.cosign_verify(repo, digest, pubkey=cosign_pub):
+        raise VerifyError(f"signature/repo-binding failed for {repo}@{digest}")
+    by_digest = f"{repo}@{digest}"
+    if not _run(["pull", by_digest], timeout=600).ok:
+        raise VerifyError(f"pull failed for {by_digest}")
+    return digest
+
+
+def retag_latest(repo: str, digest: str) -> bool:
+    """Point local ``<repo>:latest`` at the verified digest (HLD section 3 form
+    (b)). Done right before recreate, so ``:latest`` resolves to exactly the
+    bytes we recreate from and a fail-closed verify abort never leaves ``:latest``
+    moved. WITHOUT this retag, ``:latest`` stays on the old image and the next
+    ``docker compose up`` would downgrade (the section 3 anti-pattern)."""
+    return _run(["tag", f"{repo}@{digest}", f"{repo}:latest"], timeout=30).ok
+
+
+def restore_latest(repo: str, image_id: str) -> bool:
+    """Point local ``<repo>:latest`` back at a local image id (rollback). Without
+    this, rollback recreates the container from the old image but leaves
+    ``:latest`` on the rejected new digest, so a later ``docker compose up``
+    re-applies it (the section 3 anti-pattern, on the rollback path). Best-effort."""
+    if not image_id:
+        return False
+    return _run(["tag", image_id, f"{repo}:latest"], timeout=30).ok
+
+
+def verify_then_pull(repo: str, *, cosign_pub: str, tag: str = "latest") -> str:
+    """``verify_and_pull`` then ``retag_latest`` for one repo (HLD sections 3 +
+    13). Raises ``VerifyError`` fail-closed; recreates nothing."""
+    digest = verify_and_pull(repo, cosign_pub=cosign_pub, tag=tag)
+    if not retag_latest(repo, digest):
+        raise VerifyError(f"retag {repo}@{digest} -> {repo}:latest failed")
+    return digest
+
+
+def tag_previous(repo: str, image_id: str) -> bool:
+    """Tag an outgoing image id ``<repo>:previous`` (the named, persistent
+    rollback target, HLD section 9). Best-effort; a failure does not abort the
+    update (the in-flight rollback still has the captured image id)."""
+    if not image_id:
+        return False
+    ok = _run(["tag", image_id, f"{repo}:previous"], timeout=30).ok
+    if not ok:
+        logger.warning("could not tag %s as %s:previous", image_id, repo)
+    return ok
+
+
+def dangling_prune() -> None:
+    """Dangling-ONLY ``docker image prune`` after a passed gate (HLD section 5).
+
+    NEVER ``-a`` and NEVER an id-targeted ``docker rmi``: retagging ``:previous``
+    leaves the image it displaced (N-2) untagged, i.e. dangling, which a plain
+    prune reaps; a tagged or in-use image is never dangling, so this structurally
+    cannot touch ``:latest`` / ``:previous`` or any running container's image
+    (the collision after a durable rollback where ``:latest`` == ``:previous``
+    is harmless here for the same reason). Best-effort."""
+    res = _run(["image", "prune", "-f"], timeout=120)
+    if not res.ok:
+        logger.warning("dangling image prune failed (non-fatal): %s", res.stderr.strip())
+
+
+# --- fidelity recreate (HLD section 8) ------------------------------
+#
+# Recreating from `docker inspect` means we own carrying the config across. The
+# rule for image-influenced fields (Env, Labels, Cmd, Entrypoint, Healthcheck,
+# User, WorkingDir, StopSignal) is the vs-OLD delta: carry a value only if it
+# DIFFERS from the OLD image's baked config (= what compose set on top), then
+# apply it on the new image via `docker create`, which inherits the new image's
+# own defaults. Diffing against the NEW image would re-pin a baked default the
+# new image deliberately changed (a relocated venv, or the new GREFFER_UPDATER_
+# IMAGE digest), freezing it. Infra fields (Mounts, PortBindings, RestartPolicy,
+# LogConfig, ExtraHosts, NetworkMode) are carried verbatim.
+
+
+def inspect_container(container_id: str) -> dict | None:
+    """Full ``docker inspect`` of a container as a dict, or None."""
+    res = _run(["inspect", container_id], timeout=30)
+    if not res.ok:
+        return None
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+def image_config(ref_or_id: str) -> dict:
+    """The ``.Config`` of an image (the vs-OLD delta baseline). Empty dict if
+    unreadable; the delta then diffs against ``{}`` and carries the container's
+    config verbatim, the safe fail-open for fidelity (over-carry beats dropping
+    runtime config like ``GREFFER_ID``). The old image is still present at
+    recreate time (we prune only after the gate), so this normally succeeds."""
+    res = _run(["image", "inspect", ref_or_id, "--format", "{{json .Config}}"], timeout=30)
+    if not res.ok:
+        return {}
+    try:
+        cfg = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _kv_list_to_dict(env_list) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in env_list or []:
+        if isinstance(item, str):
+            k, _, v = item.partition("=")
+            out[k] = v
+    return out
+
+
+def _env_delta(container_env, old_image_env) -> dict[str, str]:
+    """vs-OLD env delta (HLD section 8): the entries the container has that the
+    OLD image did not bake identically (the compose overlay)."""
+    base = _kv_list_to_dict(old_image_env)
+    return {k: v for k, v in _kv_list_to_dict(container_env).items() if base.get(k) != v}
+
+
+def _dict_delta(container_map, old_image_map) -> dict[str, str]:
+    """vs-OLD delta for a label-like dict: carry only compose-set/changed keys
+    (so the ``com.docker.compose.*`` identity labels, absent from the image, are
+    carried and the stack stays a recognizable compose project)."""
+    base = old_image_map or {}
+    return {k: v for k, v in (container_map or {}).items() if base.get(k) != v}
+
+
+def _duration(ns) -> str:
+    """Nanoseconds (docker inspect) -> a ``docker create`` duration string."""
+    try:
+        seconds = int(ns) / 1_000_000_000
+    except (TypeError, ValueError):
+        return "0s"
+    return f"{int(seconds)}s" if seconds == int(seconds) else f"{seconds}s"
+
+
+def _network_args(host: dict, service: str) -> list[str]:
+    """NetworkMode handling, the HLD section 8 "sidecar trap": host-networked
+    sidecar gets ``--network host`` and no aliases; greffer/nginx rejoin their
+    user-defined network with the service name as alias so greffer<->nginx DNS
+    survives the recreate. A default bridge needs nothing."""
+    mode = host.get("NetworkMode") or ""
+    if mode == "host":
+        return ["--network", "host"]
+    if mode == "none":
+        return ["--network", "none"]
+    if mode in ("", "default", "bridge"):
+        return []
+    args = ["--network", mode]
+    if service:
+        args += ["--network-alias", service]
+    return args
+
+
+def _restart_args(host: dict) -> list[str]:
+    rp = host.get("RestartPolicy") or {}
+    name = rp.get("Name") or ""
+    if not name or name == "no":
+        return []
+    if name == "on-failure":
+        n = rp.get("MaximumRetryCount") or 0
+        return ["--restart", f"on-failure:{n}"] if n else ["--restart", "on-failure"]
+    return ["--restart", name]
+
+
+def _log_args(host: dict) -> list[str]:
+    lc = host.get("LogConfig") or {}
+    driver = lc.get("Type") or ""
+    if not driver:
+        return []
+    args = ["--log-driver", driver]
+    for k, v in (lc.get("Config") or {}).items():
+        args += ["--log-opt", f"{k}={v}"]
+    return args
+
+
+def _mount_args(mounts) -> list[str]:
+    """Reconstruct ``-v`` from ``.Mounts`` (NOT raw ``HostConfig.Binds``): the
+    sidecar's ``:ro`` (``RW: false``) is load-bearing and easy to drop."""
+    args: list[str] = []
+    for m in mounts or []:
+        dst = m.get("Destination")
+        mtype = m.get("Type")
+        src = m.get("Name") if mtype == "volume" else m.get("Source") if mtype == "bind" else None
+        if not dst or not src:
+            if dst and mtype not in ("volume", "bind"):
+                logger.warning("skipping unsupported mount type %r at %s", mtype, dst)
+            continue
+        spec = f"{src}:{dst}"
+        if m.get("RW") is False:
+            spec += ":ro"
+        args += ["-v", spec]
+    return args
+
+
+def _port_args(port_bindings) -> list[str]:
+    args: list[str] = []
+    for container_port, binds in (port_bindings or {}).items():
+        cp, _, proto = str(container_port).partition("/")
+        for b in binds or []:
+            host_ip, host_port = b.get("HostIp") or "", b.get("HostPort") or ""
+            if host_ip:
+                spec = f"{host_ip}:{host_port}:{cp}"
+            elif host_port:
+                spec = f"{host_port}:{cp}"
+            else:
+                spec = cp
+            if proto and proto != "tcp":
+                spec += f"/{proto}"
+            args += ["-p", spec]
+    return args
+
+
+def _healthcheck_args(cont_hc, old_img_hc) -> list[str]:
+    """vs-OLD healthcheck delta: carry only if compose set/changed it (the
+    sidecar's ``pgrep rathole`` is compose-set; greffer/nginx have none)."""
+    cont_hc = cont_hc or {}
+    if cont_hc == (old_img_hc or {}):
+        return []
+    test = cont_hc.get("Test") or []
+    if not test or test == ["NONE"]:
+        return ["--no-healthcheck"] if old_img_hc else []
+    kind = test[0]
+    if kind == "CMD-SHELL" and len(test) >= 2:
+        args = ["--health-cmd", test[1]]
+    elif kind == "CMD":
+        args = ["--health-cmd", " ".join(test[1:])]
+    else:
+        args = ["--health-cmd", " ".join(test)]
+    for flag, key in (("--health-interval", "Interval"), ("--health-timeout", "Timeout"),
+                      ("--health-start-period", "StartPeriod")):
+        if cont_hc.get(key):
+            args += [flag, _duration(cont_hc[key])]
+    if cont_hc.get("Retries"):
+        args += ["--health-retries", str(cont_hc["Retries"])]
+    return args
+
+
+_SCALAR_FIELDS = (("User", "--user"), ("WorkingDir", "--workdir"), ("StopSignal", "--stop-signal"))
+
+
+def _scalar_delta_args(cont_cfg: dict, old_img_cfg: dict) -> list[str]:
+    args: list[str] = []
+    for key, flag in _SCALAR_FIELDS:
+        cval = cont_cfg.get(key) or ""
+        if cval and cval != ((old_img_cfg or {}).get(key) or ""):
+            args += [flag, cval]
+    return args
+
+
+def _entrypoint_override(cont_ep, old_img_ep) -> str | None:
+    cont_ep = cont_ep or []
+    if cont_ep == (old_img_ep or []) or not cont_ep:
+        return None
+    if len(cont_ep) > 1:
+        logger.warning(
+            "multi-element entrypoint override not fully expressible via "
+            "docker create --entrypoint: %r; carrying argv[0] only", cont_ep)
+    return cont_ep[0]
+
+
+def _cmd_override(cont_cmd, old_img_cmd) -> list[str]:
+    cont_cmd = cont_cmd or []
+    return [] if cont_cmd == (old_img_cmd or []) else list(cont_cmd)
+
+
+def build_create_argv(container: dict, old_image_config: dict, *,
+                      image_ref: str, service: str) -> list[str]:
+    """Build the ``docker create`` argv that recreates ``container`` from
+    ``image_ref``, carrying the compose-set config per the HLD section 8
+    fidelity rule (image-influenced fields = vs-OLD delta against
+    ``old_image_config``; infra fields = verbatim). Pure: no docker calls."""
+    cfg = container.get("Config") or {}
+    host = container.get("HostConfig") or {}
+    old_cfg = old_image_config or {}
+    name = (container.get("Name") or "").lstrip("/")
+
+    argv: list[str] = ["create", "--name", name]
+    argv += _network_args(host, service)
+    # No silent drops: the CLI template puts greffer/nginx on ONE network
+    # (`internal`) and the sidecar on host, with no tmpfs. If a container is ever
+    # on >1 network or uses tmpfs (a hand-edited / future-template config), this
+    # socket recreate reattaches only the primary network and carries no tmpfs;
+    # warn so the dropped config is visible rather than lost silently.
+    nets = (container.get("NetworkSettings") or {}).get("Networks") or {}
+    if len(nets) > 1:
+        logger.warning(
+            "recreate %s: container is on %d networks; only the primary (%s) is "
+            "reattached (others dropped)", service, len(nets), host.get("NetworkMode"))
+    if host.get("Tmpfs"):
+        logger.warning("recreate %s: tmpfs mounts are not carried: %s",
+                       service, list(host["Tmpfs"]))
+    argv += _restart_args(host)
+    argv += _log_args(host)
+    for h in host.get("ExtraHosts") or []:
+        argv += ["--add-host", h]
+    for k, v in _env_delta(cfg.get("Env"), old_cfg.get("Env")).items():
+        argv += ["-e", f"{k}={v}"]
+    for k, v in _dict_delta(cfg.get("Labels"), old_cfg.get("Labels")).items():
+        argv += ["--label", f"{k}={v}"]
+    argv += _mount_args(container.get("Mounts"))
+    argv += _port_args(host.get("PortBindings"))
+    argv += _healthcheck_args(cfg.get("Healthcheck"), old_cfg.get("Healthcheck"))
+    argv += _scalar_delta_args(cfg, old_cfg)
+    entrypoint = _entrypoint_override(cfg.get("Entrypoint"), old_cfg.get("Entrypoint"))
+    if entrypoint is not None:
+        argv += ["--entrypoint", entrypoint]
+    argv.append(image_ref)
+    argv += _cmd_override(cfg.get("Cmd"), old_cfg.get("Cmd"))
+    return argv
+
+
+def _do_recreate(inspected: dict, *, image_ref: str, baseline_image_id: str | None,
+                 service: str, container_ref: str, stop_timeout: float = 30.0) -> bool:
+    """Shared recreate core: build the argv (vs-``baseline_image_id`` delta), then
+    stop -> rm -> create (same name) -> start the container. ``container_ref`` is
+    the id (forward) or name (rollback, the forward recreate changed the id).
+    Fail-closed at each step."""
+    old_cfg = image_config(baseline_image_id) if baseline_image_id else {}
+    if not old_cfg:
+        logger.warning(
+            "recreate %s: baseline image config unreadable, carrying container "
+            "config verbatim (may pin a baked default the new image changed)", service)
+    name = (inspected.get("Name") or "").lstrip("/")
+    if not name:
+        logger.error("recreate %s: container has no name", service)
+        return False
+    argv = build_create_argv(inspected, old_cfg, image_ref=image_ref, service=service)
+
+    _run(["stop", "-t", str(int(stop_timeout)), container_ref], timeout=stop_timeout + 10)
+    if not _run(["rm", "-f", container_ref], timeout=60).ok:
+        logger.error("recreate %s: removing old container failed", service)
+        return False
+    if not _run(argv, timeout=120).ok:
+        logger.error("recreate %s: docker create failed", service)
+        return False
+    if not _run(["start", name], timeout=60).ok:
+        logger.error("recreate %s: docker start failed", service)
+        return False
+    logger.info("recreated %s from %s", service, image_ref)
+    return True
+
+
+def recreate_one(container: StackContainer, *, image_ref: str,
+                 old_image_id: str | None, inspected: dict | None = None,
+                 stop_timeout: float = 30.0) -> bool:
+    """Forward recreate of one stack container from ``image_ref`` (``:latest``,
+    now the verified new digest), carrying its config per section 8.
+    ``old_image_id`` supplies the vs-OLD delta baseline and is still present.
+    The engine passes a pre-captured ``inspected`` (so it can reuse the same
+    pre-update snapshot for rollback); otherwise this inspects the container."""
+    if inspected is None:
+        inspected = inspect_container(container.container_id)
+        if not inspected:
+            logger.error("recreate %s: cannot inspect %s",
+                         container.service, container.container_id)
+            return False
+    return _do_recreate(
+        inspected, image_ref=image_ref, baseline_image_id=old_image_id,
+        service=container.service, container_ref=container.container_id,
+        stop_timeout=stop_timeout)
+
+
+def rollback_one(container: StackContainer, inspected: dict, old_image_id: str, *,
+                 stop_timeout: float = 30.0) -> bool:
+    """Roll one container back to ``old_image_id`` (HLD section 9), recreating
+    from the captured PRE-update inspect so the compose overlay is re-applied on
+    the old image (baseline = the old image, so the delta is that same overlay).
+    Targets the container by NAME, since the failed forward recreate gave it a
+    new id. The old image is still local (we prune only after the gate passes)."""
+    return _do_recreate(
+        inspected, image_ref=old_image_id, baseline_image_id=old_image_id,
+        service=container.service, container_ref=(inspected.get("Name") or "").lstrip("/"),
+        stop_timeout=stop_timeout)
+
+
+# --- socket-only probes for the /readyz gate (HLD section 9) --------
+# `docker exec <ref>` instead of the compose path's `docker compose exec`; the
+# readyz probe body is shared (compose.GREFFER_READYZ_PROBE) so they can't drift.
+
+def exec_readyz(container_ref: str) -> compose.CommandResult:
+    """Probe `/readyz` inside the greffer container over the socket."""
+    return _run(["exec", container_ref, "python", "-c", compose.GREFFER_READYZ_PROBE],
+                timeout=15)
+
+
+def exec_version(container_ref: str) -> str | None:
+    """Read the running greffer's `app.__version__` (the anti-downgrade guard,
+    HLD section 13). Attacker-forgeable, so only an honest-CI accident guard."""
+    res = _run(["exec", container_ref, "python", "-c", "import app; print(app.__version__)"],
+               timeout=10)
+    return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+
+def container_running(container_ref: str) -> bool:
+    res = _run(["inspect", "--format", "{{.State.Running}}", container_ref], timeout=10)
+    return res.ok and res.stdout.strip() == "true"
+
+
+def container_image_id_by_name(container_ref: str) -> str | None:
+    """The image id a (named) container is running, for the version-applied gate."""
+    res = _run(["inspect", "--format", "{{.Image}}", container_ref], timeout=10)
+    return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+
+def restart_count(container_ref: str) -> int:
+    res = _run(["inspect", "--format", "{{.RestartCount}}", container_ref], timeout=10)
+    if not res.ok:
+        return 0
+    try:
+        return int(res.stdout.strip())
+    except ValueError:
+        return 0

@@ -106,7 +106,25 @@ http {
     proxy_set_header Accept-Encoding $http_accept_encoding;
     client_max_body_size 10G;
     proxy_request_buffering off;
-
+{% if port.streaming %}
+    # Streaming app (SSE / long-poll / chunked), opted in via the
+    # `com.greffon.proxy.streaming` compose label. nginx buffers proxied
+    # responses by default, which holds an event stream until the buffer
+    # fills and the app's live updates never reach the browser. Disable
+    # response buffering and emit X-Accel-Buffering so any outer proxy (the
+    # manager edge nginx) disables buffering for this response too: it honors
+    # the header natively and needs no per-greffon knowledge.
+    #
+    # Applies to the whole location, not just the stream path, since the
+    # label is per-service not per-path. A streaming greffon's normal
+    # (non-stream) responses are proxied unbuffered too, a minor throughput
+    # trade-off that is acceptable for these single-tenant apps. The 1h read
+    # timeout caps an idle connection; well-behaved SSE (Remotion heartbeats
+    # every 10s) resets it continuously, and EventSource reconnects anyway.
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    add_header X-Accel-Buffering no always;
+{% endif %}
     proxy_pass http://{{port.container_name}}_{{port.port_container}}/;
   }
 }

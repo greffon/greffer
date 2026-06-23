@@ -192,6 +192,81 @@ def test_multi_container_stream_container_no_line_loss(tmp_path, monkeypatch):
     assert "d-old" not in msgs   # db had nothing new
 
 
+def test_follow_bounds_read_with_since_and_tail(tmp_path, monkeypatch):
+    # A follow poll must bound the daemon read (since + tail+1), never an
+    # open-ended `since` that returns the container's whole backlog.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    c = _container(raw=_LINES)
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers", return_value=[c]):
+        first = il.instance_logs("i1", "container", 100, None)
+        il.instance_logs("i1", "container", 100, first["next_cursor"])
+    kw = c.logs.call_args.kwargs
+    assert "since" in kw
+    assert kw["tail"] == 101  # tail (100) + 1 sentinel to detect a gap
+
+
+def test_follow_firehose_keeps_newest_and_flags_gap(tmp_path, monkeypatch):
+    # More than `tail` new lines since the cursor: keep the NEWEST tail, flag a
+    # gap, and jump the cursor to the newest so the viewer stays near-live
+    # instead of paging slowly through an unbounded backlog.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    c = _container(raw=b"2026-06-15T14:00:00.000000000Z base\n")
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers", return_value=[c]):
+        first = il.instance_logs("i1", "container", 2, None)
+        c.logs.return_value = (
+            b"2026-06-15T14:00:01.000000000Z a\n"
+            b"2026-06-15T14:00:02.000000000Z b\n"
+            b"2026-06-15T14:00:03.000000000Z c\n"
+            b"2026-06-15T14:00:04.000000000Z d\n"
+            b"2026-06-15T14:00:05.000000000Z e\n")
+        second = il.instance_logs("i1", "container", 2, first["next_cursor"])
+    assert [ln["msg"] for ln in second["lines"]] == ["d", "e"]  # newest tail
+    assert second["truncated"] is True                          # gap flagged
+    cur = il.decode_cursor(second["next_cursor"])
+    assert cur["positions"]["web"] == "2026-06-15T14:00:05.000000000Z"
+
+
+def test_follow_under_tail_is_gapless(tmp_path, monkeypatch):
+    # <= tail new lines: all returned, no gap flag (identical to a plain since
+    # read), so normal-volume follow is unchanged.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    c = _container(raw=b"2026-06-15T14:00:00.000000000Z base\n")
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers", return_value=[c]):
+        first = il.instance_logs("i1", "container", 100, None)
+        c.logs.return_value = (
+            b"2026-06-15T14:00:00.000000000Z base\n"
+            b"2026-06-15T14:00:01.000000000Z a\n"
+            b"2026-06-15T14:00:02.000000000Z b\n")
+        second = il.instance_logs("i1", "container", 100, first["next_cursor"])
+    assert [ln["msg"] for ln in second["lines"]] == ["a", "b"]
+    assert second["truncated"] is False
+
+
+def test_follow_cursor_uses_true_newest_under_interleaving(tmp_path, monkeypatch):
+    # stdout/stderr interleave can yield slightly out-of-order lines; the cursor
+    # must advance to the true-newest ts (not the last positional line) so the
+    # next poll neither re-emits nor skips, and lines come out chronological.
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    c = _container(raw=b"2026-06-15T14:00:00.000000000Z base\n")
+    with patch.object(il, "instance_is_deployed", return_value=True), \
+            patch.object(il, "list_instance_containers", return_value=[c]):
+        first = il.instance_logs("i1", "container", 100, None)
+        c.logs.return_value = (
+            b"2026-06-15T14:00:02.000000000Z later\n"     # last positionally
+            b"2026-06-15T14:00:01.000000000Z earlier\n")  # but older
+        second = il.instance_logs("i1", "container", 100, first["next_cursor"])
+    cur = il.decode_cursor(second["next_cursor"])
+    assert cur["positions"]["web"] == "2026-06-15T14:00:02.000000000Z"  # max ts
+    assert [ln["msg"] for ln in second["lines"]] == ["earlier", "later"]
+
+
 def test_service_selector_narrows_to_one_container(tmp_path, monkeypatch):
     # ?service=web returns ONLY the web container's lines, not the merged view.
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))

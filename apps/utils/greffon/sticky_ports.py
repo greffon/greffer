@@ -9,13 +9,18 @@ the per-port allocation in a small JSON sidecar in the instance directory under
 reuse it on the next start when the port is still free.
 
 All L4 ports are sticky (``same_port`` and plain alike): reuse the persisted
-port when it's still free, else allocate a fresh one. This is reuse-if-free,
-NOT a hard reservation — a stopped instance's port is free for others to take,
-and the next start's live bind-probe rotates this instance off a taken port. So
-persisting does not deplete the dedicated L4 range; it just keeps the endpoint
-stable across restarts when nothing else grabbed the port. For ``same_port``
-ports a stable endpoint is load-bearing (the app baked the port into its own
-config); for plain L4 it is a (harmless) UX improvement.
+port when it's still free, else take the lowest free one. "Free" is decided
+against the ports the docker daemon publishes for RUNNING containers (see
+apps/utils/docker/l4_ports.py), NOT a socket bind-probe: the greffer runs in
+its own container network namespace and is blind to host bindings, so a probe
+reads a host-occupied port as free and hands the same number to two instances.
+A stopped instance's port is genuinely free for others (docker releases a host
+port on stop), so persisting does not deplete the dedicated L4 range; it just
+lets an instance reclaim its endpoint on restart when nothing else took it. For
+``same_port`` ports a stable endpoint is load-bearing (the app baked the port
+into its own config); on a proxy greffer a taken same_port endpoint is a hard
+error rather than a silent rotation, while a plain-L4 (or tunnel) rotation is
+harmless.
 
 The sidecar is NOT cleaned up on delete (the greffer has no delete endpoint;
 the whole instance dir already leaks) — it's correctly reused if the same

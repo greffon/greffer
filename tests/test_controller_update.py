@@ -29,8 +29,9 @@ def _client(settings) -> AsyncClient:
 def _settings(monkeypatch, tmp_path, *, enabled=True, image=_PINNED):
     monkeypatch.setenv("GREFFER_ID", "g1")
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
-    if enabled:
-        monkeypatch.setenv("GREFFER_REMOTE_UPDATE_ENABLED", "true")
+    # Set explicitly both ways: the flag now defaults ON, so the disabled case
+    # must actively set it false rather than rely on an absent env var.
+    monkeypatch.setenv("GREFFER_REMOTE_UPDATE_ENABLED", "true" if enabled else "false")
     monkeypatch.setenv("GREFFER_UPDATER_IMAGE", image)
     monkeypatch.setenv("GREFFER_VERSION_MANIFEST_URL", "https://x/m.json")
     return get_settings()
@@ -74,22 +75,26 @@ async def test_update_happy_spawns_and_returns_202(monkeypatch, tmp_path) -> Non
     kw = spawn.call_args.kwargs
     assert kw["image"] == _PINNED
     assert kw["target_tag"] == "0.3.6"
-    assert kw["manifest_url"] == "https://x/m.json"
     assert kw["greffer_id"] == "g1"
     assert kw["data_dest"] == str(tmp_path)
-    assert kw["mode"] == "proxy"  # GREFFER_MODE unset -> default proxy
+    # socket model: the manifest_url / mode params are gone (the updater no longer
+    # uses a manifest, and discovers the stack by label, not by mode)
+    assert "manifest_url" not in kw and "mode" not in kw
 
 
 @pytest.mark.asyncio
-async def test_update_passes_tunnel_mode(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("GREFFER_MODE", "tunnel")
+async def test_update_refused_409_when_update_in_progress(monkeypatch, tmp_path) -> None:
+    # HLD section 10: a second remote update while one is recreating the stack is
+    # refused fast (the /data lock is held) rather than spawning a doomed updater.
     settings = _settings(monkeypatch, tmp_path)
-    with patch.object(updater_spawn, "spawn_updater", return_value="cid") as spawn:
+    with patch.object(updater_spawn, "spawn_updater") as spawn, \
+            patch.object(updater_spawn, "update_in_progress", return_value=True):
         async with _client(settings) as ac:
             r = await ac.post("/api/controller/update/", json={"target_tag": "0.3.6"},
                               headers={TOKEN_HEADER: "test-token"})
-    assert r.status_code == 202
-    assert spawn.call_args.kwargs["mode"] == "tunnel"
+    assert r.status_code == 409
+    assert r.json()["detail"] == "update_in_progress"
+    spawn.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,60 @@ async def test_start_success(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_same_port_conflict_returns_409(client: AsyncClient) -> None:
+    """A proxy same_port endpoint whose pinned port a neighbour holds surfaces
+    as a clean 409 with the machine code, not a 500 or a crash-looping container."""
+    from apps.utils.docker.l4_ports import L4SamePortConflict
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4SamePortConflict(
+            port_name="wireguard_51820", port=20000
+        )
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 409
+    assert "l4_same_port_conflict" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_range_exhausted_returns_409(client: AsyncClient) -> None:
+    from apps.utils.docker.l4_ports import L4PortRangeExhausted
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4PortRangeExhausted(20000, 29999)
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 409
+    assert "l4_port_range_exhausted" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_daemon_unavailable_returns_503(client: AsyncClient) -> None:
+    from apps.utils.docker.l4_ports import L4PortsUnavailable
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = L4PortsUnavailable(
+            "l4_port_enumeration_failed: boom"
+        )
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 503
+    assert "l4_port_enumeration_failed" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_start_rejects_missing_fields(client: AsyncClient) -> None:
     r = await client.post(
         "/api/controller/start/",
@@ -957,3 +1011,36 @@ async def test_start_swallows_compose_status_errors_during_wait(
     )
 
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# §10 lock: start/stop refuse 409 while a self-update is recreating the stack
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_refused_409_when_update_in_progress(client: AsyncClient) -> None:
+    """HLD §10: a manager start must not race a self-update recreating the stack;
+    the controller probes the /data lock and 409s before doing any compose work."""
+    with patch("app.routers.controller.updater_spawn.update_in_progress",
+               return_value=True), \
+            patch("app.routers.controller.repository") as mock_repo:
+        r = await client.post(
+            "/api/controller/start/", json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "update_in_progress"
+    mock_repo.get_compose_file_from_repository.assert_not_called()  # refused before any work
+
+
+@pytest.mark.asyncio
+async def test_stop_refused_409_when_update_in_progress(client: AsyncClient) -> None:
+    with patch("app.routers.controller.updater_spawn.update_in_progress",
+               return_value=True), \
+            patch("app.routers.controller.compose") as mock_compose:
+        r = await client.post(
+            "/api/controller/stop/", json={"id": "test-instance-123"},
+            headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "update_in_progress"
+    mock_compose.stop.assert_not_called()

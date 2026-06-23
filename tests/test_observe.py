@@ -14,6 +14,9 @@ def _container(name="i1_web_1", status="running", project="i1",
                service="web", ignore=False, stats=None):
     c = Mock()
     c.name = name
+    # id distinct from name: the prev-CPU sample is keyed by the immutable
+    # container id (survives rename), not the name.
+    c.id = f"id-{name}"
     c.status = status
     labels = {
         "com.docker.compose.project": project,
@@ -59,7 +62,13 @@ def _clear_caches():
     observe._stats_cache.clear()
     observe._disk_cache.clear()
     observe._df_cache.update({"at": 0.0, "volumes": None})
+    # Drive digest tests through the blocking-read fallback (container.stats
+    # mock) unless a test opts into one-shot, and start each test with an empty
+    # prev-CPU sample so cross-test state never leaks a stale delta.
+    observe._oneshot_supported = False
+    observe._cpu_prev.clear()
     yield
+    observe._cpu_prev.clear()
 
 
 # --- enumeration --------------------------------------------------------
@@ -95,23 +104,13 @@ def test_list_instance_containers_keeps_tenant_named_migrate():
 
 # --- stats digest -------------------------------------------------------
 
-def test_cpu_percent_computed():
-    # cpu_delta=100, sys_delta=1000, online=2 -> 100/1000*2*100 = 20.0
-    assert observe._cpu_percent(_running_stats()) == 20.0
-
-
-def test_cpu_percent_cold_start_sentinel():
-    cold = _running_stats()
-    cold["precpu_stats"]["system_cpu_usage"] = cold["cpu_stats"][
-        "system_cpu_usage"]  # sys_delta == 0
-    assert observe._cpu_percent(cold) == 0.0
-
-
 def test_cpu_percent_not_clamped_to_100():
-    # 4 cores fully busy -> ~400, NOT clamped (per-container is multi-core).
-    s = _running_stats(total=1100, pre_total=100, sys=2000, pre_sys=1000,
-                       online=4)
-    assert observe._cpu_percent(s) == 400.0
+    # 4 cores fully busy -> ~400, NOT clamped (per-container CPU is multi-core,
+    # unlike the host-aggregate heartbeat). delta: cpu 1000, sys 1000, online 4
+    # -> 1000/1000*4*100 = 400.0. (computed/cold/idle: see
+    # test_cpu_percent_from_prev_sample.)
+    assert observe._cpu_percent_from_prev((100, 1000, 4),
+                                          (1100, 2000, 4)) == 400.0
 
 
 def test_mem_subtracts_reclaimable_cache():
@@ -156,7 +155,7 @@ def test_instance_stats_running_and_stopped(tmp_path, monkeypatch):
     web = next(c for c in body["containers"] if c["service"] == "web")
     db = next(c for c in body["containers"] if c["service"] == "db")
     assert web["state"] == "running"
-    assert web["cpu_percent"] == 20.0
+    assert web["cpu_percent"] is None  # cold first read; CPU populates next poll
     assert web["mem_used_bytes"] == 400
     assert web["net_rx_bytes"] == 10
     assert db["state"] == "exited"
@@ -176,6 +175,159 @@ def test_instance_stats_stats_failure_yields_null_not_500(tmp_path,
         cl.containers.list.return_value = [c]
         body = observe.instance_stats("i1")
     assert body["containers"][0]["cpu_percent"] is None
+
+
+def test_instance_stats_preserves_container_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    names = [f"i1_svc{i}_1" for i in range(6)]
+    containers = [_container(name=n, service=f"svc{i}",
+                             stats=_running_stats())
+                  for i, n in enumerate(names)]
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        body = observe.instance_stats("i1")
+    # The parallel fan-out must keep results aligned to enumeration order.
+    assert [c["name"] for c in body["containers"]] == names
+
+
+def test_instance_stats_reads_containers_concurrently(tmp_path, monkeypatch):
+    """The per-container daemon reads must run in PARALLEL. A barrier that only
+    releases once N threads are simultaneously inside ``stats()`` proves it
+    deterministically: a serial read would deadlock the barrier (only ever one
+    thread inside) and raise BrokenBarrierError on timeout."""
+    import threading
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    n = 6
+    barrier = threading.Barrier(n, timeout=5)
+
+    def _concurrent_stats(*_a, **_k):
+        barrier.wait()  # blocks until all N threads are inside at once
+        return _running_stats()
+
+    containers = []
+    for i in range(n):
+        c = _container(name=f"i1_svc{i}_1", service=f"svc{i}")
+        c.stats.side_effect = _concurrent_stats
+        containers.append(c)
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = containers
+        body = observe.instance_stats("i1")
+    # All N digested with real metrics (barrier released => true concurrency).
+    # mem is immediate on a single read; CPU needs a prior sample so it is cold.
+    assert len(body["containers"]) == n
+    assert all(c["mem_used_bytes"] == 400 for c in body["containers"])
+
+
+def test_instance_stats_slow_container_times_out_to_null(tmp_path, monkeypatch):
+    """A container whose read exceeds the digest deadline degrades to null
+    metrics (state preserved) without holding back the fast containers."""
+    import time
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    monkeypatch.setattr(observe, "_STATS_DEADLINE_SECONDS", 0.2)
+    _deploy(tmp_path)
+    fast = _container(name="i1_web_1", service="web", stats=_running_stats())
+    slow = _container(name="i1_db_1", service="db")
+    slow.stats.side_effect = lambda *_a, **_k: (time.sleep(1.0)
+                                                or _running_stats())
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = [fast, slow]
+        start = time.monotonic()
+        body = observe.instance_stats("i1")
+        elapsed = time.monotonic() - start
+    web = next(c for c in body["containers"] if c["service"] == "web")
+    db = next(c for c in body["containers"] if c["service"] == "db")
+    assert web["mem_used_bytes"] == 400        # fast one digested
+    assert db["state"] == "running"            # state preserved (enumeration)
+    assert db["mem_used_bytes"] is None        # slow one degraded to null
+    assert elapsed < 1.0                        # returned at the deadline
+
+
+# --- one-shot read + CPU prev-sample delta ------------------------------
+
+def test_cpu_percent_from_prev_sample():
+    # (100,1000,2) -> (200,2000,2): (100/1000)*2*100 = 20.0
+    assert observe._cpu_percent_from_prev((100, 1000, 2), (200, 2000, 2)) == 20.0
+    assert observe._cpu_percent_from_prev(None, (200, 2000, 2)) is None  # cold
+    assert observe._cpu_percent_from_prev((100, 1000, 2),
+                                          (100, 1000, 2)) == 0.0  # idle
+
+
+def test_instance_stats_cpu_populates_on_second_poll(tmp_path, monkeypatch):
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    _deploy(tmp_path)
+    c = _container(name="i1_web_1", service="web")
+    # Two successive reads with advancing CPU counters (one-shot carries no
+    # precpu, so the percent is the delta across the two polls).
+    c.stats.side_effect = [
+        _running_stats(total=100, sys=1000),
+        _running_stats(total=200, sys=2000),
+    ]
+    with patch.object(observe, "client") as cl:
+        cl.containers.list.return_value = [c]
+        first = observe.instance_stats("i1")["containers"][0]
+        second = observe.instance_stats("i1")["containers"][0]
+    assert first["cpu_percent"] is None    # cold: seeds the sample
+    assert second["cpu_percent"] == 20.0   # delta over the inter-poll window
+
+
+def test_read_stats_uses_oneshot_when_supported():
+    observe._oneshot_supported = True
+    c = _container()
+    with patch.object(observe, "client") as cl:
+        cl.api._url.return_value = "/v1.43/containers/x/stats"
+        cl.api._result.return_value = {"cpu_stats": {}}
+        out = observe._read_stats(c)
+    cl.api._get.assert_called_once()
+    _, kwargs = cl.api._get.call_args
+    assert kwargs["params"] == {"stream": False, "one-shot": True}
+    c.stats.assert_not_called()  # never the blocking read when one-shot is on
+    assert out == {"cpu_stats": {}}
+
+
+def test_read_stats_falls_back_to_blocking_when_unsupported():
+    observe._oneshot_supported = False
+    c = _container(stats=_running_stats())
+    with patch.object(observe, "client") as cl:
+        observe._read_stats(c)
+    c.stats.assert_called_once_with(stream=False)
+    cl.api._get.assert_not_called()
+
+
+def test_api_supports_oneshot_version_gate():
+    with patch.object(observe, "client") as cl:
+        cl.api.api_version = "1.43"
+        observe._oneshot_supported = None
+        assert observe._api_supports_oneshot() is True
+        cl.api.api_version = "1.40"
+        observe._oneshot_supported = None
+        assert observe._api_supports_oneshot() is False
+        cl.api.api_version = "garbage"
+        observe._oneshot_supported = None
+        assert observe._api_supports_oneshot() is False
+
+
+def test_cpu_prev_pruned_after_ttl():
+    observe._cpu_prev["gone"] = (1, 1, 1, 0.0)
+    observe._cpu_prev["fresh"] = (1, 1, 1, 1000.0)
+    observe._prune_cpu_prev(now=1000.0 + observe._CPU_PREV_TTL_SECONDS - 1)
+    assert "gone" not in observe._cpu_prev   # ts 0.0 is well past the TTL
+    assert "fresh" in observe._cpu_prev      # ts 1000.0 still within the TTL
+
+
+def test_shutdown_stats_pool_is_idempotent_and_resets():
+    # Build the pool, tear it down without waiting, and confirm a later read
+    # transparently rebuilds a fresh one.
+    pool = observe._get_stats_pool()
+    assert pool is not None
+    observe.shutdown_stats_pool()
+    assert observe._stats_pool is None
+    observe.shutdown_stats_pool()  # second call is a no-op, never raises
+    try:
+        assert observe._get_stats_pool() is not pool
+    finally:
+        observe.shutdown_stats_pool()  # don't leak a live pool into other tests
 
 
 # --- disk digest --------------------------------------------------------

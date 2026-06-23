@@ -675,3 +675,52 @@ def test_bad_manifest_message_distinct_from_unreachable(
     assert _run(cfg) == update.EXIT_PREFLIGHT_REFUSED  # no --to -> auto-latest
     err = capsys.readouterr().err
     assert "did not name a usable latest" in err  # UPDATE_BAD_MANIFEST, not "unreachable"
+
+
+def test_acquire_update_lock_retries_through_transient_probe_hold(
+    tmp_path: Path, monkeypatch) -> None:
+    # The greffer's per-heartbeat update_in_progress probe (and controller guard)
+    # briefly hold this same /data/.update.lock; a one-shot acquire would wrongly
+    # refuse a manual `greffer update` that lands in that window. Retry absorbs it.
+    fcntl = pytest.importorskip("fcntl")
+    monkeypatch.setattr(compose, "data_volume_mountpoint", lambda f: None)  # cfg lock
+    holder = open(tmp_path / ".update.lock", "w", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle = update._acquire_update_lock(
+        tmp_path, attempts=5,
+        _sleep=lambda _s: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
+    assert handle not in (None, update._NO_HOST_LOCK)
+    update._release_update_lock(handle)
+    holder.close()
+
+
+def test_acquire_update_lock_gives_up_on_persistent_hold(
+    tmp_path: Path, monkeypatch) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    monkeypatch.setattr(compose, "data_volume_mountpoint", lambda f: None)
+    holder = open(tmp_path / ".update.lock", "w", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    sleeps = {"n": 0}
+    handle = update._acquire_update_lock(
+        tmp_path, attempts=3,
+        _sleep=lambda _s: sleeps.__setitem__("n", sleeps["n"] + 1))
+    assert handle is None
+    assert sleeps["n"] == 2  # slept between attempts, not after the last
+    holder.close()
+
+
+# --- §10 lock relocation: host lock -> /data volume rendezvous ------
+
+def test_update_lock_path_uses_data_volume_mountpoint(tmp_path: Path, monkeypatch) -> None:
+    # the host lock relocates to the /data volume mountpoint so it contends with
+    # the in-container updater's /data/.update.lock (HLD §10 rendezvous)
+    monkeypatch.setattr(compose, "data_volume_mountpoint",
+                        lambda f: "/var/lib/docker/volumes/greffer_greffon-data/_data")
+    assert update._update_lock_path(tmp_path) == Path(
+        "/var/lib/docker/volumes/greffer_greffon-data/_data/.update.lock")
+
+
+def test_update_lock_path_falls_back_to_cfg(tmp_path: Path, monkeypatch) -> None:
+    # unresolvable volume -> local cfg lock (still serializes two host runs)
+    monkeypatch.setattr(compose, "data_volume_mountpoint", lambda f: None)
+    assert update._update_lock_path(tmp_path) == tmp_path / ".update.lock"

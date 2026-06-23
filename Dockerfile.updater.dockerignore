@@ -1,0 +1,16 @@
+# Per-Dockerfile ignore for the greffer-updater build (BuildKit uses
+# <dockerfile>.dockerignore in place of the root .dockerignore). The root
+# .dockerignore is an allowlist scoped to the greffer image (app/ + apps/) and
+# deliberately strips cli/ + min_supported_baseline, which this build's
+# `context: .` needs (COPY cli/, COPY min_supported_baseline). Allowlist just the
+# updater's inputs so the context stays small and the COPYs resolve.
+*
+!cli
+!min_supported_baseline
+# Re-exclude junk inside the allowlisted dir (last matching rule wins).
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+cli/.venv
+cli/dist
+cli/.pytest_cache

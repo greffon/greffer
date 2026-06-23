@@ -45,6 +45,16 @@ RUN python -m venv /opt/venv \
 FROM python:3.11-alpine
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
+# greffer self-update v2: the digest-pinned updater image this greffer spawns
+# for a manager-triggered remote update. Baked at build time from the
+# greffon/greffer-updater published in the SAME release (see docker-publish.yml),
+# so an operator only has to flip GREFFER_REMOTE_UPDATE_ENABLED, never copy a
+# digest per host. Empty in unsigned builds (no updater published); there the
+# operator sets GREFFER_UPDATER_IMAGE explicitly. An env.env / compose value
+# overrides this default. settings.greffer_updater_image binds it.
+ARG GREFFER_UPDATER_IMAGE=
+ENV GREFFER_UPDATER_IMAGE=${GREFFER_UPDATER_IMAGE}
+
 RUN apk add --no-cache docker-cli docker-cli-compose \
       && ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \
       && docker-compose version

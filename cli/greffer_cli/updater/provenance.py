@@ -13,6 +13,8 @@ monkeypatch the subprocess layer without a real registry.
 
 from __future__ import annotations
 
+import json
+
 from .. import compose
 
 # Baked into the greffer-updater image at build time (the publish CI commits
@@ -25,17 +27,31 @@ VERSION_LABEL = "org.opencontainers.image.version"
 
 
 def resolve_digest(ref: str) -> str | None:
-    """Resolve ``greffon/<repo>:<tag>`` to its content digest (``sha256:<64hex>``),
-    or None. Uses ``docker buildx imagetools inspect`` so it needs no pull."""
+    """Resolve ``greffon/<repo>:<tag>`` to its image-INDEX digest
+    (``sha256:<64hex>``, the manifest-list digest CI cosign-signs), or None.
+    Uses ``docker buildx imagetools inspect`` so it needs no pull.
+
+    Parses ``--format '{{json .Manifest}}'`` and reads its ``digest`` rather than
+    ``--format '{{.Manifest.Digest}}'``: the latter is buildx-version-fragile (on
+    buildx >= ~0.35 it silently falls back to the verbose listing instead of
+    emitting the bare digest, so the whole verify-then-pull would refuse). The
+    JSON form is stable across the buildx versions tested (the updater's 0.34.1
+    and newer)."""
     res = compose._run(
         ["docker", "buildx", "imagetools", "inspect", ref,
-         "--format", "{{.Manifest.Digest}}"],
+         "--format", "{{json .Manifest}}"],
         timeout=60,
     )
     if not res.ok:
         return None
-    digest = res.stdout.strip()
-    if not digest.startswith("sha256:"):
+    try:
+        manifest = json.loads(res.stdout)
+    except (json.JSONDecodeError, ValueError):
+        # A buildx that ignored --format and printed the verbose listing, or any
+        # non-JSON: fail closed rather than misread a digest.
+        return None
+    digest = manifest.get("digest") if isinstance(manifest, dict) else None
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
         return None
     hexpart = digest[len("sha256:"):]
     return digest if len(hexpart) == 64 and all(
@@ -49,9 +65,21 @@ def cosign_verify(repo: str, digest: str, *, pubkey: str = DEFAULT_COSIGN_PUB) -
     required so a signature lifted from another Greffon image (an old below-floor
     nginx, or the updater) cannot pass in this slot. Fail-closed on any error."""
     ref = f"{repo}@{digest}"
+    # ``--insecure-ignore-tlog=true``: the trust model is an offline managed key
+    # (cosign verify --key), NOT keyless+Rekor (see the v2 trust-model doc,
+    # "Signing mechanism"). The publish CI signs with ``--tlog-upload=false``, so
+    # there is no transparency-log entry; without this flag cosign v2 defaults to
+    # REQUIRING one and the verify fails closed on every genuine image. The repo
+    # annotation, not a tlog identity, binds the signature to its slot.
+    # ``-a repo=<repo>`` (short for ``--annotations``) requires the signature to
+    # carry that annotation; the publish CI signs each image with the same flag.
+    # Short form on BOTH sides avoids the invalid singular ``--annotation`` (cosign
+    # only defines ``-a`` / ``--annotations``), and the release pipeline runs this
+    # exact verify as a sign->verify smoke test so a flag drift fails CI, not prod.
     res = compose._run(
         ["cosign", "verify", "--key", pubkey,
-         "--annotation", f"repo={repo}", ref],
+         "-a", f"repo={repo}",
+         "--insecure-ignore-tlog=true", ref],
         timeout=120,
     )
     return res.ok

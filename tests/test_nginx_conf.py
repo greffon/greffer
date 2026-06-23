@@ -90,6 +90,56 @@ class CreateNginxConfTests(unittest.TestCase):
         self.assertIn('location /', content)
         self.assertIn('proxy_pass http://app_8080/', content)
 
+    def test_real_template_streaming_label_disables_buffering(self):
+        """A port flagged ``streaming`` (from the com.greffon.proxy.streaming
+        label) MUST render the buffering-off directives, so SSE / long-poll
+        responses are not held by nginx's default response buffering."""
+        from apps.utils.nginx.conf import create_nginx_conf
+
+        greffon_info = {
+            'id': 'streaming-on',
+            'ports': [
+                {'container_name': 'studio', 'port_container': '3000',
+                 'streaming': True},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            greffon_path = os.path.join(tmpdir, greffon_info['id'])
+            os.makedirs(greffon_path)
+            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
+                create_nginx_conf(greffon_info)
+            with open(os.path.join(greffon_path, 'nginx.conf')) as f:
+                content = f.read()
+
+        self.assertIn('proxy_buffering off;', content)
+        self.assertIn('add_header X-Accel-Buffering no always;', content)
+        self.assertIn('proxy_read_timeout 3600s;', content)
+
+    def test_real_template_no_streaming_label_keeps_buffering(self):
+        """REGRESSION: a port WITHOUT the streaming flag must NOT emit any
+        buffering-off directive. Default buffering protects every normal
+        request/response greffon; the streaming opt-in must stay opt-in."""
+        from apps.utils.nginx.conf import create_nginx_conf
+
+        greffon_info = {
+            'id': 'streaming-off',
+            'ports': [
+                {'container_name': 'app', 'port_container': '8080'},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            greffon_path = os.path.join(tmpdir, greffon_info['id'])
+            os.makedirs(greffon_path)
+            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
+                create_nginx_conf(greffon_info)
+            with open(os.path.join(greffon_path, 'nginx.conf')) as f:
+                content = f.read()
+
+        self.assertNotIn('proxy_buffering off;', content)
+        self.assertNotIn('X-Accel-Buffering', content)
+        # The location block is otherwise intact.
+        self.assertIn('proxy_pass http://app_8080/', content)
+
     def test_create_nginx_conf_renders_template(self):
         """Jinja2 variables from greffon_info should be substituted in the
         rendered output."""
@@ -132,3 +182,41 @@ class CreateNginxConfTests(unittest.TestCase):
             # Verify no unrendered Jinja2 placeholders remain
             self.assertNotIn('{{', content)
             self.assertNotIn('}}', content)
+
+
+class ServiceStreamingLabelTests(unittest.TestCase):
+    """Tests for _service_streaming label parsing (com.greffon.proxy.streaming)."""
+
+    def _streaming(self, service):
+        from apps.utils.greffon.repository import _service_streaming
+        return _service_streaming(service)
+
+    def test_mapping_true_variants(self):
+        # Values as yaml.safe_load would yield them: quoted "true" -> 'true',
+        # bare true/yes/on -> bool True, 1 -> int 1, plus odd casing/spacing.
+        for val in ['true', True, '1', 1, ' TRUE ']:
+            self.assertTrue(
+                self._streaming({'labels': {'com.greffon.proxy.streaming': val}}),
+                f'{val!r} should read as streaming',
+            )
+
+    def test_mapping_falsey_or_absent(self):
+        self.assertFalse(self._streaming({'labels': {'com.greffon.proxy.streaming': 'false'}}))
+        self.assertFalse(self._streaming({'labels': {'other': 'true'}}))
+        self.assertFalse(self._streaming({'labels': {}}))
+        self.assertFalse(self._streaming({}))
+
+    def test_list_form(self):
+        self.assertTrue(self._streaming(
+            {'labels': ['com.greffon.proxy.streaming=true', 'foo=bar']}))
+        self.assertFalse(self._streaming(
+            {'labels': ['com.greffon.proxy.streaming=false']}))
+        # bare flag (no '=') is not truthy
+        self.assertFalse(self._streaming({'labels': ['com.greffon.proxy.streaming']}))
+
+    def test_malformed_labels_do_not_crash(self):
+        # A bare-string or otherwise malformed labels block must read as
+        # "no label", never raise and abort the start flow.
+        self.assertFalse(self._streaming({'labels': 'com.greffon.proxy.streaming=true'}))
+        self.assertFalse(self._streaming({'labels': [123, None]}))
+        self.assertFalse(self._streaming({'labels': None}))
