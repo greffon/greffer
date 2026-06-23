@@ -68,7 +68,19 @@ def _instance_lock(instance_id: str) -> threading.Lock:
 # A single process-wide lock serializing repo-WIDE ops (prune / check) so two
 # triggers never spawn redundant sidecars. restic's own exclusive repo lock is the
 # CROSS-PROCESS guarantee against a running backup sidecar; this only dedupes ours.
-_REPO_OP_LOCK = threading.Lock()
+#
+# PER-REPO (Epic B): prune/check of DIFFERENT (per-tenant managed/BYO) repos must
+# run concurrently -- a single process-wide lock would 409 every tenant's prune
+# behind one. Keyed by the restic repo URL: same repo serializes (exclusive prune),
+# different repos don't contend. The guard protects the dict; the manager's sweep
+# cadence/caps bound how many sidecars run at once.
+_REPO_OP_LOCKS: dict[str, threading.Lock] = {}
+_REPO_OP_LOCKS_GUARD = threading.Lock()
+
+
+def _repo_op_lock(repo: str) -> threading.Lock:
+    with _REPO_OP_LOCKS_GUARD:
+        return _REPO_OP_LOCKS.setdefault(repo, threading.Lock())
 
 
 def restic_env(settings) -> dict:
@@ -565,16 +577,11 @@ def prune_repo(settings) -> dict:
     backup. Best-effort, detached (no callback): the manager triggers it and reads
     nothing back; a repo-busy result simply retries next cadence.
 
-    KNOWN GAP (Epic B, deferred to a later slice): prune/check operate on the
-    greffer's OWN env repo (``settings.greffer_backup_repo``) only. They do NOT
-    receive a per-tenant ``destination``, so MANAGED / white-glove per-tenant repos
-    are never space-reclaimed or integrity-checked here -- their ``forget`` runs
-    per-backup (dropping references) but the data is never pruned, and ``check``
-    never verifies them. Closing this needs the manager to drive prune/check
-    per-destination (thread ``destination`` onto the repo-op endpoints, mirroring
-    backup/restore) AND a per-repo lock (the process-wide ``_REPO_OP_LOCK`` would
-    otherwise serialize every tenant's prune). Until then, managed-tenant prune is
-    a manager-side responsibility that this endpoint does not fulfil."""
+    Per-tenant (Epic B): ``settings`` may be the effective (brokered) settings for
+    a managed/BYO destination, so prune runs against the per-tenant repo. The
+    manager drives one prune/check per destination; the per-repo lock keeps tenants
+    from contending. (Closes the prior known gap where prune/check only ever
+    touched the greffer's env repo.)"""
     try:
         ensure_repo(settings)
         rc, _out, err = _run_restic(
@@ -608,19 +615,24 @@ def check_repo(settings) -> dict:
         return {'status': 'failed', 'error_code': 'check_failed'}
 
 
-def spawn_repo_op(settings, op: str) -> None:
-    """Run a repo-wide op (``prune`` | ``check``) in a background thread under the
-    single non-blocking repo-op lock. Raises BusyError (-> 409) if a repo op is
-    already running, so the manager retries next cadence rather than stacking
-    redundant sidecars."""
-    if not _REPO_OP_LOCK.acquire(blocking=False):
+def spawn_repo_op(settings, op: str, destination=None) -> None:
+    """Run a repo-wide op (``prune`` | ``check``) in a background thread under a
+    non-blocking PER-REPO lock. ``destination`` (Epic B) targets a manager-brokered
+    per-tenant repo; None = the greffer's own env repo. Raises BusyError (-> 409) if
+    that repo already has an op running, so the manager retries next cadence rather
+    than stacking redundant sidecars on the same repo (a different tenant's repo is
+    unaffected)."""
+    eff = _effective_settings(settings, destination)
+    if not eff.greffer_backup_repo:
+        raise BackupError('repo_uninitialized')
+    lock = _repo_op_lock(eff.greffer_backup_repo)
+    if not lock.acquire(blocking=False):
         raise BusyError(op)
     fn = prune_repo if op == 'prune' else check_repo
     try:
         threading.Thread(
-            target=_locked_job, args=(_REPO_OP_LOCK, fn, settings),
-            daemon=True,
+            target=_locked_job, args=(lock, fn, eff), daemon=True,
         ).start()
     except Exception:  # noqa: BLE001 -- if the thread can't start (e.g. thread
-        _REPO_OP_LOCK.release()  # exhaustion), never leak the PROCESS-WIDE lock
-        raise                    # (it would 409 every future prune AND check).
+        lock.release()  # exhaustion), never leak this repo's lock (it would 409
+        raise           # every future prune AND check for the same repo).

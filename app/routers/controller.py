@@ -27,6 +27,7 @@ from app.log_context import instance_id_var
 from app import backup
 from app.models.controller import (
     GreffonBackupRequest,
+    GreffonRepoOpRequest,
     GreffonBackupResponse,
     GreffonRestoreRequest,
     GreffonRestoreResponse,
@@ -377,24 +378,31 @@ def get_restore_status(id: str, restore_id: str, request: Request) -> dict:
 
 
 @router.post("/prune/", status_code=202)
-def prune_repo_endpoint(request: Request) -> dict:
+def prune_repo_endpoint(
+    request: Request, payload: GreffonRepoOpRequest = GreffonRepoOpRequest()
+) -> dict:
     """Repo-wide prune (the SPACE half of retention), 202 + detached. Refuses 409
-    if a repo op (prune/check) is already running, or a self-update is in flight."""
+    if a repo op is already running ON THE SAME REPO, or a self-update is in
+    flight. ``destination`` (Epic B) prunes a per-tenant repo; absent = env repo."""
     _refuse_if_updating(_settings(request))
     try:
-        backup.spawn_repo_op(_settings(request), "prune")
+        backup.spawn_repo_op(_settings(request), "prune",
+                             destination=payload.destination)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="repo_busy")
     return {"status": "started", "op": "prune"}
 
 
 @router.post("/check/", status_code=202)
-def check_repo_endpoint(request: Request) -> dict:
+def check_repo_endpoint(
+    request: Request, payload: GreffonRepoOpRequest = GreffonRepoOpRequest()
+) -> dict:
     """Periodic repo integrity check (epic R27), 202 + detached. Same refusal
-    rules as prune."""
+    rules as prune. ``destination`` (Epic B) checks a per-tenant repo."""
     _refuse_if_updating(_settings(request))
     try:
-        backup.spawn_repo_op(_settings(request), "check")
+        backup.spawn_repo_op(_settings(request), "check",
+                             destination=payload.destination)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="repo_busy")
     return {"status": "started", "op": "check"}

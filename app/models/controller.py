@@ -169,6 +169,13 @@ class GreffonRestoreRequest(BaseModel):
     destination: BackupDestinationBlock | None = None
 
 
+class GreffonRepoOpRequest(BaseModel):
+    # Epic B: absent -> the greffer's env repo (self-managed); present -> prune/
+    # check the manager-brokered per-tenant repo. Optional so a bodyless or {}
+    # request (the existing self-managed callers) stays valid.
+    destination: BackupDestinationBlock | None = None
+
+
 class GreffonBackupResponse(BaseModel):
     backup_id: str
 
