@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     # `forget` runs OFF the downtime-critical path with its own short timeout, so a
     # hung retention call never extends a backup/restore window.
     backup_forget_timeout_seconds: int = 300
+    # prune (space reclaim) + check (integrity) are repo-wide and can be slow;
+    # they run detached on their own cadence, so they get a generous timeout.
+    backup_prune_timeout_seconds: int = 7200
+    backup_check_timeout_seconds: int = 7200
 
     # Greffer software version, reported in the register payload and on every
     # heartbeat (see workers/heartbeat.py). Defaults to
