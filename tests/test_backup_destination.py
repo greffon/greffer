@@ -9,6 +9,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+from pydantic import ValidationError
+
+from app.models.controller import BackupDestinationBlock
+
 from app import backup
 from app.backup import _effective_settings, restic_env
 
@@ -130,3 +135,18 @@ def test_restore_instance_safety_snapshot_targets_destination(monkeypatch):
     except Exception:
         pass  # later restore stages may need more patching; we only assert the repo
     assert seen.get("repo") == "s3:https://b2/bucket/tenant1"
+
+
+# --- repo scheme hardening (review: a buggy/compromised manager must not be able
+#     to redirect a tenant backup to a non-S3 restic backend) ---------------------
+def test_destination_block_accepts_s3_repo():
+    blk = BackupDestinationBlock(repo="s3:https://b2/bucket/t1", restic_password="pw")
+    assert blk.repo == "s3:https://b2/bucket/t1"
+
+
+@pytest.mark.parametrize("bad", [
+    "local:/data/repo", "sftp:host:/repo", "rest:http://h/", "/abs/path", "b2:bucket",
+])
+def test_destination_block_rejects_non_s3_repo(bad):
+    with pytest.raises(ValidationError):
+        BackupDestinationBlock(repo=bad, restic_password="pw")

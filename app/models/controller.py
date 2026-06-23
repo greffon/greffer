@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # Defense-in-depth: restrict `id` to safe filename-like characters. The id
@@ -133,6 +133,19 @@ class BackupDestinationBlock(BaseModel):
     restic_password: str = Field(min_length=1, max_length=512)
     aws_access_key_id: str | None = Field(default=None, max_length=512)
     aws_secret_access_key: str | None = Field(default=None, max_length=512)
+
+    @field_validator("repo")
+    @classmethod
+    def _repo_must_be_s3(cls, v: str) -> str:
+        # The managed / white-glove design uses S3-compatible object storage ONLY
+        # (HLD: restic-as-is on B2/S3, no rest-server). Reject any other restic
+        # backend so a buggy or compromised manager cannot redirect a tenant's
+        # backup to a local path (``local:``/an absolute path), an SFTP host
+        # (``sftp:``), or a rest-server (``rest:``). Defense-in-depth on top of the
+        # CA-verified controller channel.
+        if not v.startswith("s3:"):
+            raise ValueError("destination repo must be an s3: restic backend")
+        return v
 
 
 class GreffonBackupRequest(BaseModel):

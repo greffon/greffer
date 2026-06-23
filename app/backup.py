@@ -563,7 +563,18 @@ def prune_repo(settings) -> dict:
     ``forget`` drops snapshot references after each backup; prune reclaims the data
     no snapshot references). EXCLUSIVE + repo-wide, hence a SEPARATE cadence from
     backup. Best-effort, detached (no callback): the manager triggers it and reads
-    nothing back; a repo-busy result simply retries next cadence."""
+    nothing back; a repo-busy result simply retries next cadence.
+
+    KNOWN GAP (Epic B, deferred to a later slice): prune/check operate on the
+    greffer's OWN env repo (``settings.greffer_backup_repo``) only. They do NOT
+    receive a per-tenant ``destination``, so MANAGED / white-glove per-tenant repos
+    are never space-reclaimed or integrity-checked here -- their ``forget`` runs
+    per-backup (dropping references) but the data is never pruned, and ``check``
+    never verifies them. Closing this needs the manager to drive prune/check
+    per-destination (thread ``destination`` onto the repo-op endpoints, mirroring
+    backup/restore) AND a per-repo lock (the process-wide ``_REPO_OP_LOCK`` would
+    otherwise serialize every tenant's prune). Until then, managed-tenant prune is
+    a manager-side responsibility that this endpoint does not fulfil."""
     try:
         ensure_repo(settings)
         rc, _out, err = _run_restic(
