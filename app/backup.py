@@ -34,6 +34,7 @@ from pathlib import Path
 import requests
 
 from apps.utils.docker import compose
+from app.token import resolve_token
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,7 @@ def _post_callback(settings, instance_id: str, action: str, payload: dict) -> bo
         resp = requests.post(
             f"{settings.greffon_base_server}/api/greffer/instances/{instance_id}/{action}/",
             json=payload,
-            headers={"X-Greffer-Token": settings.greffer_token or ""},
+            headers={"X-Greffer-Token": resolve_token(settings)},
             verify=settings.greffer_ssl_verify,
             timeout=_HTTP_TIMEOUT,
         )
