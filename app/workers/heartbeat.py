@@ -202,6 +202,9 @@ def _one_heartbeat(app: FastAPI, seq: int) -> int:
         "reasons": reasons,
         "disk_free_bytes": _disk_free_bytes(settings),
         "instances": status_map,
+        # Reported for manager-side DR cert reconciliation (R-DR10): the serial of
+        # the cert this greffer currently presents. None until the first install.
+        "cert_serial": getattr(app.state, "installed_cert_serial", None),
     }
     # Host vitals (resource-monitoring epic, Feature 1). Read from /proc,
     # independent of the docker status collection above, so they ride even a
