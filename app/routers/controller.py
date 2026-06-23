@@ -344,7 +344,8 @@ def backup_greffon(
     echoed in the backup-result callback."""
     _refuse_if_updating(_settings(request))
     try:
-        backup.spawn_backup(_settings(request), payload.id, payload.backup_id)
+        backup.spawn_backup(_settings(request), payload.id, payload.backup_id,
+                            destination=payload.destination)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="instance_busy")
     return GreffonBackupResponse(backup_id=payload.backup_id)
@@ -361,7 +362,7 @@ def restore_greffon(
     try:
         backup.spawn_restore(
             _settings(request), payload.id, payload.restic_snapshot_id,
-            payload.restore_id,
+            payload.restore_id, destination=payload.destination,
         )
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="instance_busy")

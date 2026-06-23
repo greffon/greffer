@@ -121,9 +121,26 @@ class GreffonStatusResponse(BaseModel):
     containers: list[dict[str, Any]]
 
 
+class BackupDestinationBlock(BaseModel):
+    """Manager-brokered per-tenant backup destination (Epic B managed / white-glove
+    BYO). When present on a backup/restore request, the greffer writes restic to
+    THIS repo with THESE creds instead of its own env repo, so a shared bucket can
+    hold many tenants isolated by per-instance prefix + per-instance password. The
+    block is carried in-transit over the CA-verified controller call only -- it is
+    never persisted to disk and never logged (creds reach restic via --env NAME,
+    like the env path)."""
+    repo: str = Field(min_length=1, max_length=512)
+    restic_password: str = Field(min_length=1, max_length=512)
+    aws_access_key_id: str | None = Field(default=None, max_length=512)
+    aws_secret_access_key: str | None = Field(default=None, max_length=512)
+
+
 class GreffonBackupRequest(BaseModel):
     id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
     backup_id: str = Field(min_length=1, max_length=64)
+    # Epic B: absent -> self-managed (greffer's own env repo); present -> the
+    # manager-brokered per-tenant destination.
+    destination: BackupDestinationBlock | None = None
 
 
 class GreffonRestoreRequest(BaseModel):
@@ -134,6 +151,9 @@ class GreffonRestoreRequest(BaseModel):
     # greffer can refuse a same-version-but-rewritten-compose restore.
     compose_digest: str | None = None
     allow_drift: bool = False
+    # Epic B: restore reads from (and writes its safety snapshot to) the same
+    # brokered destination the backup was written to.
+    destination: BackupDestinationBlock | None = None
 
 
 class GreffonBackupResponse(BaseModel):
