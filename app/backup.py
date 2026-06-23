@@ -109,7 +109,7 @@ def _classify(stderr: str) -> str:
 
 
 def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
-                read_only: bool) -> tuple[int, str, str]:
+                read_only: bool, timeout: int = 3600) -> tuple[int, str, str]:
     """Run the digest-pinned restic sidecar with ``(source, dest)`` mounts under
     ``/data``. Secrets reach the container via ``--env KEY`` (NAME-only) +
     ``subprocess env=`` -- NEVER ``--env KEY=VALUE``, which would put the repo
@@ -126,7 +126,7 @@ def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
         docker_args += ["-v", f"{source}:{dest}{suffix}"]
     docker_args += ["--entrypoint", "restic", settings.restic_sidecar_image, *args]
     proc = subprocess.run(
-        docker_args, capture_output=True, text=True, timeout=3600, env=env)
+        docker_args, capture_output=True, text=True, timeout=timeout, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -141,6 +141,40 @@ def ensure_repo(settings) -> None:
         if init_rc != 0:
             raise BackupError(_classify(init_err))
     _run_restic(settings, ["unlock"], [], read_only=True)
+
+
+def _forget(settings, instance_id: str, *, safety: bool) -> None:
+    """Best-effort ``restic forget`` retention (Feature #5). Builds the keep args
+    INSIDE the try so even a settings/attr error is swallowed (a forget failure
+    must NEVER fail the op it follows -- the snapshot already succeeded).
+
+    - **keep-last is FLOORED at 1** so a misconfigured NEGATIVE value can never
+      delete the just-created ``safety:<id>`` snapshot before a restore overwrite.
+    - **Tag-isolation:** restic ``--tag`` matches EXACTLY (not by prefix), so the
+      instance policy never touches a ``safety:<id>`` snapshot and vice-versa.
+    - **``--group-by tags``** pins the grouping so the keep counts can't silently
+      multiply if a snapshot's host/paths ever drift.
+    - **own short timeout** (it runs off the downtime-critical path, but bound it
+      anyway). NOT ``--prune`` (exclusive + repo-wide, a separate cadence)."""
+    try:
+        if safety:
+            tag = f"safety:{instance_id}"
+            keep = ["--keep-last", str(max(1, settings.backup_safety_keep_last))]
+        else:
+            tag = f"instance:{instance_id}"
+            keep = ["--keep-daily", str(max(0, settings.backup_keep_daily)),
+                    "--keep-weekly", str(max(0, settings.backup_keep_weekly)),
+                    "--keep-monthly", str(max(0, settings.backup_keep_monthly))]
+        rc, _out, err = _run_restic(
+            settings, ["forget", "--group-by", "tags", "--tag", tag, *keep],
+            [], read_only=True,
+            timeout=getattr(settings, "backup_forget_timeout_seconds", 300))
+        if rc != 0:
+            logger.warning("restic_forget_failed tag=%s code=%s",
+                           tag, _classify(err))
+    except Exception:  # noqa: BLE001 -- retention is best-effort, never fatal
+        logger.exception("restic_forget_error instance=%s safety=%s",
+                         instance_id, safety)
 
 
 def _backup_mounts(settings, instance_id: str) -> list[tuple[str, str]]:
@@ -303,6 +337,10 @@ def backup_instance(settings, instance_id: str, backup_id: str) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("backup_restart_failed instance=%s", instance_id)
         _remove(_backup_marker(settings, instance_id))
+        # Retention AFTER the restart (off the downtime path), only on success: a
+        # hung/slow forget must not extend the backup's stop window.
+        if payload.get("status") == "success":
+            _forget(settings, instance_id, safety=False)
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
@@ -355,6 +393,10 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
             return
         payload = {"restore_id": restore_id, "status": "success",
                    "safety_restic_snapshot_id": safety_id}
+        # Bound OLD safety snapshots now the restore SUCCEEDED -- off the
+        # pre-overwrite critical path; keep-last>=1 keeps this restore's new one,
+        # and skipping it on a failed overwrite preserves every rollback point.
+        _forget(settings, instance_id, safety=True)
     except BackupError as exc:
         payload["error_code"] = exc.code
         payload["safety_restic_snapshot_id"] = safety_id

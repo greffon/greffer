@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     restic_sidecar_image: str = "restic/restic:0.16.4"
     # Max wait for `docker compose stop` to quiesce before a backup snapshots.
     backup_stop_timeout_seconds: int = 120
+    # restic retention (Feature #5). `forget` runs after each backup, tag-isolated
+    # to instance:<id>; the safety:<id> snapshots get their OWN bounded keep-last
+    # so they neither accumulate forever nor are swept by the instance policy.
+    # Env defaults; a manager BackupPolicy override may arrive in the request later.
+    backup_keep_daily: int = 7
+    backup_keep_weekly: int = 4
+    backup_keep_monthly: int = 6
+    backup_safety_keep_last: int = 3
+    # `forget` runs OFF the downtime-critical path with its own short timeout, so a
+    # hung retention call never extends a backup/restore window.
+    backup_forget_timeout_seconds: int = 300
 
     # Greffer software version, reported in the register payload and on every
     # heartbeat (see workers/heartbeat.py). Defaults to
