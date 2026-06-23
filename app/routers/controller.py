@@ -11,6 +11,7 @@ runs sync handlers in a threadpool automatically.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from pathlib import Path
@@ -23,7 +24,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.auth import require_token
 from app.diagnostics import diag
 from app.log_context import instance_id_var
+from app import backup
 from app.models.controller import (
+    GreffonBackupRequest,
+    GreffonBackupResponse,
+    GreffonRestoreRequest,
+    GreffonRestoreResponse,
     GreffonStartRequest,
     GreffonStartResponse,
     GreffonStatusResponse,
@@ -84,7 +90,26 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
+def _serialize_instance_op(handler):
+    """Hold the in-process per-instance lock for a start/stop's whole duration so
+    it serializes against a concurrent backup/restore in the single greffer
+    process (HLD section 3: the in-process lock -- NOT a file lock -- is the real
+    serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
+    preserves the signature so FastAPI still parses the body + response_model."""
+    @functools.wraps(handler)
+    def wrapper(payload, request, *args, **kwargs):
+        lock = backup._instance_lock(payload.id)
+        if not lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="instance_busy")
+        try:
+            return handler(payload, request, *args, **kwargs)
+        finally:
+            lock.release()
+    return wrapper
+
+
 @router.post("/start/")
+@_serialize_instance_op
 def start_greffon(
     payload: GreffonStartRequest, request: Request
 ) -> GreffonStartResponse:
@@ -219,6 +244,7 @@ def start_greffon(
 
 
 @router.post("/stop/")
+@_serialize_instance_op
 def stop_greffon(
     payload: GreffonStopRequest, request: Request
 ) -> GreffonStopResponse:
@@ -307,6 +333,46 @@ def _write_pushed_client_toml(
         logger.debug("tunnel_client_toml_pushed_for_id=%s",
                      getattr(payload, "id", "?"))
     return "ok"
+
+
+@router.post("/backup/", status_code=202)
+def backup_greffon(
+    payload: GreffonBackupRequest, request: Request
+) -> GreffonBackupResponse:
+    """Cold backup: 202 + background thread (HLD section 4). The in-process
+    per-instance lock 409s a concurrent op; the manager-supplied backup_id is
+    echoed in the backup-result callback."""
+    _refuse_if_updating(_settings(request))
+    try:
+        backup.spawn_backup(_settings(request), payload.id, payload.backup_id)
+    except backup.BusyError:
+        raise HTTPException(status_code=409, detail="instance_busy")
+    return GreffonBackupResponse(backup_id=payload.backup_id)
+
+
+@router.post("/restore/", status_code=202)
+def restore_greffon(
+    payload: GreffonRestoreRequest, request: Request
+) -> GreffonRestoreResponse:
+    """Restore-in-place: 202 + background thread. The greffer restores by
+    restic_snapshot_id (it cannot map the manager UUID) and finalizes via the
+    restore-result callback carrying the safety snapshot id."""
+    _refuse_if_updating(_settings(request))
+    try:
+        backup.spawn_restore(
+            _settings(request), payload.id, payload.restic_snapshot_id,
+            payload.restore_id,
+        )
+    except backup.BusyError:
+        raise HTTPException(status_code=409, detail="instance_busy")
+    return GreffonRestoreResponse(restore_id=payload.restore_id)
+
+
+@router.get("/restore-status/")
+def get_restore_status(id: str, restore_id: str, request: Request) -> dict:
+    """Durable restore outcome for the manager's reconciler -- a stuck RestoreRun
+    is never blind-failed (its volumes may already be overwritten)."""
+    return backup.restore_status(_settings(request), id, restore_id)
 
 
 @router.post("/update/", status_code=202)

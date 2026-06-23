@@ -26,6 +26,21 @@ class Settings(BaseSettings):
     # ``X-Greffer-Token`` on the manager auth paths.
     greffer_token: str | None = None
 
+    # Backup destination (backup-restore Phase 1). The greffer holds the restic
+    # repo + creds, so the manager never touches bytes. One repo per greffer;
+    # snapshots tagged ``instance:<id>``, ``--host <greffer-id>``. Unset => the
+    # backup endpoints fail with ``repo_uninitialized``. Env: GREFFER_BACKUP_REPO,
+    # RESTIC_PASSWORD(_FILE), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+    greffer_backup_repo: str | None = None
+    restic_password: str | None = None
+    restic_password_file: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    # Digest-pinned restic sidecar image (like the updater image).
+    restic_sidecar_image: str = "restic/restic:0.16.4"
+    # Max wait for `docker compose stop` to quiesce before a backup snapshots.
+    backup_stop_timeout_seconds: int = 120
+
     # Greffer software version, reported in the register payload and on every
     # heartbeat (see workers/heartbeat.py). Defaults to
     # the worker's ``app.__version__``; overridable via ``GREFFER_VERSION`` (e.g.
