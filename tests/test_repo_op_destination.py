@@ -89,3 +89,18 @@ def test_spawn_repo_op_different_repos_do_not_contend(monkeypatch):
 def test_spawn_repo_op_uninitialized_repo_raises(monkeypatch):
     with pytest.raises(backup.BackupError):
         backup.spawn_repo_op(_settings(greffer_backup_repo=""), "prune")
+
+
+def test_repo_op_lock_is_reaped_after_completion(monkeypatch):
+    # The per-repo lock must be dropped from the registry after the op, so the
+    # dict can't grow one entry per tenant repo forever.
+    import time
+    monkeypatch.setattr(backup, "prune_repo", lambda s: {"status": "success"})
+    repo = "s3:reap-me-please"
+    backup.spawn_repo_op(_settings(greffer_backup_repo=repo), "prune")
+    for _ in range(300):
+        with backup._REPO_OP_LOCKS_GUARD:
+            if repo not in backup._REPO_OP_LOCKS:
+                return
+        time.sleep(0.01)
+    pytest.fail("per-repo lock was not reaped from the registry")

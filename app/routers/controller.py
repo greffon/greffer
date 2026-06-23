@@ -390,6 +390,8 @@ def prune_repo_endpoint(
                              destination=payload.destination)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="repo_busy")
+    except backup.BackupError as exc:
+        raise HTTPException(status_code=400, detail=exc.code)
     return {"status": "started", "op": "prune"}
 
 
@@ -405,6 +407,8 @@ def check_repo_endpoint(
                              destination=payload.destination)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="repo_busy")
+    except backup.BackupError as exc:
+        raise HTTPException(status_code=400, detail=exc.code)
     return {"status": "started", "op": "check"}
 
 

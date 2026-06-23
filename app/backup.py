@@ -623,16 +623,36 @@ def spawn_repo_op(settings, op: str, destination=None) -> None:
     than stacking redundant sidecars on the same repo (a different tenant's repo is
     unaffected)."""
     eff = _effective_settings(settings, destination)
-    if not eff.greffer_backup_repo:
+    repo = eff.greffer_backup_repo
+    if not repo:
         raise BackupError('repo_uninitialized')
-    lock = _repo_op_lock(eff.greffer_backup_repo)
+    lock = _repo_op_lock(repo)
     if not lock.acquire(blocking=False):
         raise BusyError(op)
     fn = prune_repo if op == 'prune' else check_repo
     try:
         threading.Thread(
-            target=_locked_job, args=(lock, fn, eff), daemon=True,
+            target=_repo_op_job, args=(repo, lock, fn, eff), daemon=True,
         ).start()
     except Exception:  # noqa: BLE001 -- if the thread can't start (e.g. thread
-        lock.release()  # exhaustion), never leak this repo's lock (it would 409
-        raise           # every future prune AND check for the same repo).
+        _reap_repo_op_lock(repo, lock)  # exhaustion), never leak this repo's lock
+        raise                           # (it would 409 every future op on it).
+
+
+def _reap_repo_op_lock(repo: str, lock: threading.Lock) -> None:
+    """Release the per-repo lock AND drop it from the registry so the dict can't
+    grow one entry per tenant repo forever. Safe because repo-op acquire is always
+    NON-BLOCKING (no waiters): a concurrent spawn either still sees this lock and
+    409s (we hold it until the pop), or setdefault's a FRESH lock after the pop.
+    Pop under the guard, while still holding the lock, then release."""
+    with _REPO_OP_LOCKS_GUARD:
+        if _REPO_OP_LOCKS.get(repo) is lock:
+            _REPO_OP_LOCKS.pop(repo, None)
+    lock.release()
+
+
+def _repo_op_job(repo: str, lock: threading.Lock, fn, settings) -> None:
+    try:
+        fn(settings)
+    finally:
+        _reap_repo_op_lock(repo, lock)
