@@ -78,12 +78,13 @@ def test_post_register_version_defaults_to_app_version(settings: Settings) -> No
     from app import __version__
 
     # Sanity: the fixture didn't set GREFFER_VERSION, so the default applies.
-    assert settings.greffer_version == __version__ == "0.3.10"
+    # Assert against __version__ (not a literal) so version bumps don't break it.
+    assert settings.greffer_version == __version__
     with patch("app.workers.register.requests") as mock_requests:
         mock_requests.post.return_value.status_code = 200
         _post_register(settings, "10.0.0.1", "tok")
     kwargs = mock_requests.post.call_args.kwargs
-    assert kwargs["json"]["version"] == "0.3.10"
+    assert kwargs["json"]["version"] == __version__
 
 
 def test_post_register_version_overridable_via_env(
