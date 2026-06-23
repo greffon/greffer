@@ -92,6 +92,55 @@ def restic_env(settings) -> dict:
     return env
 
 
+class _BrokeredSettings:
+    """Wraps the greffer settings but overrides ONLY the restic repo + S3 creds
+    from a manager-brokered destination block (Epic B managed / white-glove BYO).
+    Every other attribute delegates to the real settings, so the whole
+    restic_env/_run_restic/ensure_repo/_forget chain targets a per-tenant
+    destination with no signature churn -- backup_instance/restore_instance just
+    rebind ``settings`` to this proxy when a destination is present. The block is
+    in-transit only (CA-verified controller call); nothing is persisted."""
+
+    __slots__ = ("_settings", "_dest")
+
+    def __init__(self, settings, destination):
+        self._settings = settings
+        self._dest = destination
+
+    @property
+    def greffer_backup_repo(self):
+        return self._dest.repo
+
+    @property
+    def restic_password(self):
+        return self._dest.restic_password
+
+    @property
+    def restic_password_file(self):
+        # A brokered password is inline; never fall back to the env file (which
+        # would otherwise take precedence in restic_env and target the wrong repo).
+        return None
+
+    @property
+    def aws_access_key_id(self):
+        return self._dest.aws_access_key_id or self._settings.aws_access_key_id
+
+    @property
+    def aws_secret_access_key(self):
+        return self._dest.aws_secret_access_key or self._settings.aws_secret_access_key
+
+    def __getattr__(self, name):
+        return getattr(self._settings, name)
+
+
+def _effective_settings(settings, destination):
+    """The settings restic should run against: the brokered destination if the
+    manager supplied one, else the greffer's own env (self-managed, unchanged)."""
+    if destination is None:
+        return settings
+    return _BrokeredSettings(settings, destination)
+
+
 def _data_volumes(instance_id: str) -> list[str]:
     """The instance's DATA volumes (``<id>_*``), excluding the regenerated
     ``<id>_nginx_volume``."""
@@ -302,8 +351,12 @@ def reconcile_on_boot(settings) -> None:
                 _remove(state_file)
 
 
-def backup_instance(settings, instance_id: str, backup_id: str) -> None:
-    """Cold backup background job. Always restarts a running instance (try/finally)."""
+def backup_instance(settings, instance_id: str, backup_id: str,
+                    destination=None) -> None:
+    """Cold backup background job. Always restarts a running instance (try/finally).
+    ``destination`` (Epic B) routes restic to a manager-brokered per-tenant repo;
+    None keeps the greffer's own env repo (self-managed)."""
+    settings = _effective_settings(settings, destination)
     payload = {"backup_id": backup_id, "status": "failed", "error_code": "snapshot_failed"}
     was_running = compose.get_status(instance_id).get("status") == "running"
     try:
@@ -352,9 +405,12 @@ def backup_instance(settings, instance_id: str, backup_id: str) -> None:
 
 
 def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
-                     restore_id: str) -> None:
+                     restore_id: str, destination=None) -> None:
     """Restore-in-place background job: stop -> wait -> SAFETY snapshot -> restore
-    volumes -> leave stopped -> callback (the manager runs the start)."""
+    volumes -> leave stopped -> callback (the manager runs the start). ``destination``
+    (Epic B) routes restic to the same manager-brokered per-tenant repo the backup
+    was written to (the safety snapshot lands there too)."""
+    settings = _effective_settings(settings, destination)
     payload = {"restore_id": restore_id, "status": "failed", "error_code": "restore_failed"}
     started_stopped = compose.get_status(instance_id).get("status") == "running"
     safety_id = ""
@@ -454,26 +510,30 @@ def _parse_summary(stdout: str) -> tuple[str, int | None]:
     return snapshot_id, bytes_added
 
 
-def spawn_backup(settings, instance_id: str, backup_id: str) -> None:
+def spawn_backup(settings, instance_id: str, backup_id: str,
+                 destination=None) -> None:
     """Acquire the in-process lock (non-blocking) and run the job in a thread.
-    Raises BusyError (-> 409) if a concurrent op holds the lock."""
-    lock = _instance_lock(instance_id)
-    if not lock.acquire(blocking=False):
-        raise BusyError(instance_id)
-    threading.Thread(
-        target=_locked_job, args=(lock, backup_instance, settings, instance_id, backup_id),
-        daemon=True,
-    ).start()
-
-
-def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
-                  restore_id: str) -> None:
+    Raises BusyError (-> 409) if a concurrent op holds the lock. ``destination``
+    (Epic B) is forwarded to the brokered per-tenant repo, else None (self-managed)."""
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
     threading.Thread(
         target=_locked_job,
-        args=(lock, restore_instance, settings, instance_id, restic_snapshot_id, restore_id),
+        args=(lock, backup_instance, settings, instance_id, backup_id, destination),
+        daemon=True,
+    ).start()
+
+
+def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
+                  restore_id: str, destination=None) -> None:
+    lock = _instance_lock(instance_id)
+    if not lock.acquire(blocking=False):
+        raise BusyError(instance_id)
+    threading.Thread(
+        target=_locked_job,
+        args=(lock, restore_instance, settings, instance_id, restic_snapshot_id,
+              restore_id, destination),
         daemon=True,
     ).start()
 
@@ -503,7 +563,18 @@ def prune_repo(settings) -> dict:
     ``forget`` drops snapshot references after each backup; prune reclaims the data
     no snapshot references). EXCLUSIVE + repo-wide, hence a SEPARATE cadence from
     backup. Best-effort, detached (no callback): the manager triggers it and reads
-    nothing back; a repo-busy result simply retries next cadence."""
+    nothing back; a repo-busy result simply retries next cadence.
+
+    KNOWN GAP (Epic B, deferred to a later slice): prune/check operate on the
+    greffer's OWN env repo (``settings.greffer_backup_repo``) only. They do NOT
+    receive a per-tenant ``destination``, so MANAGED / white-glove per-tenant repos
+    are never space-reclaimed or integrity-checked here -- their ``forget`` runs
+    per-backup (dropping references) but the data is never pruned, and ``check``
+    never verifies them. Closing this needs the manager to drive prune/check
+    per-destination (thread ``destination`` onto the repo-op endpoints, mirroring
+    backup/restore) AND a per-repo lock (the process-wide ``_REPO_OP_LOCK`` would
+    otherwise serialize every tenant's prune). Until then, managed-tenant prune is
+    a manager-side responsibility that this endpoint does not fulfil."""
     try:
         ensure_repo(settings)
         rc, _out, err = _run_restic(
