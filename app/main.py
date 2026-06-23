@@ -58,6 +58,11 @@ def create_app(
     app.state.boot_id = uuid4().hex
     app.state.started_at = time.monotonic()
     app.state.status_map = None
+    # Serial of the cert currently installed (set on a successful cert install).
+    # Reported in the heartbeat so the manager can reconcile a post-DR-restore
+    # FORKED cert (R-DR10): a cert issued after a control-plane backup that the
+    # restored manager has no record of.
+    app.state.installed_cert_serial = None
     app.state.reregister_requested = asyncio.Event()
     # Set by registration once the cert is installed; the heartbeat gates every
     # beat on it so it never POSTs (and never 403-storms / triggers a concurrent

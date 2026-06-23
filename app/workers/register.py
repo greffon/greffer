@@ -256,6 +256,10 @@ async def _run_registration(
         await anyio.to_thread.run_sync(
             _install_cert, settings, data, abandon_on_cancel=True
         )
+        # Remember the manager-provided serial (the cert response carries it) so
+        # the heartbeat can report it for DR reconciliation (R-DR10). No PEM
+        # parsing -- the greffer has no cryptography dependency.
+        app.state.installed_cert_serial = data.get("serial_number")
         # v3 push: the manager embeds the initial rathole client.toml
         # in the cert response on accept (tunnel mode only). Write it
         # before the worker exits so rathole-client can come up

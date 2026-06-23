@@ -49,8 +49,25 @@ def test_one_heartbeat_posts_payload_with_token(
     assert body["degraded"] is False
     assert body["interval"] == settings.heartbeat_interval
     assert "captured_at" in body and "uptime_s" in body
+    assert body["cert_serial"] is None  # no cert installed yet -> None
     # No update lock held under a fresh tmp greffon_path -> reports not-updating.
     assert body["update_in_progress"] is False
+
+
+def test_one_heartbeat_reports_installed_cert_serial(
+    settings: Settings, tmp_path
+) -> None:
+    settings.greffon_path = tmp_path  # type: ignore[misc]
+    app = create_app(token="hb-tok", settings=settings)
+    app.state.status_map = {"map": {}, "at": time.monotonic()}
+    app.state.installed_cert_serial = "a1b2c3"  # set by a prior cert install
+
+    with patch("app.workers.heartbeat.requests") as mock_requests:
+        mock_requests.post.return_value.status_code = 200
+        _one_heartbeat(app, 1)
+
+    body = mock_requests.post.call_args.kwargs["json"]
+    assert body["cert_serial"] == "a1b2c3"  # reported for DR reconciliation (R-DR10)
 
 
 def test_one_heartbeat_reports_update_in_progress(

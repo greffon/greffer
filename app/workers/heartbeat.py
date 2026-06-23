@@ -219,6 +219,9 @@ def _one_heartbeat(app: FastAPI, seq: int) -> int:
         "reasons": reasons,
         "disk_free_bytes": _disk_free_bytes(settings),
         "instances": status_map,
+        # Reported for manager-side DR cert reconciliation (R-DR10): the serial of
+        # the cert this greffer currently presents. None until the first install.
+        "cert_serial": getattr(app.state, "installed_cert_serial", None),
         # Lets the manager clear its transient "updating" flag the moment a
         # self-update finishes or fails (lock released), instead of waiting out
         # its grace window (covers a failed update that never restarts the node).
