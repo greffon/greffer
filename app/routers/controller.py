@@ -344,13 +344,15 @@ def _write_pushed_client_toml(
 def backup_greffon(
     payload: GreffonBackupRequest, request: Request
 ) -> GreffonBackupResponse:
-    """Cold backup: 202 + background thread (HLD section 4). The in-process
-    per-instance lock 409s a concurrent op; the manager-supplied backup_id is
-    echoed in the backup-result callback."""
+    """Backup: 202 + background thread (HLD section 4). COLD by default (stop ->
+    snapshot -> start); HOT (no stop, restic-live data volumes) when the manager
+    sends ``volume_classes`` (Phase 3). The in-process per-instance lock 409s a
+    concurrent op; the manager-supplied backup_id is echoed in the callback."""
     _refuse_if_updating(_settings(request))
     try:
         backup.spawn_backup(_settings(request), payload.id, payload.backup_id,
-                            destination=payload.destination)
+                            destination=payload.destination,
+                            volume_classes=payload.volume_classes)
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="instance_busy")
     return GreffonBackupResponse(backup_id=payload.backup_id)
