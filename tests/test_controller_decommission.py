@@ -39,6 +39,28 @@ async def test_decommission_tears_down_volumes_and_dir(client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
+async def test_decommission_benign_nonzero_down_still_succeeds(client: AsyncClient) -> None:
+    """A non-zero `down` exit on its own does NOT fail the teardown (some compose
+    builds exit non-zero on 'nothing to remove'); the completeness verify (clean
+    volumes + dir) is what gates success. So a non-zero down with clean state -> 200."""
+    from types import SimpleNamespace
+
+    with patch("app.routers.controller.compose") as mc, patch(
+        "app.routers.controller.volume"
+    ) as mv, patch("app.routers.controller.shutil"), patch(
+        "app.routers.controller.os.path.exists", return_value=False
+    ):
+        mc.down.return_value = SimpleNamespace(returncode=1, stderr="nothing to remove")
+        mv.remove_instance_volumes.return_value = [f"{_ID}_data"]
+        mv.list_instance_volumes.return_value = []  # verify clean
+        r = await client.post(
+            "/api/controller/decommission/", json={"id": _ID}, headers=_AUTH)
+
+    assert r.status_code == 200
+    assert r.json()["removed_volumes"] == [f"{_ID}_data"]
+
+
+@pytest.mark.asyncio
 async def test_decommission_surviving_dir_is_500(client: AsyncClient) -> None:
     """The instance dir survives the rmtree (busy mount / perm) -> the
     completeness verify must fail loud, not report a false success."""

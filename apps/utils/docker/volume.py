@@ -27,6 +27,13 @@ def list_instance_volumes(instance_id):
     res = subprocess.run(
         ['docker', 'volume', 'ls', '-q', '-f', f'name={instance_id}_'],
         capture_output=True, text=True)
+    if res.returncode != 0:
+        # An un-queryable docker must NOT read as "no volumes" -- that would let
+        # the decommission completeness verify report a false clean (the very
+        # false-success the verify exists to prevent). Fail loud so the caller
+        # treats it as not-verified.
+        raise RuntimeError(
+            f'docker volume ls failed (rc={res.returncode}): {res.stderr.strip()}')
     prefix = f'{instance_id}_'
     return [line for line in res.stdout.splitlines()
             if line.strip().startswith(prefix)]

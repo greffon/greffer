@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from apps.utils.docker import compose, volume
 
 _ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -39,6 +41,16 @@ def test_remove_instance_volumes_force_rms_each_and_returns_names():
     rm_calls = [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
     assert rm_calls == [["docker", "volume", "rm", "-f", f"{_ID}_data"],
                         ["docker", "volume", "rm", "-f", f"{_ID}_db"]]
+
+
+def test_list_instance_volumes_raises_on_docker_error():
+    """A non-zero `docker volume ls` must raise, not return [] -- else the
+    decommission verify would read an un-queryable docker as 'clean'."""
+    with patch("apps.utils.docker.volume.subprocess.run",
+               return_value=SimpleNamespace(stdout="", returncode=1,
+                                            stderr="cannot connect to docker")):
+        with pytest.raises(RuntimeError):
+            volume.list_instance_volumes(_ID)
 
 
 def test_remove_instance_volumes_returns_names_even_if_rm_fails():
