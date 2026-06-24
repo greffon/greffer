@@ -194,19 +194,34 @@ def test_spawn_backup_busy_raises(monkeypatch):
 
 # ---- callback ack + crash recovery ----------------------------------------
 
-def test_post_callback_returns_ack(monkeypatch):
+def test_post_callback_classifies_status(monkeypatch):
     s = _settings()
-    monkeypatch.setattr(backup.requests, "post",
-                        lambda *a, **k: mock.Mock(status_code=200))
-    assert backup._post_callback(s, "i", "backup-result", {}) is True
-    monkeypatch.setattr(backup.requests, "post",
-                        lambda *a, **k: mock.Mock(status_code=500))
-    assert backup._post_callback(s, "i", "backup-result", {}) is False
+
+    def _status(code):
+        monkeypatch.setattr(backup.requests, "post",
+                            lambda *a, **k: mock.Mock(status_code=code))
+        return backup._post_callback(s, "i", "backup-result", {})
+
+    assert _status(200) == backup._CB_ACKED
+    assert _status(204) == backup._CB_ACKED
+    # 404 == the manager has no record of this run -> terminal, safe to drop state.
+    assert _status(404) == backup._CB_GONE
+    # 403 == ownership/token mismatch (the live cross-greffer migration window).
+    # MUST stay retryable so the durable restore-state survives for the manager poll.
+    assert _status(403) == backup._CB_RETRY
+    assert _status(500) == backup._CB_RETRY
+    assert _status(400) == backup._CB_RETRY  # other 4xx are not terminal either
 
     def _raise(*a, **k):
         raise backup.requests.ConnectionError()
     monkeypatch.setattr(backup.requests, "post", _raise)
-    assert backup._post_callback(s, "i", "backup-result", {}) is False
+    assert backup._post_callback(s, "i", "backup-result", {}) == backup._CB_RETRY
+
+
+def test_callback_settled_only_acked_or_gone():
+    assert backup._callback_settled(backup._CB_ACKED) is True
+    assert backup._callback_settled(backup._CB_GONE) is True
+    assert backup._callback_settled(backup._CB_RETRY) is False
 
 
 def test_restore_status_reads_durable_state(tmp_path):
@@ -272,7 +287,36 @@ def test_reconcile_reposts_lost_restore_callback(tmp_path, monkeypatch):
     posts = []
     monkeypatch.setattr(
         backup, "_post_callback",
-        lambda settings, iid, action, payload: posts.append(action) or True)
+        lambda settings, iid, action, payload: posts.append(action) or backup._CB_ACKED)
     backup.reconcile_on_boot(s)
     assert posts == ["restore-result"]
     assert not (inst / ".restore_r1.json").exists()  # removed on ack
+
+
+def test_reconcile_drops_restore_state_on_404_gone(tmp_path, monkeypatch):
+    # The cross-greffer migration leftover: after cutover the re-post 404s (no
+    # manager RestoreRun). 404 is terminal -> drop the orphan state file.
+    s = _settings(greffon_path=str(tmp_path))
+    inst = tmp_path / "i"
+    inst.mkdir()
+    (inst / ".restore_r1.json").write_text('{"restore_id": "r1", "status": "success"}')
+    monkeypatch.setattr(
+        backup, "_post_callback",
+        lambda settings, iid, action, payload: backup._CB_GONE)
+    backup.reconcile_on_boot(s)
+    assert not (inst / ".restore_r1.json").exists()  # dropped on terminal 404
+
+
+def test_reconcile_keeps_restore_state_on_403_retry(tmp_path, monkeypatch):
+    # REGRESSION GUARD: a 403 is the LIVE migration window (FK still on the source
+    # greffer) -- the manager polls our durable restore-status through it, so the
+    # state file MUST survive. A 403 must never be treated as terminal.
+    s = _settings(greffon_path=str(tmp_path))
+    inst = tmp_path / "i"
+    inst.mkdir()
+    (inst / ".restore_r1.json").write_text('{"restore_id": "r1", "status": "success"}')
+    monkeypatch.setattr(
+        backup, "_post_callback",
+        lambda settings, iid, action, payload: backup._CB_RETRY)
+    backup.reconcile_on_boot(s)
+    assert (inst / ".restore_r1.json").exists()  # kept for the manager poll / retry
