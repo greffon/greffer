@@ -81,12 +81,12 @@ def test_check_repo_busy_is_retryable(monkeypatch):
 
 
 def test_spawn_repo_op_busy_raises():
-    backup._REPO_OP_LOCK.acquire()
+    backup._repo_op_lock("s3:https://h/repo").acquire()
     try:
         with pytest.raises(backup.BusyError):
             backup.spawn_repo_op(_settings(), "prune")
     finally:
-        backup._REPO_OP_LOCK.release()
+        backup._repo_op_lock("s3:https://h/repo").release()
 
 
 def test_spawn_repo_op_runs_and_releases_the_lock(monkeypatch):
@@ -101,8 +101,8 @@ def test_spawn_repo_op_runs_and_releases_the_lock(monkeypatch):
     assert done.wait(timeout=5)
     # the _locked_job finally releases the lock just after the op returns; poll.
     for _ in range(200):
-        if backup._REPO_OP_LOCK.acquire(blocking=False):
-            backup._REPO_OP_LOCK.release()
+        if backup._repo_op_lock("s3:https://h/repo").acquire(blocking=False):
+            backup._repo_op_lock("s3:https://h/repo").release()
             break
         time.sleep(0.01)
     else:
@@ -120,8 +120,8 @@ def test_spawn_repo_op_dispatches_check(monkeypatch):
     backup.spawn_repo_op(_settings(), "check")
     assert done.wait(timeout=5)
     for _ in range(200):
-        if backup._REPO_OP_LOCK.acquire(blocking=False):
-            backup._REPO_OP_LOCK.release()
+        if backup._repo_op_lock("s3:https://h/repo").acquire(blocking=False):
+            backup._repo_op_lock("s3:https://h/repo").release()
             break
         time.sleep(0.01)
     else:
