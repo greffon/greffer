@@ -456,16 +456,21 @@ def decommission_greffon(
                            instance_id, result.returncode, down_error)
         removed = volume.remove_instance_volumes(instance_id)
         shutil.rmtree(inst_dir, ignore_errors=True)
+        # Completeness verify INSIDE the try so an un-queryable docker AT VERIFY
+        # TIME (list_instance_volumes raises) gets the same structured diag +
+        # 500 as a failure during the teardown itself -- the alternative (verify
+        # outside the try) made the very condition this hardening targets produce
+        # a bare, undiagnosed 500 depending on which ls call tripped.
+        residual = volume.list_instance_volumes(instance_id)
+        dir_remains = os.path.exists(inst_dir)
     except Exception:
         diag("decommission", level=logging.WARNING, outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
         raise
-    # Completeness verify -- reporting success while host state is still dirty
-    # would silently leak the very things this endpoint exists to clean. Gate on
-    # ALL of: no residual `<id>_` volume (an in-use one survives force-rm), and
-    # the instance dir actually gone (rmtree swallows a busy-mount/perm error).
-    residual = volume.list_instance_volumes(instance_id)
-    dir_remains = os.path.exists(inst_dir)
+    # Reporting success while host state is still dirty would silently leak the
+    # very things this endpoint exists to clean. Gate on ALL of: no residual
+    # `<id>_` volume (an in-use one survives force-rm), and the instance dir
+    # actually gone (rmtree swallows a busy-mount/perm error).
     if residual or dir_remains:
         diag("decommission", level=logging.WARNING, outcome="incomplete",
              residual_volumes=residual, dir_remains=dir_remains,

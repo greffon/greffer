@@ -114,6 +114,25 @@ async def test_decommission_residual_volume_is_500(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_decommission_unqueryable_docker_at_verify_is_500(client: AsyncClient) -> None:
+    """If docker goes un-queryable at VERIFY time (list_instance_volumes raises),
+    the endpoint must fail (500) -- never report a false 'clean' -- and get the
+    same handling as a teardown-time failure (the verify is inside the try)."""
+    with patch("app.routers.controller.compose") as mc, patch(
+        "app.routers.controller.volume"
+    ) as mv, patch("app.routers.controller.shutil"), patch(
+        "app.routers.controller.os.path.exists", return_value=False
+    ):
+        mc.down.return_value = None
+        mv.remove_instance_volumes.return_value = []
+        mv.list_instance_volumes.side_effect = RuntimeError("docker daemon unreachable")
+        r = await client.post(
+            "/api/controller/decommission/", json={"id": _ID}, headers=_AUTH)
+
+    assert r.status_code == 500
+
+
+@pytest.mark.asyncio
 async def test_decommission_requires_auth(client: AsyncClient) -> None:
     r = await client.post("/api/controller/decommission/", json={"id": _ID})
     assert r.status_code in (401, 403)
