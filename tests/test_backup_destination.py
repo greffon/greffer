@@ -24,7 +24,7 @@ def _settings(**kw):
         greffer_backup_repo="s3:https://env/repo", restic_password="envpw",
         restic_password_file=None, aws_access_key_id="envkey",
         aws_secret_access_key="envsecret",
-        restic_sidecar_image="restic/restic:0.16.4",
+        restic_sidecar_image="restic/restic:0.17.3",
         backup_stop_timeout_seconds=5, backup_keep_daily=7, backup_keep_weekly=4,
         backup_keep_monthly=6, backup_safety_keep_last=3,
         backup_forget_timeout_seconds=300,

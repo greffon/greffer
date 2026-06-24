@@ -36,8 +36,14 @@ class Settings(BaseSettings):
     restic_password_file: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
-    # Digest-pinned restic sidecar image (like the updater image).
-    restic_sidecar_image: str = "restic/restic:0.16.4"
+    # Digest-pinned restic sidecar image (like the updater image). MUST be >= 0.17
+    # -- restore_instance uses `restore --delete` (clean overwrite: remove target
+    # files absent from the snapshot), a flag that only landed in restic 0.17, so
+    # the prior 0.16.4 pin made RESTORE FAIL ("unknown flag: --delete"). The digest
+    # is the multi-arch manifest-list digest for 0.17.3 (platform-independent).
+    restic_sidecar_image: str = (
+        "restic/restic:0.17.3@sha256:"
+        "8f5a62b422a2cb1277ea0dd6e826fe1acf649e5b9f02d60e5268d5fd1976255a")
     # Max wait for `docker compose stop` to quiesce before a backup snapshots.
     backup_stop_timeout_seconds: int = 120
     # restic retention (Feature #5). `forget` runs after each backup, tag-isolated
