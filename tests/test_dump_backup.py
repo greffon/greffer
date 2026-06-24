@@ -70,8 +70,10 @@ def test_consumer_timeout_kills_both_and_fails():
         with pytest.raises(backup.BackupError) as exc:
             _call()
     assert exc.value.code == "timeout"
-    pair[0].kill.assert_called_once()  # both children killed (no lingering exec)
+    pair[0].kill.assert_called_once()  # both LOCAL clients killed...
     pair[1].kill.assert_called_once()
+    pair[0].wait.assert_called()       # ...and reaped (no local zombie)
+    pair[1].wait.assert_called()
 
 
 def test_producer_hang_after_consumer_exit_is_timeout():
@@ -85,6 +87,7 @@ def test_producer_hang_after_consumer_exit_is_timeout():
     assert exc.value.code == "timeout"
     pair[0].kill.assert_called_once()
     pair[1].kill.assert_called_once()
+    pair[1].wait.assert_called()  # consumer reaped in the reap loop
 
 
 def test_no_secret_in_argv():

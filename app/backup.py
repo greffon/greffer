@@ -243,8 +243,14 @@ def _dump_and_backup(settings, instance_id: str, db_container_id: str,
     except subprocess.TimeoutExpired:
         producer.kill()
         consumer.kill()
-        # REAP both: kill() alone leaves zombies until GC, which on the single-
-        # process greffer accumulate across repeated timeouts.
+        # REAP both LOCAL docker clients: kill() alone leaves zombies until GC,
+        # which on the single-process greffer accumulate across repeated timeouts.
+        # NOTE: this kills the local `docker exec`/`docker run` CLIENTS, not the
+        # in-container pg_dump -- killing a `docker exec` does not signal the
+        # exec'd process, so a hung dump can ORPHAN in the DB container until it
+        # finishes / the container restarts. The durable fix is wiring-time: run
+        # the dump under an in-container `timeout` so it self-kills (the wiring PR
+        # constructs the dump argv and owns that wrapper).
         for p in (producer, consumer):
             try:
                 p.wait(timeout=5)
