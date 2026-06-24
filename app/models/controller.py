@@ -174,6 +174,12 @@ class GreffonRestoreRequest(BaseModel):
     # Epic B: restore reads from (and writes its safety snapshot to) the same
     # brokered destination the backup was written to.
     destination: BackupDestinationBlock | None = None
+    # Phase 3 multi-artifact restore: the per-artifact manifest ({"data": ..,
+    # "db:<service>": ..}) + the volume class map. When the manifest carries db:
+    # entries the greffer runs the A4 DB restore (start -> wait-healthy ->
+    # pg_restore) instead of a plain volume overwrite.
+    manifest: dict[str, str] | None = None
+    volume_classes: dict[str, str] | None = None
 
 
 class GreffonRepoOpRequest(BaseModel):
