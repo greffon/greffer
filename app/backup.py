@@ -740,7 +740,12 @@ def _db_volumes_from_containers(instance_id: str, services) -> set:
     """The docker volume names backing the given DB services, read from docker
     state (container mounts) -- the AUTHORITATIVE, manager-independent signal for
     which volumes must NOT enter the ``--delete`` data-restore set. Used to defend
-    the irreversible overwrite even if the manager's class map is wrong/stale."""
+    the irreversible overwrite even if the manager's class map is wrong/stale.
+
+    NOTE: this runs while the instance is STOPPED. ``list_instance_containers``
+    MUST keep ``all=True`` -- a stopped container retains its ``attrs["Mounts"]``
+    (verified), but dropping ``all=True`` would hide the stopped DB container, the
+    guard would see no DB volume, and the --delete could WIPE the live DB."""
     wanted = set(services)
     db_vols = set()
     for c in observe.list_instance_containers(instance_id):
@@ -870,7 +875,10 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 _restore_database(settings, container_id, restore_argv, snap,
                                   f"{instance_id}/{service}.dump")  # raises on fail
             # DB restored -> bring up the FULL instance and leave it RUNNING; the
-            # manager must NOT re-start it (already_running).
+            # manager must NOT re-start it (already_running). If THIS final restart
+            # throws, the restore itself already succeeded on disk but the except/
+            # finally will report failed + STOP the instance (safe: the data+DB are
+            # good and safety_id is intact, so the operator just re-starts it).
             _restart(settings, instance_id)
             payload = {"restore_id": restore_id, "status": "success",
                        "safety_restic_snapshot_id": safety_id,
