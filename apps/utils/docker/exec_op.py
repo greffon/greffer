@@ -52,6 +52,8 @@ def exec_in_container(container, argv, *, environment=None) -> ExecResult:
     ``ExecResult`` with ``exit_code != 0`` (the caller gates on ``.ok``)."""
     if isinstance(argv, str):
         raise ExecError("argv must be a list (shell-free), not a string")
+    if not argv:
+        raise ExecError("argv must be a non-empty list")
     api = client.api
     try:
         exec_id = api.exec_create(
@@ -61,6 +63,12 @@ def exec_in_container(container, argv, *, environment=None) -> ExecResult:
         # stream=False blocks until the command completes and buffers output;
         # demux=True splits stdout/stderr so a dump on stdout isn't polluted by
         # a notice on stderr.
+        # CONTRACT (docker SDK 5.0.3): exec_start(stream=False, demux=True) runs
+        # consume_socket_output to socket EOF (blocks until the command exits)
+        # and returns a (stdout|None, stderr|None) 2-tuple -- a slot is None when
+        # that stream produced no frames, never a bare bytes or a generator (that
+        # is the stream=True path). The pending docker ^7.0 bump keeps this demux
+        # contract; re-verify it here if that return shape ever changes.
         output = api.exec_start(exec_id, demux=True)
         info = api.exec_inspect(exec_id)
     except _DOCKER_ERRORS as exc:

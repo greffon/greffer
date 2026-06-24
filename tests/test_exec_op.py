@@ -57,9 +57,24 @@ def test_exec_passes_environment_not_argv():
     assert api.exec_create.call_args.kwargs["environment"] == {"PGPASSWORD": "secret"}
 
 
+def test_exec_normalizes_stdout_only_demux_tuple():
+    # Real docker-py demux returns (stdout, None) when only stdout produced
+    # frames; the dataclass invariant (always bytes) must hold.
+    api = _fake_api()
+    api.exec_start.return_value = (b"DUMP", None)
+    with patch.object(exec_op.client, "api", api):
+        res = exec_op.exec_in_container(_container(), ["pg_dump"])
+    assert res.stdout == b"DUMP" and res.stderr == b"" and res.ok
+
+
 def test_exec_rejects_string_argv():
     with pytest.raises(exec_op.ExecError):
         exec_op.exec_in_container(_container(), "pg_dump -Fc")  # shell string
+
+
+def test_exec_rejects_empty_argv():
+    with pytest.raises(exec_op.ExecError):
+        exec_op.exec_in_container(_container(), [])
 
 
 def test_exec_wraps_docker_error():
