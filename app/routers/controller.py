@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Literal
@@ -27,6 +29,8 @@ from app.log_context import instance_id_var
 from app import backup
 from app.models.controller import (
     GreffonBackupRequest,
+    GreffonDecommissionRequest,
+    GreffonDecommissionResponse,
     GreffonRepoOpRequest,
     GreffonBackupResponse,
     GreffonRestoreRequest,
@@ -51,7 +55,7 @@ from app.tunnel_config import (
 )
 
 # Framework-agnostic shared code imported directly — no rewrite.
-from apps.utils.docker import compose, instance_logs, l4_ports, observe
+from apps.utils.docker import compose, instance_logs, l4_ports, observe, volume
 from apps.utils.docker import updater as updater_spawn
 from apps.utils.greffon import repository
 from apps.utils.nginx import conf
@@ -410,6 +414,68 @@ def check_repo_endpoint(
     except backup.BackupError as exc:
         raise HTTPException(status_code=400, detail=exc.code)
     return {"status": "started", "op": "check"}
+
+
+@router.post("/decommission/")
+@_serialize_instance_op
+def decommission_greffon(
+    payload: GreffonDecommissionRequest, request: Request
+) -> GreffonDecommissionResponse:
+    """Permanently tear an instance down on this greffer: remove its containers,
+    networks and NAMED volumes (``down -v``), prune any residual ``<id>_``
+    volumes, drop the instance directory, then VERIFY nothing remains before
+    reporting success.
+
+    Fixes the long-standing leaked-volume gap: a manager delete is soft-only and
+    never reached the greffer host, so ``<id>_<vol>`` volumes (and the instance
+    dir) lingered forever. The manager calls this after it has removed the
+    instance from rotation. SYNCHRONOUS + WAITED (unlike backup/prune) so the
+    manager learns the teardown actually completed.
+
+    Idempotent: an already-gone instance (no compose file, no volumes) is a
+    200 no-op. Holds the per-instance lock (``_serialize_instance_op``) so it
+    never races a start/stop/backup on the same instance (a 409 if one is in
+    flight); refuses during a self-update."""
+    _refuse_if_updating(_settings(request))
+    instance_id = payload.id
+    instance_id_var.set(instance_id)
+    _t0 = time.monotonic()
+    # The instance dir (compose / nginx.conf / baked config / deploy.log) is
+    # regenerated on every start, so removing it completes the teardown.
+    inst_dir = os.path.join(os.getenv("GREFFON_PATH", "/data"), instance_id)
+    down_error = None
+    try:
+        result = compose.down(instance_id)
+        # `down` is best-effort, but a non-zero exit means part of the teardown
+        # may not have happened. Surface it (don't fail on it alone: a benign
+        # "nothing to remove" can also exit non-zero on some compose builds) --
+        # the completeness verify below is what actually gates success.
+        if result is not None and result.returncode != 0:
+            down_error = (result.stderr or "").strip()[:500]
+            logger.warning("decommission_down_nonzero id=%s rc=%s err=%s",
+                           instance_id, result.returncode, down_error)
+        removed = volume.remove_instance_volumes(instance_id)
+        shutil.rmtree(inst_dir, ignore_errors=True)
+    except Exception:
+        diag("decommission", level=logging.WARNING, outcome="error",
+             duration_ms=round((time.monotonic() - _t0) * 1000))
+        raise
+    # Completeness verify -- reporting success while host state is still dirty
+    # would silently leak the very things this endpoint exists to clean. Gate on
+    # ALL of: no residual `<id>_` volume (an in-use one survives force-rm), and
+    # the instance dir actually gone (rmtree swallows a busy-mount/perm error).
+    residual = volume.list_instance_volumes(instance_id)
+    dir_remains = os.path.exists(inst_dir)
+    if residual or dir_remains:
+        diag("decommission", level=logging.WARNING, outcome="incomplete",
+             residual_volumes=residual, dir_remains=dir_remains,
+             down_error=down_error,
+             duration_ms=round((time.monotonic() - _t0) * 1000))
+        raise HTTPException(status_code=500, detail="decommission_incomplete")
+    diag("decommission", outcome="ok", removed_volumes=len(removed),
+         down_error=down_error,
+         duration_ms=round((time.monotonic() - _t0) * 1000))
+    return GreffonDecommissionResponse(removed_volumes=removed)
 
 
 @router.post("/update/", status_code=202)

@@ -176,6 +176,17 @@ class GreffonRepoOpRequest(BaseModel):
     destination: BackupDestinationBlock | None = None
 
 
+class GreffonDecommissionRequest(BaseModel):
+    # Permanent teardown of an instance on this greffer (Phase 3 / the
+    # leaked-volume fix). Only the id is needed; the greffer derives the compose
+    # path + the `<id>_` volume namespace from it.
+    id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
+
+
+class GreffonDecommissionResponse(BaseModel):
+    removed_volumes: list[str]
+
+
 class GreffonBackupResponse(BaseModel):
     backup_id: str
 
