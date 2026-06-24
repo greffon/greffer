@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import threading
 import time
@@ -33,7 +34,7 @@ from pathlib import Path
 
 import requests
 
-from apps.utils.docker import compose
+from apps.utils.docker import compose, observe
 from app.token import resolve_token
 
 logger = logging.getLogger(__name__)
@@ -335,13 +336,17 @@ def _hot_backup_mounts(settings, instance_id: str,
     COMPOSE volume name; the actual docker volumes are ``<id>_<vol>`` -- strip
     the prefix to look up the class.
 
-    FAILS LOUD rather than produce a partial/empty backup that would record as a
-    false success (silent data loss):
-    - a real data volume that is NOT classified ``data``/``regenerable`` (i.e.
-      unclassified, or an unexpected ``database`` that slipped past the manager)
-      raises ``volume_unclassified`` -- never silently dropped from the snapshot;
-    - if NO ``data`` volume would be snapshotted, raises ``no_data_volumes`` so an
-      empty / L4-only snapshot is never recorded as a good backup.
+    FAILS LOUD on an unclassified volume (``volume_unclassified``) rather than
+    silently drop it from the snapshot -- the manager must classify EVERY volume
+    for a hot backup. ``regenerable`` is skipped (rebuilt on start); ``database``
+    is skipped HERE because it is captured by its dump hook, not a raw snapshot
+    (see ``_run_hot_backup``).
+
+    MAY return ``[]`` -- a database-only app has no data volumes but is still
+    backupable via its dump. The CALLER decides whether the overall backup has
+    any artifact (data mounts OR a DB dump); this function no longer raises
+    ``no_data_volumes`` on its own. l4_ports.json only rides along WITH real data,
+    so it can never by itself make a dataless snapshot look successful.
 
     The instance keeps running; restic captures a live (per-volume crash-
     consistent) snapshot, which the ``data`` classification declares acceptable
@@ -353,22 +358,105 @@ def _hot_backup_mounts(settings, instance_id: str,
         cls = volume_classes.get(compose_name)
         if cls == "data":
             mounts.append((vol, f"/data/{vol}"))
-        elif cls == "regenerable":
-            continue  # intentionally not backed up (rebuilt on start)
+        elif cls in ("regenerable", "database"):
+            continue  # regenerable: rebuilt on start; database: dumped, not snapped
         else:
-            # Unclassified or unexpected: the manager must classify EVERY volume
-            # for a hot backup. Refuse rather than silently exclude it.
+            # Unclassified: the manager must classify EVERY volume for a hot
+            # backup. Refuse rather than silently exclude it.
             raise BackupError("volume_unclassified")
-    if not mounts:
-        # All volumes regenerable, or class keys didn't match any real volume.
-        # An L4-only snapshot is not a backup -- fail instead of false-success.
-        raise BackupError("no_data_volumes")
-    # l4_ports.json is added AFTER the non-empty check so it can NEVER on its own
-    # make a dataless snapshot look successful.
-    l4 = Path(settings.greffon_path) / instance_id / "l4_ports.json"
-    if l4.exists():
-        mounts.append((str(l4), "/data/_l4_ports.json"))
+    if mounts:
+        l4 = Path(settings.greffon_path) / instance_id / "l4_ports.json"
+        if l4.exists():
+            mounts.append((str(l4), "/data/_l4_ports.json"))
     return mounts
+
+
+_DUMP_HOOK_LABEL = "com.greffon.backup.dump"
+_DUMP_TIMEOUT_SECONDS = 3600
+
+
+def _dump_hooks(instance_id: str) -> list[tuple[str, str, list[str]]]:
+    """``(service, container_id, dump_argv)`` for each RUNNING container that
+    declares a dump hook (the SERVICE label ``com.greffon.backup.dump`` -- service
+    labels survive compose render, unlike volume labels, HLD A1).
+
+    The hook value is a shell-free command string -> ``shlex.split`` to argv (A5:
+    argv, never a shell, since the catalog is only semi-trusted). The dump runs
+    UNDER an in-container ``timeout`` so a hung dump SELF-KILLS inside the DB
+    container -- closing #112's gap where ``producer.kill()`` only reaped the
+    local ``docker exec`` client and orphaned the in-container pg_dump.
+
+    DB credentials are NOT in the argv: ``docker exec`` inherits the container's
+    env (PGPASSWORD etc.), and the catalog bakes literal -U/-d values. Secrets
+    never touch the command line (ps-safe)."""
+    hooks = []
+    for c in observe.list_instance_containers(instance_id):
+        if getattr(c, "status", None) != "running":
+            continue
+        cmd = (c.labels or {}).get(_DUMP_HOOK_LABEL)
+        if not cmd:
+            continue
+        service = (c.labels or {}).get("com.docker.compose.service") or c.name
+        argv = ["timeout", str(_DUMP_TIMEOUT_SECONDS), *shlex.split(cmd)]
+        hooks.append((service, c.id, argv))
+    return hooks
+
+
+def _run_hot_backup(settings, instance_id: str, backup_id: str,
+                    volume_classes: dict) -> dict:
+    """Multi-artifact HOT backup (no stop): the data-class volumes -> ONE restic
+    snapshot; each database volume's dump hook -> its OWN dump snapshot. Returns
+    the success payload, including a per-artifact ``manifest`` ({artifact ->
+    restic_snapshot_id}) the restore reads to reassemble the instance.
+
+    Raises BackupError on ANY failure -- never records a partial backup, because a
+    missing artifact means an unrestorable instance (a backed-up filesystem with a
+    lost database is worse than an obvious failure)."""
+    db_volumes = [v for v, c in volume_classes.items() if c == "database"]
+    mounts = _hot_backup_mounts(settings, instance_id, volume_classes)
+    if not mounts and not db_volumes:
+        # Nothing classified as data and no DB to dump -> an empty snapshot is not
+        # a backup. Fail loud rather than record a false success.
+        raise BackupError("no_data_volumes")
+    # Reconcile the database VOLUMES against the dump HOOKS, and do it BEFORE the
+    # data snapshot (a failure here leaves no orphan snapshot). V1 supports
+    # exactly ONE database volume dumped by exactly ONE hook: any other count is
+    # an ambiguous volume<->hook mapping that could SILENTLY OMIT a database with
+    # a success result (e.g. two DB volumes but one hook -> one DB dumped, the
+    # other skipped-from-mounts AND never dumped). Refuse rather than lose data;
+    # multi-DB needs a per-volume->service mapping (a future PR).
+    hooks = _dump_hooks(instance_id) if db_volumes else []
+    if db_volumes:
+        if len(db_volumes) > 1 or len(hooks) > 1:
+            raise BackupError("multiple_database_unsupported")
+        if not hooks:
+            raise BackupError("no_dump_hook")
+    ensure_repo(settings)
+    manifest: dict[str, str] = {}
+    total_bytes = 0
+    if mounts:
+        rc, out, err = _run_restic(
+            settings,
+            ["backup", "/data", "--json", "--tag", f"instance:{instance_id}",
+             "--host", settings.greffer_id],
+            mounts, read_only=True,
+        )
+        if rc != 0:
+            raise BackupError(_classify(err))
+        snapshot_id, bytes_added = _parse_summary(out)
+        manifest["data"] = snapshot_id
+        total_bytes += bytes_added or 0
+    for service, container_id, dump_argv in hooks:
+        snapshot_id, bytes_added = _dump_and_backup(
+            settings, instance_id, container_id, dump_argv,
+            f"{instance_id}/{service}.dump")
+        manifest[f"db:{service}"] = snapshot_id
+        total_bytes += bytes_added or 0
+    # The primary snapshot_id stays the DATA snapshot (back-compat with the
+    # single-snapshot manager); the manifest carries the full artifact set.
+    return {"backup_id": backup_id, "status": "success",
+            "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
+            "bytes_added": total_bytes, "manifest": manifest}
 
 
 def _wait_stopped(instance_id: str, timeout: int) -> bool:
@@ -495,38 +583,39 @@ def backup_instance(settings, instance_id: str, backup_id: str,
             payload["error_code"] = "instance_missing"
             return
         if hot:
-            # HOT: never stop. restic-live the DATA-class volumes (skip
-            # regenerable; a 'database' volume never reaches the hot path -- the
-            # manager keeps DB apps cold). The per-volume `data` classification
-            # IS the author's declaration that a live snapshot is acceptable for
-            # that volume (HLD A2 -- per-volume labelling is the consistency
-            # contract; we never hot-snapshot an unclassified app).
-            mounts = _hot_backup_mounts(settings, instance_id, volume_classes)
-        elif was_running:
-            # Durable marker (boot reconciliation restarts a mid-backup-stopped
-            # instance if a crash skips the finally restart).
-            _write_json(_backup_marker(settings, instance_id), {"backup_id": backup_id})
-            compose.stop({"id": instance_id})
-            stopped_for_backup = True
-            if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
-                payload["error_code"] = "stop_timeout"
-                return  # do NOT snapshot a non-quiescent instance
-            mounts = _backup_mounts(settings, instance_id)
+            # HOT: never stop. Multi-artifact -- the DATA-class volumes go to one
+            # restic snapshot and each database volume's dump hook to its own
+            # snapshot (the per-volume classification IS the author's consistency
+            # contract, HLD A2; we never hot-back-up an unclassified app).
+            # _run_hot_backup raises BackupError on any failure (no partial).
+            payload = _run_hot_backup(
+                settings, instance_id, backup_id, volume_classes)
         else:
+            if was_running:
+                # Durable marker (boot reconciliation restarts a mid-backup-
+                # stopped instance if a crash skips the finally restart).
+                _write_json(_backup_marker(settings, instance_id),
+                            {"backup_id": backup_id})
+                compose.stop({"id": instance_id})
+                stopped_for_backup = True
+                if not _wait_stopped(
+                        instance_id, settings.backup_stop_timeout_seconds):
+                    payload["error_code"] = "stop_timeout"
+                    return  # do NOT snapshot a non-quiescent instance
             mounts = _backup_mounts(settings, instance_id)
-        ensure_repo(settings)
-        rc, out, err = _run_restic(
-            settings,
-            ["backup", "/data", "--json", "--tag", f"instance:{instance_id}",
-             "--host", settings.greffer_id],
-            mounts, read_only=True,
-        )
-        if rc != 0:
-            payload["error_code"] = _classify(err)
-            return
-        snapshot_id, bytes_added = _parse_summary(out)
-        payload = {"backup_id": backup_id, "status": "success",
-                   "snapshot_id": snapshot_id, "bytes_added": bytes_added}
+            ensure_repo(settings)
+            rc, out, err = _run_restic(
+                settings,
+                ["backup", "/data", "--json", "--tag", f"instance:{instance_id}",
+                 "--host", settings.greffer_id],
+                mounts, read_only=True,
+            )
+            if rc != 0:
+                payload["error_code"] = _classify(err)
+                return
+            snapshot_id, bytes_added = _parse_summary(out)
+            payload = {"backup_id": backup_id, "status": "success",
+                       "snapshot_id": snapshot_id, "bytes_added": bytes_added}
     except BackupError as exc:
         payload["error_code"] = exc.code
     except Exception:  # noqa: BLE001
