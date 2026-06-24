@@ -534,10 +534,32 @@ def _restart(settings, instance_id: str) -> None:
     )
 
 
-def _post_callback(settings, instance_id: str, action: str, payload: dict) -> bool:
-    """POST the result to the manager (``X-Greffer-Token``); returns True iff the
-    manager acked (2xx). Never raises -- a lost callback is recovered by the
-    manager reaper / greffer boot reconciliation."""
+# Callback delivery outcomes (see ``_post_callback``).
+_CB_ACKED = "acked"  # manager 2xx -- the op is recorded and finalized
+_CB_GONE = "gone"    # manager 404 -- no such instance/run; retrying is pointless
+_CB_RETRY = "retry"  # 5xx / 403 / other / network -- transient, retry later
+
+
+def _post_callback(settings, instance_id: str, action: str, payload: dict) -> str:
+    """POST the result to the manager (``X-Greffer-Token``). Returns one of:
+
+    - ``_CB_ACKED``: manager 2xx -- the op is finalized.
+    - ``_CB_GONE``:  manager 404 -- the manager has no record of this run (or the
+      instance is gone), so the outcome is terminal and retrying is pointless. The
+      canonical source is a cross-greffer migration's internal restore, which runs
+      with NO manager RestoreRun (manager migration_services polls the greffer's
+      durable restore-status instead); once the migration has cut the instance's FK
+      over to this greffer, a reconcile re-post finalize-misses and 404s here.
+    - ``_CB_RETRY``: 5xx / network / 403 / any other status -- recover later via the
+      manager reaper / greffer boot reconciliation.
+
+    A 403 is deliberately ``_CB_RETRY``, NOT ``_CB_GONE``: during a live migration
+    the instance's FK is still on the SOURCE greffer, so this (target) greffer's
+    token mismatches and the in-flight restore callback 403s -- yet the manager is
+    actively polling our durable restore-status through exactly that window, so the
+    state file MUST survive a 403. (A 403 can also be a transient token-acceptance
+    race.) Only a 404 -- which for a migration arrives only AFTER cutover, when the
+    manager no longer needs the file -- is safe to treat as terminal. Never raises."""
     try:
         resp = requests.post(
             f"{settings.greffon_base_server}/api/greffer/instances/{instance_id}/{action}/",
@@ -546,10 +568,27 @@ def _post_callback(settings, instance_id: str, action: str, payload: dict) -> bo
             verify=settings.greffer_ssl_verify,
             timeout=_HTTP_TIMEOUT,
         )
-        return 200 <= resp.status_code < 300
     except requests.RequestException:
         logger.warning("backup_callback_failed instance=%s action=%s", instance_id, action)
-        return False
+        return _CB_RETRY
+    if 200 <= resp.status_code < 300:
+        return _CB_ACKED
+    if resp.status_code == 404:
+        logger.info(
+            "backup_callback_gone instance=%s action=%s -- no manager record, "
+            "dropping durable state", instance_id, action)
+        return _CB_GONE
+    logger.warning(
+        "backup_callback_unacked instance=%s action=%s status=%s",
+        instance_id, action, resp.status_code)
+    return _CB_RETRY
+
+
+def _callback_settled(outcome: str) -> bool:
+    """A durable restore-state file is safe to drop once the callback is settled:
+    the manager acked it (``_CB_ACKED``) or has no record of the run (``_CB_GONE``,
+    a 404). A transient outcome (``_CB_RETRY``) keeps the file for boot reconciliation."""
+    return outcome in (_CB_ACKED, _CB_GONE)
 
 
 def _instance_dir(settings, instance_id: str) -> Path:
@@ -618,7 +657,8 @@ def reconcile_on_boot(settings) -> None:
                 payload = json.loads(state_file.read_text())
             except (OSError, ValueError):
                 continue
-            if _post_callback(settings, instance_id, "restore-result", payload):
+            outcome = _post_callback(settings, instance_id, "restore-result", payload)
+            if _callback_settled(outcome):
                 _remove(state_file)
 
 
@@ -913,11 +953,14 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 compose.stop({"id": instance_id})
             except Exception:  # noqa: BLE001
                 logger.exception("restore_db_abort_stop_failed instance=%s", instance_id)
-        # Durable restore-state, kept until the manager acks (boot reconciliation
-        # re-posts a lost callback so an overwritten instance is never stranded).
+        # Durable restore-state, kept until the callback settles (boot reconciliation
+        # re-posts a lost callback so an overwritten instance is never stranded). A
+        # migration-internal restore 403s here (FK still on the source greffer) -> NOT
+        # settled -> kept, so the manager can poll restore-status through this window.
         state_path = _restore_state_path(settings, instance_id, restore_id)
         _write_json(state_path, payload)
-        if _post_callback(settings, instance_id, "restore-result", payload):
+        outcome = _post_callback(settings, instance_id, "restore-result", payload)
+        if _callback_settled(outcome):
             _remove(state_path)
 
 
