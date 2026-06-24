@@ -718,6 +718,32 @@ def stop(greffon_info):
         env=_compose_env())
 
 
+# Bound the WAITED down -- a hung docker daemon must not pin the per-instance
+# lock forever (the caller holds it for the whole decommission).
+_DOWN_TIMEOUT_SECONDS = 300
+
+
+def down(instance_id):
+    """Permanently tear an instance's containers + networks + NAMED volumes down.
+
+    WAITED (``subprocess.run``, unlike the fire-and-forget ``Popen`` of
+    start/stop) so the caller can verify removal. Idempotent: a missing compose
+    file is a no-op (the instance was never started, or is already gone -- the
+    caller's volume prune is the authoritative cleanup), and ``down`` on an
+    already-removed project exits 0. Builds the path INLINE rather than via
+    ``get_greffon_path``, which would recreate the very directory we are tearing
+    down. Returns the CompletedProcess (or None when skipped)."""
+    path = os.path.join(os.getenv('GREFFON_PATH', '/data'), instance_id)
+    compose_file = os.path.join(path, 'docker-compose.yml')
+    if not os.path.exists(compose_file):
+        return None
+    return subprocess.run(
+        ['docker-compose', '-p', instance_id, '-f', compose_file,
+         'down', '-v', '--remove-orphans'],
+        env=_compose_env(), capture_output=True, text=True,
+        timeout=_DOWN_TIMEOUT_SECONDS)
+
+
 # Label a catalog service carries to declare it a one-shot lifecycle helper
 # (DB migration, object-store bucket creation, first-run superuser seed).
 # Such a container runs to completion and then sits in ``exited`` forever,
