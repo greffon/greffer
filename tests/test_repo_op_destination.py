@@ -16,7 +16,7 @@ def _settings(**kw):
         greffer_id="g1", greffer_token="tok", greffon_path="/tmp",
         greffer_backup_repo="s3:https://env/repo", restic_password="envpw",
         restic_password_file=None, aws_access_key_id=None, aws_secret_access_key=None,
-        restic_sidecar_image="restic/restic:0.16.4",
+        restic_sidecar_image="restic/restic:0.17.3",
         backup_prune_timeout_seconds=7200, backup_check_timeout_seconds=7200,
     )
     base.update(kw)
