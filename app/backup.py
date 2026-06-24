@@ -198,6 +198,79 @@ def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _dump_and_backup(settings, instance_id: str, db_container_id: str,
+                     dump_argv: list[str], stdin_filename: str, *,
+                     timeout: int = 3600) -> tuple[str, int]:
+    """Stream ``docker exec <db> <dump_argv>`` INTO ``restic backup --stdin`` for a
+    ``database`` volume's hot backup, with DUAL exit gating (HLD A3).
+
+    The A3 trap: ``restic backup --stdin`` exits 0 on a TRUNCATED stdin (it can't
+    tell the producer died mid-dump), so gating on restic alone would record a
+    corrupt/partial dump as SUCCESS. We therefore gate on the PRODUCER (pg_dump)
+    exit code too -- a non-zero dump fails the whole backup -- and reject a
+    zero-byte dump that somehow exited 0.
+
+    ``dump_argv`` is a LIST (shell-free; the catalog hook is semi-trusted). The
+    dump's stderr is DEVNULL'd: it can leak the DB connection string/creds (like
+    restic stderr), the exit code is what gates, and DEVNULL also avoids a
+    stderr-pipe deadlock without a draining thread. Returns
+    ``(snapshot_id, bytes_added)``; raises BackupError on failure."""
+    env = restic_env(settings)
+    restic_args = ["docker", "run", "--rm", "-i"]
+    for key in env:
+        if key in ("PATH", "HOME"):
+            continue
+        restic_args += ["--env", key]  # name-only; value via env= below
+    restic_args += ["--entrypoint", "restic", settings.restic_sidecar_image,
+                    "backup", "--stdin", "--stdin-filename", stdin_filename,
+                    "--json", "--tag", f"instance:{instance_id}",
+                    "--host", settings.greffer_id]
+    producer = subprocess.Popen(
+        ["docker", "exec", db_container_id, *dump_argv],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    consumer = subprocess.Popen(
+        restic_args, stdin=producer.stdout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    # Close OUR copy of the producer stdout so the producer receives SIGPIPE if
+    # the consumer (restic) dies first -- otherwise it could hang writing the dump.
+    producer.stdout.close()
+    try:
+        out, err = consumer.communicate(timeout=timeout)
+        # INSIDE the try: a producer that hangs after the consumer exits (ignores
+        # SIGPIPE / pg_dump stuck in 'D') must become a classified 'timeout', not
+        # a bare TimeoutExpired the caller mis-reports as snapshot_failed.
+        producer.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        producer.kill()
+        consumer.kill()
+        # REAP both LOCAL docker clients: kill() alone leaves zombies until GC,
+        # which on the single-process greffer accumulate across repeated timeouts.
+        # NOTE: this kills the local `docker exec`/`docker run` CLIENTS, not the
+        # in-container pg_dump -- killing a `docker exec` does not signal the
+        # exec'd process, so a hung dump can ORPHAN in the DB container until it
+        # finishes / the container restarts. The durable fix is wiring-time: run
+        # the dump under an in-container `timeout` so it self-kills (the wiring PR
+        # constructs the dump argv and owns that wrapper).
+        for p in (producer, consumer):
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise BackupError("timeout")
+    # A3: the PRODUCER gates FIRST -- a failed/truncated/SIGPIPE'd dump fails the
+    # backup even though restic --stdin exited 0 on the partial stream.
+    if producer.returncode != 0:
+        raise BackupError("dump_failed")
+    if consumer.returncode != 0:
+        raise BackupError(_classify(err))
+    snapshot_id, bytes_added = _parse_summary(out)
+    if not bytes_added:
+        # A real pg_dump always emits a header; a zero-byte 'success' is a
+        # truncated/empty dump the producer rc didn't catch -> fail loud.
+        raise BackupError("dump_empty")
+    return snapshot_id, bytes_added
+
+
 def ensure_repo(settings) -> None:
     """First-use ``restic init`` (HLD section 4.1): a missing repo is initialized
     rather than failing every backup with ``repo_uninitialized``. Also clears a
