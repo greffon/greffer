@@ -370,6 +370,7 @@ def restore_greffon(
         backup.spawn_restore(
             _settings(request), payload.id, payload.restic_snapshot_id,
             payload.restore_id, destination=payload.destination,
+            manifest=payload.manifest, volume_classes=payload.volume_classes,
         )
     except backup.BusyError:
         raise HTTPException(status_code=409, detail="instance_busy")
