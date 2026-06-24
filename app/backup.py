@@ -736,6 +736,34 @@ def _restore_hook_for_service(instance_id: str, service: str):
     return None
 
 
+def _db_volumes_from_containers(instance_id: str, services) -> set:
+    """The docker volume names backing the given DB services, read from docker
+    state (container mounts) -- the AUTHORITATIVE, manager-independent signal for
+    which volumes must NOT enter the ``--delete`` data-restore set. Used to defend
+    the irreversible overwrite even if the manager's class map is wrong/stale."""
+    wanted = set(services)
+    db_vols = set()
+    for c in observe.list_instance_containers(instance_id):
+        if (c.labels or {}).get("com.docker.compose.service") not in wanted:
+            continue
+        for mount in (c.attrs.get("Mounts") or []):
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                db_vols.add(mount["Name"])
+    return db_vols
+
+
+def _start_services(settings, instance_id: str, services: list[str]) -> None:
+    """``docker-compose up -d <services>`` -- start ONLY the named services (the
+    DB, for the restore window) so the app is not exposed serving a half-restored
+    data-new/DB-old state before pg_restore completes (HLD A2)."""
+    compose_file = Path(settings.greffon_path) / instance_id / "docker-compose.yml"
+    subprocess.run(
+        ["docker-compose", "-p", instance_id, "-f", str(compose_file),
+         "up", "-d", *services],
+        capture_output=True, text=True, timeout=300,
+    )
+
+
 def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                      restore_id: str, destination=None,
                      manifest=None, volume_classes=None) -> None:
@@ -795,6 +823,17 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
         data_snap = (manifest or {}).get("data") or restic_snapshot_id
         data_mounts = (_hot_backup_mounts(settings, instance_id, volume_classes)
                        if db_artifacts else safety_mounts)
+        if db_artifacts:
+            # P0 GUARD, BEFORE the irreversible --delete: using DOCKER STATE (not
+            # the manager's class map), assert no volume backing a DB service is in
+            # the data-restore set. A mislabeled DB volume in the --delete set would
+            # be WIPED against a snapshot that lacks it (it's captured by a dump).
+            db_vols = _db_volumes_from_containers(instance_id, db_artifacts.keys())
+            if db_vols & {m[0] for m in data_mounts}:
+                payload = {"restore_id": restore_id, "status": "failed",
+                           "error_code": "db_volume_misclassified",
+                           "safety_restic_snapshot_id": safety_id}
+                return
         if data_mounts:  # a DB-only app has no data volumes -> skip to the DB
             rc, out, err = _run_restic(
                 settings,
@@ -808,11 +847,12 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                            "safety_restic_snapshot_id": safety_id}
                 return
         if db_artifacts:
-            # Start the instance so the DB is live for pg_restore, wait for its
-            # healthcheck, then stream each dump in. Any failure raises / returns
-            # -> the finally stops the instance and leaves safety_id for rollback.
-            _restart(settings, instance_id)
+            # Start ONLY the DB service(s) for the restore window so the app never
+            # serves a half-restored data-new/DB-old state (A2). db_started is set
+            # BEFORE the start: 'up -d' can create+start containers even if it then
+            # errors/times out, and the finally must stop them.
             db_started = True
+            _start_services(settings, instance_id, list(db_artifacts.keys()))
             for service, snap in db_artifacts.items():
                 if not _wait_db_healthy(
                         instance_id, service, _DB_READY_TIMEOUT_SECONDS):
@@ -829,8 +869,9 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 container_id, restore_argv = hook
                 _restore_database(settings, container_id, restore_argv, snap,
                                   f"{instance_id}/{service}.dump")  # raises on fail
-            # SUCCESS: the DB path leaves the instance RUNNING; the manager must
-            # NOT re-start it (already_running).
+            # DB restored -> bring up the FULL instance and leave it RUNNING; the
+            # manager must NOT re-start it (already_running).
+            _restart(settings, instance_id)
             payload = {"restore_id": restore_id, "status": "success",
                        "safety_restic_snapshot_id": safety_id,
                        "already_running": True}
