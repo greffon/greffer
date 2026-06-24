@@ -412,19 +412,25 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
     Raises BackupError on ANY failure -- never records a partial backup, because a
     missing artifact means an unrestorable instance (a backed-up filesystem with a
     lost database is worse than an obvious failure)."""
-    has_database = "database" in volume_classes.values()
+    db_volumes = [v for v, c in volume_classes.items() if c == "database"]
     mounts = _hot_backup_mounts(settings, instance_id, volume_classes)
-    if not mounts and not has_database:
+    if not mounts and not db_volumes:
         # Nothing classified as data and no DB to dump -> an empty snapshot is not
         # a backup. Fail loud rather than record a false success.
         raise BackupError("no_data_volumes")
-    # Validate the dump hooks FIRST: a database volume with no running service
-    # declaring a hook would lose the DB silently (skipped from mounts, never
-    # dumped). Refuse BEFORE the data snapshot so a misconfigured app doesn't
-    # leave an orphan snapshot behind.
-    hooks = _dump_hooks(instance_id) if has_database else []
-    if has_database and not hooks:
-        raise BackupError("no_dump_hook")
+    # Reconcile the database VOLUMES against the dump HOOKS, and do it BEFORE the
+    # data snapshot (a failure here leaves no orphan snapshot). V1 supports
+    # exactly ONE database volume dumped by exactly ONE hook: any other count is
+    # an ambiguous volume<->hook mapping that could SILENTLY OMIT a database with
+    # a success result (e.g. two DB volumes but one hook -> one DB dumped, the
+    # other skipped-from-mounts AND never dumped). Refuse rather than lose data;
+    # multi-DB needs a per-volume->service mapping (a future PR).
+    hooks = _dump_hooks(instance_id) if db_volumes else []
+    if db_volumes:
+        if len(db_volumes) > 1 or len(hooks) > 1:
+            raise BackupError("multiple_database_unsupported")
+        if not hooks:
+            raise BackupError("no_dump_hook")
     ensure_repo(settings)
     manifest: dict[str, str] = {}
     total_bytes = 0
