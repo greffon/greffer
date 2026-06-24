@@ -272,6 +272,58 @@ def _dump_and_backup(settings, instance_id: str, db_container_id: str,
     return snapshot_id, bytes_added
 
 
+def _restore_database(settings, db_container_id: str, restore_argv: list[str],
+                      restic_snapshot_id: str, dump_filename: str, *,
+                      timeout: int = 3600) -> None:
+    """Reverse of ``_dump_and_backup``: stream ``restic dump <snap> <file>`` INTO
+    ``docker exec -i <db> <restore_argv>`` (e.g. pg_restore) with DUAL exit gating.
+
+    A failed ``restic dump`` (PRODUCER) feeds pg_restore a TRUNCATED stream, and a
+    failed restore (CONSUMER) leaves a half-applied (CORRUPT) database -- so BOTH
+    ends must be checked. Either non-zero -> ``restore_failed`` (the orchestrator
+    then rolls back to the safety snapshot). ``restore_argv`` is shell-free (the
+    catalog restore hook) and the caller wraps it in an in-container ``timeout``
+    so a hung restore self-kills. Restore creds come from the DB container env via
+    ``docker exec`` inheritance, never the argv (ps-safe); ``dump_filename`` is the
+    path inside the snapshot that the backup wrote with ``--stdin-filename``."""
+    env = restic_env(settings)
+    dump_cmd = ["docker", "run", "--rm"]
+    for key in env:
+        if key in ("PATH", "HOME"):
+            continue
+        dump_cmd += ["--env", key]  # name-only; value via env= below
+    dump_cmd += ["--entrypoint", "restic", settings.restic_sidecar_image,
+                 "dump", restic_snapshot_id, dump_filename]
+    producer = subprocess.Popen(
+        dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    consumer = subprocess.Popen(
+        ["docker", "exec", "-i", db_container_id, *restore_argv],
+        stdin=producer.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    # Close OUR copy of the producer stdout so restic receives SIGPIPE if the
+    # restore (consumer) dies first.
+    producer.stdout.close()
+    try:
+        consumer.communicate(timeout=timeout)
+        # A producer (restic dump) that hangs after the consumer exits must
+        # become a classified 'timeout', not a bare TimeoutExpired (mirrors the
+        # #112 dump path P2 fix).
+        producer.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        producer.kill()
+        consumer.kill()
+        for p in (producer, consumer):
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise BackupError("timeout")
+    # Gate BOTH ends: a truncated dump (producer) OR a failed restore (consumer)
+    # means the DB is not cleanly restored -> fail so the orchestrator rolls back.
+    if producer.returncode != 0 or consumer.returncode != 0:
+        raise BackupError("restore_failed")
+
+
 def ensure_repo(settings) -> None:
     """First-use ``restic init`` (HLD section 4.1): a missing repo is initialized
     rather than failing every backup with ``repo_uninitialized``. Also clears a
