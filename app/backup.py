@@ -256,6 +256,48 @@ def _backup_mounts(settings, instance_id: str) -> list[tuple[str, str]]:
     return mounts
 
 
+def _hot_backup_mounts(settings, instance_id: str,
+                       volume_classes: dict) -> list[tuple[str, str]]:
+    """HOT mounts: the DATA-class volumes only. ``volume_classes`` is keyed by
+    COMPOSE volume name; the actual docker volumes are ``<id>_<vol>`` -- strip
+    the prefix to look up the class.
+
+    FAILS LOUD rather than produce a partial/empty backup that would record as a
+    false success (silent data loss):
+    - a real data volume that is NOT classified ``data``/``regenerable`` (i.e.
+      unclassified, or an unexpected ``database`` that slipped past the manager)
+      raises ``volume_unclassified`` -- never silently dropped from the snapshot;
+    - if NO ``data`` volume would be snapshotted, raises ``no_data_volumes`` so an
+      empty / L4-only snapshot is never recorded as a good backup.
+
+    The instance keeps running; restic captures a live (per-volume crash-
+    consistent) snapshot, which the ``data`` classification declares acceptable
+    for that volume."""
+    prefix = f"{instance_id}_"
+    mounts = []
+    for vol in _data_volumes(instance_id):
+        compose_name = vol[len(prefix):] if vol.startswith(prefix) else vol
+        cls = volume_classes.get(compose_name)
+        if cls == "data":
+            mounts.append((vol, f"/data/{vol}"))
+        elif cls == "regenerable":
+            continue  # intentionally not backed up (rebuilt on start)
+        else:
+            # Unclassified or unexpected: the manager must classify EVERY volume
+            # for a hot backup. Refuse rather than silently exclude it.
+            raise BackupError("volume_unclassified")
+    if not mounts:
+        # All volumes regenerable, or class keys didn't match any real volume.
+        # An L4-only snapshot is not a backup -- fail instead of false-success.
+        raise BackupError("no_data_volumes")
+    # l4_ports.json is added AFTER the non-empty check so it can NEVER on its own
+    # make a dataless snapshot look successful.
+    l4 = Path(settings.greffon_path) / instance_id / "l4_ports.json"
+    if l4.exists():
+        mounts.append((str(l4), "/data/_l4_ports.json"))
+    return mounts
+
+
 def _wait_stopped(instance_id: str, timeout: int) -> bool:
     """Poll until all the instance's containers are stopped (``compose.stop`` is
     fire-and-forget). Returns True if quiesced within the deadline."""
@@ -364,27 +406,42 @@ def reconcile_on_boot(settings) -> None:
 
 
 def backup_instance(settings, instance_id: str, backup_id: str,
-                    destination=None) -> None:
-    """Cold backup background job. Always restarts a running instance (try/finally).
-    ``destination`` (Epic B) routes restic to a manager-brokered per-tenant repo;
-    None keeps the greffer's own env repo (self-managed)."""
+                    destination=None, volume_classes=None) -> None:
+    """Backup background job. COLD (stop -> snapshot -> start) by default; HOT (no
+    stop, restic-live the data-class volumes) when ``volume_classes`` is given
+    (Phase 3). A cold backup that stopped a running instance always restarts it
+    (try/finally); a hot backup never stops, so never restarts. ``destination``
+    (Epic B) routes restic to a manager-brokered per-tenant repo."""
     settings = _effective_settings(settings, destination)
+    hot = bool(volume_classes)
     payload = {"backup_id": backup_id, "status": "failed", "error_code": "snapshot_failed"}
     was_running = compose.get_status(instance_id).get("status") == "running"
+    stopped_for_backup = False
     try:
         if compose.get_status(instance_id).get("status") == "unknow":
             payload["error_code"] = "instance_missing"
             return
-        if was_running:
+        if hot:
+            # HOT: never stop. restic-live the DATA-class volumes (skip
+            # regenerable; a 'database' volume never reaches the hot path -- the
+            # manager keeps DB apps cold). The per-volume `data` classification
+            # IS the author's declaration that a live snapshot is acceptable for
+            # that volume (HLD A2 -- per-volume labelling is the consistency
+            # contract; we never hot-snapshot an unclassified app).
+            mounts = _hot_backup_mounts(settings, instance_id, volume_classes)
+        elif was_running:
             # Durable marker (boot reconciliation restarts a mid-backup-stopped
             # instance if a crash skips the finally restart).
             _write_json(_backup_marker(settings, instance_id), {"backup_id": backup_id})
             compose.stop({"id": instance_id})
+            stopped_for_backup = True
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return  # do NOT snapshot a non-quiescent instance
+            mounts = _backup_mounts(settings, instance_id)
+        else:
+            mounts = _backup_mounts(settings, instance_id)
         ensure_repo(settings)
-        mounts = _backup_mounts(settings, instance_id)
         rc, out, err = _run_restic(
             settings,
             ["backup", "/data", "--json", "--tag", f"instance:{instance_id}",
@@ -403,7 +460,10 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         logger.exception("backup_instance_failed instance=%s", instance_id)
         payload["error_code"] = "snapshot_failed"
     finally:
-        if was_running:
+        # Restart ONLY if THIS backup stopped a running instance (cold path). A
+        # hot backup never stops, so it must never "restart" (which would be a
+        # spurious recreate of a healthy running instance).
+        if stopped_for_backup:
             try:
                 _restart(settings, instance_id)
             except Exception:  # noqa: BLE001
@@ -523,16 +583,18 @@ def _parse_summary(stdout: str) -> tuple[str, int | None]:
 
 
 def spawn_backup(settings, instance_id: str, backup_id: str,
-                 destination=None) -> None:
+                 destination=None, volume_classes=None) -> None:
     """Acquire the in-process lock (non-blocking) and run the job in a thread.
     Raises BusyError (-> 409) if a concurrent op holds the lock. ``destination``
-    (Epic B) is forwarded to the brokered per-tenant repo, else None (self-managed)."""
+    (Epic B) is forwarded to the brokered per-tenant repo, else None (self-managed).
+    ``volume_classes`` (Phase 3) present => HOT backup, else COLD."""
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
     threading.Thread(
         target=_locked_job,
-        args=(lock, backup_instance, settings, instance_id, backup_id, destination),
+        args=(lock, backup_instance, settings, instance_id, backup_id,
+              destination, volume_classes),
         daemon=True,
     ).start()
 

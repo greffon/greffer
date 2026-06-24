@@ -154,6 +154,13 @@ class GreffonBackupRequest(BaseModel):
     # Epic B: absent -> self-managed (greffer's own env repo); present -> the
     # manager-brokered per-tenant destination.
     destination: BackupDestinationBlock | None = None
+    # Phase 3 hot backup: {compose_volume_name: class} (data|regenerable). Present
+    # + non-empty => HOT backup (no stop; restic-live the data-class volumes, skip
+    # regenerable). Absent/empty => COLD (the manager only sends this when the app
+    # is classified, DB-free, and this greffer is hot-capable -- so an older
+    # greffer that ignores the field via extra=ignore just does a cold backup,
+    # which is always correct). NO 'database' class reaches here (those stay cold).
+    volume_classes: dict[str, str] | None = None
 
 
 class GreffonRestoreRequest(BaseModel):
