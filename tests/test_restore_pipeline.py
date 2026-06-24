@@ -34,28 +34,29 @@ def test_restore_happy_returns_none():
         assert _call() is None
 
 
-def test_failed_restic_dump_producer_fails_restore():
+def test_failed_restic_dump_is_dump_failed():
     # A truncated dump (restic dump rc != 0) feeds pg_restore a partial stream ->
-    # the DB is not cleanly restored -> fail (orchestrator rolls back).
+    # restore_dump_failed (repo/snapshot side); orchestrator rolls back.
     with mock.patch("app.backup.subprocess.Popen", side_effect=_pair(1, 0)):
         with pytest.raises(backup.BackupError) as exc:
             _call()
-    assert exc.value.code == "restore_failed"
+    assert exc.value.code == "restore_dump_failed"
 
 
-def test_failed_pg_restore_consumer_fails_restore():
-    # A failed restore leaves a half-applied (corrupt) DB -> fail.
+def test_failed_pg_restore_is_restore_failed():
+    # A failed restore leaves a half-applied (corrupt) DB -> restore_failed.
     with mock.patch("app.backup.subprocess.Popen", side_effect=_pair(0, 1)):
         with pytest.raises(backup.BackupError) as exc:
             _call()
     assert exc.value.code == "restore_failed"
 
 
-def test_both_fail_restore_failed():
+def test_both_fail_reports_producer_first():
+    # Producer (restic dump) checked first -> the upstream cause is surfaced.
     with mock.patch("app.backup.subprocess.Popen", side_effect=_pair(1, 1)):
         with pytest.raises(backup.BackupError) as exc:
             _call()
-    assert exc.value.code == "restore_failed"
+    assert exc.value.code == "restore_dump_failed"
 
 
 def test_consumer_timeout_kills_both():

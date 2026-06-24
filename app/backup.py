@@ -318,9 +318,13 @@ def _restore_database(settings, db_container_id: str, restore_argv: list[str],
             except subprocess.TimeoutExpired:
                 pass
         raise BackupError("timeout")
-    # Gate BOTH ends: a truncated dump (producer) OR a failed restore (consumer)
-    # means the DB is not cleanly restored -> fail so the orchestrator rolls back.
-    if producer.returncode != 0 or consumer.returncode != 0:
+    # Gate BOTH ends -- the orchestrator rolls back on either -- but distinguish
+    # them for triage: a producer (restic dump) failure is a repo/snapshot
+    # problem (truncated stream), a consumer (pg_restore) failure is a dump-
+    # content or target-DB problem (half-applied). Producer checked first.
+    if producer.returncode != 0:
+        raise BackupError("restore_dump_failed")
+    if consumer.returncode != 0:
         raise BackupError("restore_failed")
 
 
