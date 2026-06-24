@@ -189,9 +189,10 @@ def test_run_hot_backup_multiple_db_volumes_refused(monkeypatch):
 def test_run_hot_backup_ambiguous_multiple_hooks_refused(monkeypatch):
     # One DB volume but two services declare a dump hook -> ambiguous which dumps
     # the DB. Refuse rather than guess (could dump the wrong / omit the right one).
+    ran_restic = mock.Mock()
     monkeypatch.setattr(backup, "_data_volumes", lambda _id: ["i_pg"])
     monkeypatch.setattr(backup, "ensure_repo", lambda s: None)
-    monkeypatch.setattr(backup, "_run_restic", mock.Mock())
+    monkeypatch.setattr(backup, "_run_restic", ran_restic)
     monkeypatch.setattr(
         backup.observe, "list_instance_containers",
         lambda _id: [_container("pg", dump="pg_dump app", cid="a"),
@@ -199,6 +200,7 @@ def test_run_hot_backup_ambiguous_multiple_hooks_refused(monkeypatch):
     with pytest.raises(backup.BackupError) as exc:
         backup._run_hot_backup(_settings(), "i", "b1", {"pg": "database"})
     assert exc.value.code == "multiple_database_unsupported"
+    ran_restic.assert_not_called()  # refused before any snapshot
 
 
 def test_hot_backup_database_end_to_end(monkeypatch):
