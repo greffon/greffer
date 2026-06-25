@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # same base read an instance's repo for cross-greffer migration (the manager
     # never holds the creds). Applies ONLY to the env-repo path; a manager-
     # brokered destination is already per-instance-prefixed.
+    # The base MUST be S3/path-style (``s3:``/``rest:``/local/``sftp:`` or
+    # ``b2:bucket:PATH``): the derivation appends ``/<id>``, so a bare
+    # ``b2:bucket``/``gs:bucket``/``azure:container`` (colon-separated, no path)
+    # mis-derives (fails LOUD at restic init, never misroutes). NOTE: repo-wide
+    # prune/check stay on the base in this mode (snapshot refs still drop via
+    # per-instance ``forget``); per-instance space-reclaiming prune is a follow-up.
     greffer_backup_repo_per_instance: bool = False
     restic_password: str | None = None
     restic_password_file: str | None = None
