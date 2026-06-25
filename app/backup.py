@@ -1069,13 +1069,53 @@ def check_repo(settings) -> dict:
         return {'status': 'failed', 'error_code': 'check_failed'}
 
 
+def _per_instance_fanout(settings, destination) -> bool:
+    """True when a destination-less (self-managed) repo op must fan out across this
+    greffer's per-instance sub-repos. In per-instance mode the env repo is a BASE
+    and each instance's backups live at ``<base>/<id>``; a bare-``<base>`` prune/
+    check would touch NONE of them (the space-reclaim gap PR #118's prune
+    follow-up closes). A brokered destination is already per-instance-prefixed, so
+    the flag is env-repo-only -- mirror _effective_settings' gate exactly."""
+    return bool(destination is None
+                and getattr(settings, 'greffer_backup_repo_per_instance', False)
+                and settings.greffer_backup_repo)
+
+
+def _list_instance_ids(settings) -> list[str]:
+    """Instance ids on this greffer = the sub-dirs of ``$GREFFON_PATH`` (same
+    enumeration boot_reconcile uses). The source of which sub-repos exist: an
+    instance's backups live at ``<base>/<id>``."""
+    root = Path(settings.greffon_path)
+    if not root.exists():
+        return []
+    return [d.name for d in root.iterdir() if d.is_dir()]
+
+
+def _repo_initialized(settings) -> bool:
+    """Whether the (sub-)repo already exists, WITHOUT initializing it. Used to skip
+    never-backed-up instances in the per-instance fan-out so a prune/check sweep
+    never litters the base with empty ``<base>/<id>`` repos for instances that have
+    never opted into backup."""
+    rc, _out, _err = _run_restic(settings, ['cat', 'config'], [], read_only=True)
+    return rc == 0
+
+
 def spawn_repo_op(settings, op: str, destination=None) -> None:
     """Run a repo-wide op (``prune`` | ``check``) in a background thread under a
     non-blocking PER-REPO lock. ``destination`` (Epic B) targets a manager-brokered
     per-tenant repo; None = the greffer's own env repo. Raises BusyError (-> 409) if
     that repo already has an op running, so the manager retries next cadence rather
     than stacking redundant sidecars on the same repo (a different tenant's repo is
-    unaffected)."""
+    unaffected).
+
+    Per-instance mode (PR #118): a destination-less op fans out across this
+    greffer's ``<base>/<id>`` sub-repos instead of the bare ``<base>`` -- the
+    manager keeps firing one env-repo op per greffer (oblivious to the
+    greffer-owned flag); the greffer expands it to where the backups actually
+    live."""
+    if _per_instance_fanout(settings, destination):
+        _spawn_per_instance_repo_op(settings, op)
+        return
     eff = _effective_settings(settings, destination)
     repo = eff.greffer_backup_repo
     if not repo:
@@ -1091,6 +1131,48 @@ def spawn_repo_op(settings, op: str, destination=None) -> None:
     except Exception:  # noqa: BLE001 -- if the thread can't start (e.g. thread
         _reap_repo_op_lock(repo, lock)  # exhaustion), never leak this repo's lock
         raise                           # (it would 409 every future op on it).
+
+
+def _spawn_per_instance_repo_op(settings, op: str) -> None:
+    """Per-instance fan-out: ONE orchestrator thread that prunes/checks each
+    ``<base>/<id>`` sub-repo sequentially. Serialized on the BASE repo key (no
+    sub-repo ever targets the bare base, so it can't collide with a real per-repo
+    lock) so two overlapping fan-outs 409 the second -- same idempotency the
+    single-repo path gives. Sequential, not a thread-per-instance fan-out: these
+    are this ONE greffer's own instances sharing one base/bucket, so concurrency
+    buys little and a thread-per-instance burst would. The orchestrator returns
+    202 immediately; per-instance restic work happens in the background."""
+    base = settings.greffer_backup_repo.rstrip('/')
+    lock = _repo_op_lock(base)
+    if not lock.acquire(blocking=False):
+        raise BusyError(op)
+    fn = prune_repo if op == 'prune' else check_repo
+    try:
+        threading.Thread(
+            target=_per_instance_repo_op_job, args=(base, lock, fn, settings),
+            daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001 -- never leak the base lock on a failed start.
+        _reap_repo_op_lock(base, lock)
+        raise
+
+
+def _per_instance_repo_op_job(base: str, lock: threading.Lock, fn, settings) -> None:
+    try:
+        for iid in _list_instance_ids(settings):
+            eff = _effective_settings(settings, None, iid)
+            try:
+                # Skip never-backed-up instances so the sweep doesn't INIT empty
+                # sub-repos. _repo_initialized's own failure (e.g. transient S3)
+                # must not abort the whole fan-out -- skip this one, keep going.
+                if not _repo_initialized(eff):
+                    continue
+                fn(eff)
+            except Exception:  # noqa: BLE001 -- per-instance op is best-effort;
+                logger.exception(  # one bad sub-repo never stalls the rest.
+                    'per_instance_repo_op_failed instance=%s', iid)
+    finally:
+        _reap_repo_op_lock(base, lock)
 
 
 def _reap_repo_op_lock(repo: str, lock: threading.Lock) -> None:
