@@ -32,6 +32,19 @@ class Settings(BaseSettings):
     # backup endpoints fail with ``repo_uninitialized``. Env: GREFFER_BACKUP_REPO,
     # RESTIC_PASSWORD(_FILE), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
     greffer_backup_repo: str | None = None
+    # When true (shared-bucket self-host fleets), the env repo above is a
+    # BASE and each instance's restic repo is ``<base>/<instance_id>`` -- gives
+    # per-instance restic-lock isolation AND lets a SECOND greffer sharing the
+    # same base read an instance's repo for cross-greffer migration (the manager
+    # never holds the creds). Applies ONLY to the env-repo path; a manager-
+    # brokered destination is already per-instance-prefixed.
+    # The base MUST be S3/path-style (``s3:``/``rest:``/local/``sftp:`` or
+    # ``b2:bucket:PATH``): the derivation appends ``/<id>``, so a bare
+    # ``b2:bucket``/``gs:bucket``/``azure:container`` (colon-separated, no path)
+    # mis-derives (fails LOUD at restic init, never misroutes). NOTE: repo-wide
+    # prune/check stay on the base in this mode (snapshot refs still drop via
+    # per-instance ``forget``); per-instance space-reclaiming prune is a follow-up.
+    greffer_backup_repo_per_instance: bool = False
     restic_password: str | None = None
     restic_password_file: str | None = None
     aws_access_key_id: str | None = None

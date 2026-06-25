@@ -146,12 +146,41 @@ class _BrokeredSettings:
         return getattr(self._settings, name)
 
 
-def _effective_settings(settings, destination):
+class _PerInstanceSettings:
+    """Overrides ONLY ``greffer_backup_repo`` to the per-instance ``<base>/<id>``
+    path; every other attribute delegates (mirrors _BrokeredSettings). A plain
+    wrapper (not model_copy) so it works for any settings object."""
+
+    __slots__ = ("_settings", "_repo")
+
+    def __init__(self, settings, repo):
+        self._settings = settings
+        self._repo = repo
+
+    @property
+    def greffer_backup_repo(self):
+        return self._repo
+
+    def __getattr__(self, name):
+        return getattr(self._settings, name)
+
+
+def _effective_settings(settings, destination, instance_id=None):
     """The settings restic should run against: the brokered destination if the
-    manager supplied one, else the greffer's own env (self-managed, unchanged)."""
-    if destination is None:
-        return settings
-    return _BrokeredSettings(settings, destination)
+    manager supplied one, else the greffer's own env (self-managed). When NO
+    destination is brokered AND per-instance mode is on, the env repo is treated as
+    a BASE and this instance's repo becomes ``<base>/<instance_id>`` -- so a fleet
+    sharing one bucket gets per-instance repos (restic-lock isolation + cross-greffer
+    migration: a second greffer on the same base reads ``<base>/<id>`` directly, no
+    manager-held creds). A brokered destination is already per-instance-prefixed, so
+    the flag is env-repo-only."""
+    if destination is not None:
+        return _BrokeredSettings(settings, destination)
+    if (instance_id and getattr(settings, 'greffer_backup_repo_per_instance', False)
+            and settings.greffer_backup_repo):
+        base = settings.greffer_backup_repo.rstrip('/')
+        return _PerInstanceSettings(settings, f'{base}/{instance_id}')
+    return settings
 
 
 def _data_volumes(instance_id: str) -> list[str]:
@@ -629,7 +658,7 @@ def backup_instance(settings, instance_id: str, backup_id: str,
     (Phase 3). A cold backup that stopped a running instance always restarts it
     (try/finally); a hot backup never stops, so never restarts. ``destination``
     (Epic B) routes restic to a manager-brokered per-tenant repo."""
-    settings = _effective_settings(settings, destination)
+    settings = _effective_settings(settings, destination, instance_id)
     hot = bool(volume_classes)
     payload = {"backup_id": backup_id, "status": "failed", "error_code": "snapshot_failed"}
     was_running = compose.get_status(instance_id).get("status") == "running"
@@ -780,7 +809,7 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
     (``already_running`` tells the manager not to re-start). On ANY failure the
     instance is left stopped with the ``safety_restic_snapshot_id`` so the operator
     can roll back. ``destination`` (Epic B) routes restic to the brokered repo."""
-    settings = _effective_settings(settings, destination)
+    settings = _effective_settings(settings, destination, instance_id)
     payload = {"restore_id": restore_id, "status": "failed", "error_code": "restore_failed"}
     started_stopped = compose.get_status(instance_id).get("status") == "running"
     safety_id = ""
