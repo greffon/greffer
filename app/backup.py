@@ -1091,13 +1091,19 @@ def _list_instance_ids(settings) -> list[str]:
     return [d.name for d in root.iterdir() if d.is_dir()]
 
 
-def _repo_initialized(settings) -> bool:
-    """Whether the (sub-)repo already exists, WITHOUT initializing it. Used to skip
-    never-backed-up instances in the per-instance fan-out so a prune/check sweep
-    never litters the base with empty ``<base>/<id>`` repos for instances that have
-    never opted into backup."""
-    rc, _out, _err = _run_restic(settings, ['cat', 'config'], [], read_only=True)
-    return rc == 0
+def _repo_missing(settings) -> bool:
+    """Whether the (sub-)repo GENUINELY does not exist yet -- the ONLY case the
+    per-instance fan-out skips (so a sweep never inits empty ``<base>/<id>`` repos
+    for never-backed-up instances). Checks without initializing.
+
+    A non-missing FAILURE (wrong creds, backend outage, corrupt config) returns
+    False, NOT True: it must fall through to prune/check so the normal path logs a
+    CLASSIFIED failure. Skipping it would let a scheduled op accept 202 and silently
+    do NOTHING across every sub-repo under one global credential/backend problem."""
+    rc, _out, err = _run_restic(settings, ['cat', 'config'], [], read_only=True)
+    if rc == 0:
+        return False
+    return _classify(err) == 'repo_uninitialized'
 
 
 def spawn_repo_op(settings, op: str, destination=None) -> None:
@@ -1162,10 +1168,10 @@ def _per_instance_repo_op_job(base: str, lock: threading.Lock, fn, settings) -> 
         for iid in _list_instance_ids(settings):
             eff = _effective_settings(settings, None, iid)
             try:
-                # Skip never-backed-up instances so the sweep doesn't INIT empty
-                # sub-repos. _repo_initialized's own failure (e.g. transient S3)
-                # must not abort the whole fan-out -- skip this one, keep going.
-                if not _repo_initialized(eff):
+                # Skip ONLY genuinely-missing sub-repos so the sweep doesn't INIT
+                # empties. A non-missing failure falls through to fn(eff) so the
+                # normal path logs a classified failure (not a silent 202-noop).
+                if _repo_missing(eff):
                     continue
                 fn(eff)
             except Exception:  # noqa: BLE001 -- per-instance op is best-effort;

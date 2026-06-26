@@ -76,7 +76,7 @@ def test_fanout_prunes_each_instance_subrepo(monkeypatch):
     base = "s3:https://h/bucket"
     s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
     monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: ["a", "b", "c"])
-    monkeypatch.setattr(backup, "_repo_initialized", lambda _s: True)
+    monkeypatch.setattr(backup, "_repo_missing", lambda _s: False)
     seen, done = [], threading.Event()
 
     def _prune(settings):
@@ -101,8 +101,8 @@ def test_fanout_skips_never_backed_up_instances(monkeypatch):
     s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
     monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: ["live", "virgin"])
     monkeypatch.setattr(
-        backup, "_repo_initialized",
-        lambda eff: eff.greffer_backup_repo == f"{base}/live")
+        backup, "_repo_missing",
+        lambda eff: eff.greffer_backup_repo != f"{base}/live")
     pruned, done = [], threading.Event()
 
     def _prune(settings):
@@ -121,7 +121,7 @@ def test_fanout_one_failing_instance_does_not_abort_the_rest(monkeypatch):
     base = "s3:https://h/bucket"
     s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
     monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: ["a", "b", "c"])
-    monkeypatch.setattr(backup, "_repo_initialized", lambda _s: True)
+    monkeypatch.setattr(backup, "_repo_missing", lambda _s: False)
     pruned, done = [], threading.Event()
 
     def _prune(settings):
@@ -144,7 +144,7 @@ def test_fanout_dispatches_check(monkeypatch):
     base = "s3:https://h/bucket"
     s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
     monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: ["a"])
-    monkeypatch.setattr(backup, "_repo_initialized", lambda _s: True)
+    monkeypatch.setattr(backup, "_repo_missing", lambda _s: False)
     seen, done = [], threading.Event()
 
     def _check(settings):
@@ -174,7 +174,7 @@ def test_fanout_no_instances_is_a_noop(monkeypatch):
     base = "s3:https://h/bucket"
     s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
     monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: [])
-    monkeypatch.setattr(backup, "_repo_initialized", lambda _s: True)
+    monkeypatch.setattr(backup, "_repo_missing", lambda _s: False)
     called = []
     monkeypatch.setattr(backup, "prune_repo", lambda s: called.append(1))
     backup.spawn_repo_op(s, "prune")
@@ -201,3 +201,57 @@ def test_flag_off_does_not_fan_out(monkeypatch):
     assert done.wait(timeout=5)
     _drain_base_lock("s3:https://h/repo")
     assert seen == ["s3:https://h/repo"]
+
+
+# ---- _repo_missing: skip ONLY genuinely-missing repos --------------------
+
+
+def test_repo_missing_true_only_when_repo_uninitialized(monkeypatch):
+    s = _settings(greffer_backup_repo="s3:https://h/bucket/i")
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (1, "", "Fatal: unable to open config file: does not exist"))
+    assert backup._repo_missing(s) is True
+
+
+def test_repo_missing_false_on_present(monkeypatch):
+    s = _settings(greffer_backup_repo="s3:https://h/bucket/i")
+    monkeypatch.setattr(backup, "_run_restic", lambda *a, **k: (0, "{}", ""))
+    assert backup._repo_missing(s) is False
+
+
+def test_repo_missing_false_on_access_failure(monkeypatch):
+    # Codex P2: a wrong-password / backend-outage / corrupt-config failure is NOT
+    # "missing" -- it must return False so the fan-out falls through to
+    # prune/check and logs a CLASSIFIED failure instead of silently skipping.
+    s = _settings(greffer_backup_repo="s3:https://h/bucket/i")
+    for stderr in ("wrong password or no key found",
+                   "dial tcp: connection refused",
+                   "Head: AccessDenied: Access Denied"):
+        monkeypatch.setattr(backup, "_run_restic",
+                            lambda *a, _e=stderr, **k: (1, "", _e))
+        assert backup._repo_missing(s) is False, stderr
+
+
+def test_fanout_does_not_skip_existing_subrepo_on_access_failure(monkeypatch):
+    # End to end: under a global credential/backend problem, every sub-repo must
+    # still be handed to prune (which logs the classified failure), NOT skipped.
+    base = "s3:https://h/bucket"
+    s = _settings(greffer_backup_repo=base, greffer_backup_repo_per_instance=True)
+    monkeypatch.setattr(backup, "_list_instance_ids", lambda _s: ["a", "b"])
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (1, "", "wrong password or no key found"))
+    pruned, done = [], threading.Event()
+
+    def _prune(settings):
+        pruned.append(settings.greffer_backup_repo)
+        if len(pruned) == 2:
+            done.set()
+        return {"status": "failed", "error_code": "auth_failed"}
+
+    monkeypatch.setattr(backup, "prune_repo", _prune)
+    backup.spawn_repo_op(s, "prune")
+    assert done.wait(timeout=5)
+    _drain_base_lock(base)
+    assert sorted(pruned) == [f"{base}/a", f"{base}/b"]  # neither silently skipped
