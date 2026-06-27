@@ -1091,19 +1091,28 @@ def _list_instance_ids(settings) -> list[str]:
     return [d.name for d in root.iterdir() if d.is_dir()]
 
 
+# restic >= 0.17 dedicated exit code: the repository does not exist. The greffer
+# pins restic 0.17.3, so this is the RELIABLE missing-repo signal -- unlike a
+# stderr substring, which conflates a genuinely-absent repo with a backend outage
+# (``NoSuchBucket: ... does not exist``) or a network error (restic prefixes BOTH
+# with ``unable to open config file``). exit 10 is set ONLY when the backend is
+# reachable and the config object is genuinely absent (S3 ``IsNotExist`` matches a
+# missing KEY, not a missing bucket -> a gone bucket stays exit 1).
+_RESTIC_EXIT_NO_REPOSITORY = 10
+
+
 def _repo_missing(settings) -> bool:
     """Whether the (sub-)repo GENUINELY does not exist yet -- the ONLY case the
     per-instance fan-out skips (so a sweep never inits empty ``<base>/<id>`` repos
     for never-backed-up instances). Checks without initializing.
 
-    A non-missing FAILURE (wrong creds, backend outage, corrupt config) returns
-    False, NOT True: it must fall through to prune/check so the normal path logs a
-    CLASSIFIED failure. Skipping it would let a scheduled op accept 202 and silently
-    do NOTHING across every sub-repo under one global credential/backend problem."""
-    rc, _out, err = _run_restic(settings, ['cat', 'config'], [], read_only=True)
-    if rc == 0:
-        return False
-    return _classify(err) == 'repo_uninitialized'
+    A non-missing FAILURE (wrong creds, backend outage, gone bucket, corrupt
+    config) returns False, NOT True: it must fall through to prune/check so the
+    normal path logs a CLASSIFIED failure. Skipping it would let a scheduled op
+    accept 202 and silently do NOTHING across every sub-repo under one global
+    credential/backend problem. Hence the exit-CODE check, not a stderr match."""
+    rc, _out, _err = _run_restic(settings, ['cat', 'config'], [], read_only=True)
+    return rc == _RESTIC_EXIT_NO_REPOSITORY
 
 
 def spawn_repo_op(settings, op: str, destination=None) -> None:

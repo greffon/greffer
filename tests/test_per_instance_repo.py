@@ -206,11 +206,13 @@ def test_flag_off_does_not_fan_out(monkeypatch):
 # ---- _repo_missing: skip ONLY genuinely-missing repos --------------------
 
 
-def test_repo_missing_true_only_when_repo_uninitialized(monkeypatch):
+def test_repo_missing_true_on_exit_code_10(monkeypatch):
+    # restic >= 0.17 exit 10 == "repository does not exist" -- the ONLY skip case.
     s = _settings(greffer_backup_repo="s3:https://h/bucket/i")
     monkeypatch.setattr(
         backup, "_run_restic",
-        lambda *a, **k: (1, "", "Fatal: unable to open config file: does not exist"))
+        lambda *a, **k: (10, "", "Fatal: unable to open config file: "
+                                 "The specified key does not exist."))
     assert backup._repo_missing(s) is True
 
 
@@ -220,17 +222,25 @@ def test_repo_missing_false_on_present(monkeypatch):
     assert backup._repo_missing(s) is False
 
 
-def test_repo_missing_false_on_access_failure(monkeypatch):
-    # Codex P2: a wrong-password / backend-outage / corrupt-config failure is NOT
-    # "missing" -- it must return False so the fan-out falls through to
-    # prune/check and logs a CLASSIFIED failure instead of silently skipping.
+def test_repo_missing_false_on_access_or_backend_failure(monkeypatch):
+    # A wrong-password / backend-outage / GONE-BUCKET / corrupt-config failure is
+    # NOT "missing" (exit != 10) -- it must return False so the fan-out falls
+    # through to prune/check and logs a CLASSIFIED failure instead of silently
+    # skipping. NoSuchBucket is the trap: its stderr CONTAINS "does not exist", so
+    # a substring check would wrongly skip the whole fan-out -- the exit code (1,
+    # not 10) keeps it loud.
     s = _settings(greffer_backup_repo="s3:https://h/bucket/i")
-    for stderr in ("wrong password or no key found",
-                   "dial tcp: connection refused",
-                   "Head: AccessDenied: Access Denied"):
+    cases = [
+        (12, "wrong password or no key found"),
+        (1, "dial tcp: connection refused"),
+        (1, "Head: AccessDenied: Access Denied"),
+        (1, "Fatal: unable to open config file: NoSuchBucket: The specified "
+            "bucket does not exist."),
+    ]
+    for rc, stderr in cases:
         monkeypatch.setattr(backup, "_run_restic",
-                            lambda *a, _e=stderr, **k: (1, "", _e))
-        assert backup._repo_missing(s) is False, stderr
+                            lambda *a, _r=rc, _e=stderr, **k: (_r, "", _e))
+        assert backup._repo_missing(s) is False, (rc, stderr)
 
 
 def test_fanout_does_not_skip_existing_subrepo_on_access_failure(monkeypatch):
