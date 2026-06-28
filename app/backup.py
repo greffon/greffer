@@ -228,6 +228,24 @@ def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _restic_stats_total_size(out: str) -> int | None:
+    """Pull ``total_size`` out of ``restic stats --json`` stdout. restic emits a single JSON
+    object, but some versions/configs prefix a progress line before it (restic/restic#21891), so
+    do NOT assume stdout is only JSON: scan lines from the END for the last one that parses as a
+    JSON object carrying ``total_size``."""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "total_size" in obj:
+            return obj.get("total_size")
+    return None
+
+
 def _repo_stats(settings) -> int | None:
     """The restic repo's raw-data size (deduplicated logical size) -- the LIVE storage estimate
     for managed-tier GB metering, reported on the backup-result callback. BEST-EFFORT: returns
@@ -239,7 +257,7 @@ def _repo_stats(settings) -> int | None:
             read_only=True, timeout=600)
         if rc != 0:
             return None
-        total = json.loads(out.strip()).get("total_size")
+        total = _restic_stats_total_size(out)
         return int(total) if total is not None else None
     except (ValueError, TypeError, OSError, subprocess.SubprocessError) as exc:
         logger.warning("repo_stats_failed: %s", type(exc).__name__)

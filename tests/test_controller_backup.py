@@ -113,6 +113,17 @@ def test_cold_backup_collects_repo_stats_after_restart(monkeypatch):
     assert cb.call_args.args[3]["repo_bytes"] == 4096
 
 
+def test_restic_stats_total_size_tolerates_leading_progress_line():
+    # restic 0.19.x can prefix a progress line before the JSON object (restic/restic#21891);
+    # the parser must still find total_size, not choke on non-JSON stdout.
+    assert backup._restic_stats_total_size('{"total_size": 4096}') == 4096
+    assert backup._restic_stats_total_size(
+        '{"message_type":"status","percent_done":1}\n'
+        '{"total_size": 8192, "total_file_count": 3}') == 8192
+    assert backup._restic_stats_total_size("not json at all\n") is None
+    assert backup._restic_stats_total_size('{"no_size": 1}') is None
+
+
 def test_backup_stop_timeout_never_snapshots(monkeypatch):
     _patch_common(monkeypatch, wait=False)
     run = mock.Mock()
