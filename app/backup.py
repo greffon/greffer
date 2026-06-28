@@ -557,16 +557,11 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
         total_bytes += bytes_added or 0
     # The primary snapshot_id stays the DATA snapshot (back-compat with the
     # single-snapshot manager); the manifest carries the full artifact set.
-    result = {"backup_id": backup_id, "status": "success",
-              "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
-              "bytes_added": total_bytes, "manifest": manifest}
-    # GB metering live estimate (Epic B slice B): the repo's raw-data size AFTER this backup.
-    # Best-effort + optional in the callback -- the manager only consumes it for managed
-    # instances, and reconciles against the true B2 prefix size on a cadence regardless.
-    repo_bytes = _repo_stats(settings)
-    if repo_bytes is not None:
-        result["repo_bytes"] = repo_bytes
-    return result
+    # repo_bytes (GB-metering live estimate) is collected by the caller AFTER the restart,
+    # off the downtime path -- a slow restic stats must not extend a cold backup's stop window.
+    return {"backup_id": backup_id, "status": "success",
+            "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
+            "bytes_added": total_bytes, "manifest": manifest}
 
 
 def _wait_stopped(instance_id: str, timeout: int) -> bool:
@@ -726,10 +721,6 @@ def backup_instance(settings, instance_id: str, backup_id: str,
             snapshot_id, bytes_added = _parse_summary(out)
             payload = {"backup_id": backup_id, "status": "success",
                        "snapshot_id": snapshot_id, "bytes_added": bytes_added}
-            # GB metering live estimate (Epic B slice B): repo raw-data size after this backup.
-            repo_bytes = _repo_stats(settings)
-            if repo_bytes is not None:
-                payload["repo_bytes"] = repo_bytes
     except BackupError as exc:
         payload["error_code"] = exc.code
     except Exception:  # noqa: BLE001
@@ -749,6 +740,13 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         # hung/slow forget must not extend the backup's stop window.
         if payload.get("status") == "success":
             _forget(settings, instance_id, safety=False)
+            # GB metering live estimate (Epic B slice B): collected HERE, after the restart +
+            # off the downtime path -- a slow/unreachable restic stats (best-effort, up to 600s)
+            # must NEVER extend a cold backup's stop window (Codex P1). repo_bytes is optional
+            # in the callback; the manager reconciles against the true B2 prefix size regardless.
+            repo_bytes = _repo_stats(settings)
+            if repo_bytes is not None:
+                payload["repo_bytes"] = repo_bytes
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
