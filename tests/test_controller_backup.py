@@ -87,6 +87,32 @@ def test_backup_happy_restarts_and_reports_success(monkeypatch):
     assert payload["backup_id"] == "b1"
 
 
+def test_cold_backup_collects_repo_stats_after_restart(monkeypatch):
+    # GB-metering P1: the repo-size estimate is collected OFF the downtime path -- AFTER the
+    # instance restarts, never while it's still stopped (a slow restic stats must not extend the
+    # cold backup's outage). Also asserts repo_bytes reaches the callback payload.
+    _patch_common(monkeypatch)
+    order = []
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"S","data_added":7}', ""))
+    monkeypatch.setattr(backup, "_restart", lambda *a, **k: order.append("restart"))
+    monkeypatch.setattr(backup, "_forget", lambda *a, **k: None)
+
+    def _stats(*a, **k):
+        order.append("stats")
+        return 4096
+
+    monkeypatch.setattr(backup, "_repo_stats", _stats)
+    cb = mock.Mock()
+    monkeypatch.setattr(backup, "_post_callback", cb)
+
+    backup.backup_instance(_settings(), "i", "b1")
+
+    assert order == ["restart", "stats"]            # stats AFTER restart -> off the downtime path
+    assert cb.call_args.args[3]["repo_bytes"] == 4096
+
+
 def test_backup_stop_timeout_never_snapshots(monkeypatch):
     _patch_common(monkeypatch, wait=False)
     run = mock.Mock()
