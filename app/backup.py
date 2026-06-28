@@ -228,6 +228,24 @@ def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _repo_stats(settings) -> int | None:
+    """The restic repo's raw-data size (deduplicated logical size) -- the LIVE storage estimate
+    for managed-tier GB metering, reported on the backup-result callback. BEST-EFFORT: returns
+    None on any failure (the manager falls back to its B2-prefix reconcile). A stats failure must
+    NEVER fail a backup that already succeeded -- it reads the repo, no /data mount needed."""
+    try:
+        rc, out, _ = _run_restic(
+            settings, ["stats", "--mode", "raw-data", "--json"], [],
+            read_only=True, timeout=600)
+        if rc != 0:
+            return None
+        total = json.loads(out.strip()).get("total_size")
+        return int(total) if total is not None else None
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError) as exc:
+        logger.warning("repo_stats_failed: %s", type(exc).__name__)
+        return None
+
+
 def _dump_and_backup(settings, instance_id: str, db_container_id: str,
                      dump_argv: list[str], stdin_filename: str, *,
                      timeout: int = 3600) -> tuple[str, int]:
@@ -539,9 +557,16 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
         total_bytes += bytes_added or 0
     # The primary snapshot_id stays the DATA snapshot (back-compat with the
     # single-snapshot manager); the manifest carries the full artifact set.
-    return {"backup_id": backup_id, "status": "success",
-            "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
-            "bytes_added": total_bytes, "manifest": manifest}
+    result = {"backup_id": backup_id, "status": "success",
+              "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
+              "bytes_added": total_bytes, "manifest": manifest}
+    # GB metering live estimate (Epic B slice B): the repo's raw-data size AFTER this backup.
+    # Best-effort + optional in the callback -- the manager only consumes it for managed
+    # instances, and reconciles against the true B2 prefix size on a cadence regardless.
+    repo_bytes = _repo_stats(settings)
+    if repo_bytes is not None:
+        result["repo_bytes"] = repo_bytes
+    return result
 
 
 def _wait_stopped(instance_id: str, timeout: int) -> bool:
@@ -701,6 +726,10 @@ def backup_instance(settings, instance_id: str, backup_id: str,
             snapshot_id, bytes_added = _parse_summary(out)
             payload = {"backup_id": backup_id, "status": "success",
                        "snapshot_id": snapshot_id, "bytes_added": bytes_added}
+            # GB metering live estimate (Epic B slice B): repo raw-data size after this backup.
+            repo_bytes = _repo_stats(settings)
+            if repo_bytes is not None:
+                payload["repo_bytes"] = repo_bytes
     except BackupError as exc:
         payload["error_code"] = exc.code
     except Exception:  # noqa: BLE001
