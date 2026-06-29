@@ -44,7 +44,10 @@ def test_hot_backup_passes_only_data_volumes_to_restic(monkeypatch):
     captured = {}
 
     def _run(settings, args, mounts, **k):
-        captured["mounts"] = mounts
+        # The post-backup GB-metering `_repo_stats` also calls _run_restic (args=["stats", ...],
+        # no mounts); capture only the BACKUP invocation's mounts, not that trailing call.
+        if "stats" not in args:
+            captured["mounts"] = mounts
         return (0, '{"message_type":"summary","snapshot_id":"S","data_added":1}', "")
 
     monkeypatch.setattr(backup, "_run_restic", _run)

@@ -228,6 +228,44 @@ def _run_restic(settings, args: list[str], mounts: list[tuple[str, str]], *,
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _restic_stats_total_size(out: str) -> int | None:
+    """Pull ``total_size`` out of ``restic stats --json`` stdout. restic emits a single JSON
+    object, but some versions/configs prefix a progress line before it (restic/restic#21891), so
+    do NOT assume stdout is only JSON: scan lines from the END for the last one that parses as a
+    JSON object carrying ``total_size``."""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "total_size" in obj:
+            return obj.get("total_size")
+    return None
+
+
+def _repo_stats(settings) -> int | None:
+    """The restic repo's raw-data size (deduplicated logical size) -- the LIVE storage estimate
+    for managed-tier GB metering, reported on the backup-result callback. BEST-EFFORT: returns
+    None on any failure (the manager falls back to its B2-prefix reconcile). A stats failure must
+    NEVER fail a backup that already succeeded -- it reads the repo, no /data mount needed. Bounded
+    at 120s: this runs while backup_instance still holds the per-instance lock, so a slow/degraded
+    repo must not hold it long -- give up and let the reconcile correct the estimate instead."""
+    try:
+        rc, out, _ = _run_restic(
+            settings, ["stats", "--mode", "raw-data", "--json"], [],
+            read_only=True, timeout=120)
+        if rc != 0:
+            return None
+        total = _restic_stats_total_size(out)
+        return int(total) if total is not None else None
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError) as exc:
+        logger.warning("repo_stats_failed: %s", type(exc).__name__)
+        return None
+
+
 def _dump_and_backup(settings, instance_id: str, db_container_id: str,
                      dump_argv: list[str], stdin_filename: str, *,
                      timeout: int = 3600) -> tuple[str, int]:
@@ -539,6 +577,8 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
         total_bytes += bytes_added or 0
     # The primary snapshot_id stays the DATA snapshot (back-compat with the
     # single-snapshot manager); the manifest carries the full artifact set.
+    # repo_bytes (GB-metering live estimate) is collected by the caller AFTER the restart,
+    # off the downtime path -- a slow restic stats must not extend a cold backup's stop window.
     return {"backup_id": backup_id, "status": "success",
             "snapshot_id": manifest.get("data") or next(iter(manifest.values())),
             "bytes_added": total_bytes, "manifest": manifest}
@@ -720,6 +760,17 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         # hung/slow forget must not extend the backup's stop window.
         if payload.get("status") == "success":
             _forget(settings, instance_id, safety=False)
+            # GB metering live estimate (Epic B slice B): ONLY for a MANAGED/brokered destination
+            # (the manager consumes repo_bytes only for managed instances). Self-host (destination
+            # is None) skips it -- backup_instance runs under the per-instance lock, so a restic
+            # stats scan here would hold that lock (and risk instance_busy for a concurrent
+            # start/stop/restore) for nothing (Codex P2). Collected AFTER the restart so it's off
+            # the cold-backup downtime path regardless. repo_bytes is optional in the callback; the
+            # manager reconciles against the true B2 prefix size on its own cadence anyway.
+            if destination is not None:
+                repo_bytes = _repo_stats(settings)
+                if repo_bytes is not None:
+                    payload["repo_bytes"] = repo_bytes
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
