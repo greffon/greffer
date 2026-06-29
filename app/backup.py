@@ -250,11 +250,13 @@ def _repo_stats(settings) -> int | None:
     """The restic repo's raw-data size (deduplicated logical size) -- the LIVE storage estimate
     for managed-tier GB metering, reported on the backup-result callback. BEST-EFFORT: returns
     None on any failure (the manager falls back to its B2-prefix reconcile). A stats failure must
-    NEVER fail a backup that already succeeded -- it reads the repo, no /data mount needed."""
+    NEVER fail a backup that already succeeded -- it reads the repo, no /data mount needed. Bounded
+    at 120s: this runs while backup_instance still holds the per-instance lock, so a slow/degraded
+    repo must not hold it long -- give up and let the reconcile correct the estimate instead."""
     try:
         rc, out, _ = _run_restic(
             settings, ["stats", "--mode", "raw-data", "--json"], [],
-            read_only=True, timeout=600)
+            read_only=True, timeout=120)
         if rc != 0:
             return None
         total = _restic_stats_total_size(out)
@@ -758,13 +760,17 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         # hung/slow forget must not extend the backup's stop window.
         if payload.get("status") == "success":
             _forget(settings, instance_id, safety=False)
-            # GB metering live estimate (Epic B slice B): collected HERE, after the restart +
-            # off the downtime path -- a slow/unreachable restic stats (best-effort, up to 600s)
-            # must NEVER extend a cold backup's stop window (Codex P1). repo_bytes is optional
-            # in the callback; the manager reconciles against the true B2 prefix size regardless.
-            repo_bytes = _repo_stats(settings)
-            if repo_bytes is not None:
-                payload["repo_bytes"] = repo_bytes
+            # GB metering live estimate (Epic B slice B): ONLY for a MANAGED/brokered destination
+            # (the manager consumes repo_bytes only for managed instances). Self-host (destination
+            # is None) skips it -- backup_instance runs under the per-instance lock, so a restic
+            # stats scan here would hold that lock (and risk instance_busy for a concurrent
+            # start/stop/restore) for nothing (Codex P2). Collected AFTER the restart so it's off
+            # the cold-backup downtime path regardless. repo_bytes is optional in the callback; the
+            # manager reconciles against the true B2 prefix size on its own cadence anyway.
+            if destination is not None:
+                repo_bytes = _repo_stats(settings)
+                if repo_bytes is not None:
+                    payload["repo_bytes"] = repo_bytes
         _post_callback(settings, instance_id, "backup-result", payload)
 
 

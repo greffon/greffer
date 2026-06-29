@@ -87,10 +87,15 @@ def test_backup_happy_restarts_and_reports_success(monkeypatch):
     assert payload["backup_id"] == "b1"
 
 
+def _managed_dest():
+    return SimpleNamespace(repo="s3:https://b2/bucket/t1", restic_password="pw",
+                           aws_access_key_id="k", aws_secret_access_key="s")
+
+
 def test_cold_backup_collects_repo_stats_after_restart(monkeypatch):
-    # GB-metering P1: the repo-size estimate is collected OFF the downtime path -- AFTER the
-    # instance restarts, never while it's still stopped (a slow restic stats must not extend the
-    # cold backup's outage). Also asserts repo_bytes reaches the callback payload.
+    # GB-metering: for a MANAGED (brokered) backup the repo-size estimate is collected OFF the
+    # downtime path -- AFTER the instance restarts, never while it's still stopped (a slow restic
+    # stats must not extend the cold backup's outage). Also asserts repo_bytes reaches the payload.
     _patch_common(monkeypatch)
     order = []
     monkeypatch.setattr(
@@ -107,10 +112,30 @@ def test_cold_backup_collects_repo_stats_after_restart(monkeypatch):
     cb = mock.Mock()
     monkeypatch.setattr(backup, "_post_callback", cb)
 
-    backup.backup_instance(_settings(), "i", "b1")
+    backup.backup_instance(_settings(), "i", "b1", destination=_managed_dest())
 
     assert order == ["restart", "stats"]            # stats AFTER restart -> off the downtime path
     assert cb.call_args.args[3]["repo_bytes"] == 4096
+
+
+def test_self_host_backup_skips_repo_stats(monkeypatch):
+    # Self-host (no brokered destination) must NOT run restic stats: repo_bytes is managed-only,
+    # and the scan would hold the per-instance lock (instance_busy risk) for nothing.
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"S","data_added":7}', ""))
+    monkeypatch.setattr(backup, "_restart", mock.Mock())
+    monkeypatch.setattr(backup, "_forget", lambda *a, **k: None)
+    stats = mock.Mock()
+    monkeypatch.setattr(backup, "_repo_stats", stats)
+    cb = mock.Mock()
+    monkeypatch.setattr(backup, "_post_callback", cb)
+
+    backup.backup_instance(_settings(), "i", "b1")  # no destination -> self-host
+
+    stats.assert_not_called()
+    assert "repo_bytes" not in cb.call_args.args[3]
 
 
 def test_restic_stats_total_size_tolerates_leading_progress_line():
