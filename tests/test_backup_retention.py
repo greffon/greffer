@@ -157,3 +157,25 @@ def test_forget_swallows_exception(monkeypatch):
 
     monkeypatch.setattr(backup, "_run_restic", _boom)
     backup._forget(_settings(), "i", safety=False)     # best-effort: must NOT raise
+
+
+def test_forget_snapshot_forgets_by_restic_id(monkeypatch):
+    # The migration backstop cleanup: forget ONE snapshot by its restic id in the
+    # per-instance repo -- NOT the tag-based retention forget.
+    calls = []
+    monkeypatch.setattr(backup, "_effective_settings", lambda s, dest, iid=None: s)
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda settings, args, mounts, *, read_only, timeout=3600: (calls.append(args) or (0, "", "")))
+    ok = backup.forget_snapshot(_settings(), "i", "SNAP123")
+    assert ok is True
+    assert calls == [["forget", "SNAP123"]]     # forget by id, no --tag / --keep
+
+
+def test_forget_snapshot_best_effort_on_failure(monkeypatch):
+    monkeypatch.setattr(backup, "_effective_settings", lambda s, dest, iid=None: s)
+    monkeypatch.setattr(backup, "_classify", lambda err: "locked")
+    monkeypatch.setattr(backup, "_run_restic",
+                        lambda *a, **k: (1, "", "Fatal: repository is already locked"))
+    # A failed forget returns False, never raises (the move already succeeded).
+    assert backup.forget_snapshot(_settings(), "i", "SNAP") is False

@@ -189,6 +189,16 @@ class GreffonRepoOpRequest(BaseModel):
     destination: BackupDestinationBlock | None = None
 
 
+class GreffonForgetRequest(BaseModel):
+    # Forget ONE snapshot by restic id (the migration backstop after a successful
+    # move). ``id`` scopes the per-instance repo; ``destination`` routes to the
+    # same brokered repo the backstop was written to. The SPACE reclaim is the
+    # separate prune cadence -- forget only unreferences the snapshot.
+    id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
+    restic_snapshot_id: str = Field(min_length=1, max_length=64)
+    destination: BackupDestinationBlock | None = None
+
+
 class GreffonDecommissionRequest(BaseModel):
     # Permanent teardown of an instance on this greffer (Phase 3 / the
     # leaked-volume fix). Only the id is needed; the greffer derives the compose
