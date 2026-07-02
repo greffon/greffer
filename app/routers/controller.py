@@ -31,6 +31,7 @@ from app.models.controller import (
     GreffonBackupRequest,
     GreffonDecommissionRequest,
     GreffonDecommissionResponse,
+    GreffonForgetRequest,
     GreffonRepoOpRequest,
     GreffonBackupResponse,
     GreffonRestoreRequest,
@@ -382,6 +383,23 @@ def get_restore_status(id: str, restore_id: str, request: Request) -> dict:
     """Durable restore outcome for the manager's reconciler -- a stuck RestoreRun
     is never blind-failed (its volumes may already be overwritten)."""
     return backup.restore_status(_settings(request), id, restore_id)
+
+
+@router.post("/backup/forget/")
+def forget_snapshot_endpoint(
+    payload: GreffonForgetRequest, request: Request
+) -> dict:
+    """Forget ONE snapshot by restic id -- the migration backstop after a
+    SUCCESSFUL move. The manager calls this best-effort post-decommission so the
+    now-redundant backstop stops consuming the storage cap. Synchronous + best-
+    effort: forget is a fast metadata op, and a failure just leaves the snapshot
+    for the next prune cadence. SPACE is reclaimed by the separate prune, not
+    here (forget only unreferences)."""
+    _refuse_if_updating(_settings(request))
+    ok = backup.forget_snapshot(
+        _settings(request), payload.id, payload.restic_snapshot_id,
+        destination=payload.destination)
+    return {"status": "forgotten" if ok else "failed"}
 
 
 @router.post("/prune/", status_code=202)

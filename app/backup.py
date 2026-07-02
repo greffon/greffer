@@ -442,6 +442,33 @@ def _forget(settings, instance_id: str, *, safety: bool) -> None:
                          instance_id, safety)
 
 
+def forget_snapshot(settings, instance_id: str, restic_snapshot_id: str,
+                    *, destination=None) -> bool:
+    """Forget ONE snapshot by restic id -- the migration backstop, after a
+    SUCCESSFUL cross-greffer move. The data now lives on the target, so the
+    backstop is no longer a needed restore point and should stop consuming the
+    storage cap. Targets the per-instance repo (mirrors restore_instance's
+    ``_effective_settings``). The SPACE reclaim is the separate per-instance prune
+    cadence -- this only UNREFERENCES the snapshot. Best-effort: any failure is
+    logged, never raised (the move already succeeded; a leftover snapshot is a
+    cost, not a corruption). Returns True on a clean forget."""
+    try:
+        eff = _effective_settings(settings, destination, instance_id)
+        rc, _out, err = _run_restic(
+            eff, ["forget", restic_snapshot_id], [], read_only=True,
+            timeout=getattr(settings, "backup_forget_timeout_seconds", 300))
+        if rc != 0:
+            logger.warning(
+                "restic_forget_snapshot_failed instance=%s snapshot=%s code=%s",
+                instance_id, restic_snapshot_id, _classify(err))
+            return False
+        return True
+    except Exception:  # noqa: BLE001 -- cleanup is best-effort, never fatal
+        logger.exception("restic_forget_snapshot_error instance=%s snapshot=%s",
+                         instance_id, restic_snapshot_id)
+        return False
+
+
 def _backup_mounts(settings, instance_id: str) -> list[tuple[str, str]]:
     """The data volumes (``<id>_*`` excl. nginx) mounted at ``/data/<vol>``, plus
     ``l4_ports.json`` for L4 greffons -- the one non-regenerable instance-dir file
