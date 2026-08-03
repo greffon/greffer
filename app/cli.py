@@ -14,6 +14,7 @@ Exit codes:
     1  — at least one migration failed
     2  — bad arguments (e.g. --only references an unknown id)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,47 +27,44 @@ from apps.utils.ops_migrations.registry import all_migrations
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m app.cli",
-        description="Greffer operational CLI",
+        prog='python -m app.cli',
+        description='Greffer operational CLI',
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest='command', required=True)
 
     m = sub.add_parser(
-        "apply_ops_migrations",
-        help="Apply pending greffer operational migrations (on-disk + docker state).",
+        'apply_ops_migrations',
+        help='Apply pending greffer operational migrations (on-disk + docker state).',
     )
     m.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List migrations that would be applied without touching state.",
+        '--dry-run',
+        action='store_true',
+        help='List migrations that would be applied without touching state.',
     )
     m.add_argument(
-        "--only",
-        metavar="MIGRATION_ID",
+        '--only',
+        metavar='MIGRATION_ID',
         default=None,
-        help="Apply exactly one migration by id (must match a registered id).",
+        help='Apply exactly one migration by id (must match a registered id).',
     )
     m.add_argument(
-        "--fail-fast",
-        action="store_true",
+        '--fail-fast',
+        action='store_true',
         help=(
-            "Halt the batch on the first failure (default: keep going unless "
-            "the migration declares stop_on_failure=True)."
+            'Halt the batch on the first failure (default: keep going unless '
+            'the migration declares stop_on_failure=True).'
         ),
     )
     m.add_argument(
-        "--restore",
-        metavar="MIGRATION_ID",
+        '--restore',
+        metavar='MIGRATION_ID',
         default=None,
-        help=(
-            "Print the backup paths recorded for the given migration. "
-            "Manual step after that: apply them yourself."
-        ),
+        help=('Print the backup paths recorded for the given migration. Manual step after that: apply them yourself.'),
     )
     m.add_argument(
-        "--data-root",
+        '--data-root',
         default=None,
-        help="Override $GREFFON_PATH (default: value from Settings).",
+        help='Override $GREFFON_PATH (default: value from Settings).',
     )
     m.set_defaults(func=_apply_ops_migrations)
 
@@ -84,19 +82,18 @@ def _apply_ops_migrations(args: argparse.Namespace) -> int:
     if args.restore:
         paths = operations.restore(args.restore, data_root)
         if not paths:
-            print(f"no backups recorded for {args.restore}", file=sys.stderr)
+            print(f'no backups recorded for {args.restore}', file=sys.stderr)
             return 0
-        print(f"backups for {args.restore}:")
+        print(f'backups for {args.restore}:')
         for p in paths:
-            print(f"  {p}")
+            print(f'  {p}')
         return 0
 
     if args.only:
         known_ids = {m.id for m in all_migrations()}
         if args.only not in known_ids:
             print(
-                f"--only {args.only!r}: no migration with that id registered. "
-                f"Known: {sorted(known_ids)}",
+                f'--only {args.only!r}: no migration with that id registered. Known: {sorted(known_ids)}',
                 file=sys.stderr,
             )
             return 2
@@ -109,21 +106,31 @@ def _apply_ops_migrations(args: argparse.Namespace) -> int:
     )
 
     if not results:
-        print("no pending migrations")
+        print('no pending migrations')
         return 0
 
     failures = [r for r in results if not r.ok]
     for r in results:
-        if r.ok:
-            print(f"  OK   {r.id} ({r.duration_seconds}s) {r.summary}")
+        if r.ok and r.summary.get('advisory_failed'):
+            # ok=True only because the migration is advisory (it must not gate
+            # boot). Printing a bare OK here would tell an operator the cleanup
+            # succeeded while, for 0002, key material is still on disk.
+            print(
+                f'  WARN {r.id} ({r.duration_seconds}s) — advisory migration '
+                f'FAILED, boot continues, retries next start: {r.error} '
+                f'{r.summary}',
+                file=sys.stderr,
+            )
+        elif r.ok:
+            print(f'  OK   {r.id} ({r.duration_seconds}s) {r.summary}')
         else:
             print(
-                f"  FAIL {r.id} ({r.duration_seconds}s) — {r.error}",
+                f'  FAIL {r.id} ({r.duration_seconds}s) — {r.error}',
                 file=sys.stderr,
             )
 
     return 1 if failures else 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

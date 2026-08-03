@@ -14,6 +14,7 @@ Safety properties:
     - A migration that raises: Result.ok=False, ledger unchanged, continue to
       the next (unless mig.stop_on_failure or batch fail_fast)
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -26,9 +27,9 @@ from .base import Result, Migration
 from .ledger import Ledger
 from .registry import all_migrations
 
-logger = logging.getLogger("greffer.ops_migrations")
+logger = logging.getLogger('greffer.ops_migrations')
 
-LOCK_FILENAME = ".greffer-migrations.lock"
+LOCK_FILENAME = '.greffer-migrations.lock'
 
 
 @contextlib.contextmanager
@@ -36,7 +37,7 @@ def _runner_lock(data_root: str):
     """Exclusive flock held across the batch. Creates data_root if missing."""
     os.makedirs(data_root, exist_ok=True)
     path = os.path.join(data_root, LOCK_FILENAME)
-    with open(path, "w") as f:
+    with open(path, 'w') as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -51,11 +52,11 @@ def apply_pending(
     dry_run: bool = False,
     fail_fast: bool = False,
 ) -> list[Result]:
-    data_root = data_root or os.getenv("GREFFON_PATH", "/data")
-    if os.getenv("GREFFER_SKIP_OPS_MIGRATIONS"):
+    data_root = data_root or os.getenv('GREFFON_PATH', '/data')
+    if os.getenv('GREFFER_SKIP_OPS_MIGRATIONS'):
         logger.warning(
-            "GREFFER_SKIP_OPS_MIGRATIONS is set — skipping all ops migrations. "
-            "You must run `python -m app.cli apply_ops_migrations` manually to recover."
+            'GREFFER_SKIP_OPS_MIGRATIONS is set — skipping all ops migrations. '
+            'You must run `python -m app.cli apply_ops_migrations` manually to recover.'
         )
         return []
 
@@ -65,34 +66,55 @@ def apply_pending(
         for mig in all_migrations():
             if only is not None and mig.id != only:
                 continue
-            if ledger.is_applied(mig.id):
-                logger.debug(f"ops-migration {mig.id}: already applied, skipping")
+            # Advisory migrations deliberately ignore the ledger: their targets
+            # can appear after the first run, so a one-shot purge would skip
+            # exactly the state they exist to remove. See Migration.advisory.
+            if ledger.is_applied(mig.id) and not mig.advisory:
+                logger.debug(f'ops-migration {mig.id}: already applied, skipping')
                 continue
             if dry_run:
-                logger.info(f"ops-migration {mig.id}: would run — {mig.description}")
-                results.append(Result(id=mig.id, ok=True, summary={"dry_run": True}))
+                logger.info(f'ops-migration {mig.id}: would run — {mig.description}')
+                results.append(Result(id=mig.id, ok=True, summary={'dry_run': True}))
                 continue
 
             result = _run_single(mig, data_root, ledger)
+            if mig.advisory and not result.ok:
+                # Best-effort cleanup must not brick the node. Downgrade to a
+                # non-gating result so `app.cli` exits 0 and uvicorn still
+                # binds -- but log CRITICAL, because for 0002 this means key
+                # material is STILL on disk and an operator has to act. The
+                # next boot retries (advisory ignores the ledger).
+                logger.critical(
+                    f'ops-migration {mig.id}: FAILED but is advisory — boot '
+                    f'continues and it will retry next start. Error: '
+                    f'{result.error}. Summary: {result.summary}'
+                )
+                result = Result(
+                    id=result.id,
+                    ok=True,
+                    summary={**result.summary, 'advisory_failed': True},
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                )
             results.append(result)
             if not result.ok and (mig.stop_on_failure or fail_fast):
                 logger.error(
-                    f"ops-migration {mig.id} failed and "
-                    f"{'stop_on_failure' if mig.stop_on_failure else '--fail-fast'} "
-                    "is set; halting batch."
+                    f'ops-migration {mig.id} failed and '
+                    f'{"stop_on_failure" if mig.stop_on_failure else "--fail-fast"} '
+                    'is set; halting batch.'
                 )
                 break
         return results
 
 
 def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
-    logger.info(f"ops-migration {mig.id}: starting — {mig.description}")
+    logger.info(f'ops-migration {mig.id}: starting — {mig.description}')
     started = time.time()
     try:
         mig.check_preconditions(data_root)
         summary = mig.run(data_root) or {}
     except Exception as e:
-        logger.exception(f"ops-migration {mig.id}: FAILED: {e}")
+        logger.exception(f'ops-migration {mig.id}: FAILED: {e}')
         return Result(
             id=mig.id,
             ok=False,
@@ -101,16 +123,17 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
         )
     if not isinstance(summary, dict):
         logger.error(
-            f"ops-migration {mig.id}: returned {type(summary).__name__}, "
-            "not a dict summary; treating as failure (not marking applied)."
+            f'ops-migration {mig.id}: returned {type(summary).__name__}, '
+            'not a dict summary; treating as failure (not marking applied).'
         )
         return Result(
-            id=mig.id, ok=False,
-            error="migration did not return a dict summary",
+            id=mig.id,
+            ok=False,
+            error='migration did not return a dict summary',
             duration_seconds=round(time.time() - started, 3),
         )
     duration = round(time.time() - started, 3)
-    backups = list(summary.pop("backups", []) or [])
+    backups = list(summary.pop('backups', []) or [])
 
     # Don't mark applied if the migration reported per-item errors. A migration
     # that copied 3 of 5 volumes and logged 2 errors has NOT succeeded; marking
@@ -121,27 +144,29 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
     # Defensive: a malformed summary (non-numeric `errors`) from a misbehaving
     # migration becomes a normal failure result instead of crashing the batch.
     try:
-        error_count = int(summary.get("errors") or 0)
+        error_count = int(summary.get('errors') or 0)
     except (TypeError, ValueError):
         logger.error(
             f"ops-migration {mig.id}: returned non-numeric 'errors' key "
-            f"({summary.get('errors')!r}); treating as failure (not marking applied)."
-        )
-        return Result(
-            id=mig.id, ok=False, summary=summary,
-            error=f"malformed summary.errors={summary.get('errors')!r}",
-            duration_seconds=duration,
-        )
-    if error_count > 0:
-        logger.error(
-            f"ops-migration {mig.id}: completed with {error_count} per-item errors "
-            f"in {duration}s — NOT marked applied; will retry next run."
+            f'({summary.get("errors")!r}); treating as failure (not marking applied).'
         )
         return Result(
             id=mig.id,
             ok=False,
             summary=summary,
-            error=f"{error_count} per-item error(s)",
+            error=f'malformed summary.errors={summary.get("errors")!r}',
+            duration_seconds=duration,
+        )
+    if error_count > 0:
+        logger.error(
+            f'ops-migration {mig.id}: completed with {error_count} per-item errors '
+            f'in {duration}s — NOT marked applied; will retry next run.'
+        )
+        return Result(
+            id=mig.id,
+            ok=False,
+            summary=summary,
+            error=f'{error_count} per-item error(s)',
             duration_seconds=duration,
         )
 
@@ -151,5 +176,5 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
         duration_seconds=duration,
         backups=backups,
     )
-    logger.info(f"ops-migration {mig.id}: applied in {duration}s — {summary}")
+    logger.info(f'ops-migration {mig.id}: applied in {duration}s — {summary}')
     return Result(id=mig.id, ok=True, summary=summary, duration_seconds=duration)

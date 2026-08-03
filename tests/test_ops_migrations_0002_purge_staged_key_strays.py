@@ -57,3 +57,46 @@ def test_does_not_descend_into_subdirectories(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert PurgeStagedKeyStrays().run(str(tmp_path / 'data'))['migrated'] == 0
     assert (sub / _UUID).exists()
+
+
+def test_a_file_that_fails_to_unlink_is_not_counted_as_removed(
+        tmp_path, monkeypatch):
+    """The summary is the operator's signal for whether key material is still
+    exposed. Counting at classification time (before the unlink) reported an
+    UNDELETED private key as removed -- i.e. it said the leak was cleaned up
+    while the key was still on disk."""
+    (tmp_path / _UUID).write_text(_KEY)      # this one will fail to unlink
+    (tmp_path / _UUID2).write_text(_KEY)     # this one succeeds
+    monkeypatch.chdir(tmp_path)
+
+    real_unlink = os.unlink
+
+    def _unlink(path, *a, **kw):
+        if os.path.basename(path) == _UUID:
+            raise OSError(13, 'Permission denied')
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(os, 'unlink', _unlink)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+
+    assert summary['errors'] == 1
+    assert summary['migrated'] == 1
+    # The key point: exactly ONE key is reported removed, not two.
+    assert summary['private_keys_removed'] == 1
+    assert (summary['private_keys_removed'] + summary['certificates_removed']
+            == summary['migrated'])
+    # And the undeleted one really is still there.
+    assert (tmp_path / _UUID).exists()
+
+
+def test_skipped_counts_the_candidates_that_were_left_alone(
+        tmp_path, monkeypatch):
+    """`skipped` was hardcoded 0, so an operator could not tell the
+    narrow-by-construction filters had actually engaged."""
+    (tmp_path / _UUID).write_text(_KEY)               # removed
+    (tmp_path / _UUID2).write_text('{"not": "pem"}')  # uuid-shaped, not PEM
+    (tmp_path / 'server.key').write_text(_KEY)        # PEM, not uuid-shaped
+    monkeypatch.chdir(tmp_path)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+    assert summary['migrated'] == 1
+    assert summary['skipped'] == 2

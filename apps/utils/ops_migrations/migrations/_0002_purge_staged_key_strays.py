@@ -17,6 +17,14 @@ makes them invisible to ``git status``, so without this migration the fix
 converts a visible mess into a silent one. This runs at boot, before uvicorn
 binds, on every greffer.
 
+Marked ``advisory`` (see ``Migration.advisory``): it re-scans on EVERY boot
+rather than once, and a failure is logged loudly instead of gating startup.
+Both matter here. Strays can appear after the first run (a restored data root,
+a first boot without the bind mount) and the ``.gitignore`` rule now hides them
+from ``git status``, so a one-shot purge would silently skip the very thing it
+exists to remove. And crashlooping a greffer because one duplicate file could
+not be unlinked trades a whole node's availability for nothing.
+
 Destructive by necessity: the whole point is that this material must not
 persist. It is safe because the files are pure duplicates — the volume already
 holds its own copy, which is what nginx actually serves. Deleting them cannot
@@ -27,6 +35,7 @@ root (never a subdirectory), match the exact 36-character UUID shape with no
 extension, be a regular file, AND begin with a PEM header. Anything failing any
 one of those is left alone.
 """
+
 from __future__ import annotations
 
 import logging
@@ -36,13 +45,11 @@ import re
 from ..base import Migration
 from ..registry import register
 
-logger = logging.getLogger("greffer.ops_migrations")
+logger = logging.getLogger('greffer.ops_migrations')
 
 # The exact shape the old code produced: str(uuid4()), nothing else.
-_UUID_NAME = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
-_PEM_PREFIX = b"-----BEGIN "
+_UUID_NAME = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+_PEM_PREFIX = b'-----BEGIN '
 
 
 def _is_stray(path: str) -> bool:
@@ -54,7 +61,7 @@ def _is_stray(path: str) -> bool:
     try:
         if not os.path.isfile(path) or os.path.islink(path):
             return False
-        with open(path, "rb") as f:
+        with open(path, 'rb') as f:
             return f.read(len(_PEM_PREFIX)) == _PEM_PREFIX
     except OSError:
         return False
@@ -62,11 +69,21 @@ def _is_stray(path: str) -> bool:
 
 @register
 class PurgeStagedKeyStrays(Migration):
-    id = "0002_purge_staged_key_strays"
+    id = '0002_purge_staged_key_strays'
     description = (
-        "Delete uuid4-named PEM files left in the working directory by the "
-        "pre-fix volume-staging code (unencrypted instance TLS private keys)."
+        'Delete uuid4-named PEM files left in the working directory by the '
+        'pre-fix volume-staging code (unencrypted instance TLS private keys).'
     )
+    # Cleanup, not a state change the runtime depends on. Without this flag a
+    # single un-deletable stray (read-only mount, a hardening `USER`, an
+    # immutable flag) returns errors>0, the runner withholds `applied`, the CLI
+    # exits 1, and the `&&`-gated CMD never starts uvicorn -- so the greffer
+    # CRASHLOOPS forever to avoid leaving one duplicate file on disk. That
+    # trade is backwards. Advisory also makes the purge re-scan every boot,
+    # which matters because strays can appear after the first run (a restored
+    # data root, a first boot without the bind mount) and the .gitignore rule
+    # added alongside this migration hides them from `git status`.
+    advisory = True
 
     def run(self, data_root: str) -> dict:
         # ``data_root`` is required by the runner's contract but deliberately
@@ -75,49 +92,73 @@ class PurgeStagedKeyStrays(Migration):
         # which in a bind-mounted dev checkout is the repo root.
         del data_root
         root = os.getcwd()
-        removed = errors = 0
+        removed = errors = skipped = 0
         keys = certs = 0
         try:
             names = os.listdir(root)
         except OSError as exc:
-            logger.warning("0002: cannot list %s: %s", root, exc)
-            return {"migrated": 0, "skipped": 0, "errors": 1, "backups": []}
+            logger.warning('0002: cannot list %s: %s', root, exc)
+            return {'migrated': 0, 'skipped': 0, 'errors': 1, 'backups': []}
 
         for name in names:
             if not _UUID_NAME.match(name):
+                skipped += 1
                 continue
             path = os.path.join(root, name)
             if not _is_stray(path):
+                skipped += 1
                 continue
             # Record what it was before unlinking, so the summary tells an
             # operator whether key material was actually exposed here.
             try:
-                with open(path, "rb") as f:
+                with open(path, 'rb') as f:
                     head = f.read(40)
-                if b"PRIVATE KEY" in head:
-                    keys += 1
-                else:
-                    certs += 1
+                was_key = b'PRIVATE KEY' in head
                 os.unlink(path)
-                removed += 1
             except OSError as exc:
-                logger.warning("0002: failed to remove %s: %s", path, exc)
+                logger.warning('0002: failed to remove %s: %s', path, exc)
                 errors += 1
+                continue
+            # Count ONLY after a successful unlink. Incrementing at
+            # classification time reported a file that FAILED to unlink as
+            # removed key material -- and this summary is the operator's
+            # signal for whether a key is still exposed, so an optimistic
+            # count there is worse than no count at all.
+            if was_key:
+                keys += 1
+            else:
+                certs += 1
+            removed += 1
 
+        if errors:
+            # CRITICAL, not warning: this is the one outcome where key material
+            # the migration was written to destroy is still sitting on disk.
+            # Advisory means boot continues, so this log is the ONLY signal.
+            logger.critical(
+                '0002: FAILED to remove %d staged TLS file(s) from %s — key '
+                'material may still be exposed there. Boot continues (advisory) '
+                'and this retries on the next start; remove them by hand if it '
+                'persists.',
+                errors,
+                root,
+            )
         if removed:
             logger.warning(
-                "0002: removed %d staged TLS file(s) from %s (%d private "
-                "key(s), %d certificate(s)). These were written by the "
-                "pre-fix volume-staging code. Any leaked key belongs to a "
-                "manager-CA-signed instance cert; rotating those instances "
-                "(a restart re-mints) is the conservative follow-up.",
-                removed, root, keys, certs,
+                '0002: removed %d staged TLS file(s) from %s (%d private '
+                'key(s), %d certificate(s)). These were written by the '
+                'pre-fix volume-staging code. Any leaked key belongs to a '
+                'manager-CA-signed instance cert; rotating those instances '
+                '(a restart re-mints) is the conservative follow-up.',
+                removed,
+                root,
+                keys,
+                certs,
             )
         return {
-            "migrated": removed,
-            "skipped": 0,
-            "errors": errors,
-            "backups": [],
-            "private_keys_removed": keys,
-            "certificates_removed": certs,
+            'migrated': removed,
+            'skipped': skipped,
+            'errors': errors,
+            'backups': [],
+            'private_keys_removed': keys,
+            'certificates_removed': certs,
         }

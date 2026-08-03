@@ -265,3 +265,92 @@ class RunnerTests(TestCase):
 def _rmtree(path):
     import shutil
     shutil.rmtree(path, ignore_errors=True)
+
+
+class AdvisoryMigrationTests(TestCase):
+    """`advisory` migrations are best-effort cleanup: they must never gate boot,
+    and they must re-scan every run.
+
+    Both properties exist because of 0002 (purge leaked TLS private keys). The
+    non-advisory default is right for a migration the runtime depends on, but
+    for a cleanup it meant a single un-deletable file crashlooped the greffer
+    (errors>0 -> not applied -> CLI exit 1 -> the &&-gated CMD never starts
+    uvicorn), and a ledger entry made the purge one-shot per data_root.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(_rmtree, self.tmp)
+
+    @_with_fresh_registry
+    def test_per_item_errors_do_not_gate_boot(self):
+        class Advisory(Migration):
+            id = "0009_advisory_errors"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 0, "errors": 3}
+
+        registry.register(Advisory)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        # ok stays True -> app.cli exits 0 -> uvicorn still binds.
+        self.assertTrue(results[0].ok)
+        self.assertTrue(results[0].summary.get("advisory_failed"))
+        self.assertIn("3 per-item error", results[0].error)
+
+    @_with_fresh_registry
+    def test_a_raise_does_not_gate_boot(self):
+        class Exploding(Migration):
+            id = "0009_advisory_raises"
+            advisory = True
+            def run(self, data_root):
+                raise OSError("read-only file system")
+
+        registry.register(Exploding)
+        results = runner.apply_pending(data_root=self.tmp)
+        self.assertTrue(results[0].ok)
+        self.assertTrue(results[0].summary.get("advisory_failed"))
+
+    @_with_fresh_registry
+    def test_a_non_advisory_migration_still_gates_boot(self):
+        """Guard against the flag leaking into the default: 0001 must keep its
+        fail-closed behaviour."""
+        class Strict(Migration):
+            id = "0009_strict_errors"
+            def run(self, data_root):
+                return {"migrated": 0, "errors": 1}
+
+        registry.register(Strict)
+        results = runner.apply_pending(data_root=self.tmp)
+        self.assertFalse(results[0].ok)
+
+    @_with_fresh_registry
+    def test_advisory_reruns_even_once_applied(self):
+        """A stray that appears AFTER the first successful run still gets
+        cleaned. With ledger-gating this second run was skipped entirely."""
+        runs = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_rescan"
+            advisory = True
+            def run(self, data_root):
+                runs.append(1); return {"migrated": 0}
+
+        registry.register(Advisory)
+        runner.apply_pending(data_root=self.tmp)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(len(runs), 2)
+
+    @_with_fresh_registry
+    def test_non_advisory_still_skips_when_applied(self):
+        runs = []
+
+        class Once(Migration):
+            id = "0009_once_only"
+            def run(self, data_root):
+                runs.append(1); return {"migrated": 0}
+
+        registry.register(Once)
+        runner.apply_pending(data_root=self.tmp)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(len(runs), 1)
