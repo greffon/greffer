@@ -68,7 +68,12 @@ class PurgeStagedKeyStrays(Migration):
         "pre-fix volume-staging code (unencrypted instance TLS private keys)."
     )
 
-    def run(self) -> dict:
+    def run(self, data_root: str) -> dict:
+        # ``data_root`` is required by the runner's contract but deliberately
+        # unused: the strays are NOT under $GREFFON_PATH. The old code wrote a
+        # bare relative filename, so they resolved against the process CWD,
+        # which in a bind-mounted dev checkout is the repo root.
+        del data_root
         root = os.getcwd()
         removed = errors = 0
         keys = certs = 0
