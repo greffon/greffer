@@ -76,3 +76,44 @@ def test_staged_files_are_removed_even_when_the_copy_raises(tmp_path, monkeypatc
     for path in seen:
         assert not os.path.exists(path), (
             f'key material survived a failed copy: {path}')
+
+
+def test_path_sources_are_never_deleted(tmp_path, monkeypatch):
+    """``type: 'path'`` sources are pre-existing operator files — the rendered
+    nginx.conf and every config JSON under $GREFFON_PATH. They are NOT staged
+    and must never be unlinked. Without this, moving `staged.append` out of the
+    content branch would still pass every other test in this file while the
+    greffer deleted the operator's configs."""
+    src = tmp_path / 'nginx.conf'
+    src.write_text('server {}')
+    monkeypatch.chdir(tmp_path)
+    with mock.patch.object(volume_mod.subprocess, 'run'):
+        volume_mod.docker_copy_file_into_volume({
+            'value': 'v',
+            'files': [{'type': 'path', 'src': str(src), 'dest': 'nginx.conf'}],
+        })
+    assert src.exists(), 'a pre-existing path source was deleted'
+
+
+def test_earlier_staged_files_are_cleaned_when_a_later_copy_raises(
+        tmp_path, monkeypatch):
+    """The raise must land on the SECOND file, so this exercises the
+    accumulating-`staged`-list property. Raising on the first would pass even
+    if cleanup only ever handled one entry."""
+    monkeypatch.chdir(tmp_path)
+    seen = []
+
+    def _run(argv, **kw):
+        if argv[:2] == ['docker', 'cp']:
+            seen.append(argv[2])
+            if len(seen) == 2:
+                raise RuntimeError('second copy exploded')
+    with mock.patch.object(volume_mod.subprocess, 'run', side_effect=_run):
+        try:
+            volume_mod.docker_copy_file_into_volume(_volume())
+        except RuntimeError:
+            pass
+
+    assert len(seen) == 2, 'the raise did not land on the second copy'
+    for path in seen:
+        assert not os.path.exists(path), f'staged key material survived: {path}'
