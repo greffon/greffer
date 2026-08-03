@@ -1,5 +1,6 @@
 import os
 import subprocess
+import tempfile
 from uuid import uuid4
 import logging
 # LOGGER_NAME is hardcoded to 'greffer' in greffer/settings.py; the env
@@ -58,16 +59,38 @@ def docker_copy_file_into_volume(volume):
     container_name = str(uuid4())
     subprocess.run(['docker',  'container', 'create', '--name',
                    container_name, '-v', f'{volume["value"]}:/root', 'hello-world'])
-    for file in volume.get('files', []):
-        file_src = None
-        if file['type'] == 'path':
-            file_src = file['src']
-        elif file['type'] == 'content':
-            file_src = str(uuid4())
-            with open(file_src, "xt") as f:
-                f.write(file['content'])
-                f.close()
-        subprocess.run(['docker', 'cp', file_src,
-                       f'{container_name}:/root/{file["dest"]}'])
+    # ``content`` files are staged on disk only long enough for `docker cp` to
+    # read them, then deleted. They must NOT be written to the CWD: this runs
+    # with WORKDIR /app and compose bind-mounts ./:/app, so a relative path
+    # lands in the operator's greffer checkout on the host -- and what is staged
+    # here includes each instance's UNENCRYPTED TLS private key (``cert.key``,
+    # see apps/utils/greffon/repository.py). Previously these were written as a
+    # bare uuid4() filename in the CWD and never removed, so every greffon start
+    # left a private key behind permanently, and outside .gitignore.
+    staged = []
+    try:
+        for file in volume.get('files', []):
+            file_src = None
+            if file['type'] == 'path':
+                file_src = file['src']
+            elif file['type'] == 'content':
+                # mkstemp: 0600 by construction, in the system temp dir, never
+                # the bind-mounted CWD.
+                fd, file_src = tempfile.mkstemp(prefix='greffon-vol-')
+                staged.append(file_src)
+                with os.fdopen(fd, 'wt') as f:
+                    f.write(file['content'])
+            subprocess.run(['docker', 'cp', file_src,
+                           f'{container_name}:/root/{file["dest"]}'])
+    finally:
+        # In a finally: a raising `docker cp` must not leave key material behind.
+        # Removing the staged copy does not affect the volume, which now has its
+        # own.
+        for path in staged:
+            try:
+                os.unlink(path)
+            except OSError:
+                logger.warning(
+                    'failed to remove staged volume file %s', path)
 
     subprocess.run(['docker', 'rm', container_name])

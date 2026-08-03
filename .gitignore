@@ -132,3 +132,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Defence in depth: staged volume content is now written to the system temp
+# dir (apps/utils/docker/volume.py), but historic checkouts may still hold
+# bare UUID-named files -- some of which are unencrypted TLS private keys.
+# Never let one be committed.
+????????-????-????-????-????????????
+greffon-vol-*
