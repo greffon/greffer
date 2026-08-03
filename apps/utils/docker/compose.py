@@ -665,11 +665,21 @@ _COMPOSE_ENV_ALLOWLIST = (
 )
 
 
-def _compose_env():
+def compose_env():
     """Minimal env for the docker-compose child: structurally prevents
     ``${GREFFER_TOKEN}`` (or any other greffer-only secret) from being
-    interpolated by a hostile catalog compose."""
+    interpolated by a hostile catalog compose.
+
+    Public because EVERY ``docker-compose`` invocation in this codebase must use
+    it, including the ones in ``app/backup.py``. Those two landed after the fix
+    that introduced this and inherited ``os.environ`` for months -- see the
+    call-site test in tests/test_compose.py, which now asserts the invariant
+    across the whole tree rather than testing this function in isolation."""
     return {k: v for k, v in os.environ.items() if k in _COMPOSE_ENV_ALLOWLIST}
+
+
+# Back-compat alias for the existing private call sites in this module.
+_compose_env = compose_env
 
 
 def start(greffon_info):
