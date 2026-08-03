@@ -626,6 +626,10 @@ def _restart(settings, instance_id: str) -> None:
     compose_file = Path(settings.greffon_path) / instance_id / "docker-compose.yml"
     subprocess.run(
         ["docker-compose", "-p", instance_id, "-f", str(compose_file), "up", "-d"],
+        # Scrubbed env: without it this child inherits GREFFER_TOKEN,
+        # RESTIC_PASSWORD and the AWS keys, and docker-compose interpolates
+        # ${VAR} from that environment into a catalog-authored compose file.
+        env=compose.compose_env(),
         capture_output=True, text=True, timeout=300,
     )
 
@@ -872,6 +876,8 @@ def _start_services(settings, instance_id: str, services: list[str]) -> None:
     subprocess.run(
         ["docker-compose", "-p", instance_id, "-f", str(compose_file),
          "up", "-d", *services],
+        # Scrubbed env -- see the sibling call in _restart.
+        env=compose.compose_env(),
         capture_output=True, text=True, timeout=300,
     )
 

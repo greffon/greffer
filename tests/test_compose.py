@@ -865,3 +865,34 @@ class GetStatusTests(TestCase):
 
         result = get_status('test-id')
         self.assertEqual(result['status'], 'unknow')
+
+
+def test_every_docker_compose_invocation_uses_the_scrubbed_env():
+    """Call-site invariant, not a unit test of compose_env().
+
+    The scrubbed env exists so a hostile catalog compose cannot interpolate
+    ${GREFFER_TOKEN} / ${RESTIC_PASSWORD} / ${AWS_SECRET_ACCESS_KEY} out of the
+    greffer's own environment. Testing the helper in isolation is what let the
+    two backup.py call sites ship inheriting os.environ for months -- the helper
+    was correct and simply never called there. Assert over the tree instead.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in list((root / 'app').rglob('*.py')) + list((root / 'apps').rglob('*.py')):
+        src = path.read_text()
+        for match in re.finditer(r'\[\s*["\']docker-compose["\']', src):
+            # Look at the subprocess call this argv belongs to: from the start
+            # of the list to the closing paren of the enclosing call.
+            tail = src[match.start():match.start() + 900]
+            call = tail.split('\n    )')[0]
+            if 'env=' not in call:
+                line = src[:match.start()].count('\n') + 1
+                offenders.append(f'{path.relative_to(root)}:{line}')
+    assert not offenders, (
+        'docker-compose invoked without a scrubbed env=; these inherit '
+        'GREFFER_TOKEN and the backup credentials into a catalog-authored '
+        f'compose: {offenders}'
+    )
