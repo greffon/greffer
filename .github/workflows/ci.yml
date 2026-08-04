@@ -83,3 +83,20 @@ jobs:
         # ~8.5s locally for 717 tests; the job is dominated by setup, not by
         # the suite. No -x: a full run reports every failure at once.
         run: poetry run pytest tests/ -q
+
+      # cli/ is a SEPARATE poetry project with its own lockfile and testpaths,
+      # so the run above (root `testpaths = ["tests"]`) never collects it.
+      #
+      # This leg must stay IDENTICAL to the one in docker-publish.yml's `test`
+      # job. That job gates the signed publish, and if this workflow tested
+      # less than it does, a PR could go green and then turn main red on merge
+      # — with the failure landing on the release path rather than the PR.
+      #
+      # cli-release.yml also runs these, but only on `pull_request` with
+      # `paths: ['cli/**']`, so it misses a PR that breaks cli/ without
+      # touching it (e.g. via Dockerfile.updater or this workflow).
+      - name: Run CLI tests
+        working-directory: cli
+        run: |
+          poetry install --no-interaction --sync
+          poetry run pytest -q
