@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 
 from ..base import Migration
 from ..registry import register
@@ -53,19 +54,50 @@ _UUID_NAME = re.compile(
 _PEM_PREFIX = b"-----BEGIN "
 
 
-def _is_stray(path: str) -> bool:
-    """A file is a stray only if it is BOTH uuid4-named and PEM-headed.
+# Probe verdicts. UNKNOWN is deliberately NOT the same as CLEAN: if we could
+# not read a uuid-named candidate we do not know whether it is a private key,
+# and reporting "nothing to do" for a file we never managed to inspect would
+# tell an operator the checkout is clean while a key may still sit there.
+_PROBE_STRAY = "stray"
+_PROBE_CLEAN = "clean"
+_PROBE_UNKNOWN = "unknown"
 
-    The content sniff is what makes this safe to run unattended: a
-    coincidentally uuid-named file that is not PEM is never touched.
+
+def _probe(path: str) -> tuple[str, bytes]:
+    """Classify one uuid-named entry, returning (verdict, first bytes).
+
+    A file is a stray only if it is BOTH uuid4-named and PEM-headed. The
+    content sniff is what makes this safe to run unattended: a coincidentally
+    uuid-named file that is not PEM is never touched.
+
+    Three outcomes, not two. A permission/ACL/IO error while inspecting is
+    UNKNOWN, which the caller counts as an error -- so the CRITICAL fires and
+    the advisory re-run retries it on the next boot. Returning the head here
+    also means the caller does not re-open the file to classify it, closing a
+    TOCTOU window between the sniff and the unlink.
     """
     try:
-        if not os.path.isfile(path) or os.path.islink(path):
-            return False
-        with open(path, "rb") as f:
-            return f.read(len(_PEM_PREFIX)) == _PEM_PREFIX
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return _PROBE_CLEAN, b""      # vanished: the goal state, not an error
     except OSError:
-        return False
+        return _PROBE_UNKNOWN, b""
+    # Symlinks, directories and FIFOs are never candidates BY DESIGN (the old
+    # staging code only ever wrote regular files), so this is a real clean, not
+    # a failure to inspect. Checking the lstat result also means a FIFO is
+    # rejected before any blocking open().
+    if not stat.S_ISREG(st.st_mode):
+        return _PROBE_CLEAN, b""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(40)
+    except FileNotFoundError:
+        return _PROBE_CLEAN, b""
+    except OSError:
+        return _PROBE_UNKNOWN, b""
+    if head[:len(_PEM_PREFIX)] != _PEM_PREFIX:
+        return _PROBE_CLEAN, head
+    return _PROBE_STRAY, head
 
 
 @register
@@ -91,7 +123,7 @@ class PurgeStagedKeyStrays(Migration):
         # which in a bind-mounted dev checkout is the repo root.
         del data_root
         root = os.getcwd()
-        removed = errors = skipped = 0
+        removed = errors = skipped = unreadable = 0
         keys = certs = 0
         try:
             names = os.listdir(root)
@@ -108,14 +140,21 @@ class PurgeStagedKeyStrays(Migration):
             if not _UUID_NAME.match(name):
                 continue
             path = os.path.join(root, name)
-            if not _is_stray(path):
+            verdict, head = _probe(path)
+            if verdict == _PROBE_UNKNOWN:
+                # Could not inspect it. NOT a skip: an uninspected uuid-named
+                # file may be an unencrypted TLS private key, and calling that
+                # "already in the target state" is the one lie this summary
+                # must never tell.
+                logger.warning("0002: cannot inspect %s", path)
+                unreadable += 1
+                continue
+            if verdict == _PROBE_CLEAN:
                 skipped += 1
                 continue
-            # Record what it was before unlinking, so the summary tells an
-            # operator whether key material was actually exposed here.
+            # `head` came from the probe, so there is no second read between
+            # the sniff and the unlink.
             try:
-                with open(path, "rb") as f:
-                    head = f.read(40)
                 was_key = b"PRIVATE KEY" in head
                 os.unlink(path)
             except FileNotFoundError:
@@ -142,16 +181,17 @@ class PurgeStagedKeyStrays(Migration):
                 certs += 1
             removed += 1
 
-        if errors:
+        if errors or unreadable:
             # CRITICAL, not warning: this is the one outcome where key material
-            # the migration was written to destroy is still sitting on disk.
+            # the migration was written to destroy may still be sitting on disk.
             # Advisory means boot continues, so this log is the ONLY signal.
             logger.critical(
-                "0002: FAILED to remove %d staged TLS file(s) from %s — key "
-                "material may still be exposed there. Boot continues (advisory) "
-                "and this retries on the next start; remove them by hand if it "
-                "persists.",
-                errors, root,
+                "0002: %d staged TLS file(s) could not be removed and %d "
+                "uuid-named file(s) could not be inspected in %s — key "
+                "material may still be exposed there. Boot continues "
+                "(advisory) and this retries on the next start; check them by "
+                "hand if it persists.",
+                errors, unreadable, root,
             )
         if removed:
             logger.warning(
@@ -165,7 +205,11 @@ class PurgeStagedKeyStrays(Migration):
         return {
             "migrated": removed,
             "skipped": skipped,
-            "errors": errors,
+            # An uninspectable candidate counts toward `errors` so the runner
+            # treats the run as failed: that is what makes the advisory retry
+            # happen and stops the CLI printing a bare OK.
+            "errors": errors + unreadable,
+            "unreadable": unreadable,
             "backups": [],
             "private_keys_removed": keys,
             "certificates_removed": certs,

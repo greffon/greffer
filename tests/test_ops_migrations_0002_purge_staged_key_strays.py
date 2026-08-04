@@ -103,3 +103,45 @@ def test_skipped_counts_the_candidates_that_were_left_alone(
     # every entry in the CWD. The CWD is the whole greffer checkout, so counting
     # unrelated files would report ~28 on a clean node and mean nothing.
     assert summary['skipped'] == 1, 'server.key is not a candidate at all'
+
+
+def test_an_uninspectable_candidate_is_an_error_not_a_skip(tmp_path, monkeypatch):
+    """A uuid-named file we could not READ is UNKNOWN, not clean.
+
+    _is_stray() used to swallow the OSError and return False, so a candidate
+    blocked by permissions/ACLs/an IO error was counted as a safe skip: errors
+    stayed 0, the runner reported success, and the CLI printed a bare OK while
+    an uninspected file that may be an unencrypted TLS private key was still
+    sitting in the checkout. That is the one lie this summary must not tell.
+    """
+    (tmp_path / _UUID).write_text(_KEY)
+    monkeypatch.chdir(tmp_path)
+
+    real_open = open
+
+    def _open(path, *a, **kw):
+        if os.path.basename(str(path)) == _UUID:
+            raise PermissionError(13, 'Permission denied')
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr('builtins.open', _open)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+
+    assert summary['errors'] >= 1, 'an uninspectable candidate must not read as clean'
+    assert summary['unreadable'] == 1
+    assert summary['skipped'] == 0
+    assert summary['migrated'] == 0
+    # And it is still there, which is exactly why the run must not look clean.
+    assert (tmp_path / _UUID).exists()
+
+
+def test_a_confirmed_non_pem_candidate_is_still_a_clean_skip(tmp_path, monkeypatch):
+    """The inverse: a candidate we DID inspect and found harmless must not be
+    inflated into an error, or every boot would cry wolf."""
+    (tmp_path / _UUID).write_text('{"not": "pem"}')
+    monkeypatch.chdir(tmp_path)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+    assert summary['errors'] == 0
+    assert summary['unreadable'] == 0
+    assert summary['skipped'] == 1
+    assert (tmp_path / _UUID).exists()
