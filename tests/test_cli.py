@@ -137,3 +137,49 @@ def test_restore_no_backups_returns_0_with_warning(
     assert rc == 0
     err = capsys.readouterr().err
     assert "no backups recorded" in err
+
+
+def test_advisory_failure_prints_WARN_not_OK_and_still_exits_0(
+    settings: Settings, capsys: pytest.CaptureFixture
+) -> None:
+    """An advisory migration that failed comes back ok=True so the &&-gated CMD
+    still starts uvicorn -- but the operator report must NOT read as clean. For
+    0002 this is the only stdout/stderr signal that leaked TLS private keys are
+    still on disk; the CRITICAL goes to the logger, not here.
+
+    Without this test the whole WARN branch could be deleted and every other
+    test still passed.
+    """
+    advisory_failed = MagicMock(
+        ok=True,
+        id="0002_purge_staged_key_strays",
+        duration_seconds=0.1,
+        summary={"migrated": 0, "errors": 1, "advisory_failed": True},
+        error="1 per-item error(s)",
+    )
+    with patch("app.cli.runner") as mock_runner:
+        mock_runner.apply_pending.return_value = [advisory_failed]
+        rc = main(["apply_ops_migrations"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, "an advisory failure must never gate boot"
+    assert "WARN" in captured.err
+    assert "0002_purge_staged_key_strays" in captured.err
+    # The dangerous regression: a bare OK telling the operator it worked.
+    assert "OK   0002_purge_staged_key_strays" not in captured.out
+
+
+def test_a_clean_advisory_run_still_prints_OK(
+    settings: Settings, capsys: pytest.CaptureFixture
+) -> None:
+    """Guard the inverse: only the advisory_failed marker downgrades to WARN, so
+    a successful advisory run is not permanently mislabelled."""
+    ok_advisory = MagicMock(
+        ok=True, id="0002_purge", duration_seconds=0.1,
+        summary={"migrated": 3, "errors": 0},
+    )
+    with patch("app.cli.runner") as mock_runner:
+        mock_runner.apply_pending.return_value = [ok_advisory]
+        rc = main(["apply_ops_migrations"])
+    assert rc == 0
+    assert "OK" in capsys.readouterr().out

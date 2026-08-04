@@ -65,7 +65,10 @@ def apply_pending(
         for mig in all_migrations():
             if only is not None and mig.id != only:
                 continue
-            if ledger.is_applied(mig.id):
+            # Advisory migrations deliberately ignore the ledger: their targets
+            # can appear after the first run, so a one-shot purge would skip
+            # exactly the state they exist to remove. See Migration.advisory.
+            if ledger.is_applied(mig.id) and not mig.advisory:
                 logger.debug(f"ops-migration {mig.id}: already applied, skipping")
                 continue
             if dry_run:
@@ -74,8 +77,32 @@ def apply_pending(
                 continue
 
             result = _run_single(mig, data_root, ledger)
+            # Batch control must see the REAL outcome. `advisory` governs whether
+            # a failure gates BOOT (the process exit code), NOT whether an
+            # operator's explicit --fail-fast / stop_on_failure halt request is
+            # honoured -- reading the downgraded result below would ignore both.
+            # Safe at boot: the Dockerfile CMD passes neither flag.
+            really_failed = not result.ok
+            if mig.advisory and really_failed:
+                # Best-effort cleanup must not brick the node. Downgrade to a
+                # non-gating result so `app.cli` exits 0 and uvicorn still
+                # binds -- but log CRITICAL, because for 0002 this means key
+                # material is STILL on disk and an operator has to act. The
+                # next boot retries (advisory ignores the ledger).
+                logger.critical(
+                    f"ops-migration {mig.id}: FAILED but is advisory — boot "
+                    f"continues and it will retry next start. Error: "
+                    f"{result.error}. Summary: {result.summary}"
+                )
+                result = Result(
+                    id=result.id,
+                    ok=True,
+                    summary={**result.summary, "advisory_failed": True},
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                )
             results.append(result)
-            if not result.ok and (mig.stop_on_failure or fail_fast):
+            if really_failed and (mig.stop_on_failure or fail_fast):
                 logger.error(
                     f"ops-migration {mig.id} failed and "
                     f"{'stop_on_failure' if mig.stop_on_failure else '--fail-fast'} "
@@ -110,7 +137,23 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
             duration_seconds=round(time.time() - started, 3),
         )
     duration = round(time.time() - started, 3)
-    backups = list(summary.pop("backups", []) or [])
+    # Defensive, same reason as the `errors` guard below: a misbehaving
+    # migration returning a non-iterable `backups` raised TypeError straight
+    # out of apply_pending, bypassing even the advisory downgrade.
+    try:
+        backups = list(summary.pop("backups", []) or [])
+    except TypeError:
+        logger.error(
+            f"ops-migration {mig.id}: returned non-iterable 'backups' key; "
+            "treating as failure (not marking applied)."
+        )
+        return Result(
+            id=mig.id,
+            ok=False,
+            summary=summary,
+            error="malformed summary.backups",
+            duration_seconds=duration,
+        )
 
     # Don't mark applied if the migration reported per-item errors. A migration
     # that copied 3 of 5 volumes and logged 2 errors has NOT succeeded; marking
@@ -144,6 +187,22 @@ def _run_single(mig: Migration, data_root: str, ledger: Ledger) -> Result:
             error=f"{error_count} per-item error(s)",
             duration_seconds=duration,
         )
+
+    if mig.advisory:
+        # Advisory migrations re-run every boot, so the read side above ignores
+        # their ledger entry -- it has no consumer. Writing it anyway was a live
+        # crashloop risk: `mark_applied` is OUTSIDE the try above, so an
+        # ENOSPC/EIO inside Ledger._atomic_write propagates out of apply_pending,
+        # exits non-zero, and the `&&`-gated CMD never starts uvicorn -- the very
+        # failure this flag exists to prevent, reached by another route. It also
+        # froze run 1's summary forever, since mark_applied early-returns once
+        # applied while later runs reported real failures.
+        logger.info(
+            f"ops-migration {mig.id}: advisory, completed in {duration}s — "
+            f"{summary} (not recorded in the ledger; re-runs every boot)"
+        )
+        return Result(
+            id=mig.id, ok=True, summary=summary, duration_seconds=duration)
 
     ledger.mark_applied(
         mig.id,

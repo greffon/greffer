@@ -57,3 +57,91 @@ def test_does_not_descend_into_subdirectories(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert PurgeStagedKeyStrays().run(str(tmp_path / 'data'))['migrated'] == 0
     assert (sub / _UUID).exists()
+
+
+def test_a_file_that_fails_to_unlink_is_not_counted_as_removed(
+        tmp_path, monkeypatch):
+    """The summary is the operator's signal for whether key material is still
+    exposed. Counting at classification time (before the unlink) reported an
+    UNDELETED private key as removed -- i.e. it said the leak was cleaned up
+    while the key was still on disk."""
+    (tmp_path / _UUID).write_text(_KEY)      # this one will fail to unlink
+    (tmp_path / _UUID2).write_text(_KEY)     # this one succeeds
+    monkeypatch.chdir(tmp_path)
+
+    real_unlink = os.unlink
+
+    def _unlink(path, *a, **kw):
+        if os.path.basename(path) == _UUID:
+            raise OSError(13, 'Permission denied')
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(os, 'unlink', _unlink)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+
+    assert summary['errors'] == 1
+    assert summary['migrated'] == 1
+    # The key point: exactly ONE key is reported removed, not two.
+    assert summary['private_keys_removed'] == 1
+    assert (summary['private_keys_removed'] + summary['certificates_removed']
+            == summary['migrated'])
+    # And the undeleted one really is still there.
+    assert (tmp_path / _UUID).exists()
+
+
+def test_skipped_counts_the_candidates_that_were_left_alone(
+        tmp_path, monkeypatch):
+    """`skipped` was hardcoded 0, so an operator could not tell the
+    narrow-by-construction filters had actually engaged."""
+    (tmp_path / _UUID).write_text(_KEY)               # removed
+    (tmp_path / _UUID2).write_text('{"not": "pem"}')  # uuid-shaped, not PEM
+    (tmp_path / 'server.key').write_text(_KEY)        # PEM, not uuid-shaped
+    monkeypatch.chdir(tmp_path)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+    assert summary['migrated'] == 1
+    # `skipped` counts uuid-NAMED candidates the content sniff spared -- NOT
+    # every entry in the CWD. The CWD is the whole greffer checkout, so counting
+    # unrelated files would report ~28 on a clean node and mean nothing.
+    assert summary['skipped'] == 1, 'server.key is not a candidate at all'
+
+
+def test_an_uninspectable_candidate_is_an_error_not_a_skip(tmp_path, monkeypatch):
+    """A uuid-named file we could not READ is UNKNOWN, not clean.
+
+    _is_stray() used to swallow the OSError and return False, so a candidate
+    blocked by permissions/ACLs/an IO error was counted as a safe skip: errors
+    stayed 0, the runner reported success, and the CLI printed a bare OK while
+    an uninspected file that may be an unencrypted TLS private key was still
+    sitting in the checkout. That is the one lie this summary must not tell.
+    """
+    (tmp_path / _UUID).write_text(_KEY)
+    monkeypatch.chdir(tmp_path)
+
+    real_open = open
+
+    def _open(path, *a, **kw):
+        if os.path.basename(str(path)) == _UUID:
+            raise PermissionError(13, 'Permission denied')
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr('builtins.open', _open)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+
+    assert summary['errors'] >= 1, 'an uninspectable candidate must not read as clean'
+    assert summary['unreadable'] == 1
+    assert summary['skipped'] == 0
+    assert summary['migrated'] == 0
+    # And it is still there, which is exactly why the run must not look clean.
+    assert (tmp_path / _UUID).exists()
+
+
+def test_a_confirmed_non_pem_candidate_is_still_a_clean_skip(tmp_path, monkeypatch):
+    """The inverse: a candidate we DID inspect and found harmless must not be
+    inflated into an error, or every boot would cry wolf."""
+    (tmp_path / _UUID).write_text('{"not": "pem"}')
+    monkeypatch.chdir(tmp_path)
+    summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
+    assert summary['errors'] == 0
+    assert summary['unreadable'] == 0
+    assert summary['skipped'] == 1
+    assert (tmp_path / _UUID).exists()

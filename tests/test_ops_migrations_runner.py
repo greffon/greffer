@@ -14,6 +14,13 @@ def _with_fresh_registry(fn):
     """Decorator — snapshot the registry before, restore after. Lets tests
     define their own Migration classes without polluting real migrations."""
     def wrapper(self, *a, **kw):
+        # Force the real migrations package to register BEFORE snapshotting.
+        # all_migrations() imports it for its @register side effect, so without
+        # this the first test to call apply_pending() registers 0001/0002 midway
+        # through its own body -- they land in the reset registry and show up as
+        # extra results. That made the file order-dependent: green in a full run
+        # (another module imported it first), red when run on its own.
+        from apps.utils.ops_migrations import migrations  # noqa: F401
         snapshot = dict(registry._REGISTRY)
         registry.reset_for_tests()
         try:
@@ -265,3 +272,212 @@ class RunnerTests(TestCase):
 def _rmtree(path):
     import shutil
     shutil.rmtree(path, ignore_errors=True)
+
+
+class AdvisoryMigrationTests(TestCase):
+    """`advisory` migrations are best-effort cleanup: they must never gate boot,
+    and they must re-scan every run.
+
+    Both properties exist because of 0002 (purge leaked TLS private keys). The
+    non-advisory default is right for a migration the runtime depends on, but
+    for a cleanup it meant a single un-deletable file crashlooped the greffer
+    (errors>0 -> not applied -> CLI exit 1 -> the &&-gated CMD never starts
+    uvicorn), and a ledger entry made the purge one-shot per data_root.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(_rmtree, self.tmp)
+
+    @_with_fresh_registry
+    def test_per_item_errors_do_not_gate_boot(self):
+        class Advisory(Migration):
+            id = "0009_advisory_errors"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 0, "errors": 3}
+
+        registry.register(Advisory)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        # ok stays True -> app.cli exits 0 -> uvicorn still binds.
+        self.assertTrue(results[0].ok)
+        self.assertTrue(results[0].summary.get("advisory_failed"))
+        self.assertIn("3 per-item error", results[0].error)
+
+    @_with_fresh_registry
+    def test_a_raise_does_not_gate_boot(self):
+        class Exploding(Migration):
+            id = "0009_advisory_raises"
+            advisory = True
+            def run(self, data_root):
+                raise OSError("read-only file system")
+
+        registry.register(Exploding)
+        results = runner.apply_pending(data_root=self.tmp)
+        self.assertTrue(results[0].ok)
+        self.assertTrue(results[0].summary.get("advisory_failed"))
+
+    @_with_fresh_registry
+    def test_a_non_advisory_migration_still_gates_boot(self):
+        """Guard against the flag leaking into the default: 0001 must keep its
+        fail-closed behaviour."""
+        class Strict(Migration):
+            id = "0009_strict_errors"
+            def run(self, data_root):
+                return {"migrated": 0, "errors": 1}
+
+        registry.register(Strict)
+        results = runner.apply_pending(data_root=self.tmp)
+        self.assertFalse(results[0].ok)
+
+    @_with_fresh_registry
+    def test_advisory_reruns_even_once_applied(self):
+        """A stray that appears AFTER the first successful run still gets
+        cleaned. With ledger-gating this second run was skipped entirely."""
+        runs = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_rescan"
+            advisory = True
+            def run(self, data_root):
+                runs.append(1); return {"migrated": 0}
+
+        registry.register(Advisory)
+        runner.apply_pending(data_root=self.tmp)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(len(runs), 2)
+
+    @_with_fresh_registry
+    def test_non_advisory_still_skips_when_applied(self):
+        runs = []
+
+        class Once(Migration):
+            id = "0009_once_only"
+            def run(self, data_root):
+                runs.append(1); return {"migrated": 0}
+
+        registry.register(Once)
+        runner.apply_pending(data_root=self.tmp)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(len(runs), 1)
+
+    @_with_fresh_registry
+    def test_fail_fast_still_halts_the_batch_on_an_advisory_failure(self):
+        """`advisory` decides whether a failure gates BOOT, not whether an
+        operator's explicit --fail-fast is honoured. Downgrading the result
+        before the halt check silently ignored the flag (Codex P2)."""
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_first"
+            advisory = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        results = runner.apply_pending(data_root=self.tmp, fail_fast=True)
+
+        self.assertEqual(ran, ["0009_advisory_first"], "--fail-fast did not halt")
+        # ...and the halt still must not gate boot: the advisory result stays ok,
+        # so the CLI exits 0.
+        self.assertTrue(all(r.ok for r in results))
+
+    @_with_fresh_registry
+    def test_advisory_plus_stop_on_failure_is_rejected_at_registration(self):
+        """The combination is unsafe at boot: the halt skips every LATER
+        migration while advisory keeps the exit code 0, so uvicorn binds on
+        state a required migration never touched -- the very thing the
+        &&-gated CMD prevents. Reject it at import time."""
+        class Contradictory(Migration):
+            id = "0009_advisory_and_stop"
+            advisory = True
+            stop_on_failure = True
+            def run(self, data_root):
+                return {}
+
+        with self.assertRaises(ValueError) as ctx:
+            registry.register(Contradictory)
+        self.assertIn("advisory", str(ctx.exception))
+
+    @_with_fresh_registry
+    def test_without_fail_fast_an_advisory_failure_does_not_halt(self):
+        """The default path is unchanged: a non-gating failure lets the rest of
+        the batch run, which is the whole point of advisory at boot."""
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_nohalt"
+            advisory = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later_nohalt"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(ran, ["0009_advisory_nohalt", "0010_later_nohalt"])
+
+    @_with_fresh_registry
+    def test_advisory_never_writes_the_ledger(self):
+        """`mark_applied` sits OUTSIDE _run_single's try, so an ENOSPC/EIO in
+        Ledger._atomic_write propagates out of apply_pending, exits non-zero,
+        and the &&-gated CMD never starts uvicorn -- the exact crashloop
+        `advisory` exists to prevent, reached by another route. The read side
+        already ignores an advisory entry, so it has no consumer.
+
+        Also fixes a frozen summary: mark_applied early-returns once applied, so
+        run 1's numbers stuck forever while later runs reported real failures.
+        """
+        class Advisory(Migration):
+            id = "0009_advisory_noledger"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 1}
+
+        registry.register(Advisory)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        self.assertTrue(results[0].ok)
+        self.assertFalse(
+            Ledger.load(self.tmp).is_applied("0009_advisory_noledger"),
+            "an advisory migration must not be recorded in the ledger",
+        )
+
+    @_with_fresh_registry
+    def test_a_failing_ledger_write_cannot_crash_an_advisory_boot(self):
+        """End-to-end of the above: even with the ledger write guaranteed to
+        blow up, an advisory-only batch still returns cleanly."""
+        class Advisory(Migration):
+            id = "0009_advisory_ledger_boom"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 0}
+
+        registry.register(Advisory)
+        with patch.object(
+            Ledger, "mark_applied", side_effect=OSError(28, "No space left")
+        ):
+            results = runner.apply_pending(data_root=self.tmp)   # must not raise
+        self.assertTrue(results[0].ok)
+
+    @_with_fresh_registry
+    def test_a_non_advisory_migration_still_records_the_ledger(self):
+        class Once(Migration):
+            id = "0009_records"
+            def run(self, data_root):
+                return {"migrated": 0}
+
+        registry.register(Once)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertTrue(Ledger.load(self.tmp).is_applied("0009_records"))

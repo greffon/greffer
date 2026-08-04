@@ -10,8 +10,13 @@ so operator runbooks (``--dry-run``, ``--only``, ``--fail-fast``,
 ``--restore``) continue to work verbatim.
 
 Exit codes:
-    0  — every attempted migration succeeded (or all were already applied)
-    1  — at least one migration failed
+    0  — every attempted migration succeeded (or all were already applied).
+         ALSO returned when an ``advisory`` migration failed: such a migration
+         is best-effort cleanup and must never stop the server from starting,
+         so its failure surfaces as a WARN line on stderr plus a CRITICAL log,
+         not a non-zero exit. A script that must react to it should match the
+         WARN line / the ``advisory_failed`` summary key, not ``$?``.
+    1  — at least one NON-advisory migration failed
     2  — bad arguments (e.g. --only references an unknown id)
 """
 from __future__ import annotations
@@ -114,7 +119,18 @@ def _apply_ops_migrations(args: argparse.Namespace) -> int:
 
     failures = [r for r in results if not r.ok]
     for r in results:
-        if r.ok:
+        if r.ok and r.summary.get("advisory_failed"):
+            # ok=True only because the migration is advisory (it must not gate
+            # boot). A bare OK here would tell an operator the cleanup worked
+            # while, for 0002, TLS private keys are still on disk -- and this
+            # is the only stdout/stderr signal they get.
+            print(
+                f"  WARN {r.id} ({r.duration_seconds}s) — advisory migration "
+                f"FAILED, boot continues, retries next start: {r.error} "
+                f"{r.summary}",
+                file=sys.stderr,
+            )
+        elif r.ok:
             print(f"  OK   {r.id} ({r.duration_seconds}s) {r.summary}")
         else:
             print(

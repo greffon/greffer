@@ -73,6 +73,31 @@ class Migration(ABC):
     # migrations that depend on the before-state.
     stop_on_failure: bool = False
 
+    # If True this migration is BEST-EFFORT CLEANUP, not a state change the
+    # runtime depends on. Three consequences, all deliberate:
+    #
+    #   1. It NEVER gates boot. A failure is logged at CRITICAL and the batch
+    #      result stays ok, so `app.cli` exits 0 and the `&&`-gated CMD still
+    #      starts uvicorn. The default (non-advisory) behaviour is right for a
+    #      migration like 0001, where serving on un-migrated state would be
+    #      wrong -- but for a cleanup, taking the node offline is a far worse
+    #      outcome than leaving the thing uncleaned.
+    #   2. It IGNORES the ledger and re-runs every boot. Cleanup targets can
+    #      appear AFTER the migration first ran (a restored data root, a first
+    #      boot without the bind mount), and a ledger entry would make the
+    #      purge one-shot per data_root -- silently skipping exactly the state
+    #      it exists to remove. Re-running also retries whatever failed last
+    #      boot, which is what makes (1) safe to do.
+    #   3. It is never RECORDED in the ledger either. `mark_applied` runs
+    #      outside the runner's try, so an I/O error there would propagate and
+    #      crashloop the boot this flag exists to protect; and since (2) means
+    #      nothing reads the entry, writing it bought nothing.
+    #
+    # An advisory migration MUST therefore be cheap enough to run on every
+    # boot, and must be a no-op when there is nothing to do. It may NOT also
+    # set `stop_on_failure` -- see registry.register for why.
+    advisory: bool = False
+
     @abstractmethod
     def run(self, data_root: str) -> dict:
         """Perform the migration. Return a JSON-serializable summary dict.

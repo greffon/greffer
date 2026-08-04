@@ -26,6 +26,17 @@ def register(cls: type[Migration]) -> type[Migration]:
         raise TypeError(f"register() expected a Migration subclass, got {cls!r}")
     if not cls.id:
         raise ValueError(f"{cls.__name__} has no id set")
+    if cls.advisory and cls.stop_on_failure:
+        # Contradictory, and actively unsafe at boot: the halt skips every
+        # LATER migration while advisory keeps the exit code 0, so uvicorn
+        # binds on state a required migration never touched -- exactly what
+        # the `&&`-gated CMD prevents. Reject at import time, don't document it.
+        raise ValueError(
+            f"{cls.__name__} sets both advisory and stop_on_failure. advisory "
+            "means a failure must not gate boot; stop_on_failure means a "
+            "failure must stop later migrations from running. Together they "
+            "let the server start on state a required migration never touched."
+        )
     if cls.id in _REGISTRY:
         existing = _REGISTRY[cls.id]
         raise DuplicateMigrationId(
