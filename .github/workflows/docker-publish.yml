@@ -219,7 +219,18 @@ jobs:
           # Fails here if the private key and the declared public key are not
           # a pair — i.e. the fleet would be signed with a key that no node's
           # baked cosign.pub can verify.
-          if ! diff -q derived.pub declared.pub >/dev/null; then
+          #
+          # Compare whitespace-STRIPPED content, not raw bytes. `cosign
+          # public-key` emits a PEM terminated with a newline while the
+          # `printf '%s'` above writes the variable without one, so a byte-exact
+          # `diff` reports a difference between two IDENTICAL keys and blocks a
+          # legitimate release. That is exactly what it did on 6d9e099: the
+          # keypair was correct (the published 0.9.0 signature verifies against
+          # this very variable) and the publish was refused anyway.
+          # Stripping whitespace also makes this immune to CRLF or stray
+          # indentation in the variable. The base64 body is the key material, so
+          # nothing is weakened: a genuinely different key still differs.
+          if [ "$(tr -d '[:space:]' < derived.pub)" != "$(tr -d '[:space:]' < declared.pub)" ]; then
             echo "::error::COSIGN_PRIVATE_KEY does not match the COSIGN_PUBLIC_KEY variable. Refusing to publish." >&2
             exit 1
           fi
