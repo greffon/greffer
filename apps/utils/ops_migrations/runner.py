@@ -78,7 +78,13 @@ def apply_pending(
                 continue
 
             result = _run_single(mig, data_root, ledger)
-            if mig.advisory and not result.ok:
+            # Batch control must see the REAL outcome. `advisory` governs whether
+            # a failure gates BOOT (the process exit code), NOT whether an
+            # operator's explicit --fail-fast / stop_on_failure halt request is
+            # honoured -- reading the downgraded result below would silently
+            # ignore both. Safe at boot: the Dockerfile CMD passes neither flag.
+            really_failed = not result.ok
+            if mig.advisory and really_failed:
                 # Best-effort cleanup must not brick the node. Downgrade to a
                 # non-gating result so `app.cli` exits 0 and uvicorn still
                 # binds -- but log CRITICAL, because for 0002 this means key
@@ -97,7 +103,7 @@ def apply_pending(
                     duration_seconds=result.duration_seconds,
                 )
             results.append(result)
-            if not result.ok and (mig.stop_on_failure or fail_fast):
+            if really_failed and (mig.stop_on_failure or fail_fast):
                 logger.error(
                     f'ops-migration {mig.id} failed and '
                     f'{"stop_on_failure" if mig.stop_on_failure else "--fail-fast"} '

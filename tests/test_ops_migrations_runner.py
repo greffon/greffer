@@ -14,6 +14,13 @@ def _with_fresh_registry(fn):
     """Decorator — snapshot the registry before, restore after. Lets tests
     define their own Migration classes without polluting real migrations."""
     def wrapper(self, *a, **kw):
+        # Force the real migrations package to register BEFORE snapshotting.
+        # all_migrations() imports it for its @register side effect, so without
+        # this the first test to call apply_pending() registers 0001/0002 midway
+        # through its own body -- they land in the reset registry and show up as
+        # extra results. That made the file order-dependent: green in a full run
+        # (another module imported it first), red when run on its own.
+        from apps.utils.ops_migrations import migrations  # noqa: F401
         snapshot = dict(registry._REGISTRY)
         registry.reset_for_tests()
         try:
@@ -354,3 +361,73 @@ class AdvisoryMigrationTests(TestCase):
         runner.apply_pending(data_root=self.tmp)
         runner.apply_pending(data_root=self.tmp)
         self.assertEqual(len(runs), 1)
+
+    @_with_fresh_registry
+    def test_fail_fast_still_halts_the_batch_on_an_advisory_failure(self):
+        """`advisory` decides whether a failure gates BOOT, not whether an
+        operator's explicit --fail-fast is honoured. Downgrading the result
+        before the halt check silently ignored the flag (Codex P2)."""
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_first"
+            advisory = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        results = runner.apply_pending(data_root=self.tmp, fail_fast=True)
+
+        self.assertEqual(ran, ["0009_advisory_first"], "--fail-fast did not halt")
+        # ...and the halt still must not gate boot: the advisory result stays ok,
+        # so the CLI exits 0.
+        self.assertTrue(all(r.ok for r in results))
+
+    @_with_fresh_registry
+    def test_stop_on_failure_still_halts_on_an_advisory_failure(self):
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_stop"
+            advisory = True
+            stop_on_failure = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later_stop"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(ran, ["0009_advisory_stop"])
+
+    @_with_fresh_registry
+    def test_without_fail_fast_an_advisory_failure_does_not_halt(self):
+        """The default path is unchanged: a non-gating failure lets the rest of
+        the batch run, which is the whole point of advisory at boot."""
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_nohalt"
+            advisory = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later_nohalt"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertEqual(ran, ["0009_advisory_nohalt", "0010_later_nohalt"])
