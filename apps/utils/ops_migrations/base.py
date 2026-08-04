@@ -27,14 +27,13 @@ Author rules — *required* for every migration we add:
    under the old code (e.g. the migration only matters if old-style volumes
    exist) should check and early-return from `run()` with all-zero summary.
 """
-
 from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-ID_RE = re.compile(r'^\d{4}_[a-z][a-z0-9_]*$')
+ID_RE = re.compile(r"^\d{4}_[a-z][a-z0-9_]*$")
 
 
 class MigrationError(Exception):
@@ -52,7 +51,6 @@ class DuplicateMigrationId(MigrationError):
 @dataclass
 class Result:
     """What the runner records for each migration in a batch."""
-
     id: str
     ok: bool
     summary: dict = field(default_factory=dict)
@@ -64,10 +62,10 @@ class Migration(ABC):
     """Subclass this and register via `ops_migrations.registry.register`."""
 
     # Unique, sortable. Must match r"^\d{4}_[a-z][a-z0-9_]*$".
-    id: str = ''
+    id: str = ""
 
     # Short human description. Printed by `--dry-run`.
-    description: str = ''
+    description: str = ""
 
     # If True, a raise in this migration halts the rest of the batch.
     # Default False: log the error, mark this migration as not-applied, and
@@ -76,23 +74,28 @@ class Migration(ABC):
     stop_on_failure: bool = False
 
     # If True this migration is BEST-EFFORT CLEANUP, not a state change the
-    # runtime depends on. Two consequences, both deliberate:
+    # runtime depends on. Three consequences, all deliberate:
     #
     #   1. It NEVER gates boot. A failure is logged at CRITICAL and the batch
     #      result stays ok, so `app.cli` exits 0 and the `&&`-gated CMD still
-    #      starts uvicorn. The default (non-advisory) behaviour is the right
-    #      one for a migration like 0001, where serving on un-migrated state
-    #      would be wrong -- but for a cleanup, taking the node offline is a
-    #      far worse outcome than leaving the thing uncleaned.
+    #      starts uvicorn. The default (non-advisory) behaviour is right for a
+    #      migration like 0001, where serving on un-migrated state would be
+    #      wrong -- but for a cleanup, taking the node offline is a far worse
+    #      outcome than leaving the thing uncleaned.
     #   2. It IGNORES the ledger and re-runs every boot. Cleanup targets can
     #      appear AFTER the migration first ran (a restored data root, a first
     #      boot without the bind mount), and a ledger entry would make the
     #      purge one-shot per data_root -- silently skipping exactly the state
     #      it exists to remove. Re-running also retries whatever failed last
     #      boot, which is what makes (1) safe to do.
+    #   3. It is never RECORDED in the ledger either. `mark_applied` runs
+    #      outside the runner's try, so an I/O error there would propagate and
+    #      crashloop the boot this flag exists to protect; and since (2) means
+    #      nothing reads the entry, writing it bought nothing.
     #
     # An advisory migration MUST therefore be cheap enough to run on every
-    # boot, and must be a no-op when there is nothing to do.
+    # boot, and must be a no-op when there is nothing to do. It may NOT also
+    # set `stop_on_failure` -- see registry.register for why.
     advisory: bool = False
 
     @abstractmethod
@@ -116,5 +119,6 @@ class Migration(ABC):
         # kwarg *and* with a non-empty id string).
         if cls.id and not ID_RE.match(cls.id):
             raise InvalidMigrationId(
-                f"{cls.__name__}.id={cls.id!r} must match {ID_RE.pattern!r} (e.g. '0001_namespace_catalog_volumes')"
+                f"{cls.__name__}.id={cls.id!r} must match {ID_RE.pattern!r} "
+                "(e.g. '0001_namespace_catalog_volumes')"
             )

@@ -99,4 +99,7 @@ def test_skipped_counts_the_candidates_that_were_left_alone(
     monkeypatch.chdir(tmp_path)
     summary = PurgeStagedKeyStrays().run(str(tmp_path / 'data'))
     assert summary['migrated'] == 1
-    assert summary['skipped'] == 2
+    # `skipped` counts uuid-NAMED candidates the content sniff spared -- NOT
+    # every entry in the CWD. The CWD is the whole greffer checkout, so counting
+    # unrelated files would report ~28 on a clean node and mean nothing.
+    assert summary['skipped'] == 1, 'server.key is not a candidate at all'

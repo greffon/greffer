@@ -390,25 +390,21 @@ class AdvisoryMigrationTests(TestCase):
         self.assertTrue(all(r.ok for r in results))
 
     @_with_fresh_registry
-    def test_stop_on_failure_still_halts_on_an_advisory_failure(self):
-        ran = []
-
-        class Advisory(Migration):
-            id = "0009_advisory_stop"
+    def test_advisory_plus_stop_on_failure_is_rejected_at_registration(self):
+        """The combination is unsafe at boot: the halt skips every LATER
+        migration while advisory keeps the exit code 0, so uvicorn binds on
+        state a required migration never touched -- the very thing the
+        &&-gated CMD prevents. Reject it at import time."""
+        class Contradictory(Migration):
+            id = "0009_advisory_and_stop"
             advisory = True
             stop_on_failure = True
             def run(self, data_root):
-                ran.append(self.id); return {"migrated": 0, "errors": 1}
+                return {}
 
-        class Later(Migration):
-            id = "0010_later_stop"
-            def run(self, data_root):
-                ran.append(self.id); return {"migrated": 0}
-
-        registry.register(Advisory)
-        registry.register(Later)
-        runner.apply_pending(data_root=self.tmp)
-        self.assertEqual(ran, ["0009_advisory_stop"])
+        with self.assertRaises(ValueError) as ctx:
+            registry.register(Contradictory)
+        self.assertIn("advisory", str(ctx.exception))
 
     @_with_fresh_registry
     def test_without_fail_fast_an_advisory_failure_does_not_halt(self):
@@ -431,3 +427,57 @@ class AdvisoryMigrationTests(TestCase):
         registry.register(Later)
         runner.apply_pending(data_root=self.tmp)
         self.assertEqual(ran, ["0009_advisory_nohalt", "0010_later_nohalt"])
+
+    @_with_fresh_registry
+    def test_advisory_never_writes_the_ledger(self):
+        """`mark_applied` sits OUTSIDE _run_single's try, so an ENOSPC/EIO in
+        Ledger._atomic_write propagates out of apply_pending, exits non-zero,
+        and the &&-gated CMD never starts uvicorn -- the exact crashloop
+        `advisory` exists to prevent, reached by another route. The read side
+        already ignores an advisory entry, so it has no consumer.
+
+        Also fixes a frozen summary: mark_applied early-returns once applied, so
+        run 1's numbers stuck forever while later runs reported real failures.
+        """
+        class Advisory(Migration):
+            id = "0009_advisory_noledger"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 1}
+
+        registry.register(Advisory)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        self.assertTrue(results[0].ok)
+        self.assertFalse(
+            Ledger.load(self.tmp).is_applied("0009_advisory_noledger"),
+            "an advisory migration must not be recorded in the ledger",
+        )
+
+    @_with_fresh_registry
+    def test_a_failing_ledger_write_cannot_crash_an_advisory_boot(self):
+        """End-to-end of the above: even with the ledger write guaranteed to
+        blow up, an advisory-only batch still returns cleanly."""
+        class Advisory(Migration):
+            id = "0009_advisory_ledger_boom"
+            advisory = True
+            def run(self, data_root):
+                return {"migrated": 0}
+
+        registry.register(Advisory)
+        with patch.object(
+            Ledger, "mark_applied", side_effect=OSError(28, "No space left")
+        ):
+            results = runner.apply_pending(data_root=self.tmp)   # must not raise
+        self.assertTrue(results[0].ok)
+
+    @_with_fresh_registry
+    def test_a_non_advisory_migration_still_records_the_ledger(self):
+        class Once(Migration):
+            id = "0009_records"
+            def run(self, data_root):
+                return {"migrated": 0}
+
+        registry.register(Once)
+        runner.apply_pending(data_root=self.tmp)
+        self.assertTrue(Ledger.load(self.tmp).is_applied("0009_records"))
