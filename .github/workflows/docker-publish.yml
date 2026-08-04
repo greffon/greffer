@@ -73,6 +73,25 @@ jobs:
       - name: Run tests
         run: poetry run pytest tests/ -q
 
+      # cli/ is a SEPARATE poetry project with its own lockfile and its own
+      # testpaths, so the run above (root `testpaths = ["tests"]`) never
+      # collects it. That matters here and not in ci.yml: Dockerfile.updater
+      # line 25 is `COPY cli/ /src/`, so greffon/greffer-updater is built
+      # entirely from cli/ source — including updater/provenance.py, the code
+      # that runs `cosign verify` on customer nodes — and it is in the signed
+      # set below. Without this leg the gate would sign that image having
+      # tested none of it, which is precisely the hole this workflow claims to
+      # close.
+      #
+      # cli-release.yml also runs these, but only on `pull_request` with
+      # `paths: ['cli/**']` and on `cli-v*` tags, so a push straight to main
+      # reaches the publish with cli/ untested.
+      - name: Run CLI tests
+        working-directory: cli
+        run: |
+          poetry install --no-interaction --sync
+          poetry run pytest -q
+
   docker:
     needs: test
     runs-on: ubuntu-latest
@@ -156,14 +175,55 @@ jobs:
         # echoing these is safe.
         env:
           HAS_PRIV: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+          HAS_PASS: ${{ secrets.COSIGN_PASSWORD != '' }}
           HAS_PUB: ${{ vars.COSIGN_PUBLIC_KEY != '' }}
         run: |
-          if [ "$HAS_PRIV" != "true" ] || [ "$HAS_PUB" != "true" ]; then
-            echo "::error::cosign key material missing (COSIGN_PRIVATE_KEY secret present=$HAS_PRIV, COSIGN_PUBLIC_KEY variable present=$HAS_PUB). Refusing to publish unsigned fleet images." >&2
+          if [ "$HAS_PRIV" != "true" ] || [ "$HAS_PASS" != "true" ] || [ "$HAS_PUB" != "true" ]; then
+            echo "::error::cosign key material missing (COSIGN_PRIVATE_KEY=$HAS_PRIV, COSIGN_PASSWORD=$HAS_PASS, COSIGN_PUBLIC_KEY=$HAS_PUB). Refusing to publish unsigned fleet images." >&2
             exit 1
           fi
           echo "enabled=true" >> "$GITHUB_OUTPUT"
-          echo "cosign signing enabled"
+          echo "cosign key material present"
+      -
+        # Install cosign BEFORE the builds so the next step can prove the key
+        # works while nothing has been pushed yet.
+        name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      -
+        name: Prove the signing key is usable before pushing anything
+        # Presence is not usability. The check above only proves the three
+        # values are non-empty; it cannot tell whether COSIGN_PASSWORD actually
+        # decrypts COSIGN_PRIVATE_KEY, whether the private key and the declared
+        # public key are a PAIR, or whether cosign itself works. Without this
+        # step a rotated-but-mismatched password sails through, all five images
+        # push (including four :latest tags), and only then does `cosign sign`
+        # fail 150 lines later — leaving UNSIGNED fleet images live while the
+        # job goes red. The old ::warning:: behaviour at least failed in the
+        # same place; a presence-only gate just moves the failure without
+        # closing it.
+        #
+        # `cosign public-key` derives the public half from the private key,
+        # which requires the password, so a single command proves all three:
+        # password correct, pair matches, cosign functional. Runs before the
+        # first `push: true`, so a failure here publishes nothing.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f declared.pub derived.pub' EXIT
+          printf '%s' "$COSIGN_PUBLIC_KEY" > declared.pub
+          # Fails here if COSIGN_PASSWORD does not decrypt the private key.
+          cosign public-key --key env://COSIGN_PRIVATE_KEY > derived.pub
+          # Fails here if the private key and the declared public key are not
+          # a pair — i.e. the fleet would be signed with a key that no node's
+          # baked cosign.pub can verify.
+          if ! diff -q derived.pub declared.pub >/dev/null; then
+            echo "::error::COSIGN_PRIVATE_KEY does not match the COSIGN_PUBLIC_KEY variable. Refusing to publish." >&2
+            exit 1
+          fi
+          echo "signing key verified: password decrypts the key and the pair matches"
       -
         name: Stage cosign public key for the updater build
         # Deliver cosign.pub to the updater build as a FILE, not an inline secret.
@@ -290,10 +350,6 @@ jobs:
           # only ships an amd64 manifest and forces emulation on
           # ARM hosts (Apple Silicon, Graviton, Pi).
           platforms: linux/amd64,linux/arm64
-      -
-        name: Install cosign
-        if: steps.cosign_cfg.outputs.enabled == 'true'
-        uses: sigstore/cosign-installer@v3
       -
         name: Sign + smoke-verify images (managed key, no tlog)
         # Sign every greffon/* image by DIGEST with a per-repo annotation, exactly

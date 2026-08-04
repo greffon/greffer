@@ -27,13 +27,24 @@ concurrency:
 jobs:
   test:
     # MUST be a Linux runner with a live Docker daemon, and must NOT be moved
-    # to macOS or into a `container:`. apps/utils/docker/base.py:6 builds its
-    # client at MODULE scope (`client = docker.from_env()`), and from_env()
-    # performs a server handshake, so with no daemon reachable the import fails
-    # during pytest collection and the whole suite errors before a single test
-    # runs. ubuntu-latest ships a running daemon; the GitHub macOS runners do
-    # not. The suite itself needs no containers (it mocks docker throughout) —
-    # it is purely the import that requires one.
+    # to macOS or into a `container:`.
+    #
+    # Three modules build a docker client at MODULE scope:
+    #   apps/utils/docker/compose.py:20   <- the one reached at COLLECTION,
+    #                                        via tests/test_controller_routes.py
+    #   apps/utils/docker/l4_ports.py:35  <- via app/routers/controller.py
+    #   apps/utils/docker/base.py:6       <- runtime only (resolved by
+    #                                        mock.patch string lookup)
+    #
+    # docker.from_env() performs a server-version handshake, so with no daemon
+    # reachable the import raises DockerException during pytest collection and
+    # the whole suite errors before a single test runs. Verified by importing
+    # tests.test_controller_routes with DOCKER_HOST pointed at a dead port: it
+    # fails at compose.py:20. Fixing base.py alone would NOT lift this.
+    #
+    # ubuntu-latest ships a running daemon; the GitHub macOS runners do not.
+    # The suite needs no containers (it mocks docker throughout) — it is purely
+    # the import that requires one.
     runs-on: ubuntu-latest
 
     steps:
