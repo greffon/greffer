@@ -244,7 +244,13 @@ jobs:
             --tlog-upload=false --output-signature preflight.sig preflight.blob
           if ! cosign verify-blob --key declared.pub --signature preflight.sig \
                  --insecure-ignore-tlog=true preflight.blob; then
-            echo "::error::COSIGN_PUBLIC_KEY is not a loadable PEM for the private key that signs the fleet. Refusing to publish." >&2
+            # Two distinct causes reach here and the operator needs to know
+            # which: cosign's own line just above says "PEM decoding failed"
+            # for a malformed key, or "invalid signature when validating ASN.1"
+            # for a well-formed key that simply is not the pair. Naming only
+            # the first would actively misdirect on the more likely incident
+            # (private key rotated, COSIGN_PUBLIC_KEY variable left stale).
+            echo "::error::COSIGN_PUBLIC_KEY is either not a loadable PEM, or not the public half of the COSIGN_PRIVATE_KEY that signs the fleet. See the cosign output above for which. Refusing to publish." >&2
             exit 1
           fi
           echo "signing key verified: password decrypts the key, the declared PEM loads, and the pair round-trips"
