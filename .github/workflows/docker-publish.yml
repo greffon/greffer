@@ -212,29 +212,42 @@ jobs:
           COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          trap 'rm -f declared.pub derived.pub' EXIT
+          trap 'rm -f declared.pub preflight.blob preflight.sig' EXIT
+
+          # Write the variable EXACTLY as the later steps consume it: this same
+          # `printf '%s'` produces the cosign.pub baked into greffer-updater and
+          # the one the signing loop verifies with. Whatever we prove here must
+          # be proven about these precise bytes.
           printf '%s' "$COSIGN_PUBLIC_KEY" > declared.pub
-          # Fails here if COSIGN_PASSWORD does not decrypt the private key.
-          cosign public-key --key env://COSIGN_PRIVATE_KEY > derived.pub
-          # Fails here if the private key and the declared public key are not
-          # a pair — i.e. the fleet would be signed with a key that no node's
-          # baked cosign.pub can verify.
+
+          # Round-trip a throwaway blob rather than comparing key text. One
+          # command proves all four things the publish depends on:
+          #   1. COSIGN_PASSWORD decrypts COSIGN_PRIVATE_KEY   (sign-blob)
+          #   2. declared.pub is a PEM cosign can actually load (verify-blob)
+          #   3. the two halves are a pair                     (verify succeeds)
+          #   4. cosign itself works with these exact flags
           #
-          # Compare whitespace-STRIPPED content, not raw bytes. `cosign
-          # public-key` emits a PEM terminated with a newline while the
-          # `printf '%s'` above writes the variable without one, so a byte-exact
-          # `diff` reports a difference between two IDENTICAL keys and blocks a
-          # legitimate release. That is exactly what it did on 6d9e099: the
-          # keypair was correct (the published 0.9.0 signature verifies against
-          # this very variable) and the publish was refused anyway.
-          # Stripping whitespace also makes this immune to CRLF or stray
-          # indentation in the variable. The base64 body is the key material, so
-          # nothing is weakened: a genuinely different key still differs.
-          if [ "$(tr -d '[:space:]' < derived.pub)" != "$(tr -d '[:space:]' < declared.pub)" ]; then
-            echo "::error::COSIGN_PRIVATE_KEY does not match the COSIGN_PUBLIC_KEY variable. Refusing to publish." >&2
+          # Text comparison was tried and is wrong twice over. Byte-exact `diff`
+          # rejects a correct key over a trailing newline and blocked the
+          # publish on 6d9e099. Stripping whitespace to fix that then ACCEPTS a
+          # malformed PEM (e.g. a leading space before -----BEGIN) whose
+          # stripped form matches but which `cosign verify --key` rejects with
+          # "PEM decoding failed" — and since the raw value is only consumed
+          # after the images are pushed, that failure would land too late to
+          # stop the release. Loading the key is the only check that means
+          # anything, so let cosign load it.
+          #
+          # Same flags as the signing loop (managed key, no tlog), so a cosign
+          # behaviour or flag drift also fails here, before anything is pushed.
+          echo "greffer signing-key preflight" > preflight.blob
+          cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+            --tlog-upload=false --output-signature preflight.sig preflight.blob
+          if ! cosign verify-blob --key declared.pub --signature preflight.sig \
+                 --insecure-ignore-tlog=true preflight.blob; then
+            echo "::error::COSIGN_PUBLIC_KEY is not a loadable PEM for the private key that signs the fleet. Refusing to publish." >&2
             exit 1
           fi
-          echo "signing key verified: password decrypts the key and the pair matches"
+          echo "signing key verified: password decrypts the key, the declared PEM loads, and the pair round-trips"
       -
         name: Stage cosign public key for the updater build
         # Deliver cosign.pub to the updater build as a FILE, not an inline secret.
