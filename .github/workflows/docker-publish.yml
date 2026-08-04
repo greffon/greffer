@@ -219,7 +219,16 @@ jobs:
           # Fails here if the private key and the declared public key are not
           # a pair — i.e. the fleet would be signed with a key that no node's
           # baked cosign.pub can verify.
-          if ! diff -q derived.pub declared.pub >/dev/null; then
+          #
+          # Compared via "$(cat ...)" and NOT `diff`, because command
+          # substitution strips trailing newlines from BOTH sides. `cosign
+          # public-key` emits a trailing newline; the stored COSIGN_PUBLIC_KEY
+          # variable has none (177 bytes vs 178), and `printf '%s'` faithfully
+          # preserves that. A byte comparison therefore NEVER matched, so this
+          # gate rejected a perfectly good key pair and blocked every publish
+          # from the moment it merged. Proven by generating a known-matching
+          # pair and running the old comparison against it.
+          if [ "$(cat derived.pub)" != "$(cat declared.pub)" ]; then
             echo "::error::COSIGN_PRIVATE_KEY does not match the COSIGN_PUBLIC_KEY variable. Refusing to publish." >&2
             exit 1
           fi
