@@ -5,8 +5,76 @@ on:
     branches:
       - 'main'
 
+# Read-only token. Nothing in this workflow uses GITHUB_TOKEN: it authenticates
+# to Docker Hub with DOCKERHUB_TOKEN and pushes no GHCR package, so it needs no
+# `packages: write` and no `contents: write`. Without this the default is a
+# WRITE-scoped token held across `poetry install`, five `docker build`s and
+# several third-party actions.
+permissions:
+  contents: read
+
+# SERIALIZE publishes: one stable group for the whole branch, so a second merge
+# queues behind the first instead of running alongside it. All five builds push
+# the same mutable `:latest` tags and the signing loop re-resolves digests from
+# them, so two concurrent runs can interleave and leave an older or mixed image
+# set as `:latest`.
+#
+# Note this is the OPPOSITE of the per-SHA grouping used by the CI workflows.
+# There the goal is that every SHA keeps its own result, so runs must never
+# contend; here the goal is that publishes never overlap, so they must.
+#
+# cancel-in-progress: false because a half-finished publish can leave some of
+# the four greffon/* images pushed at the new version and others not, splitting
+# proxy-mode and tunnel-mode nodes onto different builds.
+#
+# Accepted trade-off: a concurrency group holds one running plus one pending
+# run, so if a third merge lands while one is running the middle SHA's publish
+# is dropped. `:latest` still converges to the newest commit; only an
+# intermediate version tag could be skipped, which needs three merges inside a
+# single publish window AND a version bump on the middle one. Serialization is
+# worth more than publishing every intermediate SHA.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Gate: the fleet's self-update consumes the signatures produced below, so a
+  # signed image must never be built from an untested commit. Runs the same
+  # suite as ci.yml (which covers PRs); `docker` needs it, so a red suite
+  # blocks the publish entirely.
+  #
+  # Deliberately a job in THIS workflow rather than a `workflow_run` gate on
+  # ci.yml. workflow_run executes from the default branch with the full secret
+  # set, fires on any branch's completion including fork PRs, and its
+  # github.sha is the default-branch tip rather than the SHA that was tested —
+  # so it would reintroduce the very untested-publish hole it aims to close.
+  test:
+    # ubuntu-latest with a live Docker daemon is required; see the runner note
+    # in ci.yml (apps/utils/docker/base.py builds a client at import time).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install --no-cache-dir "poetry==1.8.5"
+
+      - name: Install dependencies
+        # No cache here on purpose: this is the gate in front of a signed fleet
+        # release, so it resolves from poetry.lock every time rather than
+        # trusting a restored env. --sync matches ci.yml so the two paths
+        # cannot diverge if a cache is ever added here.
+        run: poetry install --no-interaction --sync
+
+      - name: Run tests
+        run: poetry run pytest tests/ -q
+
   docker:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       -
@@ -66,24 +134,36 @@ jobs:
           done
           echo "signed set covers all greffon/* images in $tmpl"
       -
-        name: Detect cosign configuration
+        name: Require cosign key material
         id: cosign_cfg
-        # Signing + the greffer-updater image are gated on the managed-key
-        # material being provisioned (COSIGN_PRIVATE_KEY secret + COSIGN_PUBLIC_KEY
-        # variable). Until ops sets them, the node images still publish (unsigned),
-        # so this workflow never turns main red for lack of a key. Comparing the
-        # secret to '' yields a boolean, never the secret value, so echoing is safe.
+        # FAIL CLOSED. This step used to emit a ::warning:: and continue,
+        # publishing UNSIGNED greffon/greffer:latest, greffer-nginx and
+        # tunnel-sidecar while main stayed green. That turns a config outage
+        # (an expired, rotated, or cleared key) into a silent trust downgrade
+        # for the whole fleet, and it is the same "absence of signal reads as
+        # green" failure this workflow is otherwise careful about.
+        #
+        # Note COSIGN_PUBLIC_KEY is a repository VARIABLE, not a secret, so it
+        # carries weaker access controls than the private key it gates:
+        # clearing it alone was enough to flip the entire pipeline to unsigned.
+        #
+        # landing-page's publish-greffer-version.yml already refuses loudly on
+        # missing key material; this now matches it. If an unsigned build is
+        # ever genuinely needed, add an explicit workflow_dispatch input for it
+        # rather than letting an empty secret decide.
+        #
+        # Comparing a secret to '' yields a boolean, never the secret value, so
+        # echoing these is safe.
         env:
           HAS_PRIV: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
           HAS_PUB: ${{ vars.COSIGN_PUBLIC_KEY != '' }}
         run: |
-          if [ "$HAS_PRIV" = "true" ] && [ "$HAS_PUB" = "true" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "cosign signing enabled"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::cosign signing disabled (set the COSIGN_PRIVATE_KEY secret + COSIGN_PUBLIC_KEY variable); publishing UNSIGNED node images and skipping greffon/greffer-updater"
+          if [ "$HAS_PRIV" != "true" ] || [ "$HAS_PUB" != "true" ]; then
+            echo "::error::cosign key material missing (COSIGN_PRIVATE_KEY secret present=$HAS_PRIV, COSIGN_PUBLIC_KEY variable present=$HAS_PUB). Refusing to publish unsigned fleet images." >&2
+            exit 1
           fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "cosign signing enabled"
       -
         name: Stage cosign public key for the updater build
         # Deliver cosign.pub to the updater build as a FILE, not an inline secret.

@@ -1,0 +1,74 @@
+name: CI
+
+# Runs the greffer's application test suite (tests/, 717 tests) on every PR.
+#
+# Pushes to main are deliberately NOT triggered here: docker-publish.yml runs
+# the same suite as a `test` job that gates the publish, so covering main in
+# both places would just run it twice on every merge. The gate lives next to
+# the thing it gates.
+#
+# Note this suite is distinct from cli/tests/, which cli-release.yml already
+# covers under `paths: ['cli/**']`. Until now nothing ran tests/ at all.
+on:
+  pull_request:
+    branches: [main]
+
+# Read-only token: this job runs third-party code (`poetry install` resolves
+# and executes package build hooks), and it has no reason to write anything.
+permissions:
+  contents: read
+
+# One group per PR ref, cancelling superseded runs; a force-push makes the
+# prior result irrelevant. No per-SHA branch needed here (PR-only trigger).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # MUST be a Linux runner with a live Docker daemon, and must NOT be moved
+    # to macOS or into a `container:`. apps/utils/docker/base.py:6 builds its
+    # client at MODULE scope (`client = docker.from_env()`), and from_env()
+    # performs a server handshake, so with no daemon reachable the import fails
+    # during pytest collection and the whole suite errors before a single test
+    # runs. ubuntu-latest ships a running daemon; the GitHub macOS runners do
+    # not. The suite itself needs no containers (it mocks docker throughout) —
+    # it is purely the import that requires one.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the runtime image (Dockerfile: python:3.11-alpine) so CI
+          # exercises the interpreter the greffer actually ships on.
+          python-version: "3.11"
+
+      - name: Install Poetry
+        # Pinned to match cli-release.yml so the two CI paths in this repo
+        # cannot drift onto different resolvers.
+        run: pip install --no-cache-dir "poetry==1.8.5"
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        # --sync is load-bearing, not decoration. The cache above restores
+        # ~/.cache/pypoetry, which contains virtualenvs/, and the restore-keys
+        # prefix can hand us an env built from an OLDER poetry.lock. A plain
+        # `poetry install` adds and updates but never REMOVES, so a PR that
+        # drops a dependency would keep importing it and pass green here, then
+        # fail in the publish job's fresh env after merge. --sync prunes
+        # anything absent from the current lock so the env always matches it.
+        run: poetry install --no-interaction --sync
+
+      - name: Run tests
+        # ~8.5s locally for 717 tests; the job is dominated by setup, not by
+        # the suite. No -x: a full run reports every failure at once.
+        run: poetry run pytest tests/ -q
