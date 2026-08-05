@@ -83,7 +83,15 @@ def apply_pending(
             # honoured -- reading the downgraded result below would ignore both.
             # Safe at boot: the Dockerfile CMD passes neither flag.
             really_failed = not result.ok
-            if mig.advisory and really_failed:
+            # A halt means every LATER migration is skipped. Downgrading the
+            # result in that case would report exit 0 for a batch that did not
+            # finish -- so uvicorn could start on state a required migration
+            # never touched, which is precisely the combination rejected in
+            # registry.register. Only downgrade when the batch is going to run
+            # to completion anyway. At boot neither flag is passed, so the
+            # crashloop protection this whole flag exists for is unaffected.
+            halting = really_failed and (mig.stop_on_failure or fail_fast)
+            if mig.advisory and really_failed and not halting:
                 # Best-effort cleanup must not brick the node. Downgrade to a
                 # non-gating result so `app.cli` exits 0 and uvicorn still
                 # binds -- but log CRITICAL, because for 0002 this means key
@@ -102,7 +110,7 @@ def apply_pending(
                     duration_seconds=result.duration_seconds,
                 )
             results.append(result)
-            if really_failed and (mig.stop_on_failure or fail_fast):
+            if halting:
                 logger.error(
                     f"ops-migration {mig.id} failed and "
                     f"{'stop_on_failure' if mig.stop_on_failure else '--fail-fast'} "

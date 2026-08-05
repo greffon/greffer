@@ -385,9 +385,15 @@ class AdvisoryMigrationTests(TestCase):
         results = runner.apply_pending(data_root=self.tmp, fail_fast=True)
 
         self.assertEqual(ran, ["0009_advisory_first"], "--fail-fast did not halt")
-        # ...and the halt still must not gate boot: the advisory result stays ok,
-        # so the CLI exits 0.
-        self.assertTrue(all(r.ok for r in results))
+        # A halt skipped 0010_later, so the run did NOT finish and must not
+        # report success: exit 0 here would let a caller (or a runbook) treat a
+        # partially-applied batch as complete. The advisory downgrade is
+        # deliberately suppressed when halting.
+        self.assertFalse(
+            all(r.ok for r in results),
+            "a halted batch reported success, so the CLI would exit 0 having "
+            "skipped every later migration",
+        )
 
     @_with_fresh_registry
     def test_advisory_plus_stop_on_failure_is_rejected_at_registration(self):
@@ -481,3 +487,28 @@ class AdvisoryMigrationTests(TestCase):
         registry.register(Once)
         runner.apply_pending(data_root=self.tmp)
         self.assertTrue(Ledger.load(self.tmp).is_applied("0009_records"))
+
+    @_with_fresh_registry
+    def test_a_completing_batch_still_downgrades_the_advisory_failure(self):
+        """The boot path: no flags, so nothing halts, every migration runs, and
+        the advisory failure stays non-gating -> CLI exit 0 -> uvicorn binds."""
+        ran = []
+
+        class Advisory(Migration):
+            id = "0009_advisory_boot"
+            advisory = True
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0, "errors": 1}
+
+        class Later(Migration):
+            id = "0010_later_boot"
+            def run(self, data_root):
+                ran.append(self.id); return {"migrated": 0}
+
+        registry.register(Advisory)
+        registry.register(Later)
+        results = runner.apply_pending(data_root=self.tmp)
+
+        self.assertEqual(ran, ["0009_advisory_boot", "0010_later_boot"])
+        self.assertTrue(all(r.ok for r in results), "boot must not be gated")
+        self.assertTrue(results[0].summary.get("advisory_failed"))
