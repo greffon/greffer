@@ -189,6 +189,23 @@ jobs:
         # works while nothing has been pushed yet.
         name: Install cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          # Pin to the version customer NODES verify with. Dockerfile.updater
+          # bakes cosign v2.4.3 (COPY --from=ghcr.io/sigstore/cosign/cosign:v2.4.3),
+          # while the installer's default floats — the last publish resolved
+          # v2.5.2. That meant CI signed with one version and the fleet verified
+          # with another, and the preflight round-trip below verified with the CI
+          # version, so it could not have caught a cross-version difference at
+          # all. Its comment claims to catch "cosign behaviour or flag drift";
+          # that was only ever true of the CI-side binary.
+          #
+          # Measured: v2.4.3 supports every flag used here (sign-blob/verify-blob
+          # with --tlog-upload=false and --insecure-ignore-tlog, public-key with
+          # env://), and a v2.5.2-made signature DOES verify under v2.4.3 today,
+          # so this is closing a latent drift risk rather than a live break.
+          #
+          # Keep this in lockstep with Dockerfile.updater. If one moves, move both.
+          cosign-release: v2.4.3
       -
         name: Prove the signing key is usable before pushing anything
         # Presence is not usability. The check above only proves the three
