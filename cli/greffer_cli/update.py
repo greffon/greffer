@@ -162,6 +162,43 @@ def resolve_target(
     return None
 
 
+def version_tuple(value: str | None) -> tuple[int, ...] | None:
+    """Dotted-numeric version -> comparable tuple, or ``None`` if it is not
+    dotted-numeric (``latest``, a dev tag, a digest pin, ``None``).
+
+    Deliberately strict: anything we cannot order with confidence returns
+    ``None`` so callers can decline to make an ordering claim rather than
+    guess. Comparison is on the numeric components only, so ``0.9.0`` and
+    ``0.9`` order equal-ish by prefix -- fine here, where every published
+    greffer version is X.Y.Z.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    parts = value.split('.')
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def is_downgrade(current: str | None, target: str | None) -> bool | None:
+    """Would moving ``current`` -> ``target`` go BACKWARDS?
+
+    ``True``  = target is strictly older than current.
+    ``False`` = target is the same or newer.
+    ``None``  = unknown; at least one side is not dotted-numeric, so no
+                ordering claim is possible.
+    """
+    cur = version_tuple(current)
+    tgt = version_tuple(target)
+    if cur is None or tgt is None:
+        return None
+    # Compare on a common length so 0.9 vs 0.9.0 does not read as a downgrade.
+    width = max(len(cur), len(tgt))
+    cur = cur + (0,) * (width - len(cur))
+    tgt = tgt + (0,) * (width - len(tgt))
+    return tgt < cur
+
+
 def no_rollback_blocked(
     manifest: Manifest | None, current: str | None, target: str,
 ) -> bool | None:
@@ -485,14 +522,23 @@ def run_update(
             print(strings.UPDATE_NO_TARGET, file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED
 
+    downgrade = is_downgrade(current_version, resolved)
+
     if check_only:
-        behind = (
-            current_version is not None
-            and resolved != current_version
-        )
+        # Report the DIRECTION, not merely "different". A stale manifest made
+        # an older `latest` read as "available: yes", which is how a downgrade
+        # looked like a routine update.
+        if downgrade:
+            available = "no — target is OLDER than current"
+        else:
+            available = (
+                "yes" if current_version is not None and resolved != current_version
+                else "no/unknown"
+            )
+        behind = available
         print(strings.UPDATE_CHECK.format(
             current=current_version or "unknown", target=resolved,
-            available=("yes" if behind else "no/unknown"),
+            available=behind,
         ))
         return EXIT_OK
 
@@ -506,6 +552,26 @@ def run_update(
         return EXIT_PREFLIGHT_REFUSED
     if not compose.data_volume_is_named(compose_file):
         print(strings.UPDATE_PREFLIGHT_NO_DATA_VOLUME, file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+
+    # ORDERING GUARD. resolve_target() takes the manifest's `latest` at face
+    # value with no comparison against what is running, so a manifest that
+    # lags the fleet silently rolls nodes BACKWARDS. This is not theoretical:
+    # the published manifest sat at 0.5.0 while nodes ran 0.9.0, and
+    # `min_supported` does not help (it is parsed but never enforced), nor
+    # does no_rollback_from (a stale manifest cannot list a pair it has never
+    # seen).
+    #
+    # Only auto-latest is refused. An explicit `--to` is a deliberate operator
+    # choice, and rolling back on purpose is a legitimate thing to want; it
+    # still passes through the no-rollback check below.
+    #
+    # is_downgrade() returns None when either side is not dotted-numeric, and
+    # None is NOT a downgrade: an unorderable pair must not block an update.
+    if downgrade and target is None:
+        print(strings.UPDATE_REFUSED_DOWNGRADE.format(
+            current=current_version, target=resolved,
+        ), file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED
 
     blocked = no_rollback_blocked(manifest, current_version, resolved)
@@ -532,6 +598,32 @@ def run_update(
               file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED
     try:
+        # ---- 2b. Re-check the version UNDER the lock ------------------
+        # Everything above ran unlocked, so `current_version` may be stale: the
+        # in-container remote updater flocks this SAME /data/.update.lock inode
+        # and can advance the node between our read and this acquire. Without
+        # re-reading, the sequence is
+        #   this run reads 0.5 -> remote update lands 0.9 -> we take the lock ->
+        #   manifest target 0.7 looks like a forward update -> node rolls back
+        # which is exactly the downgrade the guard exists to prevent, just
+        # through a narrower window. Re-read and re-decide on the fresh value.
+        locked_version = compose.exec_greffer_version(compose_file)
+        if locked_version != current_version:
+            current_version = locked_version
+            if is_downgrade(current_version, resolved) and target is None:
+                print(strings.UPDATE_REFUSED_DOWNGRADE.format(
+                    current=current_version, target=resolved,
+                ), file=sys.stderr)
+                return EXIT_PREFLIGHT_REFUSED
+            # The rollback-safety pair is keyed on the running version too, so
+            # it has to be re-evaluated against the same fresh value.
+            if (no_rollback_blocked(manifest, current_version, resolved) is not False
+                    and not confirm_no_rollback):
+                print(strings.UPDATE_NEEDS_CONFIRM_NO_ROLLBACK.format(
+                    current=current_version or "unknown", target=resolved,
+                ), file=sys.stderr)
+                return EXIT_PREFLIGHT_REFUSED
+
         # ---- 3. Rewrite + pull + recreate ----------------------------
         old_refs = compose.set_image_tag(compose_file, resolved)
         gate_passed = False

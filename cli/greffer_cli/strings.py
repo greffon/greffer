@@ -332,6 +332,15 @@ UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
     "unreachable).\n  → re-run with `--confirm-no-rollback` to proceed anyway."
 )
 
+UPDATE_REFUSED_DOWNGRADE = (
+    "✗ Refusing to downgrade: {current} is NEWER than the target {target}.\n"
+    "  The version manifest advertises {target} as latest, which means it is\n"
+    "  stale relative to this node. Updating would roll back features and run\n"
+    "  older code against on-disk state written by {current}.\n"
+    "  → if you really intend to go back, say so explicitly: "
+    "`greffer update --to {target}`."
+)
+
 UPDATE_ALREADY = "✓ Already up to date (running {target}). Nothing to do."
 
 UPDATE_PULL_FAILED = (

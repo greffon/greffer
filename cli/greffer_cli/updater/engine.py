@@ -38,25 +38,18 @@ def _is_downgrade(new: str | None, old: str | None) -> bool:
     """True iff ``new`` < ``old`` by dotted-numeric compare. The anti-downgrade
     guard (HLD section 13): catches an honest-CI ``:latest`` force-pushed to an
     older build. NOT a trust control (``app.__version__`` is attacker-forgeable,
-    section 7), so non-numeric versions are treated as not-a-downgrade."""
-    def parse(v: str | None):
-        if not v:
-            return None
-        parts = []
-        for p in v.split("."):
-            if not p.isdigit():
-                return None
-            parts.append(int(p))
-        return tuple(parts)
-    pn, po = parse(new), parse(old)
-    if pn is None or po is None:
-        return False
-    # Pad to equal length so 0.3 and 0.3.0 compare EQUAL (not 0.3 < 0.3.0, which
-    # would wrongly refuse 0.3 as a downgrade from a running 0.3.0).
-    width = max(len(pn), len(po))
-    pn += (0,) * (width - len(pn))
-    po += (0,) * (width - len(po))
-    return pn < po
+    section 7), so non-numeric versions are treated as not-a-downgrade.
+
+    Delegates to ``update.is_downgrade`` so the operator CLI (``greffer
+    update``) and this remote path can never disagree about which direction a
+    version pair points. Note the argument order is inverted between the two:
+    here it is (new, old); there it is (current, target).
+
+    ``update.is_downgrade`` returns ``None`` when a pair is unorderable, which
+    collapses to ``False`` here to preserve this function's contract -- an
+    unorderable target falls through to the post-gate guard rather than being
+    refused up front."""
+    return update.is_downgrade(old, new) is True
 
 
 def _rollback(done: list, *, greffer_name: str, greffer_id: str | None,

@@ -724,3 +724,131 @@ def test_update_lock_path_falls_back_to_cfg(tmp_path: Path, monkeypatch) -> None
     # unresolvable volume -> local cfg lock (still serializes two host runs)
     monkeypatch.setattr(compose, "data_volume_mountpoint", lambda f: None)
     assert update._update_lock_path(tmp_path) == tmp_path / ".update.lock"
+
+
+# --- ordering guard (downgrade refusal) ------------------------------
+#
+# resolve_target() takes the manifest's `latest` at face value, so a manifest
+# that lags the fleet used to silently roll nodes BACKWARDS. Observed live:
+# the published manifest sat at 0.5.0 while nodes ran 0.9.0.
+
+@pytest.mark.parametrize(
+    ("current", "target", "expected"),
+    [
+        ("0.9.0", "0.5.0", True),      # the live bug
+        ("0.5.0", "0.9.0", False),     # normal update
+        ("0.9.0", "0.9.0", False),     # same
+        ("0.9", "0.9.0", False),       # zero-padding, not a downgrade
+        ("0.9.0", "0.10.0", False),    # numeric, not lexical: 10 > 9
+        ("0.10.0", "0.9.0", True),
+        ("latest", "0.9.0", None),     # unorderable -> no claim
+        ("0.9.0", "v0.8.0", None),
+        (None, "0.9.0", None),
+        ("0.9.0", None, None),
+    ],
+)
+def test_is_downgrade(current, target, expected) -> None:
+    assert update.is_downgrade(current, target) is expected
+
+
+def _manifest(latest: str):
+    return lambda url, timeout=10.0: update.Manifest(latest=latest)
+
+
+def test_auto_latest_refuses_a_downgrade(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """A stale manifest must not roll the node back."""
+    fake = FakeDocker()
+    fake.install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.5.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.9.0")
+
+    rc = _run(cfg)  # no --to: auto-latest
+
+    assert rc == update.EXIT_PREFLIGHT_REFUSED
+    err = capsys.readouterr().err
+    assert "Refusing to downgrade" in err
+    # Refused BEFORE any pull: the node is untouched.
+    assert fake.running_image != fake.target_image
+
+
+def test_explicit_to_still_allows_a_deliberate_rollback(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--to is an operator decision; going back on purpose stays possible."""
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.5.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.9.0")
+
+    rc = _run(cfg, target="0.3.4", confirm_no_rollback=True)
+
+    assert rc != update.EXIT_PREFLIGHT_REFUSED
+
+
+def test_forward_update_is_unaffected(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.3.4"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.3.0")
+
+    assert _run(cfg) == update.EXIT_OK
+
+
+def test_unorderable_current_version_does_not_block(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unparseable running version must not wedge updates shut."""
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.3.4"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "latest")
+
+    assert _run(cfg) == update.EXIT_OK
+
+
+def test_check_reports_downgrade_direction(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """--check used to print 'available: yes' for an OLDER target."""
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.5.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.9.0")
+
+    rc = _run(cfg, check_only=True)
+
+    assert rc == update.EXIT_OK
+    assert "OLDER" in capsys.readouterr().out
+
+
+def test_downgrade_guard_rechecks_under_the_lock(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """The version read before the lock can go stale.
+
+    The in-container remote updater flocks the SAME /data/.update.lock inode,
+    so it can advance the node between our unlocked read and our acquire:
+      this run reads 0.5 -> remote update lands 0.9 -> we take the lock ->
+      manifest target 0.7 looks forward -> node would roll back to 0.7.
+    """
+    fake = FakeDocker()
+    fake.install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest("0.7.0"))
+
+    seen: list[str] = []
+
+    def racing_version(_f):
+        # First read (unlocked) sees the old version; by the time we hold the
+        # lock a concurrent updater has advanced the node to 0.9.0.
+        seen.append("x")
+        return "0.5.0" if len(seen) == 1 else "0.9.0"
+
+    monkeypatch.setattr(compose, "exec_greffer_version", racing_version)
+
+    rc = _run(cfg)
+
+    assert rc == update.EXIT_PREFLIGHT_REFUSED
+    assert "Refusing to downgrade" in capsys.readouterr().err
+    # Refused before the compose was rewritten / pulled.
+    assert fake.running_image != fake.target_image
+    assert len(seen) >= 2, "expected a re-read under the lock"
