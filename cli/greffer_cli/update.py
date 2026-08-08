@@ -612,6 +612,16 @@ def run_update(
     # construction (hld-v2-per-container-recreate section 11), replacing it with
     # verify-then-pull + a pre-run no-downgrade refusal; adding it there would
     # reverse a recorded decision.
+    #
+    # SCOPE, so nobody reads this as stronger than it is: the floor is checked
+    # against the requested TAG, not against the version of the bytes that end
+    # up running. A tag moved or mispublished to below-floor content passes.
+    # Closing that needs the pulled image's version label, which v1 has no
+    # machinery to read -- and would not close it against a hostile registry
+    # anyway, since that label is forgeable (v2 trust model section 7). v1 does
+    # not cosign-verify images at all and is operator-trust by design, so
+    # tag-trust is already its baseline; this guard raises the floor on honest
+    # mistakes, not on a compromised registry.
     if below_floor(resolved, manifest.min_supported if manifest else None):
         print(strings.UPDATE_REFUSED_BELOW_FLOOR.format(
             target=resolved, min_supported=manifest.min_supported,
