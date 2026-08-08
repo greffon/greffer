@@ -175,7 +175,15 @@ def version_tuple(value: str | None) -> tuple[int, ...] | None:
     if not isinstance(value, str) or not value:
         return None
     parts = value.split('.')
-    if not all(p.isdigit() for p in parts):
+    # isdigit() alone is NOT enough to make int() safe on manifest-supplied
+    # text. It is True for non-ASCII digit characters ('²'.isdigit() is True
+    # but int('²') raises ValueError), and for arbitrarily long runs of digits
+    # int() raises once past CPython's integer-string limit (4300 by default).
+    # Either would turn a malformed manifest into a traceback out of `greffer
+    # update` / `--check`, so require plain ASCII digits and bound the length.
+    # 18 digits is far beyond any real version component (even date-shaped ones
+    # are 8) while staying comfortably inside the limit.
+    if not all(p.isascii() and p.isdigit() and 0 < len(p) <= 18 for p in parts):
         return None
     return tuple(int(p) for p in parts)
 
@@ -197,6 +205,38 @@ def is_downgrade(current: str | None, target: str | None) -> bool | None:
     cur = cur + (0,) * (width - len(cur))
     tgt = tgt + (0,) * (width - len(tgt))
     return tgt < cur
+
+
+def below_floor(target: str | None, min_supported: str | None) -> bool | None:
+    """Is ``target`` below the manifest's ``min_supported`` floor?
+
+    ``True``  = strictly below the floor -> a known-vulnerable release.
+    ``False`` = at or above the floor.
+    ``None``  = no claim (floor absent, or either side not dotted-numeric).
+
+    Per the trust model the floor exists to "block below-floor reintroduction",
+    i.e. an update must never put the node back onto a release the project has
+    declared unsupported. Distinct from is_downgrade(), which is about DIRECTION
+    relative to what is running: 0.9 -> 0.8 is a downgrade but may still be above
+    the floor, and a fresh install of a below-floor version is not a downgrade at
+    all yet is still refused here.
+
+    Honest scope: v1 fetches the manifest over HTTPS but does NOT verify its
+    signature, and there is no /data ratchet, so a hostile or rolled-back origin
+    can serve a LOWER floor. This is a safety guard against accidentally landing
+    on a known-bad release, not a security control against a hostile origin. The
+    signed-manifest + ratchet half of the design (HLD section 11) is not built.
+    """
+    if not min_supported:
+        return None
+    tgt = version_tuple(target)
+    flr = version_tuple(min_supported)
+    if tgt is None or flr is None:
+        return None
+    width = max(len(tgt), len(flr))
+    tgt = tgt + (0,) * (width - len(tgt))
+    flr = flr + (0,) * (width - len(flr))
+    return tgt < flr
 
 
 def no_rollback_blocked(
@@ -528,7 +568,9 @@ def run_update(
         # Report the DIRECTION, not merely "different". A stale manifest made
         # an older `latest` read as "available: yes", which is how a downgrade
         # looked like a routine update.
-        if downgrade:
+        if below_floor(resolved, manifest.min_supported if manifest else None):
+            available = f"no — target is BELOW the supported floor {manifest.min_supported}"
+        elif downgrade:
             available = "no — target is OLDER than current"
         else:
             available = (
@@ -552,6 +594,38 @@ def run_update(
         return EXIT_PREFLIGHT_REFUSED
     if not compose.data_volume_is_named(compose_file):
         print(strings.UPDATE_PREFLIGHT_NO_DATA_VOLUME, file=sys.stderr)
+        return EXIT_PREFLIGHT_REFUSED
+
+    # MIN_SUPPORTED FLOOR. The manifest carries a floor and, until now, nothing
+    # read it: it was parsed into Manifest and never consulted, and the
+    # min_supported_baseline file baked into the updater image has no reader in
+    # cli/ at all. Per the trust model the floor exists to "block below-floor
+    # reintroduction" -- an update must never land the node on a release the
+    # project has withdrawn as known-bad.
+    #
+    # Checked BEFORE the ordering guard so a below-floor target reports the
+    # stronger reason, and NOT overridable by `--to`: unlike a downgrade (a
+    # legitimate operator choice) a below-floor release is withdrawn, so an
+    # explicit request for one is exactly what this refuses.
+    #
+    # v2 is deliberately out of scope. The :latest updater drops the floor by
+    # construction (hld-v2-per-container-recreate section 11), replacing it with
+    # verify-then-pull + a pre-run no-downgrade refusal; adding it there would
+    # reverse a recorded decision.
+    #
+    # SCOPE, so nobody reads this as stronger than it is: the floor is checked
+    # against the requested TAG, not against the version of the bytes that end
+    # up running. A tag moved or mispublished to below-floor content passes.
+    # Closing that needs the pulled image's version label, which v1 has no
+    # machinery to read -- and would not close it against a hostile registry
+    # anyway, since that label is forgeable (v2 trust model section 7). v1 does
+    # not cosign-verify images at all and is operator-trust by design, so
+    # tag-trust is already its baseline; this guard raises the floor on honest
+    # mistakes, not on a compromised registry.
+    if below_floor(resolved, manifest.min_supported if manifest else None):
+        print(strings.UPDATE_REFUSED_BELOW_FLOOR.format(
+            target=resolved, min_supported=manifest.min_supported,
+        ), file=sys.stderr)
         return EXIT_PREFLIGHT_REFUSED
 
     # ORDERING GUARD. resolve_target() takes the manifest's `latest` at face
