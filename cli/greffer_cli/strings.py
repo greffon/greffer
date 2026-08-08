@@ -332,6 +332,14 @@ UPDATE_NEEDS_CONFIRM_NO_ROLLBACK = (
     "unreachable).\n  → re-run with `--confirm-no-rollback` to proceed anyway."
 )
 
+UPDATE_REFUSED_BELOW_FLOOR = (
+    "✗ Refusing to install {target}: it is below the supported floor "
+    "{min_supported}.\n"
+    "  Releases under the floor are withdrawn as known-bad, so the update would\n"
+    "  put this node back onto one. This refusal is not overridable by `--to`.\n"
+    "  → pick {min_supported} or newer (`greffer update --check` shows latest)."
+)
+
 UPDATE_REFUSED_DOWNGRADE = (
     "✗ Refusing to downgrade: {current} is NEWER than the target {target}.\n"
     "  The version manifest advertises {target} as latest, which means it is\n"

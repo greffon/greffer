@@ -852,3 +852,123 @@ def test_downgrade_guard_rechecks_under_the_lock(
     # Refused before the compose was rewritten / pulled.
     assert fake.running_image != fake.target_image
     assert len(seen) >= 2, "expected a re-read under the lock"
+
+
+# --- min_supported floor ---------------------------------------------
+#
+# The manifest has always carried min_supported and nothing read it. Per the
+# trust model the floor "blocks below-floor reintroduction": an update must
+# never land the node on a release withdrawn as known-bad.
+
+@pytest.mark.parametrize(
+    ("target", "floor", "expected"),
+    [
+        ("0.2.0", "0.3.0", True),
+        ("0.3.0", "0.3.0", False),     # at the floor is allowed
+        ("0.9.0", "0.3.0", False),
+        ("0.3", "0.3.0", False),       # zero-padding
+        ("0.9.0", "0.10.0", True),     # numeric, not lexical
+        ("0.2.0", None, None),         # no floor -> no claim
+        ("latest", "0.3.0", None),     # unorderable -> no claim
+    ],
+)
+def test_below_floor(target, floor, expected) -> None:
+    assert update.below_floor(target, floor) is expected
+
+
+def _manifest_full(latest: str, min_supported: str | None):
+    return lambda url, timeout=10.0: update.Manifest(
+        latest=latest, min_supported=min_supported,
+    )
+
+
+def test_auto_latest_refuses_a_below_floor_target(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    fake = FakeDocker()
+    fake.install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest_full("0.2.0", "0.3.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.1.0")
+
+    rc = _run(cfg)
+
+    assert rc == update.EXIT_PREFLIGHT_REFUSED
+    assert "below the supported floor" in capsys.readouterr().err
+    assert fake.running_image != fake.target_image
+
+
+def test_explicit_to_cannot_override_the_floor(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """Unlike a downgrade, a below-floor release is withdrawn: --to must NOT work."""
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest_full("0.9.0", "0.3.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.9.0")
+
+    rc = _run(cfg, target="0.2.0", confirm_no_rollback=True)
+
+    assert rc == update.EXIT_PREFLIGHT_REFUSED
+    assert "below the supported floor" in capsys.readouterr().err
+
+
+def test_at_the_floor_is_allowed(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest_full("0.3.4", "0.3.4"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.3.0")
+
+    assert _run(cfg) == update.EXIT_OK
+
+
+def test_absent_floor_does_not_block(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest without min_supported must not wedge updates shut."""
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest_full("0.3.4", None))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.3.0")
+
+    assert _run(cfg) == update.EXIT_OK
+
+
+def test_check_reports_below_floor(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(update, "fetch_manifest", _manifest_full("0.2.0", "0.3.0"))
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.1.0")
+
+    assert _run(cfg, check_only=True) == update.EXIT_OK
+    assert "BELOW the supported floor" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "².0.0",        # superscript two: isdigit() True, int() raises
+        "0.².0",
+        "٠.0.0",        # arabic-indic zero: isdigit() True, int() raises
+        "9" * 5000,          # past CPython's int-string conversion limit
+        "1." + "9" * 5000,
+        "1..2",              # empty component
+        "",
+        ".",
+    ],
+)
+def test_version_tuple_never_raises_on_hostile_input(value) -> None:
+    """The manifest is fetched over HTTPS from an external origin, so a
+    malformed version must return None, never crash the CLI."""
+    assert update.version_tuple(value) is None
+
+
+def test_hostile_floor_does_not_crash_the_update(
+    cfg: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeDocker().install(monkeypatch)
+    monkeypatch.setattr(
+        update, "fetch_manifest", _manifest_full("0.3.4", "².0.0"),
+    )
+    monkeypatch.setattr(compose, "exec_greffer_version", lambda f: "0.3.0")
+    # An unorderable floor makes no claim, so the update proceeds normally.
+    assert _run(cfg) == update.EXIT_OK
