@@ -1122,3 +1122,20 @@ def test_the_happy_path_reloads_rather_than_restarting(
 
     assert wired['reload'] == ['inst-1'], 'the certificate must be reloaded, not restarted into place'
     assert wired['restart'] == []
+
+
+def test_renewal_stands_off_while_compose_is_working(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Testing compose_inflight() alone proved nothing: deleting the CALL to it
+    left the whole suite green while renewal wrote into a sidecar compose was
+    mid-recreate."""
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: False)
+    monkeypatch.setattr(cert_renewal, 'compose_inflight', lambda s, g: True)
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['install'] == [], 'must not write into a sidecar compose is recreating'
+    assert result.status == cert_renewal.SKIPPED

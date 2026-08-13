@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import socket
 import ssl
@@ -89,9 +90,50 @@ _blind_streak = 0
 # confirmation is terminal, because the next tick reads the new certificate as
 # not-due and never reports again -- leaving the manager alarming on a healthy
 # instance, its pending parked as an orphan, and the superseded certificate
-# unrevoked. In-process, so a greffer restart forgets the debt; the instance is
-# serving a valid certificate either way, only the bookkeeping is lost.
+# unrevoked.
+#
+# Persisted, because the window it covers is a manager outage and the obvious
+# operator response to one is to restart or update the greffer -- which would
+# drop exactly the debts accumulated during it. `greffer update` recreates this
+# process by design, so an in-process-only ledger loses the record precisely
+# when it is most likely to hold anything.
 _unconfirmed: dict[str, str] = {}
+_UNCONFIRMED_FILE = '.cert-unconfirmed.json'
+
+
+def _unconfirmed_path(settings: Settings):
+    return settings.greffon_path / _UNCONFIRMED_FILE
+
+
+def _load_unconfirmed(settings: Settings) -> None:
+    """Read the owed-confirmation ledger from disk, once per pass.
+
+    Best-effort in both directions: a missing, unreadable or corrupt file just
+    means no debts, never a failed pass. The cost of losing it is stale
+    bookkeeping on the manager, not a broken instance.
+    """
+    try:
+        raw = _unconfirmed_path(settings).read_text(encoding='utf-8')
+    except (OSError, AttributeError):
+        return
+    try:
+        stored = json.loads(raw)
+    except ValueError:
+        logger.warning('cert_renewal_unconfirmed_unreadable')
+        return
+    if isinstance(stored, dict):
+        for k, v in stored.items():
+            if isinstance(k, str) and isinstance(v, str):
+                _unconfirmed.setdefault(k, v)
+
+
+def _save_unconfirmed(settings: Settings) -> None:
+    try:
+        _unconfirmed_path(settings).write_text(
+            json.dumps(_unconfirmed), encoding='utf-8')
+    except (OSError, AttributeError, TypeError):
+        # A read-only or full volume must not fail a renewal that worked.
+        logger.warning('cert_renewal_unconfirmed_unwritable', exc_info=True)
 
 # One renewal pass at a time on this node. The periodic tick and the operator's
 # /renew-certs/ call both land here in the same process, and two passes would
@@ -616,6 +658,37 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         lock.release()
 
 
+COMPOSE_INFLIGHT_FILE = '.compose-inflight'
+# A marker older than this is treated as stale rather than as a live compose
+# child. A greffer restart between spawning compose and reaping it would
+# otherwise block renewal for that instance permanently -- and permanent
+# non-renewal is the bug, so this fails toward renewing.
+_INFLIGHT_STALE_SECONDS = 15 * 60
+
+
+def compose_inflight(settings: Settings, greffon_id: str) -> bool:
+    """True while a compose child for this instance is still running.
+
+    The per-instance lock does not cover this on its own. ``compose.start`` and
+    ``compose.stop`` are ``subprocess.Popen`` -- they return immediately -- and
+    ``_serialize_instance_op`` releases the lock when the HANDLER returns, while
+    ``_wait_for_compose_running`` only runs on the tunnel branch. So a
+    proxy-mode start (and every stop) frees the lock while compose is still
+    pulling or recreating the container.
+
+    A StartedAt timestamp cannot see that window: during a pull the EXISTING
+    sidecar is still up with an old start time, so it reads as settled right
+    up to the moment it is replaced. Only an explicit marker written before the
+    child is spawned covers the whole span.
+    """
+    path = settings.greffon_path / greffon_id / COMPOSE_INFLIGHT_FILE
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age < _INFLIGHT_STALE_SECONDS
+
+
 def _sidecar_settling(greffon_id: str) -> bool:
     """True if the sidecar started so recently that a compose child may still
     be working on it.
@@ -666,7 +739,14 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(SKIPPED, None)
     host = settings.greffer_cert_probe_host
 
+    if compose_inflight(settings, greffon_id):
+        diag('cert_renewal_skipped', instance=greffon_id, reason='compose_inflight')
+        return Outcome(SKIPPED, None)
+
     if _sidecar_settling(greffon_id):
+        # Belt to the marker's braces: covers a compose child this process did
+        # not spawn (a manual `docker compose up` on the node, a restart the
+        # daemon performed under `restart: unless-stopped`).
         diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
         return Outcome(SKIPPED, None)
 
@@ -776,6 +856,7 @@ def renew_all(settings: Settings, token: str, only: str | None = None,
 
 def _renew_all_locked(settings, collect_status_map, only, force,
                       token) -> PassResult:
+    _load_unconfirmed(settings)
     considered = errors = renewed = skipped = 0
     selected = None
     capped = False
@@ -852,6 +933,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
     # reaches again.
     for stale in set(_unconfirmed) - set(statuses):
         _unconfirmed.pop(stale, None)
+    _save_unconfirmed(settings)
     # renewed/skipped broken out, not just considered/errors. `considered`
     # counts instances LOOKED AT, so a node where all 200 are skipped for
     # no_published_port logged considered=200 errors=0 -- indistinguishable
@@ -878,9 +960,16 @@ async def cert_renewal_worker(app: FastAPI) -> None:
         # only stop renewal everywhere.
         logger.info('cert renewal worker disabled by CERT_RENEWAL_ENABLED')
         return
+    # The delay before the NEXT pass, carried across iterations. A bare
+    # `sleep(_CAPPED_RETRY_SECONDS)` inside the handler does not shorten
+    # anything: control returns to the top and sleeps the full interval as
+    # well, so the advertised one-hour retry actually happened seven hours
+    # later -- worse than no retry, because the log claimed otherwise.
+    delay = settings.greffer_cert_renewal_interval
     try:
         while True:
-            await asyncio.sleep(settings.greffer_cert_renewal_interval)
+            await asyncio.sleep(delay)
+            delay = settings.greffer_cert_renewal_interval
             try:
                 # Re-read every tick, never snapshot at startup. register.py
                 # rewrites app.state.greffer_token on rotation (a degraded-boot
@@ -905,7 +994,7 @@ async def cert_renewal_worker(app: FastAPI) -> None:
                 # own budget and take ~40h to clear 200 expired certificates.
                 diag('cert_renewal_tick_capped_retry',
                      delay_seconds=_CAPPED_RETRY_SECONDS)
-                await asyncio.sleep(_CAPPED_RETRY_SECONDS)
+                delay = _CAPPED_RETRY_SECONDS
             except Exception:  # the loop outlives any one tick
                 logger.exception('cert_renewal_tick_failed')
     except asyncio.CancelledError:

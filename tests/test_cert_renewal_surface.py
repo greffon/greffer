@@ -10,6 +10,7 @@ mod-256 exit-code fix from the same commit.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 from unittest.mock import patch
 
 import pytest
@@ -252,7 +253,7 @@ async def test_a_capped_tick_retries_within_the_hour(settings: Settings, monkeyp
 
     async def _sleep(n):
         slept.append(n)
-        if len(slept) >= 2:
+        if len(slept) >= 3:
             raise asyncio.CancelledError
 
     ticks: list = []
@@ -268,7 +269,14 @@ async def test_a_capped_tick_retries_within_the_hour(settings: Settings, monkeyp
     with pytest.raises(asyncio.CancelledError):
         await cert_renewal.cert_renewal_worker(app)
 
-    assert slept[1] == cert_renewal._CAPPED_RETRY_SECONDS
+    # The whole SEQUENCE, not just that the short delay appears somewhere.
+    # Asserting slept[1] alone passed while the loop then slept another full
+    # interval on top, making the real retry 7h and the log line a lie.
+    assert slept[:3] == [
+        settings.greffer_cert_renewal_interval,
+        cert_renewal._CAPPED_RETRY_SECONDS,
+        cert_renewal._CAPPED_RETRY_SECONDS,
+    ], slept
 
 
 @pytest.mark.asyncio
@@ -352,3 +360,132 @@ def test_renew_all_forwards_force_to_each_instance(settings: Settings, monkeypat
         cert_renewal.renew_all(settings, 'tok', only='i1', force=True)
 
     assert seen == [True]
+
+
+def test_the_owed_ledger_survives_a_greffer_restart(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The window this covers is a manager outage, and the operator's response
+    to one is often to restart or update the greffer -- dropping exactly the
+    debts accumulated during it. `greffer update` recreates the process by
+    design.
+    """
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.NOT_DUE, 'aa'))
+    cert_renewal._unconfirmed['i1'] = 'deadbeef'
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        cert_renewal.renew_all(settings, 'tok')
+
+    # A fresh process: the in-memory map is gone, the file is not.
+    cert_renewal._unconfirmed.clear()
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        cert_renewal.renew_all(settings, 'tok')
+
+    assert cert_renewal._unconfirmed.get('i1') == 'deadbeef'
+
+
+def test_a_corrupt_ledger_does_not_fail_the_pass(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale bookkeeping is the cost of losing it; a broken pass is not."""
+    settings.greffon_path = tmp_path
+    (tmp_path / '.cert-unconfirmed.json').write_text('{not json')
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.NOT_DUE, 'aa'))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        assert cert_renewal.renew_all(settings, 'tok').errors == 0
+
+
+def test_an_unwritable_volume_does_not_fail_the_pass(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.greffon_path = pathlib.Path('/nonexistent-volume-xyz')
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.RENEWED, 'aa'))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        assert cert_renewal.renew_all(settings, 'tok').renewed == 1
+
+
+# ---------------------------------------------------------------------------
+# The compose in-flight marker. A StartedAt timestamp cannot see this window:
+# while compose is PULLING, the existing sidecar is still up with an old start
+# time, so it reads as settled right until it is replaced.
+# ---------------------------------------------------------------------------
+
+def test_renewal_waits_for_a_running_compose_child(settings: Settings, tmp_path) -> None:
+    settings.greffon_path = tmp_path
+    inst = tmp_path / 'i1'
+    inst.mkdir()
+    (inst / cert_renewal.COMPOSE_INFLIGHT_FILE).write_text('1234')
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is True
+
+
+def test_a_stale_marker_does_not_wedge_renewal_forever(settings: Settings, tmp_path) -> None:
+    """A greffer restart between spawning compose and reaping it would
+    otherwise block that instance permanently -- and permanent non-renewal is
+    the bug this feature exists to fix, so it must fail toward renewing."""
+    import os
+    import time as _time
+
+    settings.greffon_path = tmp_path
+    inst = tmp_path / 'i1'
+    inst.mkdir()
+    marker = inst / cert_renewal.COMPOSE_INFLIGHT_FILE
+    marker.write_text('1234')
+    old = _time.time() - cert_renewal._INFLIGHT_STALE_SECONDS - 60
+    os.utime(marker, (old, old))
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is False
+
+
+def test_no_marker_means_no_compose_child(settings: Settings, tmp_path) -> None:
+    settings.greffon_path = tmp_path
+    assert cert_renewal.compose_inflight(settings, 'i1') is False
+
+
+def test_a_start_publishes_and_then_clears_the_marker(settings: Settings, tmp_path) -> None:
+    """The marker must span the child's whole life and not outlive it."""
+    import threading
+
+    from app.routers import controller
+
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i1').mkdir()
+    done = threading.Event()
+
+    class _Proc:
+        pid = 4321
+
+        @staticmethod
+        def wait(timeout=None):
+            done.wait(timeout)
+
+    controller._mark_compose_inflight(settings, 'i1', _Proc())
+    assert cert_renewal.compose_inflight(settings, 'i1') is True, 'not published'
+
+    done.set()
+    for _ in range(100):
+        if not cert_renewal.compose_inflight(settings, 'i1'):
+            break
+        __import__('time').sleep(0.02)
+    assert cert_renewal.compose_inflight(settings, 'i1') is False, 'never cleared'
+
+
+def test_an_unwritable_marker_does_not_break_start(settings: Settings) -> None:
+    """Purely additive: if the marker cannot be written, behaviour is exactly
+    what it was before this existed."""
+    from app.routers import controller
+
+    settings.greffon_path = pathlib.Path('/nonexistent-volume-xyz')
+
+    class _Proc:
+        pid = 1
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    controller._mark_compose_inflight(settings, 'i1', _Proc())  # must not raise

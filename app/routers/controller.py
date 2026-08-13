@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 import os
 import shutil
 import time
@@ -24,6 +25,7 @@ import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth import require_token
+from app.workers import cert_renewal
 from app.diagnostics import diag
 from app.log_context import instance_id_var
 from app import backup
@@ -63,6 +65,10 @@ from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
 
+# Upper bound on how long the in-flight reaper waits for a compose child before
+# giving up and clearing the marker anyway. Longer than any realistic pull.
+_INFLIGHT_REAP_TIMEOUT = 15 * 60
+
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
 # without ``wait``), so we have to poll ``compose.get_status`` to know
@@ -94,6 +100,44 @@ def _refuse_if_updating(settings) -> None:
     lock_path = Path(settings.greffon_path) / ".update.lock"
     if updater_spawn.update_in_progress(lock_path):
         raise HTTPException(status_code=409, detail="update_in_progress")
+
+
+def _mark_compose_inflight(settings, greffon_id: str, proc):
+    """Publish "a compose child is working on this instance" for its lifetime.
+
+    The per-instance lock cannot express this. ``compose.start`` / ``stop`` are
+    ``subprocess.Popen`` and return at once, so this decorator's lock is
+    released while the child is still pulling images or recreating containers.
+    The certificate-renewal worker writes into the instance's nginx sidecar and
+    must not do so mid-recreate: the manager cannot afterwards tell which
+    certificate is live and logs ``instance_cert_renewal_orphan`` at CRITICAL,
+    refusing to revoke either.
+
+    Purely additive. If the marker cannot be written, or the reaper thread
+    dies, behaviour is exactly what it was before: renewal proceeds, and the
+    marker goes stale on its own (see ``_INFLIGHT_STALE_SECONDS``) so it can
+    never wedge renewal off permanently.
+    """
+    if proc is None:
+        return
+    path = Path(settings.greffon_path) / greffon_id / cert_renewal.COMPOSE_INFLIGHT_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(getattr(proc, "pid", "")), encoding="utf-8")
+    except OSError:
+        logger.warning("compose_inflight_unwritable instance=%s", greffon_id)
+        return
+
+    def _reap():
+        try:
+            proc.wait(timeout=_INFLIGHT_REAP_TIMEOUT)
+        except Exception:  # noqa: BLE001 -- the unlink below is the point
+            logger.warning("compose_inflight_reap_failed instance=%s", greffon_id)
+        finally:
+            path.unlink(missing_ok=True)
+
+    threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
+                     daemon=True).start()
 
 
 def _serialize_instance_op(handler):
@@ -204,7 +248,8 @@ def start_greffon(
         compose.create_compose(compose_template, greffon_info)
         conf.create_nginx_conf(greffon_info)
         compose.create_volumes_then_copy_files(greffon_info)
-        compose.start(greffon_info)
+        _mark_compose_inflight(_settings(request), greffon_info["id"],
+                               compose.start(greffon_info))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="start", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
@@ -259,7 +304,8 @@ def stop_greffon(
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
     _t0 = time.monotonic()
     try:
-        compose.stop(greffon)
+        _mark_compose_inflight(_settings(request), greffon.get("id"),
+                               compose.stop(greffon))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="stop", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
