@@ -38,6 +38,7 @@ import logging
 import socket
 import ssl
 import sys
+import threading
 import time
 
 import anyio
@@ -74,6 +75,18 @@ class _NodeRateLimited(Exception):
 # Consecutive instances whose sidecar answered nothing. Reset by any readable
 # one, so it only climbs when the fault is shared.
 _blind_streak = 0
+
+# One renewal pass at a time on this node. The periodic tick and the operator's
+# /renew-certs/ call both land here in the same process, and two passes would
+# interleave over the shared blind-streak counter and the backoff map, each
+# undoing the other's accounting -- while racing each other for the same
+# per-instance locks and the same per-greffer mint budget. There is no reason
+# to run two.
+_pass_lock = threading.Lock()
+
+
+class RenewalAlreadyRunning(Exception):
+    """A renewal pass is already in progress on this node."""
 
 
 def _nginx_container(greffon_id: str) -> str:
@@ -611,6 +624,15 @@ def renew_all(settings: Settings, only: str | None = None,
     """
     from app.workers.status_collect import collect_status_map
 
+    if not _pass_lock.acquire(blocking=False):
+        raise RenewalAlreadyRunning
+    try:
+        return _renew_all_locked(settings, collect_status_map, only, force)
+    finally:
+        _pass_lock.release()
+
+
+def _renew_all_locked(settings, collect_status_map, only, force) -> int:
     token = resolve_token(settings)
     considered = errors = 0
     global _blind_streak

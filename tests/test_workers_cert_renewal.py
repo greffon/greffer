@@ -880,3 +880,37 @@ async def test_the_worker_off_switch_actually_returns(settings: Settings) -> Non
 
     # Returns rather than sleeping for the interval.
     await asyncio.wait_for(cert_renewal.cert_renewal_worker(app), timeout=5)
+
+
+def test_two_renewal_passes_do_not_interleave(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The periodic tick and the operator's call land in the SAME process.
+
+    Interleaved, they trample the shared blind-streak counter and backoff map,
+    race each other for the same per-instance locks, and split one per-greffer
+    mint budget two ways. There is no reason to run two.
+    """
+    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
+    monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: None)
+
+    assert cert_renewal._pass_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(cert_renewal.RenewalAlreadyRunning):
+            cert_renewal.renew_all(settings)
+    finally:
+        cert_renewal._pass_lock.release()
+
+
+def test_the_pass_lock_is_released_after_a_failed_tick(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pass that raises must not wedge renewal on this node for good."""
+    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
+
+    def _boom(s):
+        raise RuntimeError('docker is gone')
+
+    monkeypatch.setattr(cert_renewal, '_renew_all_locked',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    with pytest.raises(RuntimeError):
+        cert_renewal.renew_all(settings)
+
+    assert cert_renewal._pass_lock.acquire(blocking=False), 'lock leaked'
+    cert_renewal._pass_lock.release()

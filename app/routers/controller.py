@@ -355,11 +355,18 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
     manager refuses to resolve and logs as instance_cert_renewal_orphan.
     Running the pass here puts it behind the same lock as everything else.
     """
-    from app.workers.cert_renewal import renew_all
+    from app.workers.cert_renewal import RenewalAlreadyRunning, renew_all
 
     settings = _settings(request)
     _refuse_if_updating(settings)
-    errors = renew_all(settings, only=id, force=force)
+    try:
+        errors = renew_all(settings, only=id, force=force)
+    except RenewalAlreadyRunning:
+        # The periodic tick (or another operator call) already holds the pass.
+        # 409 rather than queueing: a pass can take minutes on a busy node, and
+        # a caller blocked behind one would hold a threadpool worker the whole
+        # time for a job that is already being done.
+        raise HTTPException(status_code=409, detail="renewal_in_progress") from None
     return {"errors": errors}
 
 

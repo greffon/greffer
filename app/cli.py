@@ -157,6 +157,9 @@ def _renew_certs(args: argparse.Namespace) -> int:
     except requests.RequestException as exc:
         print(f"cannot reach the local greffer API: {exc}", file=sys.stderr)
         return 1
+    if res.status_code == 409 and 'renewal_in_progress' in res.text:
+        print("a renewal pass is already running on this node", file=sys.stderr)
+        return 1
     if res.status_code != 200:
         print(f"renewal refused: {res.status_code} {res.text[:200]}",
               file=sys.stderr)
