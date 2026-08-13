@@ -168,7 +168,9 @@ def test_backoff_grows_and_is_capped(settings: Settings) -> None:
         cert_renewal._note_failure('inst-1', settings.greffer_cert_renewal_interval)
     failures, deadline = cert_renewal._renewal_backoff['inst-1']
     assert failures == 40
-    assert deadline - time.monotonic() <= cert_renewal._BACKOFF_CAP_SECONDS
+    # A LITERAL, not the constant: asserting against _BACKOFF_CAP_SECONDS is
+    # circular, so widening the cap to 30 days passed this test unchanged.
+    assert deadline - time.monotonic() <= 24 * 60 * 60
 
 
 def test_a_recovered_instance_is_renewed_again(
@@ -342,7 +344,7 @@ def test_the_tick_reports_how_many_instances_failed(settings: Settings, monkeypa
         'app.workers.status_collect.collect_status_map',
         return_value={'a': 'running', 'b': 'running', 'c': 'stopped'},
     ):
-        assert cert_renewal.renew_all(settings, 'tok') == 2
+        assert cert_renewal.renew_all(settings, 'tok').errors == 2
 
 
 def test_a_slow_reload_is_not_a_mismatch(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -649,10 +651,16 @@ def test_install_writes_the_pair_in_one_archive(monkeypatch: pytest.MonkeyPatch)
     path, blob = captured[0]
     assert path == '/etc/nginx'
     with tarfile.open(fileobj=__import__('io').BytesIO(blob)) as tar:
-        got = {m.name: tar.extractfile(m).read().decode() for m in tar.getmembers()}
+        members = {m.name: m for m in tar.getmembers()}
+        got = {n: tar.extractfile(m).read().decode() for n, m in members.items()}
     assert set(got) == {'cert.key', 'pem.crt'}
     assert 'PRIVATE KEY' in got['cert.key'], 'key and certificate are swapped'
     assert 'CERTIFICATE' in got['pem.crt'], 'key and certificate are swapped'
+    # tar defaults to 0644, while the START path stages this key through
+    # mkstemp (0600) and docker cp preserves it. Unasserted, every renewal
+    # silently widened an unencrypted TLS private key to world-readable.
+    assert members['cert.key'].mode == 0o600, oct(members['cert.key'].mode)
+    assert members['pem.crt'].mode == 0o644, oct(members['pem.crt'].mode)
 
 
 def test_the_sidecar_container_name_matches_compose(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -797,6 +805,11 @@ def test_mint_returns_the_manager_payload(settings: Settings, monkeypatch: pytes
     assert got['serial_number'] == NEW
     assert seen['url'].endswith('/api/greffer/instances/inst-1/cert/')
     assert seen['headers'] == {'X-Greffer-Token': 'tok-123'}
+    # The mint RESPONSE carries the instance's unencrypted private key, and
+    # `never verify=False on requests calls` is a project rule. Unasserted, the
+    # mutation to verify=False passed the whole suite.
+    assert seen['verify'] == settings.greffer_ssl_verify
+    assert seen['timeout'] == cert_renewal._HTTP_TIMEOUT_SECONDS
 
 
 def test_a_node_wide_rate_limit_is_not_charged_to_the_instance(
@@ -845,12 +858,14 @@ def test_a_blind_probe_path_stops_the_tick(settings: Settings, wired, monkeypatc
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (None, None))
     minted: list = []
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: minted.append(g) or _cert())
-    fleet = {f'i{n}': 'running' for n in range(8)}
+    # Well above _BLIND_STREAK_ABORT: sized AT the constant, raising the
+    # constant to the fleet size made the abort a no-op and still passed.
+    fleet = {f'i{n}': 'running' for n in range(40)}
 
     with patch('app.workers.status_collect.collect_status_map', return_value=fleet):
         cert_renewal.renew_all(settings, 'tok')
 
-    assert len(minted) == cert_renewal._BLIND_STREAK_ABORT, (
+    assert len(minted) == 3, (
         f'minted {len(minted)} certificates against an unobservable fleet')
 
 
@@ -1008,7 +1023,7 @@ def test_a_refusal_is_counted_as_an_error(settings: Settings, wired, monkeypatch
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
     with patch('app.workers.status_collect.collect_status_map',
                return_value={'inst-1': 'running'}):
-        assert cert_renewal.renew_all(settings, 'tok') == 1
+        assert cert_renewal.renew_all(settings, 'tok').errors == 1
 
 
 def test_an_unmatched_instance_selector_is_an_error(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -133,6 +133,23 @@ class Outcome(NamedTuple):
     serial: str | None
 
 
+class PassResult(NamedTuple):
+    """Counts for one pass, plus the outcome of an explicitly selected instance.
+
+    `errors` alone could not answer the operator's question. An instance skipped
+    for a real reason -- inside the compose settle window, no published port --
+    is not an error, so a targeted `renew_certs --instance X` over a skipped X
+    reported a clean pass having renewed nothing. That is the incident sequence:
+    restart the app, still 502, run the emergency renewal, be told it worked.
+    """
+
+    considered: int
+    renewed: int
+    skipped: int
+    errors: int
+    selected: str | None
+
+
 RENEWED = "renewed"
 NOT_DUE = "not_due"
 SKIPPED = "skipped"
@@ -313,12 +330,18 @@ def _install(greffon_id: str, cert: dict) -> None:
 
     stream = io.BytesIO()
     with tarfile.TarFile(fileobj=stream, mode='w') as tar:
-        for name, content in (('cert.key', cert['private_key']),
-                              ('pem.crt', cert['certificate'])):
+        for name, content, mode in (('cert.key', cert['private_key'], 0o600),
+                                    ('pem.crt', cert['certificate'], 0o644)):
             data = content.encode('utf-8')
             info = tarfile.TarInfo(name=name)
             info.size = len(data)
             info.mtime = int(_time.time())
+            # Explicit, because tar defaults to 0644 and the start path stages
+            # this key through mkstemp (0600) which docker cp preserves. Without
+            # it every renewal silently widens an unencrypted TLS private key,
+            # in a tree that ships an ops migration to purge strayed copies of
+            # this exact file.
+            info.mode = mode
             tar.addfile(info, io.BytesIO(data))
     stream.seek(0)
     client.containers.get(_nginx_container(greffon_id)).put_archive(
@@ -726,7 +749,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
 
 
 def renew_all(settings: Settings, token: str, only: str | None = None,
-              force: bool = False) -> int:
+              force: bool = False) -> PassResult:
     """One tick over every instance on this greffer. Returns the error count.
 
     ``token`` is the one THIS process registered with, passed in rather than
@@ -751,8 +774,10 @@ def renew_all(settings: Settings, token: str, only: str | None = None,
         _pass_lock.release()
 
 
-def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
-    considered = errors = 0
+def _renew_all_locked(settings, collect_status_map, only, force,
+                      token) -> PassResult:
+    considered = errors = renewed = skipped = 0
+    selected = None
     capped = False
     global _blind_streak
     _blind_streak = 0
@@ -774,9 +799,15 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
             # A failure that does not raise is still a failure. Counting only
             # exceptions had `renew_certs` exit 0 after a manager refusal or a
             # certificate still unserved past the restart.
-            if renew_one(settings, token, greffon_id,
-                         force=force).status == FAILED:
+            outcome = renew_one(settings, token, greffon_id, force=force)
+            if greffon_id == only:
+                selected = outcome.status
+            if outcome.status == FAILED:
                 errors += 1
+            elif outcome.status == RENEWED:
+                renewed += 1
+            elif outcome.status == SKIPPED:
+                skipped += 1
         except _NodeRateLimited:
             # The node hit the manager's per-greffer cap. Every remaining
             # instance would collect the same refusal, so stopping here is not
@@ -789,6 +820,8 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
             break
         except Exception:  # one instance must not end the tick
             errors += 1
+            if greffon_id == only:
+                selected = FAILED
             # Armed HERE too, not only on a clean mismatch. A sidecar that has
             # been deleted, or a manager that is unreachable, raises out of
             # _mint / _install rather than returning -- and those are the
@@ -819,11 +852,16 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
     # reaches again.
     for stale in set(_unconfirmed) - set(statuses):
         _unconfirmed.pop(stale, None)
-    diag('cert_renewal_tick', considered=considered, errors=errors,
-         backing_off=len(_renewal_backoff), owed=len(_unconfirmed))
+    # renewed/skipped broken out, not just considered/errors. `considered`
+    # counts instances LOOKED AT, so a node where all 200 are skipped for
+    # no_published_port logged considered=200 errors=0 -- indistinguishable
+    # from a node that renewed everything.
+    diag('cert_renewal_tick', considered=considered, renewed=renewed,
+         skipped=skipped, errors=errors, backing_off=len(_renewal_backoff),
+         owed=len(_unconfirmed))
     if capped:
         raise NodeCapped
-    return errors
+    return PassResult(considered, renewed, skipped, errors, selected)
 
 
 async def cert_renewal_worker(app: FastAPI) -> None:
@@ -834,7 +872,6 @@ async def cert_renewal_worker(app: FastAPI) -> None:
     greffers restarting together must not stampede the manager's mint endpoint.
     """
     settings: Settings = app.state.settings
-    token: str = app.state.greffer_token
     if not settings.greffer_cert_renewal_enabled:
         # A per-node off switch. The manager's CERT_RENEWAL_ENABLED is
         # fleet-wide, so without this an operator seeing one node misbehave can
@@ -845,8 +882,17 @@ async def cert_renewal_worker(app: FastAPI) -> None:
         while True:
             await asyncio.sleep(settings.greffer_cert_renewal_interval)
             try:
+                # Re-read every tick, never snapshot at startup. register.py
+                # rewrites app.state.greffer_token on rotation (a degraded-boot
+                # ephemeral token later superseded by an on-disk one, a restore,
+                # an operator rotation), and monitor.py / heartbeat.py both
+                # re-read for exactly this reason. A stale token 403s every mint
+                # and report, and _mint reads 403 as a generic refusal, so each
+                # instance walks the backoff to the cap and the whole node's
+                # certificates expire silently.
                 await anyio.to_thread.run_sync(
-                    renew_all, settings, token, abandon_on_cancel=True
+                    renew_all, settings, app.state.greffer_token,
+                    abandon_on_cancel=True
                 )
             except RenewalAlreadyRunning:
                 # An operator's renew_certs holds the pass. Not a crash, and

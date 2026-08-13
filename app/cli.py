@@ -132,7 +132,7 @@ def _renew_certs(args: argparse.Namespace) -> int:
     import requests
 
     from app.auth import TOKEN_HEADER
-    from app.token import resolve_token
+    from app.token import load_persisted_token
 
     if args.force and not args.instance:
         # A fleet-wide force fires one mint per running instance at once. On a
@@ -144,6 +144,16 @@ def _renew_certs(args: argparse.Namespace) -> int:
         return 2
 
     settings = get_settings()
+    # load_persisted_token, NOT resolve_token: the latter MINTS and persists a
+    # new token when none exists. This process is a client, not the node's
+    # identity -- minting here would 401 against the running greffer and stage
+    # a CLI-invented token at the manager on the next re-register.
+    token = settings.greffer_token or load_persisted_token(
+        settings.greffon_path / ".greffer-token")
+    if not token:
+        print("no greffer token on this node; is the greffer running?",
+              file=sys.stderr)
+        return 1
     params = {"force": "true" if args.force else "false"}
     if args.instance:
         params["id"] = args.instance
@@ -151,7 +161,7 @@ def _renew_certs(args: argparse.Namespace) -> int:
         res = requests.post(
             "http://127.0.0.1:8000/api/controller/renew-certs/",
             params=params,
-            headers={TOKEN_HEADER: resolve_token(settings)},
+            headers={TOKEN_HEADER: token},
             timeout=_RENEW_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
@@ -173,8 +183,14 @@ def _renew_certs(args: argparse.Namespace) -> int:
         print(f"renewal refused: {res.status_code} {res.text[:200]}",
               file=sys.stderr)
         return 1
-    errors = res.json().get("errors", 0)
-    print(f"renewal pass complete, errors={errors}")
+    if res.status_code == 409 and 'instance_not_renewed' in res.text:
+        print(f"instance {args.instance!r} was not renewed: {res.text[:200]}",
+              file=sys.stderr)
+        return 1
+    body = res.json()
+    errors = body.get("errors", 0)
+    print(f"renewal pass complete: renewed={body.get('renewed', 0)} "
+          f"skipped={body.get('skipped', 0)} errors={errors}")
     # NOT the raw count: sys.exit truncates modulo 256, so a node with 256
     # failing instances would report success to any wrapping script.
     return 1 if errors else 0

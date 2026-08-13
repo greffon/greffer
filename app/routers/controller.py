@@ -356,6 +356,7 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
     Running the pass here puts it behind the same lock as everything else.
     """
     from app.workers.cert_renewal import (
+        RENEWED,
         InstanceNotFound,
         NodeCapped,
         RenewalAlreadyRunning,
@@ -371,7 +372,7 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
         # manager's hourly cap into backoff, at the worst possible moment.
         raise HTTPException(status_code=400, detail="force_requires_instance")
     try:
-        errors = renew_all(settings, request.app.state.greffer_token,
+        result = renew_all(settings, request.app.state.greffer_token,
                            only=id, force=force)
     except InstanceNotFound:
         raise HTTPException(status_code=404, detail="instance_not_found") from None
@@ -385,7 +386,20 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
         # a caller blocked behind one would hold a threadpool worker the whole
         # time for a job that is already being done.
         raise HTTPException(status_code=409, detail="renewal_in_progress") from None
-    return {"errors": errors}
+    if id is not None and result.selected != RENEWED:
+        # An explicitly selected instance that was skipped renewed nothing, and
+        # "0 errors" would tell an operator mid-incident that it had. A skip is
+        # legitimate (inside the compose settle window, no published port) but
+        # it is not the renewal that was asked for.
+        raise HTTPException(
+            status_code=409,
+            detail=f"instance_not_renewed:{result.selected or 'skipped'}")
+    return {
+        "errors": result.errors,
+        "renewed": result.renewed,
+        "skipped": result.skipped,
+        "considered": result.considered,
+    }
 
 
 @router.post("/backup/", status_code=202)
