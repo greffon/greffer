@@ -127,6 +127,11 @@ def _load_unconfirmed(settings: Settings) -> None:
                 _unconfirmed.setdefault(k, v)
 
 
+def _clear_debt(settings: Settings, greffon_id: str) -> None:
+    if _unconfirmed.pop(greffon_id, None) is not None:
+        _save_unconfirmed(settings)
+
+
 def _save_unconfirmed(settings: Settings) -> None:
     try:
         _unconfirmed_path(settings).write_text(
@@ -475,7 +480,8 @@ def _report(settings: Settings, token: str, greffon_id: str,
                            greffon_id, attempt, exc_info=True)
             res = None
         if res is not None and res.status_code == 200:
-            _unconfirmed.pop(greffon_id, None)
+            if _unconfirmed.pop(greffon_id, None) is not None:
+                _save_unconfirmed(settings)
             return
         if res is not None and res.status_code == 409:
             # serial_mismatch / no_pending_mint / stale. The manager received
@@ -483,14 +489,25 @@ def _report(settings: Settings, token: str, greffon_id: str,
             # a transport failure, and not retryable -- the pending is gone.
             diag('cert_renewal_report_rejected', instance=greffon_id,
                  body=res.text[:120], level=logging.WARNING)
-            _unconfirmed.pop(greffon_id, None)
+            if _unconfirmed.pop(greffon_id, None) is not None:
+                _save_unconfirmed(settings)
             return
+        if res is not None and res.status_code in (401, 403):
+            # A token rotation between this pass reading app.state and the
+            # manager receiving the call. The next pass reads a fresh token, so
+            # this is retryable -- and it must be retried, because the sidecar
+            # is already serving a not-due certificate that no later pass would
+            # otherwise report.
+            logger.warning('cert_renewal_report_unauthorized instance=%s',
+                           greffon_id)
+            break
         if res is not None and res.status_code < 500:
             logger.warning(
                 'cert_renewal_report_failed instance=%s status=%s body=%s',
                 greffon_id, res.status_code, res.text[:200],
             )
             _unconfirmed.pop(greffon_id, None)
+            _save_unconfirmed(settings)
             return
         # 5xx or transport. Worth retrying, and it MUST be retried here: a
         # dropped confirmation is otherwise terminal. The certificate is
@@ -503,8 +520,14 @@ def _report(settings: Settings, token: str, greffon_id: str,
             time.sleep(_REPORT_RETRY_SECONDS * (attempt + 1))
     # Owed, not lost. Retried at the top of the next pass, before the not-due
     # check that would otherwise skip this instance forever.
-    if served_serial:
-        _unconfirmed[greffon_id] = served_serial
+    #
+    # Recorded even when nothing was served: "we could not tell the manager
+    # what this instance is serving" is the debt, and an unobservable sidecar
+    # is the case that most needs chasing. Written through immediately rather
+    # than at the end of the pass -- a pass over a large fleet takes minutes,
+    # and an update or restart inside that window is exactly what loses it.
+    _unconfirmed[greffon_id] = served_serial or ''
+    _save_unconfirmed(settings)
     diag('cert_renewal_report_unconfirmed', instance=greffon_id,
          serial=served_serial, level=logging.ERROR)
 
@@ -758,12 +781,13 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
     # certificate is already installed and serving, so the not-due check below
     # would skip this instance forever and the manager would keep alarming on a
     # healthy one while the superseded certificate is never revoked.
-    owed = _unconfirmed.get(greffon_id)
-    if owed and _same_serial(before_serial, owed):
+    if greffon_id in _unconfirmed:
+        # Report what is served NOW, not the serial the debt was filed under.
+        # The debt means "the manager has not been told what this instance is
+        # serving", and the current handshake is always the truthful answer --
+        # including None, which the manager reads as a mismatch and uses to
+        # retire its dead pending mint.
         _report(settings, token, greffon_id, before_serial)
-    elif owed:
-        # Something else has since changed what is served; the old debt is moot.
-        _unconfirmed.pop(greffon_id, None)
 
     if not force and not _due_for_renewal(
             before_expiry, settings.greffer_cert_renewal_window_days):

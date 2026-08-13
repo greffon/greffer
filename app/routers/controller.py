@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import subprocess
 import threading
 import os
 import shutil
@@ -65,9 +66,10 @@ from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
 
-# Upper bound on how long the in-flight reaper waits for a compose child before
-# giving up and clearing the marker anyway. Longer than any realistic pull.
-_INFLIGHT_REAP_TIMEOUT = 15 * 60
+# How often the reaper re-stamps the marker while the compose child is alive,
+# and the total time it will track one before abandoning it.
+_INFLIGHT_HEARTBEAT_SECONDS = 30
+_INFLIGHT_MAX_SECONDS = 60 * 60
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
@@ -129,12 +131,36 @@ def _mark_compose_inflight(settings, greffon_id: str, proc):
         return
 
     def _reap():
-        try:
-            proc.wait(timeout=_INFLIGHT_REAP_TIMEOUT)
-        except Exception:  # noqa: BLE001 -- the unlink below is the point
-            logger.warning("compose_inflight_reap_failed instance=%s", greffon_id)
-        finally:
-            path.unlink(missing_ok=True)
+        # Heartbeat the marker while the child lives, and clear it only when the
+        # child has actually exited. A single bounded wait cleared the marker on
+        # TIMEOUT -- precisely when the child was definitively still running --
+        # which reopened the race for exactly the long pulls the marker exists
+        # to cover. The touch also keeps the marker from ageing into staleness
+        # under a slow pull, so staleness now means only "the reaper is gone".
+        deadline = time.monotonic() + _INFLIGHT_MAX_SECONDS
+        while True:
+            try:
+                proc.wait(timeout=_INFLIGHT_HEARTBEAT_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() > deadline:
+                    # A compose op running this long is pathological. Give up
+                    # tracking rather than block renewal on this instance for
+                    # good -- permanent non-renewal is the bug being fixed.
+                    logger.warning("compose_inflight_abandoned instance=%s",
+                                   greffon_id)
+                    break
+                try:
+                    path.touch()
+                except OSError:
+                    break
+            except Exception:  # noqa: BLE001 -- stop tracking, but leave the
+                # marker: it expires on its own, and clearing it here would
+                # green-light renewal against a child we can no longer observe.
+                logger.warning("compose_inflight_reap_failed instance=%s",
+                               greffon_id)
+                return
+        path.unlink(missing_ok=True)
 
     threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
                      daemon=True).start()

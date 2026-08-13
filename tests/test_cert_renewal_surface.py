@@ -489,3 +489,87 @@ def test_an_unwritable_marker_does_not_break_start(settings: Settings) -> None:
             return 0
 
     controller._mark_compose_inflight(settings, 'i1', _Proc())  # must not raise
+
+
+def test_a_slow_pull_keeps_the_marker_alive(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single bounded wait cleared the marker ON TIMEOUT -- exactly when the
+    child was definitively still running, reopening the race for the long pulls
+    the marker exists to cover."""
+    import subprocess
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 0.01)
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i1').mkdir()
+    finished = threading.Event()
+
+    class _SlowProc:
+        pid = 99
+
+        @staticmethod
+        def wait(timeout=None):
+            if not finished.wait(timeout):
+                raise subprocess.TimeoutExpired('docker', timeout)
+            return 0
+
+    controller._mark_compose_inflight(settings, 'i1', _SlowProc())
+    _time.sleep(0.1)  # several heartbeats while the "pull" runs
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
+        'the marker must survive a child that outlives one wait window')
+
+    finished.set()
+    for _ in range(200):
+        if not cert_renewal.compose_inflight(settings, 'i1'):
+            break
+        _time.sleep(0.01)
+    assert cert_renewal.compose_inflight(settings, 'i1') is False
+
+
+def test_an_unauthorized_report_keeps_the_debt(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token rotated between this pass reading app.state and the manager
+    receiving the call. The next pass reads a fresh token, so dropping the debt
+    here strands a serving certificate the manager never learns about."""
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(
+        'requests.post',
+        lambda *a, **k: type('R', (), {'status_code': 403, 'text': ''})())
+
+    cert_renewal._report(settings, 'stale-token', 'i1', 'aa11')
+
+    assert cert_renewal._unconfirmed.get('i1') == 'aa11'
+
+
+def test_an_unobservable_sidecar_is_still_owed(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`if served_serial:` skipped the debt for exactly the case that most
+    needs chasing."""
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(
+        'requests.post',
+        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'i1', None)
+
+    assert 'i1' in cert_renewal._unconfirmed
+
+
+def test_the_debt_is_written_through_before_the_pass_ends(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass over a large fleet takes minutes; an update inside that window is
+    what loses debts held only in memory."""
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(
+        'requests.post',
+        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'i1', 'aa11')
+
+    on_disk = (tmp_path / '.cert-unconfirmed.json').read_text()
+    assert 'i1' in on_disk, 'the debt only existed in memory'
