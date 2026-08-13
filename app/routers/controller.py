@@ -104,6 +104,23 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
+def _clear_marker(path: Path, proc) -> None:
+    """Remove the marker only if it is still OURS.
+
+    The marker path is per-instance but each call spawns its own reaper, and
+    the manager's restart flow is stop-then-start with the lock released
+    between them. `docker-compose stop` finishes in seconds while `up -d` is
+    still pulling, so an unconditional unlink let the stop's reaper delete the
+    start's marker and open exactly the window the marker exists to close. The
+    pid written at publication time is what tells them apart.
+    """
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(getattr(proc, "pid", "")):
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _mark_compose_inflight(settings, greffon_id: str, proc):
     """Publish "a compose child is working on this instance" for its lifetime.
 
@@ -131,11 +148,11 @@ def _mark_compose_inflight(settings, greffon_id: str, proc):
         return
 
     def _reap():
-        # Heartbeat the marker while the child lives, and clear it only when the
+        # Heartbeat the marker while the child lives, and clear it only once the
         # child has actually exited. A single bounded wait cleared the marker on
         # TIMEOUT -- precisely when the child was definitively still running --
-        # which reopened the race for exactly the long pulls the marker exists
-        # to cover. The touch also keeps the marker from ageing into staleness
+        # reopening the race for exactly the long pulls the marker exists to
+        # cover. The touch also keeps the marker from ageing into staleness
         # under a slow pull, so staleness now means only "the reaper is gone".
         deadline = time.monotonic() + _INFLIGHT_MAX_SECONDS
         while True:
@@ -153,17 +170,24 @@ def _mark_compose_inflight(settings, greffon_id: str, proc):
                 try:
                     path.touch()
                 except OSError:
-                    break
+                    # The instance directory is gone (a decommission), so there
+                    # is nothing left to protect and nothing to clear.
+                    return
             except Exception:  # noqa: BLE001 -- stop tracking, but leave the
                 # marker: it expires on its own, and clearing it here would
                 # green-light renewal against a child we can no longer observe.
                 logger.warning("compose_inflight_reap_failed instance=%s",
                                greffon_id)
                 return
-        path.unlink(missing_ok=True)
+        _clear_marker(path, proc)
 
-    threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
-                     daemon=True).start()
+    try:
+        threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
+                         daemon=True).start()
+    except Exception:  # noqa: BLE001 -- "purely additive" has to mean it
+        # Thread-limit exhaustion must not 500 a start whose compose child has
+        # already spawned. The marker then expires on its own.
+        logger.warning("compose_inflight_thread_failed instance=%s", greffon_id)
 
 
 def _serialize_instance_op(handler):

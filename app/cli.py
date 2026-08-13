@@ -179,12 +179,12 @@ def _renew_certs(args: argparse.Namespace) -> int:
               "the requested renewal did NOT happen. Retry within the hour.",
               file=sys.stderr)
         return 1
-    if res.status_code != 200:
-        print(f"renewal refused: {res.status_code} {res.text[:200]}",
-              file=sys.stderr)
-        return 1
     if res.status_code == 409 and 'instance_not_renewed' in res.text:
         print(f"instance {args.instance!r} was not renewed: {res.text[:200]}",
+              file=sys.stderr)
+        return 1
+    if res.status_code != 200:
+        print(f"renewal refused: {res.status_code} {res.text[:200]}",
               file=sys.stderr)
         return 1
     body = res.json()

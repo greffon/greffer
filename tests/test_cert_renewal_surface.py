@@ -24,6 +24,21 @@ from app.workers import cert_renewal
 RENEW_URL = '/api/controller/renew-certs/'
 
 
+@pytest.fixture(autouse=True)
+def _no_carried_state():
+    """Module-level state leaks between tests otherwise.
+
+    A debt written by one test satisfied another's `'i1' in _unconfirmed`
+    assertion on its own, which is a test that passes without the code under
+    it doing anything.
+    """
+    cert_renewal._unconfirmed.clear()
+    cert_renewal._renewal_backoff.clear()
+    yield
+    cert_renewal._unconfirmed.clear()
+    cert_renewal._renewal_backoff.clear()
+
+
 @pytest.fixture
 def client(settings: Settings):
     app = create_app(token='tok', settings=settings)
@@ -573,3 +588,269 @@ def test_the_debt_is_written_through_before_the_pass_ends(
 
     on_disk = (tmp_path / '.cert-unconfirmed.json').read_text()
     assert 'i1' in on_disk, 'the debt only existed in memory'
+
+
+# ---------------------------------------------------------------------------
+# The marker's PRODUCER side. Deleting both publications from start and stop
+# left the whole suite green: the previous tests called
+# _mark_compose_inflight directly, never through the endpoints.
+# ---------------------------------------------------------------------------
+
+class _NeverExits:
+    """A compose child that is still working."""
+
+    pid = 4242
+
+    @staticmethod
+    def wait(timeout=None):
+        import subprocess
+        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
+
+
+def test_starting_an_instance_publishes_the_marker(
+    client, settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.helpers import SAMPLE_START_PAYLOAD
+
+    payload = dict(SAMPLE_START_PAYLOAD)
+    instance_id = payload['id']
+    settings.greffon_path = tmp_path
+    (tmp_path / instance_id).mkdir()
+
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose, \
+            patch('app.routers.controller.conf'):
+        repo.get_compose_file_from_repository.return_value = {}
+        repo.get_greffon_info.return_value = {'ports': [], 'id': instance_id}
+        compose.start.return_value = _NeverExits()
+        res = client.post('/api/controller/start/', json=payload,
+                          headers={TOKEN_HEADER: 'tok'})
+
+    assert res.status_code == 200, res.text
+    assert cert_renewal.compose_inflight(settings, instance_id) is True, (
+        'start must publish the marker, or renewal can write into a sidecar '
+        'compose is still recreating'
+    )
+
+
+def test_stopping_an_instance_publishes_the_marker(
+    client, settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i2').mkdir()
+
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose:
+        repo.get_greffon_info.return_value = {'ports': [], 'id': 'i2'}
+        compose.stop.return_value = _NeverExits()
+        res = client.post('/api/controller/stop/', json={'id': 'i2'},
+                          headers={TOKEN_HEADER: 'tok'})
+
+    assert res.status_code == 200, res.text
+    assert cert_renewal.compose_inflight(settings, 'i2') is True
+
+
+def test_the_heartbeat_is_what_keeps_a_long_pull_marked(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned against the STALENESS bound, not just against elapsed time.
+
+    A test that checks a marker written 0.1s ago still reads in-flight passes
+    with or without the heartbeat, because the staleness bound is 15 minutes.
+    Only shrinking that bound makes the re-stamp load-bearing -- and without
+    it, any pull longer than the bound ages the marker out and renewal
+    proceeds mid-recreate.
+    """
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 0.02)
+    monkeypatch.setattr(cert_renewal, '_INFLIGHT_STALE_SECONDS', 0.15)
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i1').mkdir()
+    done = threading.Event()
+
+    class _SlowPull:
+        pid = 77
+
+        @staticmethod
+        def wait(timeout=None):
+            import subprocess
+            if not done.wait(timeout):
+                raise subprocess.TimeoutExpired('docker', timeout)
+            return 0
+
+    controller._mark_compose_inflight(settings, 'i1', _SlowPull())
+    _time.sleep(0.5)  # far longer than the staleness bound
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
+        'without the heartbeat the marker ages out mid-pull')
+    done.set()
+
+
+def test_a_stop_reaper_does_not_clear_a_start_marker(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manager restarts an instance as stop-then-start, and the lock is
+    released between them. `docker-compose stop` finishes in seconds while
+    `up -d` is still pulling, so an unconditional unlink let the stop's reaper
+    delete the start's marker -- opening exactly the window it exists to close.
+    """
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    # A SLOW heartbeat on purpose. With a fast one the surviving reaper
+    # re-creates the file within milliseconds, so the deletion is invisible to
+    # an assertion made afterwards -- which is exactly how an unconditional
+    # unlink passed this test. In production the window is up to 30s, and
+    # renewal only has to sample it once.
+    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 30)
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i1').mkdir()
+    stop_done = threading.Event()
+    pull_done = threading.Event()
+
+    class _Proc:
+        def __init__(self, pid, ev):
+            self.pid = pid
+            self._ev = ev
+
+        def wait(self, timeout=None):
+            import subprocess
+            if not self._ev.wait(timeout):
+                raise subprocess.TimeoutExpired('docker', timeout)
+            return 0
+
+    controller._mark_compose_inflight(settings, 'i1', _Proc(101, stop_done))
+    controller._mark_compose_inflight(settings, 'i1', _Proc(202, pull_done))
+    stop_done.set()          # the quick stop child exits
+    _time.sleep(0.2)         # while the pull is still running
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
+        "the stop's reaper cleared the marker the start still needs")
+    pull_done.set()
+
+
+def test_the_ledger_is_written_atomically(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rename-into-place, because the event this ledger exists to survive IS a kill.
+
+    write_text truncates and then writes, so a kill or ENOSPC inside that
+    window leaves a truncated file that reads back as ZERO debts -- losing the
+    debts rather than just the update. It is rewritten once per failed report,
+    so a manager outage across a fleet opens one such window per instance.
+
+    Asserting the rename rather than a corrupted-file outcome: the truncation
+    window cannot be observed from a test, and an assertion that merely reads
+    the file back afterwards passes for the unsafe implementation too.
+    """
+    import os as _os
+
+    settings.greffon_path = tmp_path
+    ledger = tmp_path / '.cert-unconfirmed.json'
+    replaced: list = []
+    real_replace = _os.replace
+    monkeypatch.setattr(_os, 'replace',
+                        lambda a, b: replaced.append((str(a), str(b))) or real_replace(a, b))
+
+    cert_renewal._unconfirmed['i1'] = 'aa11'
+    cert_renewal._save_unconfirmed(settings)
+
+    assert replaced, 'the ledger was written in place, not renamed into place'
+    src, dst = replaced[-1]
+    assert dst == str(ledger)
+    assert src != str(ledger), 'the temp file must be a different path'
+    assert 'i1' in ledger.read_text()
+    assert not list(tmp_path.glob('*.tmp')), 'temp file left behind'
+
+
+def test_a_failed_rename_leaves_the_existing_ledger_intact(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os as _os
+
+    settings.greffon_path = tmp_path
+    ledger = tmp_path / '.cert-unconfirmed.json'
+    cert_renewal._unconfirmed['keep-me'] = 'aa11'
+    cert_renewal._save_unconfirmed(settings)
+
+    monkeypatch.setattr(_os, 'replace',
+                        lambda *a, **k: (_ for _ in ()).throw(OSError('ENOSPC')))
+    cert_renewal._unconfirmed['and-me'] = 'bb22'
+    cert_renewal._save_unconfirmed(settings)  # must not raise
+
+    import json as _json
+    assert _json.loads(ledger.read_text()) == {'keep-me': 'aa11'}
+
+
+@pytest.mark.asyncio
+async def test_a_short_interval_clamps_the_capped_retry(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node on a 30-minute tick must not wait an HOUR after being rate
+    limited -- that is longer than it would have waited anyway, the inverse of
+    what the capped retry is for."""
+    from fastapi import FastAPI
+
+    settings.greffer_cert_renewal_interval = 600
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(
+        cert_renewal, 'renew_all',
+        lambda *a, **k: (_ for _ in ()).throw(cert_renewal.NodeCapped()))
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept == [600, 600], slept
+
+
+@pytest.mark.asyncio
+async def test_the_delay_returns_to_normal_after_a_capped_tick(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cap ONCE, then recover.
+
+    Every other test here stubs renew_all to cap on every tick, so
+    [interval, capped, capped] comes out identically whether or not the delay
+    is reset -- the reset was entirely unpinned. Without it a single
+    rate-limited tick would pin the node to the short retry forever, hammering
+    the mint endpoint six times more often than intended for good.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    slept: list = []
+    ticks: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 3:
+            raise asyncio.CancelledError
+
+    def _cap_once(*a, **kw):
+        ticks.append(1)
+        if len(ticks) == 1:
+            raise cert_renewal.NodeCapped
+        return _result()
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', _cap_once)
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    interval = settings.greffer_cert_renewal_interval
+    assert slept == [interval, cert_renewal._CAPPED_RETRY_SECONDS, interval], slept

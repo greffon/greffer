@@ -36,6 +36,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import os
 import socket
 import ssl
 import sys
@@ -133,9 +134,19 @@ def _clear_debt(settings: Settings, greffon_id: str) -> None:
 
 
 def _save_unconfirmed(settings: Settings) -> None:
+    """Write the ledger atomically.
+
+    ``write_text`` truncates and then writes, and the event this ledger exists
+    to survive -- a kill during `greffer update`, a full volume -- lands inside
+    that window and leaves a truncated file that reads back as ZERO debts. It
+    is now rewritten once per failed report, so a manager outage across a large
+    fleet opens one truncate window per instance rather than one per pass.
+    """
+    path = _unconfirmed_path(settings)
     try:
-        _unconfirmed_path(settings).write_text(
-            json.dumps(_unconfirmed), encoding='utf-8')
+        tmp = path.with_name(path.name + '.tmp')
+        tmp.write_text(json.dumps(_unconfirmed), encoding='utf-8')
+        os.replace(tmp, path)
     except (OSError, AttributeError, TypeError):
         # A read-only or full volume must not fail a renewal that worked.
         logger.warning('cert_renewal_unconfirmed_unwritable', exc_info=True)
@@ -480,8 +491,7 @@ def _report(settings: Settings, token: str, greffon_id: str,
                            greffon_id, attempt, exc_info=True)
             res = None
         if res is not None and res.status_code == 200:
-            if _unconfirmed.pop(greffon_id, None) is not None:
-                _save_unconfirmed(settings)
+            _clear_debt(settings, greffon_id)
             return
         if res is not None and res.status_code == 409:
             # serial_mismatch / no_pending_mint / stale. The manager received
@@ -489,8 +499,7 @@ def _report(settings: Settings, token: str, greffon_id: str,
             # a transport failure, and not retryable -- the pending is gone.
             diag('cert_renewal_report_rejected', instance=greffon_id,
                  body=res.text[:120], level=logging.WARNING)
-            if _unconfirmed.pop(greffon_id, None) is not None:
-                _save_unconfirmed(settings)
+            _clear_debt(settings, greffon_id)
             return
         if res is not None and res.status_code in (401, 403):
             # A token rotation between this pass reading app.state and the
@@ -506,8 +515,7 @@ def _report(settings: Settings, token: str, greffon_id: str,
                 'cert_renewal_report_failed instance=%s status=%s body=%s',
                 greffon_id, res.status_code, res.text[:200],
             )
-            _unconfirmed.pop(greffon_id, None)
-            _save_unconfirmed(settings)
+            _clear_debt(settings, greffon_id)
             return
         # 5xx or transport. Worth retrying, and it MUST be retried here: a
         # dropped confirmation is otherwise terminal. The certificate is
@@ -1018,7 +1026,11 @@ async def cert_renewal_worker(app: FastAPI) -> None:
                 # own budget and take ~40h to clear 200 expired certificates.
                 diag('cert_renewal_tick_capped_retry',
                      delay_seconds=_CAPPED_RETRY_SECONDS)
-                delay = _CAPPED_RETRY_SECONDS
+                # Clamped: the validator admits intervals as short as 60s,
+                # and an unconditional hour would make a rate-limited node wait
+                # LONGER than it otherwise would -- the inverse of the point.
+                delay = min(_CAPPED_RETRY_SECONDS,
+                            settings.greffer_cert_renewal_interval)
             except Exception:  # the loop outlives any one tick
                 logger.exception('cert_renewal_tick_failed')
     except asyncio.CancelledError:
