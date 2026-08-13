@@ -75,8 +75,53 @@ def main(argv: list[str] | None = None) -> int:
     )
     m.set_defaults(func=_apply_ops_migrations)
 
+    r = sub.add_parser(
+        "renew_certs",
+        help=(
+            "Renew per-instance upstream certificates now, instead of waiting "
+            "for the next worker tick."
+        ),
+        description=(
+            "Runs one renewal pass over this node's running instances: mint a "
+            "replacement from the manager, install it into the instance's nginx "
+            "sidecar, reload, then verify over TLS that the sidecar is actually "
+            "serving the new serial (restarting it if not). Exit code is the "
+            "number of instances that errored."
+        ),
+    )
+    r.add_argument(
+        "--instance",
+        metavar="GREFFON_ID",
+        default=None,
+        help="Renew exactly one instance (default: every running instance).",
+    )
+    r.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Ignore this node's backoff and not-due check. For an instance that "
+            "is already serving an expired certificate and cannot wait for the "
+            "backoff to elapse. The manager still applies its own window, "
+            "cooldown and rate limit, so this grants nothing extra."
+        ),
+    )
+    r.set_defaults(func=_renew_certs)
+
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _renew_certs(args: argparse.Namespace) -> int:
+    """Force a renewal pass. Exit code = number of instances that errored.
+
+    Exists for the operator whose instances are ALREADY 502ing on an expired
+    certificate: the worker would fix them on its own schedule, but "wait up to
+    six hours" is not an answer while an app is down.
+    """
+    from app.workers.cert_renewal import renew_all
+
+    settings = get_settings()
+    return renew_all(settings, only=args.instance, force=args.force)
 
 
 def _apply_ops_migrations(args: argparse.Namespace) -> int:

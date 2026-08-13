@@ -116,6 +116,25 @@ class Settings(BaseSettings):
         # both the register and heartbeat paths.
         return v[:32] if v else v
 
+    @field_validator("cert_renewal_interval")
+    @classmethod
+    def _cert_renewal_interval_in_range(cls, v):
+        # 0 would busy-loop the worker AND silently disarm the backoff, whose
+        # delay is a multiple of this value -- the two failures that compound
+        # into unbounded certificate issuance.
+        if not 60 <= v <= 86400:
+            raise ValueError("cert_renewal_interval must be between 60 and 86400")
+        return v
+
+    @field_validator("cert_renewal_window_days")
+    @classmethod
+    def _cert_renewal_window_sane(cls, v):
+        # Above the 30-day cert TTL every instance is permanently "due"; at or
+        # below 0 nothing ever renews.
+        if not 1 <= v <= 29:
+            raise ValueError("cert_renewal_window_days must be between 1 and 29")
+        return v
+
     @field_validator("heartbeat_interval")
     @classmethod
     def _heartbeat_interval_in_range(cls, v):
@@ -164,8 +183,20 @@ class Settings(BaseSettings):
     # so a 6-hour tick gives ~28 attempts inside a 7-day window -- enough that a
     # manager outage, a rate limit, or a sidecar restart all get retried long
     # before anything expires, without polling a mint endpoint hourly.
+    cert_renewal_enabled: bool = True
     cert_renewal_interval: int = 6 * 60 * 60
     cert_renewal_window_days: int = 7
+    # Where the renewal worker dials to ask a sidecar which certificate it is
+    # serving. NOT 127.0.0.1: the greffer runs in its own network namespace on
+    # the `internal` bridge, so its loopback has none of the instance ports on
+    # it -- the same mistake apps/utils/docker/l4_ports.py documents. The
+    # sidecar's port is published on the HOST, reached through the
+    # host-gateway alias this compose file already declares.
+    #
+    # Deliberately separate from greffer_public_host, which is the address
+    # BROWSERS use and which setup-dev.sh pins to 127.0.0.1 for exactly that
+    # reason. Sharing it would make the probe unreachable in dev.
+    cert_probe_host: str = "host.docker.internal"
     monitor_interval: int = 5
     # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
     # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL
