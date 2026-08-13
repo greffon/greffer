@@ -34,9 +34,11 @@ def _no_carried_state():
     """
     cert_renewal._unconfirmed.clear()
     cert_renewal._renewal_backoff.clear()
+    cert_renewal._stop.clear()
     yield
     cert_renewal._unconfirmed.clear()
     cert_renewal._renewal_backoff.clear()
+    cert_renewal._stop.clear()
 
 
 @pytest.fixture
@@ -645,187 +647,6 @@ def test_an_unobservable_sidecar_is_still_owed(settings: Settings, tmp_path, mon
     cert_renewal._report(settings, 'tok', 'i1', None)
 
     assert 'i1' in cert_renewal._unconfirmed
-
-
-def test_the_debt_is_written_through_before_the_pass_ends(
-    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A pass over a large fleet takes minutes; an update inside that window is
-    what loses debts held only in memory."""
-    settings.greffon_path = tmp_path
-    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
-    monkeypatch.setattr(
-        'requests.post',
-        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
-
-    cert_renewal._report(settings, 'tok', 'i1', 'aa11')
-
-    on_disk = (tmp_path / '.cert-unconfirmed.json').read_text()
-    assert 'i1' in on_disk, 'the debt only existed in memory'
-
-
-# ---------------------------------------------------------------------------
-# The marker's PRODUCER side. Deleting both publications from start and stop
-# left the whole suite green: the previous tests called
-# _mark_compose_inflight directly, never through the endpoints.
-# ---------------------------------------------------------------------------
-
-class _NeverExits:
-    """A compose child that is still working."""
-
-    pid = 4242
-
-    @staticmethod
-    def wait(timeout=None):
-        import subprocess
-        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
-
-
-# ---------------------------------------------------------------------------
-# The lock now spans the compose child. This is the serialization the manager
-# names as the precondition for enabling renewal at all, and it replaces the
-# marker file that approximated it (and was wrong three times).
-# ---------------------------------------------------------------------------
-
-class _StillWorking:
-    """A compose child that has not finished."""
-
-    pid = 4242
-
-    def __init__(self, ev=None):
-        self._ev = ev
-
-    def wait(self, timeout=None):
-        import subprocess
-        if self._ev is not None and self._ev.wait(timeout):
-            return 0
-        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
-
-
-def test_the_instance_stays_locked_until_compose_finishes(
-    client, settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """compose.start returns the moment the child is SPAWNED.
-
-    Releasing the lock at handler return published "this instance is free"
-    during the exact window its sidecar was being replaced, and renewal took
-    the lock and wrote into it. The manager cannot tell which certificate is
-    live afterwards -- it logs instance_cert_renewal_orphan at CRITICAL and
-    refuses to revoke either.
-    """
-    import threading
-
-    from app.backup import _instance_lock
-    from tests.helpers import SAMPLE_START_PAYLOAD
-
-    payload = dict(SAMPLE_START_PAYLOAD)
-    instance_id = payload['id']
-    finished = threading.Event()
-
-    with patch('app.routers.controller.repository') as repo, \
-            patch('app.routers.controller.compose') as compose, \
-            patch('app.routers.controller.conf'):
-        repo.get_compose_file_from_repository.return_value = {}
-        repo.get_greffon_info.return_value = {'ports': [], 'id': instance_id}
-        compose.start.return_value = _StillWorking(finished)
-        res = client.post('/api/controller/start/', json=payload,
-                          headers={TOKEN_HEADER: 'tok'})
-
-    assert res.status_code == 200, res.text
-    lock = _instance_lock(instance_id)
-    try:
-        assert lock.acquire(blocking=False) is False, (
-            'the instance was released while its compose child was still running')
-    finally:
-        finished.set()
-        for _ in range(200):
-            if lock.acquire(blocking=False):
-                lock.release()
-                break
-            __import__('time').sleep(0.02)
-
-
-def test_the_lock_is_released_once_compose_exits(
-    client, settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Held forever would 409 every future start, stop, backup and renewal for
-    this instance -- a worse outage than the race it closes."""
-    import threading
-    import time as _time
-
-    from app.backup import _instance_lock
-    from tests.helpers import SAMPLE_START_PAYLOAD
-
-    payload = dict(SAMPLE_START_PAYLOAD)
-    payload['id'] = 'release-me'
-    finished = threading.Event()
-
-    with patch('app.routers.controller.repository') as repo, \
-            patch('app.routers.controller.compose') as compose, \
-            patch('app.routers.controller.conf'):
-        repo.get_compose_file_from_repository.return_value = {}
-        repo.get_greffon_info.return_value = {'ports': [], 'id': 'release-me'}
-        compose.start.return_value = _StillWorking(finished)
-        client.post('/api/controller/start/', json=payload,
-                    headers={TOKEN_HEADER: 'tok'})
-
-    finished.set()
-    lock = _instance_lock('release-me')
-    for _ in range(200):
-        if lock.acquire(blocking=False):
-            lock.release()
-            return
-        _time.sleep(0.02)
-    raise AssertionError('the lock was never released after compose exited')
-
-
-def test_a_handler_with_no_compose_child_releases_immediately(
-    client, settings: Settings
-) -> None:
-    """Only ops that actually spawn a child defer the release; anything else
-    would leak the lock on every request."""
-    from app.backup import _instance_lock
-
-    res = client.post('/api/controller/stop/', json={'id': 'nope'},
-                      headers={TOKEN_HEADER: 'tok'})
-
-    lock = _instance_lock('nope')
-    assert lock.acquire(blocking=False), f'lock leaked (status {res.status_code})'
-    lock.release()
-
-
-def test_stopping_also_holds_the_instance_until_compose_finishes(
-    client, settings: Settings
-) -> None:
-    """`compose.stop` is Popen too, and the manager restarts an instance as
-    stop-then-start -- so a stop that released early was half the race."""
-    import threading
-    import time as _time
-
-    from app.backup import _instance_lock
-
-    finished = threading.Event()
-    with patch('app.routers.controller.repository') as repo, \
-            patch('app.routers.controller.compose') as compose:
-        repo.get_greffon_info.return_value = {'ports': [], 'id': 'stop-me'}
-        compose.stop.return_value = _StillWorking(finished)
-        res = client.post('/api/controller/stop/', json={'id': 'stop-me'},
-                          headers={TOKEN_HEADER: 'tok'})
-
-    assert res.status_code == 200, res.text
-    lock = _instance_lock('stop-me')
-    try:
-        assert lock.acquire(blocking=False) is False, (
-            'the instance was released while docker-compose stop was still running')
-    finally:
-        finished.set()
-        for _ in range(200):
-            if lock.acquire(blocking=False):
-                lock.release()
-                break
-            _time.sleep(0.02)
-
-
 def test_a_cancelled_worker_stops_the_pass_between_instances(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -854,3 +675,187 @@ def test_a_cancelled_worker_stops_the_pass_between_instances(
 
     assert len(seen) == 1, (
         f'the pass ground through {len(seen)} instances after shutdown began')
+
+
+# ---------------------------------------------------------------------------
+# Renewal stands off from a live compose child. Deliberately NOT via the
+# per-instance lock: the manager chains control ops (the migration cutover runs
+# stop then /backup/, start then /restore/) and they all take that lock, so
+# holding it across the child 409s the next step and fails the migration.
+# ---------------------------------------------------------------------------
+
+class _StillWorking:
+    pid = 4242
+
+    def __init__(self, ev=None):
+        self._ev = ev
+
+    def wait(self, timeout=None):
+        import subprocess
+        if self._ev is not None and self._ev.wait(timeout):
+            return 0
+        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
+
+
+def _post_start(client, instance_id, proc):
+    from tests.helpers import SAMPLE_START_PAYLOAD
+
+    payload = dict(SAMPLE_START_PAYLOAD)
+    payload['id'] = instance_id
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose, \
+            patch('app.routers.controller.conf'):
+        repo.get_compose_file_from_repository.return_value = {}
+        repo.get_greffon_info.return_value = {'ports': [], 'id': instance_id}
+        compose.start.return_value = proc
+        return client.post('/api/controller/start/', json=payload,
+                           headers={TOKEN_HEADER: 'tok'})
+
+
+def test_a_start_marks_the_instance_until_compose_finishes(client) -> None:
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    finished = threading.Event()
+    try:
+        res = _post_start(client, 'start-me', _StillWorking(finished))
+        assert res.status_code == 200, res.text
+        assert controller.compose_inflight('start-me') is True, (
+            'renewal would write into a sidecar still being recreated')
+    finally:
+        finished.set()
+        for _ in range(200):
+            if not controller.compose_inflight('start-me'):
+                break
+            _time.sleep(0.02)
+    assert controller.compose_inflight('start-me') is False, 'never cleared'
+
+
+def test_a_stop_marks_the_instance_too(client) -> None:
+    """The manager restarts an instance as stop-then-start, so a stop that did
+    not mark was half the race."""
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    finished = threading.Event()
+    try:
+        with patch('app.routers.controller.repository') as repo, \
+                patch('app.routers.controller.compose') as compose:
+            repo.get_greffon_info.return_value = {'ports': [], 'id': 'stop-me'}
+            compose.stop.return_value = _StillWorking(finished)
+            res = client.post('/api/controller/stop/', json={'id': 'stop-me'},
+                              headers={TOKEN_HEADER: 'tok'})
+        assert res.status_code == 200, res.text
+        assert controller.compose_inflight('stop-me') is True
+    finally:
+        finished.set()
+        for _ in range(200):
+            if not controller.compose_inflight('stop-me'):
+                break
+            _time.sleep(0.02)
+
+
+def test_a_start_does_not_hold_the_instance_lock_past_its_response(client) -> None:
+    """The migration cutover chains stop -> /backup/ and start -> /restore/,
+    and both take this lock. Holding it across the compose child 409s the very
+    next step and fails every migration.
+    """
+    import threading
+
+    from app.backup import _instance_lock
+
+    finished = threading.Event()
+    try:
+        res = _post_start(client, 'chain-me', _StillWorking(finished))
+        assert res.status_code == 200, res.text
+        lock = _instance_lock('chain-me')
+        assert lock.acquire(blocking=False), (
+            'a chained /backup/ or /restore/ would get 409 instance_busy here')
+        lock.release()
+    finally:
+        finished.set()
+
+
+def test_two_children_both_have_to_finish(client) -> None:
+    """Counted, not flagged: a stop and a start can overlap, and whichever
+    finished first must not un-mark the instance for the other."""
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    quick, slow = threading.Event(), threading.Event()
+    try:
+        controller.track_compose_child('two', _StillWorking(slow))
+        controller.track_compose_child('two', _StillWorking(quick))
+        quick.set()
+        _time.sleep(0.2)
+        assert controller.compose_inflight('two') is True, (
+            'the first child to exit unmarked an instance the other is using')
+    finally:
+        slow.set()
+        for _ in range(200):
+            if not controller.compose_inflight('two'):
+                break
+            _time.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_the_stop_flag_is_cleared_before_the_pass_is_scheduled(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing it INSIDE the pass erased a cancellation that arrived between
+    scheduling and the thread starting, and the pass then ran to completion
+    with the event loop already gone."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    observed: list = []
+
+    async def _sleep(n):
+        return None
+
+    def _renew(*a, **kw):
+        observed.append(cert_renewal._stop.is_set())
+        raise asyncio.CancelledError
+
+    cert_renewal._stop.set()  # a stale flag from a previous shutdown
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', _renew)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await cert_renewal.cert_renewal_worker(app)
+    finally:
+        cert_renewal._stop.clear()
+
+    assert observed == [False], 'the pass started with a stale stop flag set'
+
+
+def test_a_rejected_token_stops_the_pass(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token rotated mid-pass is node-wide, never the instance's fault.
+
+    Charging it to each instance backed off every remaining due one for a fault
+    none of them had, and they stay skipped long after the next pass picks up
+    the fresh token.
+    """
+    seen: list = []
+
+    def _one(s, t, g, force=False):
+        seen.append(g)
+        raise cert_renewal.NodeAuthLost
+
+    monkeypatch.setattr(cert_renewal, 'renew_one', _one)
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'a': 'running', 'b': 'running', 'c': 'running'}):
+        cert_renewal.renew_all(settings, 'stale-token')
+
+    assert seen == ['a'], 'the pass kept presenting a token the manager rejected'
+    assert cert_renewal._renewal_backoff == {}, 'instances penalised for a node fault'

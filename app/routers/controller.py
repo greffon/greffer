@@ -15,7 +15,6 @@ import functools
 import logging
 import os
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -65,12 +64,11 @@ from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
 
-# Ops in flight on this threadpool worker hand their compose children here so
-# the serializer can keep the instance locked until they exit.
-_op_local = threading.local()
-# Upper bound on holding an instance locked for a compose child. Long enough for
-# a cold multi-gigabyte pull, short enough that a wedged child cannot 409 the
-# instance forever.
+# Instances with a live compose child, read by the certificate-renewal worker.
+_inflight: dict[str, int] = {}
+_inflight_guard = threading.Lock()
+# Long enough for a cold multi-gigabyte pull; past it we stop tracking rather
+# than mute renewal for that instance for good.
 _COMPOSE_WAIT_SECONDS = 30 * 60
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
@@ -106,54 +104,60 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
-def defer_lock_release(proc) -> None:
-    """Keep this op's instance lock held until ``proc`` exits.
+def compose_inflight(greffon_id: str) -> bool:
+    """True while a compose child spawned by THIS process is working on the instance."""
+    with _inflight_guard:
+        return _inflight.get(greffon_id, 0) > 0
+
+
+def track_compose_child(greffon_id: str, proc):
+    """Mark the instance as mid-compose until ``proc`` exits.
 
     ``compose.start`` / ``compose.stop`` are ``subprocess.Popen``: they return
     the moment the child is spawned, while it is still pulling images and
-    recreating containers. Releasing the lock at handler return therefore
-    published "this instance is free" during the exact window in which its
-    sidecar is being replaced -- and the certificate-renewal worker, which
-    writes a key and a certificate into that sidecar, took the lock and
-    proceeded. The manager cannot afterwards tell which certificate is live: it
-    logs ``instance_cert_renewal_orphan`` at CRITICAL and refuses to revoke
-    either. Its own comment names serializing renewal against start as the
-    precondition for enabling renewal at all.
+    recreating containers. The certificate-renewal worker writes a key and a
+    certificate into the instance's nginx sidecar, and doing that mid-recreate
+    leaves the manager unable to tell which certificate is live -- it logs
+    ``instance_cert_renewal_orphan`` at CRITICAL and refuses to revoke either.
 
-    Thread-local because the decorator below and the handler it wraps run on
-    the same threadpool worker, and the lock guarantees only one op per
-    instance is ever in flight.
+    Deliberately NOT the per-instance lock, even though that is what serializes
+    start against backup/restore. The manager chains control ops back to back
+    (the migration cutover does stop then /backup/, start then /restore/) and
+    they all take that lock, so holding it across the child 409s the next step
+    and fails the migration. This signal is read only by renewal, which has no
+    such chaining and can simply wait for the next tick.
+
+    In-process because it only ever needs to be: the greffer runs --workers 1,
+    and `renew_certs` delegates to this process rather than doing the work
+    itself, so every renewal shares this dict with every start and stop. A
+    greffer restart clears it, and ``_sidecar_settling`` covers that window.
     """
     if proc is None:
         return
-    getattr(_op_local, "procs", None) is None and setattr(_op_local, "procs", [])
-    _op_local.procs.append(proc)
+    with _inflight_guard:
+        _inflight[greffon_id] = _inflight.get(greffon_id, 0) + 1
 
+    def _wait():
+        try:
+            proc.wait(timeout=_COMPOSE_WAIT_SECONDS)
+        except Exception:  # the decrement below is the point
+            logger.warning("compose_wait_failed instance=%s", greffon_id,
+                           exc_info=True)
+        finally:
+            with _inflight_guard:
+                remaining = _inflight.get(greffon_id, 1) - 1
+                if remaining > 0:
+                    _inflight[greffon_id] = remaining
+                else:
+                    _inflight.pop(greffon_id, None)
 
-def _release_after_children(lock, procs, greffon_id: str) -> None:
-    """Wait out every compose child this op spawned, then free the instance."""
     try:
-        deadline = time.monotonic() + _COMPOSE_WAIT_SECONDS
-        for proc in procs:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                logger.warning("compose_wait_abandoned instance=%s", greffon_id)
-                break
-            try:
-                proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                # Bounded on purpose: a compose op running this long is
-                # pathological, and holding the lock forever would 409 every
-                # future start, stop, backup and renewal for this instance --
-                # a worse outage than the race being closed.
-                logger.warning("compose_wait_timeout instance=%s", greffon_id)
-                break
-            except Exception:  # noqa: BLE001 -- release the lock regardless
-                logger.warning("compose_wait_failed instance=%s", greffon_id,
-                               exc_info=True)
-                break
-    finally:
-        lock.release()
+        threading.Thread(target=_wait, name=f"compose-wait-{greffon_id}",
+                         daemon=True).start()
+    except Exception:  # noqa: BLE001 -- a stuck counter would mute renewal
+        logger.warning("compose_wait_thread_failed instance=%s", greffon_id)
+        with _inflight_guard:
+            _inflight.pop(greffon_id, None)
 
 
 def _serialize_instance_op(handler):
@@ -163,36 +167,22 @@ def _serialize_instance_op(handler):
     serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
     preserves the signature so FastAPI still parses the body + response_model.
 
-    "Whole duration" now includes the compose child the handler spawns: see
-    ``defer_lock_release``. The lock moves to a waiter thread rather than the
-    request blocking on it, so the API answers as promptly as it always did
-    while the instance stays marked busy until compose is actually finished.
+    NOT extended across the compose child. The manager chains control ops
+    immediately -- the migration cutover runs stop then /backup/, and start then
+    /restore/ -- and every one of those takes this same lock, so holding it past
+    the response would 409 the next step and fail the migration. Renewal is the
+    only thing that must stand off from a running compose child, and it does
+    that through ``compose_inflight`` below rather than through this lock.
     """
     @functools.wraps(handler)
     def wrapper(payload, request, *args, **kwargs):
         lock = backup._instance_lock(payload.id)
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="instance_busy")
-        _op_local.procs = []
         try:
             return handler(payload, request, *args, **kwargs)
         finally:
-            procs = [p for p in getattr(_op_local, "procs", []) if p is not None]
-            _op_local.procs = []
-            if not procs:
-                lock.release()
-            else:
-                try:
-                    threading.Thread(
-                        target=_release_after_children,
-                        args=(lock, procs, payload.id),
-                        name=f"compose-wait-{payload.id}",
-                        daemon=True,
-                    ).start()
-                except Exception:  # noqa: BLE001 -- never strand the lock
-                    logger.warning("compose_wait_thread_failed instance=%s",
-                                   payload.id)
-                    lock.release()
+            lock.release()
     return wrapper
 
 
@@ -286,7 +276,7 @@ def start_greffon(
         compose.create_compose(compose_template, greffon_info)
         conf.create_nginx_conf(greffon_info)
         compose.create_volumes_then_copy_files(greffon_info)
-        defer_lock_release(compose.start(greffon_info))
+        track_compose_child(greffon_info["id"], compose.start(greffon_info))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="start", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
@@ -341,7 +331,7 @@ def stop_greffon(
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
     _t0 = time.monotonic()
     try:
-        defer_lock_release(compose.stop(greffon))
+        track_compose_child(greffon.get("id"), compose.stop(greffon))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="stop", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))

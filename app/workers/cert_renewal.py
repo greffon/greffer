@@ -178,6 +178,17 @@ class InstanceNotFound(Exception):
     """An explicit --instance selector matched nothing on this node."""
 
 
+class NodeAuthLost(Exception):
+    """The manager rejected this pass's token.
+
+    Node-wide, never the instance's fault: the token rotated between the pass
+    reading app.state and the manager receiving the call. Charging it to each
+    instance in turn would back off every remaining due one on the node for a
+    fault none of them had, and they stay skipped long after the next pass
+    picks up the fresh token.
+    """
+
+
 class NodeCapped(Exception):
     """The pass stopped on the manager's per-greffer mint cap.
 
@@ -360,6 +371,9 @@ def _mint(settings: Settings, token: str, greffon_id: str) -> dict | None:
         logger.info('cert_renewal_cooling_down instance=%s', greffon_id)
         _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
         return None
+    if res.status_code in (401, 403):
+        logger.warning('cert_renewal_mint_unauthorized instance=%s', greffon_id)
+        raise NodeAuthLost
     if res.status_code != 200:
         # 409 cert_cn_would_not_match in particular can never self-resolve --
         # the greffer's address changed and the field row did not -- so
@@ -749,12 +763,20 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(SKIPPED, None)
     host = settings.greffer_cert_probe_host
 
+    from app.routers.controller import compose_inflight
+
+    if compose_inflight(greffon_id):
+        # A start or stop this process launched is still recreating the
+        # sidecar. Writing a certificate into it now leaves the manager unable
+        # to tell which one is live.
+        diag('cert_renewal_skipped', instance=greffon_id, reason='compose_inflight')
+        return Outcome(SKIPPED, None)
+
     if _sidecar_settling(greffon_id):
-        # The instance LOCK is the real serializer now: start and stop hold it
-        # until their compose child exits, so a renewal can no longer overlap
-        # one this process spawned. This covers what the lock cannot see -- a
-        # compose child nobody here spawned (a manual `docker compose up`, a
-        # recreate the daemon performed under `restart: unless-stopped`).
+        # What the in-process signal cannot see: a compose child nobody here
+        # spawned (a manual `docker compose up`, a recreate the daemon
+        # performed under `restart: unless-stopped`), and the moments right
+        # after a greffer restart cleared the counter.
         diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
         return Outcome(SKIPPED, None)
 
@@ -883,12 +905,20 @@ def _renew_all_locked(settings, collect_status_map, only, force,
                       token) -> PassResult:
     _load_unconfirmed(settings)
     considered = errors = renewed = skipped = 0
-    _stop.clear()
     selected = None
     capped = False
     global _blind_streak
     _blind_streak = 0
+    if _stop.is_set():
+        return PassResult(0, 0, 0, 0, None)
     statuses = collect_status_map(settings)
+    if _stop.is_set():
+        # The sweep is the single longest blocking call in a pass -- one docker
+        # round trip per instance, each able to burn the SDK's 60s timeout
+        # against a hung daemon. Checking only between instances would still
+        # let a shutdown wait out the whole sweep first.
+        diag('cert_renewal_pass_interrupted', considered=0, level=logging.WARNING)
+        return PassResult(0, 0, 0, 0, None)
     if only is not None and only not in statuses:
         # A typo'd or stale id would otherwise skip every instance and report a
         # clean pass, so the operator's emergency command would exit 0 having
@@ -921,6 +951,11 @@ def _renew_all_locked(settings, collect_status_map, only, force,
                 renewed += 1
             elif outcome.status == SKIPPED:
                 skipped += 1
+        except NodeAuthLost:
+            # Every remaining instance would present the same rejected token.
+            diag('cert_renewal_tick_unauthorized', considered=considered,
+                 level=logging.WARNING)
+            break
         except _NodeRateLimited:
             # The node hit the manager's per-greffer cap. Every remaining
             # instance would collect the same refusal, so stopping here is not
@@ -1017,6 +1052,11 @@ async def cert_renewal_worker(app: FastAPI) -> None:
                 # and report, and _mint reads 403 as a generic refusal, so each
                 # instance walks the backoff to the cap and the whole node's
                 # certificates expire silently.
+                # Cleared HERE, before the offload. Clearing inside the pass
+                # erased a cancellation that arrived between scheduling and the
+                # thread starting, and the pass then ran on to completion with
+                # the loop already gone.
+                _stop.clear()
                 await anyio.to_thread.run_sync(
                     renew_all, settings, app.state.greffer_token,
                     abandon_on_cancel=True

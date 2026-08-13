@@ -43,9 +43,11 @@ def _no_carried_backoff():
     """The backoff map is module state; a leak makes later tests silently skip."""
     cert_renewal._renewal_backoff.clear()
     cert_renewal._unconfirmed.clear()
+    cert_renewal._stop.clear()
     yield
     cert_renewal._renewal_backoff.clear()
     cert_renewal._unconfirmed.clear()
+    cert_renewal._stop.clear()
 
 
 @pytest.fixture
@@ -1177,4 +1179,37 @@ def test_a_healthy_certificate_settles_an_old_failure(
 
     cert_renewal.renew_one(settings, 'tok', 'inst-1')
 
+    assert 'inst-1' not in cert_renewal._renewal_backoff
+
+
+def test_renewal_skips_an_instance_compose_is_working_on(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Testing the signal in isolation proves nothing: deleting the CALL to it
+    is what lets renewal write into a sidecar mid-recreate."""
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: False)
+    monkeypatch.setattr('app.routers.controller.compose_inflight', lambda g: True)
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['install'] == [], 'wrote into a sidecar compose is recreating'
+    assert result.status == cert_renewal.SKIPPED
+
+
+def test_a_rejected_token_raises_node_wide(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """403 is the manager saying "not you", not "not this instance".
+
+    Recording it as an instance failure backs off every remaining due instance
+    on the node for a rotation none of them caused.
+    """
+    class _Res:
+        status_code = 403
+        text = '{"message": "invalid_greffer_token"}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda *a, **k: _Res())
+
+    with pytest.raises(cert_renewal.NodeAuthLost):
+        cert_renewal._mint(settings, 'stale', 'inst-1')
     assert 'inst-1' not in cert_renewal._renewal_backoff
