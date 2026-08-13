@@ -9,6 +9,7 @@ pass against the bug.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import time
 from unittest.mock import patch
@@ -607,3 +608,275 @@ def test_an_instance_that_raises_still_backs_off(settings: Settings, monkeypatch
         cert_renewal.renew_all(settings)
 
     assert 'inst-1' in cert_renewal._renewal_backoff
+
+
+# ---------------------------------------------------------------------------
+# The functions the `wired` fixture replaces. Without these, five simultaneous
+# fatal mutations (swapped key/cert contents, compose-v1 container name, wrong
+# report route and body key, container-port instead of host-port, dead
+# off-switch) all left the suite green.
+# ---------------------------------------------------------------------------
+
+def test_install_writes_the_pair_in_one_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both files, right names, right contents, one extraction.
+
+    One archive because two put_archive calls leave a window holding a NEW key
+    against the OLD certificate. nginx serves from memory so nothing looks
+    wrong, until the sidecar restarts weeks later for an unrelated reason and
+    crash-loops on the mismatched pair.
+    """
+    import tarfile
+
+    import apps.utils.docker.base as docker_base
+
+    captured: list = []
+
+    class _Container:
+        @staticmethod
+        def put_archive(path, stream):
+            captured.append((path, stream.read()))
+            return True
+
+    monkeypatch.setattr(
+        docker_base, 'client',
+        type('C', (), {'containers': type('Cs', (), {
+            'get': staticmethod(lambda name: _Container())})()})())
+
+    cert_renewal._install('inst-1', _cert())
+
+    assert len(captured) == 1, 'the pair must land in a single extraction'
+    path, blob = captured[0]
+    assert path == '/etc/nginx'
+    with tarfile.open(fileobj=__import__('io').BytesIO(blob)) as tar:
+        got = {m.name: tar.extractfile(m).read().decode() for m in tar.getmembers()}
+    assert set(got) == {'cert.key', 'pem.crt'}
+    assert 'PRIVATE KEY' in got['cert.key'], 'key and certificate are swapped'
+    assert 'CERTIFICATE' in got['pem.crt'], 'key and certificate are swapped'
+
+
+def test_the_sidecar_container_name_matches_compose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """<project>-<service>-1, where the project is the instance id.
+
+    compose.py runs `docker-compose -p <instance id>` and names the service
+    `greffon_nginx`; compose v2 joins them with hyphens. A v1-style name
+    (underscores) resolves to no container at all, so every docker call in this
+    worker would fail against a healthy sidecar.
+    """
+    import inspect
+
+    from apps.utils.docker import compose
+
+    # Tie the two halves to their real sources rather than restating the string:
+    # the service key compose writes, and the project name it passes to -p.
+    src = inspect.getsource(compose)
+    assert "compose['services']['greffon_nginx']" in src
+    assert "'-p', greffon_info['id']" in src
+
+    assert cert_renewal._nginx_container('abc-123') == 'abc-123-greffon_nginx-1'
+
+
+def test_the_probe_uses_the_host_published_port(settings: Settings, tmp_path) -> None:
+    """The HOST side of the mapping, not the container side.
+
+    "45347:8000" -- 8000 is inside the sidecar's network namespace and means
+    nothing from the greffer's. Taking the wrong half makes every verification
+    dial a closed port.
+    """
+    inst = tmp_path / 'inst-1'
+    inst.mkdir()
+    (inst / 'docker-compose.yml').write_text(
+        'services:\n'
+        '  greffon_nginx:\n'
+        '    image: nginx\n'
+        '    ports:\n'
+        '      - "45347:8000"\n'
+    )
+    settings.greffon_path = tmp_path
+
+    assert cert_renewal._sidecar_host_port(settings, 'inst-1') == 45347
+
+
+def test_a_missing_compose_is_not_an_exception(settings: Settings, tmp_path) -> None:
+    """An instance dir removed mid-tick must skip, not end the tick."""
+    settings.greffon_path = tmp_path
+    assert cert_renewal._sidecar_host_port(settings, 'not-there') is None
+
+
+def test_report_posts_the_served_serial_to_the_right_route(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route, body key and auth header are a contract with the manager.
+
+    `instance_cert_installed` reads exactly `served_serial` and authenticates on
+    X-Greffer-Token; anything else is a silent no-op that leaves the mint
+    pending forever.
+    """
+    seen: dict = {}
+
+    class _Res:
+        status_code = 200
+        text = '{"message": "confirmed"}'
+
+    def _post(url, **kw):
+        seen['url'] = url
+        seen.update(kw)
+        return _Res()
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', _post)
+    cert_renewal._report(settings, 'tok-123', 'inst-1', NEW)
+
+    assert seen['url'].endswith('/api/greffer/instances/inst-1/cert-installed/')
+    assert seen['json'] == {'served_serial': NEW}
+    assert seen['headers'] == {'X-Greffer-Token': 'tok-123'}
+    assert seen['verify'] == settings.greffer_ssl_verify
+
+
+def test_a_dropped_confirmation_is_retried(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lost 200 is otherwise terminal.
+
+    The certificate is installed and serving, so the next tick reads it as
+    not-due and never reports again: the manager's cert_serial stays pinned to
+    a superseded value and alarms on a healthy instance. The manager's own 503
+    exists so the greffer re-reports.
+    """
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    attempts: list = []
+
+    class _Res:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = ''
+
+    def _post(url, **kw):
+        attempts.append(url)
+        return _Res(200 if len(attempts) == 3 else 503)
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', _post)
+    cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+
+    assert len(attempts) == 3, 'a 503 must be retried, not accepted'
+
+
+def test_a_rejected_report_is_not_retried(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """409 means the manager acted. Retrying cannot change the answer and the
+    pending it referred to is already gone."""
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    attempts: list = []
+
+    class _Res:
+        status_code = 409
+        text = '{"message": "serial_mismatch"}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post',
+                        lambda url, **kw: attempts.append(url) or _Res())
+    cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+
+    assert len(attempts) == 1
+
+
+def test_mint_returns_the_manager_payload(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Res:
+        status_code = 200
+        text = ''
+
+        @staticmethod
+        def json():
+            return _cert()
+
+    seen: dict = {}
+
+    def _post(url, **kw):
+        seen['url'] = url
+        seen.update(kw)
+        return _Res()
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', _post)
+    got = cert_renewal._mint(settings, 'tok-123', 'inst-1')
+
+    assert got['serial_number'] == NEW
+    assert seen['url'].endswith('/api/greffer/instances/inst-1/cert/')
+    assert seen['headers'] == {'X-Greffer-Token': 'tok-123'}
+
+
+def test_a_node_wide_rate_limit_is_not_charged_to_the_instance(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-greffer 30/h cap says nothing about THIS instance.
+
+    Backing it off exponentially pushes healthy instances behind a limit none
+    of them caused, and the node then uses a fraction of its own budget.
+    """
+    class _Res:
+        status_code = 429
+        text = '{"message": "rate_limited"}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda *a, **k: _Res())
+
+    with pytest.raises(cert_renewal._NodeRateLimited):
+        cert_renewal._mint(settings, 'tok', 'inst-1')
+    assert 'inst-1' not in cert_renewal._renewal_backoff
+
+
+def test_a_capped_node_stops_the_tick(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every remaining instance would collect the same refusal."""
+    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
+    seen: list = []
+
+    def _one(s, t, g, force=False):
+        seen.append(g)
+        raise cert_renewal._NodeRateLimited
+
+    monkeypatch.setattr(cert_renewal, 'renew_one', _one)
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'a': 'running', 'b': 'running', 'c': 'running'}):
+        cert_renewal.renew_all(settings)
+
+    assert seen == ['a'], 'the tick must stop at the cap, not grind through it'
+
+
+def test_a_blind_probe_path_stops_the_tick(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sidecars answering nothing in a row is a statement about the greffer.
+
+    A firewall rule, a missing host-gateway alias or a hung daemon would
+    otherwise have the tick mint, fail to verify, restart and back off every
+    instance on the node in one pass.
+    """
+    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (None, None))
+    minted: list = []
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: minted.append(g) or _cert())
+    fleet = {f'i{n}': 'running' for n in range(8)}
+
+    with patch('app.workers.status_collect.collect_status_map', return_value=fleet):
+        cert_renewal.renew_all(settings)
+
+    assert len(minted) == cert_renewal._BLIND_STREAK_ABORT, (
+        f'minted {len(minted)} certificates against an unobservable fleet')
+
+
+def test_an_unobservable_sidecar_is_not_restarted(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never bounce a container you cannot see.
+
+    Restarting on "no answer" turns one broken probe path into a rolling
+    restart of every healthy instance on the node, every tick.
+    """
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (None, None))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+
+    cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['restart'] == [], 'must not restart an unobservable sidecar'
+    assert wired['report'] == [None], 'but must still report the truth'
+
+
+@pytest.mark.asyncio
+async def test_the_worker_off_switch_actually_returns(settings: Settings) -> None:
+    """A dead off-switch is worse than none: it reads as disabled and renews."""
+    from fastapi import FastAPI
+
+    settings.cert_renewal_enabled = False
+    app = FastAPI()
+    app.state.settings = settings
+
+    # Returns rather than sleeping for the interval.
+    await asyncio.wait_for(cert_renewal.cert_renewal_worker(app), timeout=5)

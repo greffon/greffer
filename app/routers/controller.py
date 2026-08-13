@@ -341,6 +341,28 @@ def _write_pushed_client_toml(
     return "ok"
 
 
+@router.post("/renew-certs/")
+def renew_certs_endpoint(request: Request, id: str | None = None,
+                         force: bool = False) -> dict:
+    """Run a certificate renewal pass now, inside THIS process.
+
+    The CLI delegates here rather than doing the work itself. Renewal writes a
+    key and a certificate into a sidecar that a concurrent Start is recreating
+    and writing its own pair into, and the serializer for that is an
+    IN-PROCESS lock (HLD section 3). A `python -m app.cli` invocation is a
+    second process, so it would take a brand-new lock this one has never seen
+    and race start/stop/backup with nothing in between -- the interleaving the
+    manager refuses to resolve and logs as instance_cert_renewal_orphan.
+    Running the pass here puts it behind the same lock as everything else.
+    """
+    from app.workers.cert_renewal import renew_all
+
+    settings = _settings(request)
+    _refuse_if_updating(settings)
+    errors = renew_all(settings, only=id, force=force)
+    return {"errors": errors}
+
+
 @router.post("/backup/", status_code=202)
 def backup_greffon(
     payload: GreffonBackupRequest, request: Request

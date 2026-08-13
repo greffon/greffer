@@ -26,6 +26,10 @@ import sys
 
 from app.settings import get_settings
 from apps.utils.ops_migrations import operations, runner
+
+# A renewal pass walks every running instance, each with its own HTTP calls and
+# settle window, so it can legitimately take minutes on a busy node.
+_RENEW_TIMEOUT_SECONDS = 1800
 from apps.utils.ops_migrations.registry import all_migrations
 
 
@@ -101,8 +105,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Ignore this node's backoff and not-due check. For an instance that "
             "is already serving an expired certificate and cannot wait for the "
-            "backoff to elapse. The manager still applies its own window, "
-            "cooldown and rate limit, so this grants nothing extra."
+            "backoff to elapse. Requires --instance. The manager still applies "
+            "its own window, cooldown and rate limit, so this grants nothing "
+            "extra."
         ),
     )
     r.set_defaults(func=_renew_certs)
@@ -112,16 +117,53 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _renew_certs(args: argparse.Namespace) -> int:
-    """Force a renewal pass. Exit code = number of instances that errored.
+    """Ask the RUNNING greffer to renew now. Exit code = instances that errored.
 
     Exists for the operator whose instances are ALREADY 502ing on an expired
     certificate: the worker would fix them on its own schedule, but "wait up to
     six hours" is not an answer while an app is down.
+
+    Delegates over the local API instead of doing the work in this process.
+    Renewal writes into a sidecar that a concurrent Start may be recreating,
+    and the only thing serializing those is an in-process lock -- which a
+    second process cannot take. Running it here would race start/stop/backup
+    with nothing in between.
     """
-    from app.workers.cert_renewal import renew_all
+    import requests
+
+    from app.auth import TOKEN_HEADER
+    from app.token import resolve_token
+
+    if args.force and not args.instance:
+        # A fleet-wide force fires one mint per running instance at once. On a
+        # node with more instances than the manager's 30/hour per-greffer cap,
+        # the excess collect 429s -- so the emergency lever would push healthy
+        # instances into backoff at the worst possible moment. Name the one
+        # that is broken.
+        print("--force requires --instance", file=sys.stderr)
+        return 2
 
     settings = get_settings()
-    return renew_all(settings, only=args.instance, force=args.force)
+    params = {"force": "true" if args.force else "false"}
+    if args.instance:
+        params["id"] = args.instance
+    try:
+        res = requests.post(
+            "http://127.0.0.1:8000/api/controller/renew-certs/",
+            params=params,
+            headers={TOKEN_HEADER: resolve_token(settings)},
+            timeout=_RENEW_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        print(f"cannot reach the local greffer API: {exc}", file=sys.stderr)
+        return 1
+    if res.status_code != 200:
+        print(f"renewal refused: {res.status_code} {res.text[:200]}",
+              file=sys.stderr)
+        return 1
+    errors = res.json().get("errors", 0)
+    print(f"renewal pass complete, errors={errors}")
+    return int(errors)
 
 
 def _apply_ops_migrations(args: argparse.Namespace) -> int:
