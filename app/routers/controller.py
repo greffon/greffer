@@ -357,17 +357,28 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
     """
     from app.workers.cert_renewal import (
         InstanceNotFound,
+        NodeCapped,
         RenewalAlreadyRunning,
         renew_all,
     )
 
     settings = _settings(request)
     _refuse_if_updating(settings)
+    if force and id is None:
+        # Server-side, not just in the CLI: this token is the manager's too, so
+        # a client-side-only guard is no guard. A fleet-wide force fires one
+        # mint per running instance at once and pushes everything past the
+        # manager's hourly cap into backoff, at the worst possible moment.
+        raise HTTPException(status_code=400, detail="force_requires_instance")
     try:
         errors = renew_all(settings, request.app.state.greffer_token,
                            only=id, force=force)
     except InstanceNotFound:
         raise HTTPException(status_code=404, detail="instance_not_found") from None
+    except NodeCapped:
+        # The renewals asked for did not happen. Saying "0 errors" here is what
+        # tells an operator mid-incident that their recovery worked.
+        raise HTTPException(status_code=429, detail="node_rate_limited") from None
     except RenewalAlreadyRunning:
         # The periodic tick (or another operator call) already holds the pass.
         # 409 rather than queueing: a pass can take minutes on a busy node, and

@@ -164,13 +164,20 @@ def _renew_certs(args: argparse.Namespace) -> int:
         print(f"no running instance {args.instance!r} on this node",
               file=sys.stderr)
         return 1
+    if res.status_code == 429 and 'node_rate_limited' in res.text:
+        print("this node is at the manager's hourly certificate cap; "
+              "the requested renewal did NOT happen. Retry within the hour.",
+              file=sys.stderr)
+        return 1
     if res.status_code != 200:
         print(f"renewal refused: {res.status_code} {res.text[:200]}",
               file=sys.stderr)
         return 1
     errors = res.json().get("errors", 0)
     print(f"renewal pass complete, errors={errors}")
-    return int(errors)
+    # NOT the raw count: sys.exit truncates modulo 256, so a node with 256
+    # failing instances would report success to any wrapping script.
+    return 1 if errors else 0
 
 
 def _apply_ops_migrations(args: argparse.Namespace) -> int:

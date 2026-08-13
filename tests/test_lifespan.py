@@ -51,7 +51,7 @@ async def test_lifespan_starts_three_workers_when_enabled(
 
     expected = {
         "greffer-register", "greffer-monitor", "greffer-crl-sync",
-        "greffer-heartbeat", "greffer-reregister",
+        "greffer-heartbeat", "greffer-reregister", "greffer-cert-renewal",
     }
     # Patch the bindings that `start_workers` uses — those are module-level
     # imports in `app/workers/__init__.py`, so patching `app.workers.X`
@@ -60,7 +60,9 @@ async def test_lifespan_starts_three_workers_when_enabled(
         "app.workers.monitor_worker", new=_noop_worker
     ), patch("app.workers.crl_sync_worker", new=_noop_worker), patch(
         "app.workers.heartbeat_worker", new=_noop_worker
-    ), patch("app.workers.reregister_worker", new=_noop_worker):
+    ), patch("app.workers.reregister_worker", new=_noop_worker), patch(
+        "app.workers.cert_renewal_worker", new=_noop_worker
+    ):
         async with lifespan(app):
             current_names = {
                 t.get_name() for t in asyncio.all_tasks() if not t.done()
@@ -83,7 +85,8 @@ def _patch_all_workers():
 
     stack = ExitStack()
     for name in ("register_worker", "monitor_worker", "crl_sync_worker",
-                 "heartbeat_worker", "reregister_worker", "watchdog_worker"):
+                 "heartbeat_worker", "reregister_worker", "watchdog_worker",
+                 "cert_renewal_worker"):
         stack.enter_context(patch(f"app.workers.{name}", new=_noop_worker))
     return stack
 

@@ -70,6 +70,10 @@ _REPORT_RETRY_SECONDS = 2
 # working on it. compose.start/stop are Popen and the controller's lock is
 # released when the HANDLER returns, not when compose exits.
 _COMPOSE_SETTLE_SECONDS = 90
+# After stopping on the manager's per-greffer cap, come back in an hour rather
+# than a full interval: the cap refills hourly, so waiting six hours spends a
+# sixth of the available budget while instances are expiring.
+_CAPPED_RETRY_SECONDS = 60 * 60
 
 
 class _NodeRateLimited(Exception):
@@ -104,6 +108,15 @@ class RenewalAlreadyRunning(Exception):
 
 class InstanceNotFound(Exception):
     """An explicit --instance selector matched nothing on this node."""
+
+
+class NodeCapped(Exception):
+    """The pass stopped on the manager's per-greffer mint cap.
+
+    Distinct from "no errors": the requested renewals did not happen. An
+    operator running the emergency command against a 502ing app must not be
+    told it worked.
+    """
 
 
 class Outcome(NamedTuple):
@@ -260,7 +273,7 @@ def _mint(settings: Settings, token: str, greffon_id: str) -> dict | None:
             logger.info('cert_renewal_node_rate_limited instance=%s', greffon_id)
             raise _NodeRateLimited
         logger.info('cert_renewal_cooling_down instance=%s', greffon_id)
-        _note_failure(greffon_id, settings.cert_renewal_interval)
+        _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
         return None
     if res.status_code != 200:
         # 409 cert_cn_would_not_match in particular can never self-resolve --
@@ -273,7 +286,7 @@ def _mint(settings: Settings, token: str, greffon_id: str) -> dict | None:
             res.status_code,
             res.text[:200],
         )
-        _note_failure(greffon_id, settings.cert_renewal_interval)
+        _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
         return None
     return res.json()
 
@@ -573,7 +586,7 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         # Not a failure either -- whatever holds the lock (a Start, most
         # likely) mints its own certificate anyway.
         diag('cert_renewal_skipped', instance=greffon_id, reason='instance_busy')
-        return None
+        return Outcome(SKIPPED, None)
     try:
         return _renew_locked(settings, token, greffon_id, force)
     finally:
@@ -628,7 +641,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
     if port is None:
         diag('cert_renewal_skipped', instance=greffon_id, reason='no_published_port')
         return Outcome(SKIPPED, None)
-    host = settings.cert_probe_host
+    host = settings.greffer_cert_probe_host
 
     if _sidecar_settling(greffon_id):
         diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
@@ -650,7 +663,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         _unconfirmed.pop(greffon_id, None)
 
     if not force and not _due_for_renewal(
-            before_expiry, settings.cert_renewal_window_days):
+            before_expiry, settings.greffer_cert_renewal_window_days):
         diag('cert_renewal_skipped', instance=greffon_id, reason='not_due')
         return Outcome(NOT_DUE, before_serial)
 
@@ -708,7 +721,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(RENEWED, served)
     diag('cert_renewal_outcome', instance=greffon_id, outcome='not_served',
          wanted=wanted, served=served, level=logging.ERROR)
-    _note_failure(greffon_id, settings.cert_renewal_interval)
+    _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
     return Outcome(FAILED, served)
 
 
@@ -740,6 +753,7 @@ def renew_all(settings: Settings, token: str, only: str | None = None,
 
 def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
     considered = errors = 0
+    capped = False
     global _blind_streak
     _blind_streak = 0
     statuses = collect_status_map(settings)
@@ -771,6 +785,7 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
             # exponentially for a limit none of them caused.
             diag('cert_renewal_tick_capped', considered=considered,
                  level=logging.WARNING)
+            capped = True
             break
         except Exception:  # one instance must not end the tick
             errors += 1
@@ -780,7 +795,7 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
             # failures most likely to repeat. Without this they retry at the
             # full tick rate forever, each one burning a fresh 30-day mint out
             # of the budget the backoff exists to protect.
-            _note_failure(greffon_id, settings.cert_renewal_interval)
+            _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
             logger.exception('cert_renewal_instance_error instance=%s', greffon_id)
         if _blind_streak >= _BLIND_STREAK_ABORT:
             # Three sidecars in a row answering nothing is a statement about
@@ -799,8 +814,15 @@ def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
     # healthy" -- drifts upward forever on instances that do not exist.
     for stale in set(_renewal_backoff) - set(statuses):
         _renewal_backoff.pop(stale, None)
+    # Same reasoning for the owed-confirmation ledger: its entries are only
+    # ever cleared inside _renew_locked, which a departed instance never
+    # reaches again.
+    for stale in set(_unconfirmed) - set(statuses):
+        _unconfirmed.pop(stale, None)
     diag('cert_renewal_tick', considered=considered, errors=errors,
-         backing_off=len(_renewal_backoff))
+         backing_off=len(_renewal_backoff), owed=len(_unconfirmed))
+    if capped:
+        raise NodeCapped
     return errors
 
 
@@ -813,7 +835,7 @@ async def cert_renewal_worker(app: FastAPI) -> None:
     """
     settings: Settings = app.state.settings
     token: str = app.state.greffer_token
-    if not settings.cert_renewal_enabled:
+    if not settings.greffer_cert_renewal_enabled:
         # A per-node off switch. The manager's CERT_RENEWAL_ENABLED is
         # fleet-wide, so without this an operator seeing one node misbehave can
         # only stop renewal everywhere.
@@ -821,11 +843,23 @@ async def cert_renewal_worker(app: FastAPI) -> None:
         return
     try:
         while True:
-            await asyncio.sleep(settings.cert_renewal_interval)
+            await asyncio.sleep(settings.greffer_cert_renewal_interval)
             try:
                 await anyio.to_thread.run_sync(
                     renew_all, settings, token, abandon_on_cancel=True
                 )
+            except RenewalAlreadyRunning:
+                # An operator's renew_certs holds the pass. Not a crash, and
+                # logging it as one buried a real traceback in false alarms.
+                diag('cert_renewal_tick_skipped', reason='pass_in_progress')
+            except NodeCapped:
+                # Expected on a node with more due instances than the manager's
+                # hourly budget. Retry sooner than the full interval: at 30/h
+                # against a 6h tick the node would otherwise use a sixth of its
+                # own budget and take ~40h to clear 200 expired certificates.
+                diag('cert_renewal_tick_capped_retry',
+                     delay_seconds=_CAPPED_RETRY_SECONDS)
+                await asyncio.sleep(_CAPPED_RETRY_SECONDS)
             except Exception:  # the loop outlives any one tick
                 logger.exception('cert_renewal_tick_failed')
     except asyncio.CancelledError:

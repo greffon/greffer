@@ -116,23 +116,23 @@ class Settings(BaseSettings):
         # both the register and heartbeat paths.
         return v[:32] if v else v
 
-    @field_validator("cert_renewal_interval")
+    @field_validator("greffer_cert_renewal_interval")
     @classmethod
     def _cert_renewal_interval_in_range(cls, v):
         # 0 would busy-loop the worker AND silently disarm the backoff, whose
         # delay is a multiple of this value -- the two failures that compound
         # into unbounded certificate issuance.
         if not 60 <= v <= 86400:
-            raise ValueError("cert_renewal_interval must be between 60 and 86400")
+            raise ValueError("greffer_cert_renewal_interval must be between 60 and 86400")
         return v
 
-    @field_validator("cert_renewal_window_days")
+    @field_validator("greffer_cert_renewal_window_days")
     @classmethod
     def _cert_renewal_window_sane(cls, v):
         # Above the 30-day cert TTL every instance is permanently "due"; at or
         # below 0 nothing ever renews.
         if not 1 <= v <= 29:
-            raise ValueError("cert_renewal_window_days must be between 1 and 29")
+            raise ValueError("greffer_cert_renewal_window_days must be between 1 and 29")
         return v
 
     @field_validator("heartbeat_interval")
@@ -180,12 +180,22 @@ class Settings(BaseSettings):
 
     crl_sync_interval: int = 300
     # Per-instance upstream certificate renewal. The certs carry a 30-day TTL,
+    #
+    # ALL FOUR carry the ``greffer_`` prefix, and two of them must. pydantic-
+    # settings maps field -> env var by field NAME, so bare
+    # ``cert_renewal_enabled`` / ``cert_renewal_window_days`` would bind
+    # CERT_RENEWAL_ENABLED and CERT_RENEWAL_WINDOW_DAYS -- the manager's own
+    # Django settings, with different meanings on each side (fleet feature flag
+    # vs per-node kill switch; the manager's 10-day admission window vs this
+    # node's 7-day local one). A deployment setting the manager's
+    # CERT_RENEWAL_WINDOW_DAYS=3650 in a shared env would push a value past
+    # this validator's cap and the greffer would refuse to boot.
     # so a 6-hour tick gives ~28 attempts inside a 7-day window -- enough that a
     # manager outage, a rate limit, or a sidecar restart all get retried long
     # before anything expires, without polling a mint endpoint hourly.
-    cert_renewal_enabled: bool = True
-    cert_renewal_interval: int = 6 * 60 * 60
-    cert_renewal_window_days: int = 7
+    greffer_cert_renewal_enabled: bool = True
+    greffer_cert_renewal_interval: int = 6 * 60 * 60
+    greffer_cert_renewal_window_days: int = 7
     # Where the renewal worker dials to ask a sidecar which certificate it is
     # serving. NOT 127.0.0.1: the greffer runs in its own network namespace on
     # the `internal` bridge, so its loopback has none of the instance ports on
@@ -196,7 +206,7 @@ class Settings(BaseSettings):
     # Deliberately separate from greffer_public_host, which is the address
     # BROWSERS use and which setup-dev.sh pins to 127.0.0.1 for exactly that
     # reason. Sharing it would make the probe unreachable in dev.
-    cert_probe_host: str = "host.docker.internal"
+    greffer_cert_probe_host: str = "host.docker.internal"
     monitor_interval: int = 5
     # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
     # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL

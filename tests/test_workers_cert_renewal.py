@@ -165,7 +165,7 @@ def test_backoff_grows_and_is_capped(settings: Settings) -> None:
     transiently broken instance still recovers on its own.
     """
     for _ in range(40):
-        cert_renewal._note_failure('inst-1', settings.cert_renewal_interval)
+        cert_renewal._note_failure('inst-1', settings.greffer_cert_renewal_interval)
     failures, deadline = cert_renewal._renewal_backoff['inst-1']
     assert failures == 40
     assert deadline - time.monotonic() <= cert_renewal._BACKOFF_CAP_SECONDS
@@ -178,7 +178,7 @@ def test_a_recovered_instance_is_renewed_again(
     served = [(OLD, _expiring(1)), (NEW, None)]
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: served.pop(0))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
-    cert_renewal._note_failure('inst-1', settings.cert_renewal_interval)
+    cert_renewal._note_failure('inst-1', settings.greffer_cert_renewal_interval)
     cert_renewal._renewal_backoff['inst-1'] = (1, time.monotonic() - 1)  # elapsed
 
     cert_renewal.renew_one(settings, 'tok', 'inst-1')
@@ -195,7 +195,7 @@ def test_a_healthy_certificate_is_left_alone(settings: Settings, wired, monkeypa
     monkeypatch.setattr(
         cert_renewal,
         '_served_certificate',
-        lambda h, p: (OLD, _expiring(settings.cert_renewal_window_days + 5)),
+        lambda h, p: (OLD, _expiring(settings.greffer_cert_renewal_window_days + 5)),
     )
     minted = []
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: minted.append(g) or _cert())
@@ -298,7 +298,7 @@ def test_force_renews_through_the_backoff(settings: Settings, wired, monkeypatch
     served = [(OLD, _expiring(1)), (NEW, None)]
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: served.pop(0))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
-    cert_renewal._note_failure('inst-1', settings.cert_renewal_interval)
+    cert_renewal._note_failure('inst-1', settings.greffer_cert_renewal_interval)
 
     cert_renewal.renew_one(settings, 'tok', 'inst-1', force=True)
 
@@ -309,7 +309,7 @@ def test_force_renews_a_certificate_that_is_not_due(settings: Settings, wired, m
     """The greffer reads the expiry off the served cert, so a sidecar serving a
     stale-but-valid one looks healthy to it. The manager holds the real record,
     so forcing hands it the decision rather than making one here."""
-    served = [(OLD, _expiring(settings.cert_renewal_window_days + 20)), (NEW, None)]
+    served = [(OLD, _expiring(settings.greffer_cert_renewal_window_days + 20)), (NEW, None)]
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: served.pop(0))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
 
@@ -405,7 +405,12 @@ def test_a_renewal_never_races_a_start_on_the_same_sidecar(
     finally:
         held.release()
 
-    assert result is None
+    assert result == cert_renewal.Outcome(cert_renewal.SKIPPED, None), (
+        'busy must honour the Outcome contract: returning None made the caller '
+        'raise AttributeError, which the broad handler then counted as an '
+        'error AND armed the backoff -- so a nightly backup overlapping the '
+        'tick could push an instance to the 24h cap and expire its cert'
+    )
     assert wired['install'] == [], 'must not write into a sidecar another op holds'
     assert 'inst-1' not in cert_renewal._renewal_backoff, 'busy is not a failure'
 
@@ -428,8 +433,8 @@ def test_a_departed_instance_is_dropped_from_the_backoff_map(
     """Otherwise `backing_off` -- the one health number this worker emits --
     counts instances the node no longer runs, forever."""
     monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: None)
-    cert_renewal._note_failure('gone', settings.cert_renewal_interval)
-    cert_renewal._note_failure('here', settings.cert_renewal_interval)
+    cert_renewal._note_failure('gone', settings.greffer_cert_renewal_interval)
+    cert_renewal._note_failure('here', settings.greffer_cert_renewal_interval)
 
     with patch('app.workers.status_collect.collect_status_map',
                return_value={'here': 'running'}):
@@ -823,7 +828,8 @@ def test_a_capped_node_stops_the_tick(settings: Settings, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(cert_renewal, 'renew_one', _one)
     with patch('app.workers.status_collect.collect_status_map',
-               return_value={'a': 'running', 'b': 'running', 'c': 'running'}):
+               return_value={'a': 'running', 'b': 'running', 'c': 'running'}), \
+            pytest.raises(cert_renewal.NodeCapped):
         cert_renewal.renew_all(settings, 'tok')
 
     assert seen == ['a'], 'the tick must stop at the cap, not grind through it'
@@ -868,7 +874,7 @@ async def test_the_worker_off_switch_actually_returns(settings: Settings) -> Non
     """A dead off-switch is worse than none: it reads as disabled and renews."""
     from fastapi import FastAPI
 
-    settings.cert_renewal_enabled = False
+    settings.greffer_cert_renewal_enabled = False
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
@@ -945,7 +951,7 @@ def test_an_owed_confirmation_is_retried_on_the_next_pass(
     cert_renewal._unconfirmed['inst-1'] = NEW
     # Serving the new cert already, with plenty of life left: not due.
     monkeypatch.setattr(cert_renewal, '_served_certificate',
-                        lambda h, p: (NEW, _expiring(settings.cert_renewal_window_days + 10)))
+                        lambda h, p: (NEW, _expiring(settings.greffer_cert_renewal_window_days + 10)))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: pytest.fail('must not re-mint'))
 
     result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
@@ -1060,3 +1066,44 @@ def test_a_just_started_sidecar_is_treated_as_settling(monkeypatch: pytest.Monke
             lambda n: type('X', (), {'attrs': {'State': {'StartedAt': stamp}}})())})()})())
 
     assert cert_renewal._sidecar_settling('inst-1') is True
+
+
+def test_the_probe_dials_the_configured_host_not_loopback(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """127.0.0.1 inside the greffer's own netns has no instance ports on it.
+
+    That was round-1 defect (c), and it stayed re-introducible: every
+    orchestration test stubs _served_certificate as `lambda h, p` and no test
+    ever looked at `h`, so hardcoding loopback passed the entire suite while
+    making the feature inert.
+    """
+    settings.greffer_cert_probe_host = 'host.docker.internal'
+    hosts: list = []
+    served = [(OLD, _expiring(1)), (NEW, None)]
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: hosts.append(h) or served.pop(0))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+
+    cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert hosts and set(hosts) == {'host.docker.internal'}, hosts
+
+
+def test_the_happy_path_reloads_rather_than_restarting(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reload is the mechanism; the restart is only the fallback.
+
+    `wired` recorded the reload call and nothing ever asserted it, so skipping
+    the reload entirely -- degrading every renewal into a connection-dropping
+    container restart on every instance every 30 days -- passed the suite.
+    """
+    served = [(OLD, _expiring(1)), (NEW, None)]
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: served.pop(0))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+
+    cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['reload'] == ['inst-1'], 'the certificate must be reloaded, not restarted into place'
+    assert wired['restart'] == []
