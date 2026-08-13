@@ -689,7 +689,7 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         lock.release()
 
 
-COMPOSE_INFLIGHT_FILE = '.compose-inflight'
+COMPOSE_INFLIGHT_PREFIX = '.compose-inflight'
 # A marker older than this is treated as stale rather than as a live compose
 # child. A greffer restart between spawning compose and reaping it would
 # otherwise block renewal for that instance permanently -- and permanent
@@ -712,12 +712,24 @@ def compose_inflight(settings: Settings, greffon_id: str) -> bool:
     up to the moment it is replaced. Only an explicit marker written before the
     child is spawned covers the whole span.
     """
-    path = settings.greffon_path / greffon_id / COMPOSE_INFLIGHT_FILE
+    # One marker per CHILD, not one per instance. A single shared file could
+    # only ever record the latest writer, so with two children in flight -- the
+    # manager restarts an instance as stop-then-start, and the lock is released
+    # between them -- whichever exited first took the marker away from the one
+    # still working. Any live child keeps the instance marked.
     try:
-        age = time.time() - path.stat().st_mtime
+        markers = list((settings.greffon_path / greffon_id).glob(
+            COMPOSE_INFLIGHT_PREFIX + '.*'))
     except OSError:
         return False
-    return age < _INFLIGHT_STALE_SECONDS
+    now = time.time()
+    for marker in markers:
+        try:
+            if now - marker.stat().st_mtime < _INFLIGHT_STALE_SECONDS:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _sidecar_settling(greffon_id: str) -> bool:
@@ -799,6 +811,11 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
 
     if not force and not _due_for_renewal(
             before_expiry, settings.greffer_cert_renewal_window_days):
+        # A healthy certificate settles any old failure. Something else fixed
+        # this instance -- a start, a restart, an operator -- and keeping the
+        # entry would both inflate `backing_off` forever and make the next
+        # unrelated failure resume at the old escalated delay.
+        _clear_backoff(greffon_id)
         diag('cert_renewal_skipped', instance=greffon_id, reason='not_due')
         return Outcome(NOT_DUE, before_serial)
 
@@ -810,7 +827,18 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(FAILED, before_serial)
     wanted = cert.get('serial_number')
 
-    _install(greffon_id, cert)
+    try:
+        _install(greffon_id, cert)
+    except Exception:
+        # The certificate was ISSUED. Letting this propagate to renew_all's
+        # generic handler leaves the manager holding a pending mint nobody ever
+        # resolves, against this module's report-on-both-outcomes contract.
+        # Report what the sidecar is still serving so the dead mint is retired.
+        logger.exception('cert_renewal_install_failed instance=%s', greffon_id)
+        _report(settings, token, greffon_id, before_serial)
+        _note_failure(greffon_id, settings.greffer_cert_renewal_interval)
+        return Outcome(FAILED, before_serial)
+
     if _reload(greffon_id):
         served, _ = _await_serial(host, port, wanted)
     else:
@@ -1002,6 +1030,12 @@ async def cert_renewal_worker(app: FastAPI) -> None:
         while True:
             await asyncio.sleep(delay)
             delay = settings.greffer_cert_renewal_interval
+            # Registration first, exactly as heartbeat_worker does. A pass that
+            # runs during initial acceptance or a re-registration gets 403 on
+            # every request, and _mint reads 403 as this instance's own failure
+            # -- so one badly timed tick puts every due instance on the node
+            # into a 6-to-24-hour backoff for a fault none of them had.
+            await app.state.registered.wait()
             try:
                 # Re-read every tick, never snapshot at startup. register.py
                 # rewrites app.state.greffer_token on rotation (a degraded-boot

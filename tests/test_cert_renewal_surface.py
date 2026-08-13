@@ -231,6 +231,8 @@ async def test_the_loop_sleeps_before_the_first_tick(settings: Settings, monkeyp
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     slept: list = []
     ticks: list = []
 
@@ -264,6 +266,8 @@ async def test_a_capped_tick_retries_within_the_hour(settings: Settings, monkeyp
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     slept: list = []
 
     async def _sleep(n):
@@ -303,6 +307,8 @@ async def test_an_operator_pass_does_not_look_like_a_crashed_worker(
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     calls: list = []
 
     async def _sleep(n):
@@ -339,6 +345,8 @@ async def test_the_tick_reads_the_token_fresh_each_time(settings: Settings, monk
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'token-A'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     seen: list = []
     ticks: list = []
 
@@ -433,7 +441,7 @@ def test_renewal_waits_for_a_running_compose_child(settings: Settings, tmp_path)
     settings.greffon_path = tmp_path
     inst = tmp_path / 'i1'
     inst.mkdir()
-    (inst / cert_renewal.COMPOSE_INFLIGHT_FILE).write_text('1234')
+    (inst / f'{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.0').write_text('1234')
 
     assert cert_renewal.compose_inflight(settings, 'i1') is True
 
@@ -448,7 +456,7 @@ def test_a_stale_marker_does_not_wedge_renewal_forever(settings: Settings, tmp_p
     settings.greffon_path = tmp_path
     inst = tmp_path / 'i1'
     inst.mkdir()
-    marker = inst / cert_renewal.COMPOSE_INFLIGHT_FILE
+    marker = inst / f'{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.0'
     marker.write_text('1234')
     old = _time.time() - cert_renewal._INFLIGHT_STALE_SECONDS - 60
     os.utime(marker, (old, old))
@@ -799,6 +807,8 @@ async def test_a_short_interval_clamps_the_capped_retry(
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     slept: list = []
 
     async def _sleep(n):
@@ -833,6 +843,8 @@ async def test_the_delay_returns_to_normal_after_a_capped_tick(
     app = FastAPI()
     app.state.settings = settings
     app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
     slept: list = []
     ticks: list = []
 
@@ -854,3 +866,103 @@ async def test_the_delay_returns_to_normal_after_a_capped_tick(
 
     interval = settings.greffer_cert_renewal_interval
     assert slept == [interval, cert_renewal._CAPPED_RETRY_SECONDS, interval], slept
+
+
+def test_a_sibling_child_cannot_unmark_a_running_one(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One marker per child, not one per instance.
+
+    A shared file can only record the LATEST writer, so a stop issued during a
+    cold `up -d` pull overwrote the start's marker with its own pid and then
+    removed it on exit -- while the pull was still recreating the sidecar.
+    """
+    import threading
+    import time as _time
+
+    from app.routers import controller
+
+    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 30)
+    settings.greffon_path = tmp_path
+    (tmp_path / 'i1').mkdir()
+    slow, quick = threading.Event(), threading.Event()
+
+    class _Proc:
+        def __init__(self, pid, ev):
+            self.pid, self._ev = pid, ev
+
+        def wait(self, timeout=None):
+            import subprocess
+            if not self._ev.wait(timeout):
+                raise subprocess.TimeoutExpired('docker', timeout)
+            return 0
+
+    controller._mark_compose_inflight(settings, 'i1', _Proc(1, slow))   # the pull
+    controller._mark_compose_inflight(settings, 'i1', _Proc(2, quick))  # the stop
+    quick.set()
+    _time.sleep(0.2)
+
+    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
+        'the second child unmarked an instance the first is still working on')
+    slow.set()
+
+
+def test_the_renewal_worker_is_watched_as_fatal() -> None:
+    """A renewal worker that dies silently IS the bug this feature fixes.
+
+    Without it in FATAL_WORKERS, /readyz stays healthy, the watchdog never
+    restarts the process, and certificates simply stop being renewed until
+    instances 502 -- with the node reporting itself fine throughout.
+    """
+    from app import readiness
+
+    assert 'greffer-cert-renewal' in readiness.FATAL_WORKERS
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_node_does_not_register_a_dead_worker(settings: Settings) -> None:
+    """The task is fatal-watched, so one that returned because the feature is
+    off would read as a dead worker and fail /readyz on every such node."""
+    from app import workers
+
+    settings.greffer_cert_renewal_enabled = False
+    app = create_app(token='tok', settings=settings)
+    app.state.registered = asyncio.Event()
+    tasks = workers.start_workers(app)
+    try:
+        names = {t.get_name() for t in tasks}
+        assert 'greffer-cert-renewal' not in names
+    finally:
+        for t in tasks:
+            t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_pass_waits_for_registration(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tick during initial acceptance or a re-registration 403s on every
+    request, and _mint reads 403 as the instance's own failure -- so one badly
+    timed tick backs off every due instance on the node for 6 to 24 hours."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()  # deliberately NOT set
+    ran: list = []
+
+    async def _sleep(n):
+        return None
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all',
+                        lambda *a, **k: ran.append(1) or _result())
+
+    task = asyncio.create_task(cert_renewal.cert_renewal_worker(app))
+    await asyncio.wait({task}, timeout=0.2)
+    try:
+        assert ran == [], 'a pass ran before the greffer was registered'
+        app.state.registered.set()
+        await asyncio.wait({task}, timeout=0.2)
+        assert ran, 'the pass never ran after registration'
+    finally:
+        task.cancel()

@@ -34,6 +34,12 @@ FATAL_WORKERS = (
     "greffer-crl-sync",
     "greffer-heartbeat",
     "greffer-reregister",
+    # Only present when renewal is enabled -- start_workers does not create the
+    # task otherwise, and a missing task is not a dead one (the loop below
+    # skips names it does not find). A renewal worker that dies silently is the
+    # bug this feature exists to fix: certificates simply stop being renewed
+    # and the node keeps reporting itself healthy until instances 502.
+    "greffer-cert-renewal",
 )
 
 # A short-timeout client dedicated to the readiness ping. The shared

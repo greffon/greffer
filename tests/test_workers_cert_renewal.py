@@ -1139,3 +1139,37 @@ def test_renewal_stands_off_while_compose_is_working(
 
     assert wired['install'] == [], 'must not write into a sidecar compose is recreating'
     assert result.status == cert_renewal.SKIPPED
+
+
+def test_an_issued_cert_is_reported_even_if_installing_it_fails(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mint already happened. Letting the exception escape leaves the
+    manager holding a pending nobody resolves."""
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+    monkeypatch.setattr(cert_renewal, '_install',
+                        lambda g, c: (_ for _ in ()).throw(RuntimeError('no such container')))
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['report'] == [OLD], 'the dead mint was never retired'
+    assert result.status == cert_renewal.FAILED
+    assert 'inst-1' in cert_renewal._renewal_backoff
+
+
+def test_a_healthy_certificate_settles_an_old_failure(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Something else repaired the instance. Keeping the entry inflates the
+    `backing_off` health number forever and makes the next unrelated failure
+    resume at the old escalated delay."""
+    monkeypatch.setattr(
+        cert_renewal, '_served_certificate',
+        lambda h, p: (NEW, _expiring(settings.greffer_cert_renewal_window_days + 10)))
+    cert_renewal._note_failure('inst-1', settings.greffer_cert_renewal_interval)
+    cert_renewal._renewal_backoff['inst-1'] = (4, time.monotonic() - 1)  # elapsed
+
+    cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert 'inst-1' not in cert_renewal._renewal_backoff

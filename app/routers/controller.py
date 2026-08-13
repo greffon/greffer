@@ -12,6 +12,7 @@ runs sync handlers in a threadpool automatically.
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import subprocess
 import threading
@@ -70,6 +71,8 @@ logger = logging.getLogger("greffer")
 # and the total time it will track one before abandoning it.
 _INFLIGHT_HEARTBEAT_SECONDS = 30
 _INFLIGHT_MAX_SECONDS = 60 * 60
+# Unique suffix per compose child, so concurrent children get distinct markers.
+_inflight_seq = itertools.count()
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
@@ -104,23 +107,6 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
-def _clear_marker(path: Path, proc) -> None:
-    """Remove the marker only if it is still OURS.
-
-    The marker path is per-instance but each call spawns its own reaper, and
-    the manager's restart flow is stop-then-start with the lock released
-    between them. `docker-compose stop` finishes in seconds while `up -d` is
-    still pulling, so an unconditional unlink let the stop's reaper delete the
-    start's marker and open exactly the window the marker exists to close. The
-    pid written at publication time is what tells them apart.
-    """
-    try:
-        if path.read_text(encoding="utf-8").strip() == str(getattr(proc, "pid", "")):
-            path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def _mark_compose_inflight(settings, greffon_id: str, proc):
     """Publish "a compose child is working on this instance" for its lifetime.
 
@@ -139,7 +125,11 @@ def _mark_compose_inflight(settings, greffon_id: str, proc):
     """
     if proc is None:
         return
-    path = Path(settings.greffon_path) / greffon_id / cert_renewal.COMPOSE_INFLIGHT_FILE
+    # A marker of this child's OWN, so a sibling that finishes first cannot
+    # unmark an instance another child is still working on. A shared file can
+    # only record the latest writer.
+    path = (Path(settings.greffon_path) / greffon_id
+            / f"{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.{next(_inflight_seq)}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(getattr(proc, "pid", "")), encoding="utf-8")
@@ -179,7 +169,7 @@ def _mark_compose_inflight(settings, greffon_id: str, proc):
                 logger.warning("compose_inflight_reap_failed instance=%s",
                                greffon_id)
                 return
-        _clear_marker(path, proc)
+        path.unlink(missing_ok=True)
 
     try:
         threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
