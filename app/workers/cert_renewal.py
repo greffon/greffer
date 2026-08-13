@@ -699,6 +699,24 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
     """
     from app.backup import _instance_lock
 
+    if greffon_id in _unconfirmed:
+        # Settled BEFORE taking the lock: it writes nothing into the sidecar,
+        # and at three attempts on a 30s timeout it is the longest thing that
+        # was happening under it. The manager chains control ops that take this
+        # same lock non-blocking -- a migration cutover step landing on a held
+        # lock gets 409 instance_busy and treats it as terminal -- so every
+        # second of hold time is a migration failure waiting for a coincidence.
+        #
+        # Reports what is served NOW, not the serial the debt was filed under:
+        # the debt means "the manager has not been told what this instance is
+        # serving", and the current handshake is always the truthful answer --
+        # including None, which the manager reads as a mismatch and uses to
+        # retire its dead pending mint.
+        port = _sidecar_host_port(settings, greffon_id)
+        if port is not None:
+            served_now, _ = _served_certificate(settings.greffer_cert_probe_host, port)
+            _report(settings, token, greffon_id, served_now)
+
     lock = _instance_lock(greffon_id)
     if not lock.acquire(blocking=False):
         # Non-blocking: a renewal is never urgent enough to queue behind a
@@ -788,14 +806,6 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
     # certificate is already installed and serving, so the not-due check below
     # would skip this instance forever and the manager would keep alarming on a
     # healthy one while the superseded certificate is never revoked.
-    if greffon_id in _unconfirmed:
-        # Report what is served NOW, not the serial the debt was filed under.
-        # The debt means "the manager has not been told what this instance is
-        # serving", and the current handshake is always the truthful answer --
-        # including None, which the manager reads as a mismatch and uses to
-        # retire its dead pending mint.
-        _report(settings, token, greffon_id, before_serial)
-
     if not force and not _due_for_renewal(
             before_expiry, settings.greffer_cert_renewal_window_days):
         # A healthy certificate settles any old failure. Something else fixed
@@ -906,7 +916,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
     _load_unconfirmed(settings)
     considered = errors = renewed = skipped = 0
     selected = None
-    capped = False
+    capped = unauthorized = False
     global _blind_streak
     _blind_streak = 0
     if _stop.is_set():
@@ -955,6 +965,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
             # Every remaining instance would present the same rejected token.
             diag('cert_renewal_tick_unauthorized', considered=considered,
                  level=logging.WARNING)
+            unauthorized = True
             break
         except _NodeRateLimited:
             # The node hit the manager's per-greffer cap. Every remaining
@@ -1008,6 +1019,12 @@ def _renew_all_locked(settings, collect_status_map, only, force,
     diag('cert_renewal_tick', considered=considered, renewed=renewed,
          skipped=skipped, errors=errors, backing_off=len(_renewal_backoff),
          owed=len(_unconfirmed))
+    if unauthorized:
+        # NOT a clean pass. Returning normally had the operator's emergency
+        # command print "renewal pass complete, errors=0" and exit 0 after the
+        # manager rejected this node's token -- the same failure the NodeCapped
+        # mapping below exists to prevent.
+        raise NodeAuthLost
     if capped:
         raise NodeCapped
     return PassResult(considered, renewed, skipped, errors, selected)

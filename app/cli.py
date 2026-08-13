@@ -174,6 +174,10 @@ def _renew_certs(args: argparse.Namespace) -> int:
         print(f"no running instance {args.instance!r} on this node",
               file=sys.stderr)
         return 1
+    if res.status_code == 502 and 'node_auth_lost' in res.text:
+        print("the manager rejected this node's token; no certificate was "
+              "renewed. Check the greffer's registration.", file=sys.stderr)
+        return 1
     if res.status_code == 429 and 'node_rate_limited' in res.text:
         print("this node is at the manager's hourly certificate cap; "
               "the requested renewal did NOT happen. Retry within the hour.",

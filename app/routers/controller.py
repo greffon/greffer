@@ -67,9 +67,7 @@ logger = logging.getLogger("greffer")
 # Instances with a live compose child, read by the certificate-renewal worker.
 _inflight: dict[str, int] = {}
 _inflight_guard = threading.Lock()
-# Long enough for a cold multi-gigabyte pull; past it we stop tracking rather
-# than mute renewal for that instance for good.
-_COMPOSE_WAIT_SECONDS = 30 * 60
+
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
@@ -102,6 +100,15 @@ def _refuse_if_updating(settings) -> None:
     lock_path = Path(settings.greffon_path) / ".update.lock"
     if updater_spawn.update_in_progress(lock_path):
         raise HTTPException(status_code=409, detail="update_in_progress")
+
+
+def _release_compose_child(greffon_id: str) -> None:
+    with _inflight_guard:
+        remaining = _inflight.get(greffon_id, 1) - 1
+        if remaining > 0:
+            _inflight[greffon_id] = remaining
+        else:
+            _inflight.pop(greffon_id, None)
 
 
 def compose_inflight(greffon_id: str) -> bool:
@@ -139,25 +146,34 @@ def track_compose_child(greffon_id: str, proc):
 
     def _wait():
         try:
-            proc.wait(timeout=_COMPOSE_WAIT_SECONDS)
+            # UNBOUNDED on purpose. A bound here would decrement while the
+            # child is definitively still running -- a cold multi-gigabyte
+            # pull, or an `up -d` gated on `depends_on: service_healthy` behind
+            # a slow database init -- and renewal would then install, verify
+            # and REPORT a certificate that compose immediately replaces with
+            # the start path's own. The manager's cert_serial ends up pinned to
+            # a certificate nobody serves, and the next tick reads not-due and
+            # never corrects it.
+            #
+            # The file-marker design this replaced needed a bound because a
+            # stale marker on disk could wedge renewal for good. A counter in
+            # this process cannot: the process that owns it owns the child, and
+            # a restart clears it by construction.
+            proc.wait()
         except Exception:  # the decrement below is the point
             logger.warning("compose_wait_failed instance=%s", greffon_id,
                            exc_info=True)
         finally:
-            with _inflight_guard:
-                remaining = _inflight.get(greffon_id, 1) - 1
-                if remaining > 0:
-                    _inflight[greffon_id] = remaining
-                else:
-                    _inflight.pop(greffon_id, None)
+            _release_compose_child(greffon_id)
 
     try:
         threading.Thread(target=_wait, name=f"compose-wait-{greffon_id}",
                          daemon=True).start()
     except Exception:  # noqa: BLE001 -- a stuck counter would mute renewal
+        # Decrement, never pop: popping erased the mark of a SIBLING child that
+        # is still running, which is the failure this counter exists to stop.
         logger.warning("compose_wait_thread_failed instance=%s", greffon_id)
-        with _inflight_guard:
-            _inflight.pop(greffon_id, None)
+        _release_compose_child(greffon_id)
 
 
 def _serialize_instance_op(handler):
@@ -430,6 +446,7 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
     from app.workers.cert_renewal import (
         RENEWED,
         InstanceNotFound,
+        NodeAuthLost,
         NodeCapped,
         RenewalAlreadyRunning,
         renew_all,
@@ -448,6 +465,12 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
                            only=id, force=force)
     except InstanceNotFound:
         raise HTTPException(status_code=404, detail="instance_not_found") from None
+    except NodeAuthLost:
+        # The manager rejected this node's token. Distinct from "nothing to do":
+        # no renewal happened and none will until the token is sorted out.
+        # 502, not 401: the CALLER authenticated fine. It is this node's own
+        # token that the manager rejected, which is an upstream failure.
+        raise HTTPException(status_code=502, detail="node_auth_lost") from None
     except NodeCapped:
         # The renewals asked for did not happen. Saying "0 errors" here is what
         # tells an operator mid-incident that their recovery worked.

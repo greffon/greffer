@@ -854,8 +854,87 @@ def test_a_rejected_token_stops_the_pass(settings: Settings, monkeypatch: pytest
 
     monkeypatch.setattr(cert_renewal, 'renew_one', _one)
     with patch('app.workers.status_collect.collect_status_map',
-               return_value={'a': 'running', 'b': 'running', 'c': 'running'}):
+               return_value={'a': 'running', 'b': 'running', 'c': 'running'}), \
+            pytest.raises(cert_renewal.NodeAuthLost):
         cert_renewal.renew_all(settings, 'stale-token')
 
     assert seen == ['a'], 'the pass kept presenting a token the manager rejected'
     assert cert_renewal._renewal_backoff == {}, 'instances penalised for a node fault'
+
+
+def test_a_rejected_token_is_not_a_clean_pass_at_the_surface(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's emergency lever must not print success.
+
+    Returning normally had the CLI print "renewal pass complete, errors=0" and
+    exit 0 after the manager rejected the node's token -- the same failure the
+    NodeCapped 429 mapping beside it exists to prevent.
+    """
+    monkeypatch.setattr(
+        'app.workers.cert_renewal.renew_all',
+        lambda *a, **k: (_ for _ in ()).throw(cert_renewal.NodeAuthLost()))
+
+    res = client.post(RENEW_URL, headers={TOKEN_HEADER: 'tok'})
+
+    assert res.status_code != 200, res.text
+    assert 'node_auth_lost' in res.text
+
+
+def test_the_cli_exits_nonzero_when_the_token_was_rejected(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, _ = _run_cli(monkeypatch, settings,
+                       _Res(502, '{"detail": "node_auth_lost"}'),
+                       ['renew_certs'])
+    assert code != 0
+
+
+def test_a_departed_instance_is_dropped_from_the_owed_ledger(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its twin for the backoff map is pinned; this one was not.
+
+    A decommissioned or migrated-away instance kept its debt in memory AND in
+    .cert-unconfirmed.json for the life of the process, so `owed=` in the tick
+    diag drifts upward forever on instances that do not exist -- the same drift
+    the backoff prune exists to prevent.
+    """
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.NOT_DUE, 'aa'))
+    cert_renewal._unconfirmed['gone'] = 'dead1'
+    cert_renewal._unconfirmed['here'] = 'live1'
+
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'here': 'running'}):
+        cert_renewal.renew_all(settings, 'tok')
+
+    assert set(cert_renewal._unconfirmed) == {'here'}
+    assert 'gone' not in (tmp_path / '.cert-unconfirmed.json').read_text()
+
+
+def test_a_failed_reaper_thread_does_not_unmark_a_sibling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Popping instead of decrementing erased the mark of a child that is
+    still running -- the exact failure the counter exists to stop."""
+    import threading
+
+    from app.routers import controller
+
+    live = threading.Event()
+    controller.track_compose_child('sib', _StillWorking(live))
+    assert controller.compose_inflight('sib') is True
+
+    real_thread = threading.Thread
+    monkeypatch.setattr(
+        threading, 'Thread',
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('cannot start thread')))
+    try:
+        controller.track_compose_child('sib', _StillWorking(None))
+    finally:
+        monkeypatch.setattr(threading, 'Thread', real_thread)
+
+    assert controller.compose_inflight('sib') is True, (
+        "the failed spawn erased a running sibling's mark")
+    live.set()
