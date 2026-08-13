@@ -42,8 +42,10 @@ def _expiring(days: int) -> dt.datetime:
 def _no_carried_backoff():
     """The backoff map is module state; a leak makes later tests silently skip."""
     cert_renewal._renewal_backoff.clear()
+    cert_renewal._unconfirmed.clear()
     yield
     cert_renewal._renewal_backoff.clear()
+    cert_renewal._unconfirmed.clear()
 
 
 @pytest.fixture
@@ -80,7 +82,7 @@ def test_a_reload_that_did_not_take_escalates_to_a_restart(
     result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
 
     assert wired['restart'] == ['inst-1'], 'a reload that did not take must restart the sidecar'
-    assert result == NEW
+    assert result == cert_renewal.Outcome(cert_renewal.RENEWED, NEW)
     assert wired['report'] == [NEW]
 
 
@@ -118,7 +120,7 @@ def test_a_renewal_that_never_takes_reports_the_serial_actually_served(
 
     assert wired['restart'] == ['inst-1'], 'it should still have tried the restart'
     assert wired['report'] == [OLD], 'the manager must be told what is really served'
-    assert result == OLD
+    assert result == cert_renewal.Outcome(cert_renewal.FAILED, OLD)
 
 
 def test_an_unreadable_sidecar_still_reports(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,7 +231,7 @@ def test_a_manager_with_renewal_off_is_not_an_error(settings: Settings, wired, m
 
     assert wired['install'] == []
     assert wired['restart'] == []
-    assert result == OLD
+    assert result == cert_renewal.Outcome(cert_renewal.FAILED, OLD)
 
 
 def test_one_bad_instance_does_not_end_the_tick(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,7 +242,6 @@ def test_one_bad_instance_does_not_end_the_tick(settings: Settings, monkeypatch:
     certificate on the machine had expired.
     """
     monkeypatch.setattr(cert_renewal, 'collect_status_map', lambda s: {}, raising=False)
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     seen: list[str] = []
 
     def _one(s, t, greffon_id, force=False):
@@ -254,21 +255,20 @@ def test_one_bad_instance_does_not_end_the_tick(settings: Settings, monkeypatch:
         'app.workers.status_collect.collect_status_map',
         return_value={'bad': 'running', 'good': 'running'},
     ):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert seen == ['bad', 'good']
 
 
 def test_a_stopped_instance_is_skipped(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """No sidecar to reload, and start re-mints anyway."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     seen: list[str] = []
     monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: seen.append(g))
     with patch(
         'app.workers.status_collect.collect_status_map',
         return_value={'up': 'running', 'down': 'stopped'},
     ):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert seen == ['up']
 
@@ -320,21 +320,19 @@ def test_force_renews_a_certificate_that_is_not_due(settings: Settings, wired, m
 
 def test_only_leaves_the_rest_of_the_fleet_alone(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """`--instance` must not renew the whole node as a side effect."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     seen: list[str] = []
     monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: seen.append(g))
     with patch(
         'app.workers.status_collect.collect_status_map',
         return_value={'a': 'running', 'b': 'running'},
     ):
-        cert_renewal.renew_all(settings, only='b')
+        cert_renewal.renew_all(settings, 'tok', only='b')
 
     assert seen == ['b']
 
 
 def test_the_tick_reports_how_many_instances_failed(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """The CLI's exit code is this count, so an operator script can branch on it."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
 
     def _boom(s, t, g, force=False):
         raise RuntimeError('sidecar unreachable')
@@ -344,7 +342,7 @@ def test_the_tick_reports_how_many_instances_failed(settings: Settings, monkeypa
         'app.workers.status_collect.collect_status_map',
         return_value={'a': 'running', 'b': 'running', 'c': 'stopped'},
     ):
-        assert cert_renewal.renew_all(settings) == 2
+        assert cert_renewal.renew_all(settings, 'tok') == 2
 
 
 def test_a_slow_reload_is_not_a_mismatch(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,14 +427,13 @@ def test_a_departed_instance_is_dropped_from_the_backoff_map(
 ) -> None:
     """Otherwise `backing_off` -- the one health number this worker emits --
     counts instances the node no longer runs, forever."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: None)
     cert_renewal._note_failure('gone', settings.cert_renewal_interval)
     cert_renewal._note_failure('here', settings.cert_renewal_interval)
 
     with patch('app.workers.status_collect.collect_status_map',
                return_value={'here': 'running'}):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert set(cert_renewal._renewal_backoff) == {'here'}
 
@@ -597,7 +594,6 @@ def test_an_instance_that_raises_still_backs_off(settings: Settings, monkeypatch
     backoff here they retry at the full tick rate forever, each one burning a
     fresh 30-day mint from the budget the backoff exists to protect.
     """
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
 
     def _boom(s, t, g, force=False):
         raise RuntimeError('sidecar is gone')
@@ -605,7 +601,7 @@ def test_an_instance_that_raises_still_backs_off(settings: Settings, monkeypatch
     monkeypatch.setattr(cert_renewal, 'renew_one', _boom)
     with patch('app.workers.status_collect.collect_status_map',
                return_value={'inst-1': 'running'}):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert 'inst-1' in cert_renewal._renewal_backoff
 
@@ -819,7 +815,6 @@ def test_a_node_wide_rate_limit_is_not_charged_to_the_instance(
 
 def test_a_capped_node_stops_the_tick(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every remaining instance would collect the same refusal."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     seen: list = []
 
     def _one(s, t, g, force=False):
@@ -829,7 +824,7 @@ def test_a_capped_node_stops_the_tick(settings: Settings, monkeypatch: pytest.Mo
     monkeypatch.setattr(cert_renewal, 'renew_one', _one)
     with patch('app.workers.status_collect.collect_status_map',
                return_value={'a': 'running', 'b': 'running', 'c': 'running'}):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert seen == ['a'], 'the tick must stop at the cap, not grind through it'
 
@@ -841,14 +836,13 @@ def test_a_blind_probe_path_stops_the_tick(settings: Settings, wired, monkeypatc
     otherwise have the tick mint, fail to verify, restart and back off every
     instance on the node in one pass.
     """
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (None, None))
     minted: list = []
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: minted.append(g) or _cert())
     fleet = {f'i{n}': 'running' for n in range(8)}
 
     with patch('app.workers.status_collect.collect_status_map', return_value=fleet):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert len(minted) == cert_renewal._BLIND_STREAK_ABORT, (
         f'minted {len(minted)} certificates against an unobservable fleet')
@@ -877,6 +871,7 @@ async def test_the_worker_off_switch_actually_returns(settings: Settings) -> Non
     settings.cert_renewal_enabled = False
     app = FastAPI()
     app.state.settings = settings
+    app.state.greffer_token = 'tok'
 
     # Returns rather than sleeping for the interval.
     await asyncio.wait_for(cert_renewal.cert_renewal_worker(app), timeout=5)
@@ -889,20 +884,18 @@ def test_two_renewal_passes_do_not_interleave(settings: Settings, monkeypatch: p
     race each other for the same per-instance locks, and split one per-greffer
     mint budget two ways. There is no reason to run two.
     """
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
     monkeypatch.setattr(cert_renewal, 'renew_one', lambda s, t, g, force=False: None)
 
     assert cert_renewal._pass_lock.acquire(blocking=False)
     try:
         with pytest.raises(cert_renewal.RenewalAlreadyRunning):
-            cert_renewal.renew_all(settings)
+            cert_renewal.renew_all(settings, 'tok')
     finally:
         cert_renewal._pass_lock.release()
 
 
 def test_the_pass_lock_is_released_after_a_failed_tick(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """A pass that raises must not wedge renewal on this node for good."""
-    monkeypatch.setattr(cert_renewal, 'resolve_token', lambda s: 'tok')
 
     def _boom(s):
         raise RuntimeError('docker is gone')
@@ -910,7 +903,160 @@ def test_the_pass_lock_is_released_after_a_failed_tick(settings: Settings, monke
     monkeypatch.setattr(cert_renewal, '_renew_all_locked',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
     with pytest.raises(RuntimeError):
-        cert_renewal.renew_all(settings)
+        cert_renewal.renew_all(settings, 'tok')
 
     assert cert_renewal._pass_lock.acquire(blocking=False), 'lock leaked'
     cert_renewal._pass_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Codex round. Each of these fails against the code as it stood before it.
+# ---------------------------------------------------------------------------
+
+def test_a_failed_reload_still_escalates_to_a_restart(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reload that errored is the strongest reason to restart, not a reason to give up.
+
+    Skipping the probe when `nginx -s reload` failed denied a reachable,
+    restartable sidecar the one fallback that would have fixed it -- so it kept
+    serving the old certificate until expiry, which is the bug.
+    """
+    served = [(OLD, _expiring(1)), (OLD, None), (NEW, None)]
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: served.pop(0))
+    monkeypatch.setattr(cert_renewal, '_reload', lambda g: False)
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['restart'] == ['inst-1']
+    assert result.status == cert_renewal.RENEWED
+
+
+def test_an_owed_confirmation_is_retried_on_the_next_pass(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dropped confirmation is otherwise permanent.
+
+    The certificate IS serving, so every later tick reads it as not-due and
+    never reports again: the manager keeps alarming on a healthy instance, its
+    pending stays parked as an orphan, and the superseded certificate is never
+    revoked. Retrying inside one pass is not enough -- the manager can be down
+    for longer than three attempts.
+    """
+    cert_renewal._unconfirmed['inst-1'] = NEW
+    # Serving the new cert already, with plenty of life left: not due.
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (NEW, _expiring(settings.cert_renewal_window_days + 10)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: pytest.fail('must not re-mint'))
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['report'] == [NEW], 'the owed confirmation must be re-sent'
+    assert result.status == cert_renewal.NOT_DUE
+
+
+def test_an_unconfirmed_report_is_remembered(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(cert_renewal.requests, 'post',
+                        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+
+    assert cert_renewal._unconfirmed.get('inst-1') == NEW
+
+
+def test_a_confirmed_report_clears_the_debt(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    cert_renewal._unconfirmed['inst-1'] = NEW
+    monkeypatch.setattr(cert_renewal.requests, 'post',
+                        lambda *a, **k: type('R', (), {'status_code': 200, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+
+    assert 'inst-1' not in cert_renewal._unconfirmed
+
+
+def test_the_pass_uses_the_token_it_was_given(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """resolve_token MINTS a fresh token when the token file is unreadable.
+
+    That is a supported degraded mode: the app keeps ONE ephemeral token in
+    app.state and the manager knows that one. Resolving per pass would present
+    a different claimant every time, 403 every renewal, and expire every
+    certificate on the node.
+    """
+    seen: list = []
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: seen.append(t) or cert_renewal.Outcome(cert_renewal.SKIPPED, None))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'a': 'running'}):
+        cert_renewal.renew_all(settings, 'registered-token')
+
+    assert seen == ['registered-token']
+
+
+def test_a_refusal_is_counted_as_an_error(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI's exit code is this count, and a manager refusal renews nothing.
+
+    Counting only exceptions had `renew_certs` exit 0 after doing nothing,
+    telling an operator mid-incident that their emergency recovery worked.
+    """
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'inst-1': 'running'}):
+        assert cert_renewal.renew_all(settings, 'tok') == 1
+
+
+def test_an_unmatched_instance_selector_is_an_error(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo'd id would otherwise skip everything and report a clean pass."""
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'real-one': 'running'}), \
+            pytest.raises(cert_renewal.InstanceNotFound):
+        cert_renewal.renew_all(settings, 'tok', only='typo')
+
+
+def test_a_sidecar_compose_may_still_be_recreating_is_left_alone(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The instance lock does not cover the compose child.
+
+    compose.start/stop are subprocess.Popen and the controller releases the
+    lock when the HANDLER returns; _wait_for_compose_running only runs on the
+    tunnel branch. So in proxy mode the lock is free while compose is still
+    recreating the sidecar, and writing a certificate into that window leaves
+    the manager unable to tell which cert is live -- it logs
+    instance_cert_renewal_orphan at CRITICAL and refuses to revoke either.
+    """
+    monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: True)
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert wired['install'] == []
+    assert result.status == cert_renewal.SKIPPED
+
+
+def test_a_long_running_sidecar_is_not_treated_as_settling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Otherwise nothing would ever renew."""
+    import apps.utils.docker.base as docker_base
+
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=5))
+    stamp = old.strftime('%Y-%m-%dT%H:%M:%S.123456789Z')
+    monkeypatch.setattr(
+        docker_base, 'client',
+        type('C', (), {'containers': type('Cs', (), {'get': staticmethod(
+            lambda n: type('X', (), {'attrs': {'State': {'StartedAt': stamp}}})())})()})())
+
+    assert cert_renewal._sidecar_settling('inst-1') is False
+
+
+def test_a_just_started_sidecar_is_treated_as_settling(monkeypatch: pytest.MonkeyPatch) -> None:
+    import apps.utils.docker.base as docker_base
+
+    now = dt.datetime.now(dt.timezone.utc)
+    stamp = now.strftime('%Y-%m-%dT%H:%M:%S.123456789Z')
+    monkeypatch.setattr(
+        docker_base, 'client',
+        type('C', (), {'containers': type('Cs', (), {'get': staticmethod(
+            lambda n: type('X', (), {'attrs': {'State': {'StartedAt': stamp}}})())})()})())
+
+    assert cert_renewal._sidecar_settling('inst-1') is True

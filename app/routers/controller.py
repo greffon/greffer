@@ -355,12 +355,19 @@ def renew_certs_endpoint(request: Request, id: str | None = None,
     manager refuses to resolve and logs as instance_cert_renewal_orphan.
     Running the pass here puts it behind the same lock as everything else.
     """
-    from app.workers.cert_renewal import RenewalAlreadyRunning, renew_all
+    from app.workers.cert_renewal import (
+        InstanceNotFound,
+        RenewalAlreadyRunning,
+        renew_all,
+    )
 
     settings = _settings(request)
     _refuse_if_updating(settings)
     try:
-        errors = renew_all(settings, only=id, force=force)
+        errors = renew_all(settings, request.app.state.greffer_token,
+                           only=id, force=force)
+    except InstanceNotFound:
+        raise HTTPException(status_code=404, detail="instance_not_found") from None
     except RenewalAlreadyRunning:
         # The periodic tick (or another operator call) already holds the pass.
         # 409 rather than queueing: a pass can take minutes on a busy node, and

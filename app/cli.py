@@ -160,6 +160,10 @@ def _renew_certs(args: argparse.Namespace) -> int:
     if res.status_code == 409 and 'renewal_in_progress' in res.text:
         print("a renewal pass is already running on this node", file=sys.stderr)
         return 1
+    if res.status_code == 404 and 'instance_not_found' in res.text:
+        print(f"no running instance {args.instance!r} on this node",
+              file=sys.stderr)
+        return 1
     if res.status_code != 200:
         print(f"renewal refused: {res.status_code} {res.text[:200]}",
               file=sys.stderr)

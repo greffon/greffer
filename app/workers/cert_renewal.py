@@ -40,6 +40,7 @@ import ssl
 import sys
 import threading
 import time
+from typing import NamedTuple
 
 import anyio
 import requests
@@ -47,7 +48,6 @@ from fastapi import FastAPI
 
 from app.diagnostics import diag
 from app.settings import Settings
-from app.token import resolve_token
 
 logger = logging.getLogger('greffer')
 
@@ -66,6 +66,10 @@ _BLIND_STREAK_ABORT = 3
 # reports again), so 5xx and transport failures are retried here.
 _REPORT_ATTEMPTS = 3
 _REPORT_RETRY_SECONDS = 2
+# How long after a sidecar starts we assume a compose child may still be
+# working on it. compose.start/stop are Popen and the controller's lock is
+# released when the HANDLER returns, not when compose exits.
+_COMPOSE_SETTLE_SECONDS = 90
 
 
 class _NodeRateLimited(Exception):
@@ -75,6 +79,15 @@ class _NodeRateLimited(Exception):
 # Consecutive instances whose sidecar answered nothing. Reset by any readable
 # one, so it only climbs when the fault is shared.
 _blind_streak = 0
+
+# Certificates that ARE serving but whose confirmation never reached the
+# manager. Retried at the top of the next pass: without this a dropped
+# confirmation is terminal, because the next tick reads the new certificate as
+# not-due and never reports again -- leaving the manager alarming on a healthy
+# instance, its pending parked as an orphan, and the superseded certificate
+# unrevoked. In-process, so a greffer restart forgets the debt; the instance is
+# serving a valid certificate either way, only the bookkeeping is lost.
+_unconfirmed: dict[str, str] = {}
 
 # One renewal pass at a time on this node. The periodic tick and the operator's
 # /renew-certs/ call both land here in the same process, and two passes would
@@ -87,6 +100,30 @@ _pass_lock = threading.Lock()
 
 class RenewalAlreadyRunning(Exception):
     """A renewal pass is already in progress on this node."""
+
+
+class InstanceNotFound(Exception):
+    """An explicit --instance selector matched nothing on this node."""
+
+
+class Outcome(NamedTuple):
+    """What a single instance's pass did, and what it is serving now.
+
+    The status is separate from the serial because most failures here do not
+    raise: a manager refusal, a certificate still unserved after a restart, a
+    sidecar mid-transition. Returning only the serial made every one of those
+    indistinguishable from success, so `renew_certs` exited 0 after renewing
+    nothing -- the operator's emergency lever reporting that it had worked.
+    """
+
+    status: str
+    serial: str | None
+
+
+RENEWED = "renewed"
+NOT_DUE = "not_due"
+SKIPPED = "skipped"
+FAILED = "failed"
 
 
 def _nginx_container(greffon_id: str) -> str:
@@ -360,6 +397,7 @@ def _report(settings: Settings, token: str, greffon_id: str,
                            greffon_id, attempt, exc_info=True)
             res = None
         if res is not None and res.status_code == 200:
+            _unconfirmed.pop(greffon_id, None)
             return
         if res is not None and res.status_code == 409:
             # serial_mismatch / no_pending_mint / stale. The manager received
@@ -367,12 +405,14 @@ def _report(settings: Settings, token: str, greffon_id: str,
             # a transport failure, and not retryable -- the pending is gone.
             diag('cert_renewal_report_rejected', instance=greffon_id,
                  body=res.text[:120], level=logging.WARNING)
+            _unconfirmed.pop(greffon_id, None)
             return
         if res is not None and res.status_code < 500:
             logger.warning(
                 'cert_renewal_report_failed instance=%s status=%s body=%s',
                 greffon_id, res.status_code, res.text[:200],
             )
+            _unconfirmed.pop(greffon_id, None)
             return
         # 5xx or transport. Worth retrying, and it MUST be retried here: a
         # dropped confirmation is otherwise terminal. The certificate is
@@ -383,8 +423,12 @@ def _report(settings: Settings, token: str, greffon_id: str,
         # The manager's own 503 exists so the greffer re-reports.
         if attempt + 1 < _REPORT_ATTEMPTS:
             time.sleep(_REPORT_RETRY_SECONDS * (attempt + 1))
-    logger.error('cert_renewal_report_unconfirmed instance=%s serial=%s',
-                 greffon_id, served_serial)
+    # Owed, not lost. Retried at the top of the next pass, before the not-due
+    # check that would otherwise skip this instance forever.
+    if served_serial:
+        _unconfirmed[greffon_id] = served_serial
+    diag('cert_renewal_report_unconfirmed', instance=greffon_id,
+         serial=served_serial, level=logging.ERROR)
 
 
 def _sidecar_host_port(settings: Settings, greffon_id: str) -> int | None:
@@ -536,33 +580,86 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         lock.release()
 
 
+def _sidecar_settling(greffon_id: str) -> bool:
+    """True if the sidecar started so recently that a compose child may still
+    be working on it.
+
+    The per-instance lock does NOT cover this on its own. ``compose.start`` and
+    ``compose.stop`` are ``subprocess.Popen`` -- they return immediately -- and
+    ``_serialize_instance_op`` releases the lock when the HANDLER returns.
+    ``_wait_for_compose_running`` only runs on the tunnel branch, so a
+    proxy-mode start (and every stop) frees the lock while compose is still
+    recreating the container. Writing into a sidecar in that window means our
+    certificate is either wiped by the recreate or wins over the one the start
+    just recorded, and the manager cannot tell which -- it logs
+    ``instance_cert_renewal_orphan`` at CRITICAL and refuses to revoke either.
+
+    Residual: this narrows the window, it does not close it. Closing it needs
+    start/stop to hold the lock until compose exits, which is a change to the
+    shared control path and not this feature's to make.
+    """
+    from apps.utils.docker.base import client
+
+    try:
+        started = client.containers.get(
+            _nginx_container(greffon_id)).attrs['State']['StartedAt']
+    except Exception:  # noqa: BLE001 -- unreadable state must not block renewal
+        return False
+    try:
+        # Docker's RFC3339 has nanoseconds; Python takes six digits.
+        head, _, tail = started.partition('.')
+        cleaned = f'{head}.{tail[:6]}+00:00' if tail else f'{head}+00:00'
+        when = dt.datetime.fromisoformat(cleaned.replace('Z', ''))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - when) < dt.timedelta(
+        seconds=_COMPOSE_SETTLE_SECONDS)
+
+
 def _renew_locked(settings: Settings, token: str, greffon_id: str,
-                  force: bool) -> str | None:
+                  force: bool) -> Outcome:
     if _in_backoff(greffon_id) and not force:
         diag('cert_renewal_skipped', instance=greffon_id, reason='backoff')
-        return None
+        return Outcome(SKIPPED, None)
 
     port = _sidecar_host_port(settings, greffon_id)
     if port is None:
         diag('cert_renewal_skipped', instance=greffon_id, reason='no_published_port')
-        return None
+        return Outcome(SKIPPED, None)
     host = settings.cert_probe_host
+
+    if _sidecar_settling(greffon_id):
+        diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
+        return Outcome(SKIPPED, None)
 
     before_serial, before_expiry = _served_certificate(host, port)
     global _blind_streak
     _blind_streak = _blind_streak + 1 if before_serial is None else 0
+
+    # A confirmation we owed from an earlier pass, before anything else. The
+    # certificate is already installed and serving, so the not-due check below
+    # would skip this instance forever and the manager would keep alarming on a
+    # healthy one while the superseded certificate is never revoked.
+    owed = _unconfirmed.get(greffon_id)
+    if owed and _same_serial(before_serial, owed):
+        _report(settings, token, greffon_id, before_serial)
+    elif owed:
+        # Something else has since changed what is served; the old debt is moot.
+        _unconfirmed.pop(greffon_id, None)
+
     if not force and not _due_for_renewal(
             before_expiry, settings.cert_renewal_window_days):
         diag('cert_renewal_skipped', instance=greffon_id, reason='not_due')
-        return before_serial
+        return Outcome(NOT_DUE, before_serial)
 
     cert = _mint(settings, token, greffon_id)
     if cert is None:
-        # 404 (renewal off / instance gone), 429 (capped or cooling down), or a
-        # permanent 409. Nothing was issued, so there is nothing to install and
-        # nothing to report; _mint arms the backoff for the cases that warrant
-        # one.
-        return before_serial
+        # 404 (renewal off / instance gone), 429 cooling down, or a permanent
+        # 409. Nothing was issued, so there is nothing to install and nothing
+        # to report; _mint arms the backoff for the cases that warrant one.
+        return Outcome(FAILED, before_serial)
     wanted = cert.get('serial_number')
 
     _install(greffon_id, cert)
@@ -570,12 +667,13 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         served, _ = _await_serial(host, port, wanted)
     else:
         # A reload that provably never happened is a different fault from one
-        # that was delivered and ignored, with a different remediation. Skip
-        # the settle wait -- there is nothing to settle -- and keep the two
-        # countable apart in the logs.
+        # that was delivered and ignored, and it has nothing to settle. Probe
+        # once anyway: the restart escalation below is exactly the fallback for
+        # a sidecar that is reachable but did not take the new certificate, and
+        # skipping the probe here would deny it that.
         diag('cert_renewal_reload_error', instance=greffon_id,
              level=logging.WARNING)
-        served = None
+        served, _ = _served_certificate(host, port)
 
     if served is None:
         # Cannot see the sidecar at all. NOT a mismatch: restarting a container
@@ -586,9 +684,9 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         logger.warning('cert_renewal_unobservable instance=%s port=%s',
                        greffon_id, port)
     elif not _same_serial(served, wanted):
-        # The reload was delivered and the sidecar has had _SETTLE_SECONDS to
-        # adopt it. THIS is the case the whole worker is shaped around: on the
-        # stock sidecar image nothing else would ever notice.
+        # The sidecar is reachable and is not serving the new certificate.
+        # THIS is the case the whole worker is shaped around: on the stock
+        # sidecar image nothing else would ever notice.
         logger.warning(
             'cert_renewal_reload_did_not_take instance=%s wanted=%s served=%s',
             greffon_id, wanted, served,
@@ -604,19 +702,26 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
     _report(settings, token, greffon_id, served)
 
     if _same_serial(served, wanted):
-        diag('cert_renewal_outcome', instance=greffon_id, outcome='renewed',
+        diag('cert_renewal_outcome', instance=greffon_id, outcome=RENEWED,
              serial=served)
         _clear_backoff(greffon_id)
-    else:
-        diag('cert_renewal_outcome', instance=greffon_id, outcome='not_served',
-             wanted=wanted, served=served, level=logging.ERROR)
-        _note_failure(greffon_id, settings.cert_renewal_interval)
-    return served
+        return Outcome(RENEWED, served)
+    diag('cert_renewal_outcome', instance=greffon_id, outcome='not_served',
+         wanted=wanted, served=served, level=logging.ERROR)
+    _note_failure(greffon_id, settings.cert_renewal_interval)
+    return Outcome(FAILED, served)
 
 
-def renew_all(settings: Settings, only: str | None = None,
+def renew_all(settings: Settings, token: str, only: str | None = None,
               force: bool = False) -> int:
     """One tick over every instance on this greffer. Returns the error count.
+
+    ``token`` is the one THIS process registered with, passed in rather than
+    resolved here. ``resolve_token`` mints a fresh random token every call when
+    the token file cannot be read or written -- a supported degraded mode in
+    which the app keeps a single ephemeral token in ``app.state``. Resolving
+    per pass would hand the manager a different claimant each time, 403 every
+    renewal, and expire every certificate on the node.
 
     Per-instance failures are contained: one unreachable sidecar must not stop
     the others from renewing, because they expire on their own schedules and a
@@ -627,17 +732,22 @@ def renew_all(settings: Settings, only: str | None = None,
     if not _pass_lock.acquire(blocking=False):
         raise RenewalAlreadyRunning
     try:
-        return _renew_all_locked(settings, collect_status_map, only, force)
+        return _renew_all_locked(settings, collect_status_map, only, force,
+                                 token)
     finally:
         _pass_lock.release()
 
 
-def _renew_all_locked(settings, collect_status_map, only, force) -> int:
-    token = resolve_token(settings)
+def _renew_all_locked(settings, collect_status_map, only, force, token) -> int:
     considered = errors = 0
     global _blind_streak
     _blind_streak = 0
     statuses = collect_status_map(settings)
+    if only is not None and only not in statuses:
+        # A typo'd or stale id would otherwise skip every instance and report a
+        # clean pass, so the operator's emergency command would exit 0 having
+        # touched nothing.
+        raise InstanceNotFound(only)
     for greffon_id, status in statuses.items():
         if only is not None and greffon_id != only:
             continue
@@ -647,7 +757,12 @@ def _renew_all_locked(settings, collect_status_map, only, force) -> int:
             continue
         considered += 1
         try:
-            renew_one(settings, token, greffon_id, force=force)
+            # A failure that does not raise is still a failure. Counting only
+            # exceptions had `renew_certs` exit 0 after a manager refusal or a
+            # certificate still unserved past the restart.
+            if renew_one(settings, token, greffon_id,
+                         force=force).status == FAILED:
+                errors += 1
         except _NodeRateLimited:
             # The node hit the manager's per-greffer cap. Every remaining
             # instance would collect the same refusal, so stopping here is not
@@ -697,6 +812,7 @@ async def cert_renewal_worker(app: FastAPI) -> None:
     greffers restarting together must not stampede the manager's mint endpoint.
     """
     settings: Settings = app.state.settings
+    token: str = app.state.greffer_token
     if not settings.cert_renewal_enabled:
         # A per-node off switch. The manager's CERT_RENEWAL_ENABLED is
         # fleet-wide, so without this an operator seeing one node misbehave can
@@ -708,7 +824,7 @@ async def cert_renewal_worker(app: FastAPI) -> None:
             await asyncio.sleep(settings.cert_renewal_interval)
             try:
                 await anyio.to_thread.run_sync(
-                    renew_all, settings, abandon_on_cancel=True
+                    renew_all, settings, token, abandon_on_cancel=True
                 )
             except Exception:  # the loop outlives any one tick
                 logger.exception('cert_renewal_tick_failed')
