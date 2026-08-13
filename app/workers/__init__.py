@@ -25,6 +25,7 @@ import logging
 
 from fastapi import FastAPI
 
+from app.workers.cert_renewal import cert_renewal_worker
 from app.workers.crl import crl_sync_worker
 from app.workers.heartbeat import heartbeat_worker
 from app.workers.monitor import monitor_worker
@@ -42,6 +43,8 @@ def start_workers(app: FastAPI) -> list[asyncio.Task]:
         asyncio.create_task(heartbeat_worker(app), name="greffer-heartbeat"),
         asyncio.create_task(
             reregister_worker(app), name="greffer-reregister"),
+        asyncio.create_task(
+            cert_renewal_worker(app), name="greffer-cert-renewal"),
     ]
     # Self-heal watchdog (Feature #3), on by default. Appended after the others
     # so their tasks exist by the time it first evaluates readiness.

@@ -160,6 +160,12 @@ class Settings(BaseSettings):
     docker_nginx_name: str = "greffer-nginx-1"
 
     crl_sync_interval: int = 300
+    # Per-instance upstream certificate renewal. The certs carry a 30-day TTL,
+    # so a 6-hour tick gives ~28 attempts inside a 7-day window -- enough that a
+    # manager outage, a rate limit, or a sidecar restart all get retried long
+    # before anything expires, without polling a mint endpoint hourly.
+    cert_renewal_interval: int = 6 * 60 * 60
+    cert_renewal_window_days: int = 7
     monitor_interval: int = 5
     # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
     # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL
