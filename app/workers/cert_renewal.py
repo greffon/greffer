@@ -159,6 +159,16 @@ def _save_unconfirmed(settings: Settings) -> None:
 # to run two.
 _pass_lock = threading.Lock()
 
+# Set when the worker task is cancelled, so an in-flight pass stops between
+# instances. anyio's worker threads are NOT daemons, so `abandon_on_cancel`
+# stops the event loop WAITING on the pass without stopping the pass -- the
+# interpreter then joins it at exit. The watchdog self-heals by SIGTERMing its
+# own process, and nothing external SIGKILLs it, so a pass still grinding
+# through a hung docker daemon (60s SDK timeout per call, per instance) would
+# keep the container alive for exactly as long as the fault it is meant to
+# recover from. readiness.py documents this same hazard for its docker ping.
+_stop = threading.Event()
+
 
 class RenewalAlreadyRunning(Exception):
     """A renewal pass is already in progress on this node."""
@@ -689,49 +699,6 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         lock.release()
 
 
-COMPOSE_INFLIGHT_PREFIX = '.compose-inflight'
-# A marker older than this is treated as stale rather than as a live compose
-# child. A greffer restart between spawning compose and reaping it would
-# otherwise block renewal for that instance permanently -- and permanent
-# non-renewal is the bug, so this fails toward renewing.
-_INFLIGHT_STALE_SECONDS = 15 * 60
-
-
-def compose_inflight(settings: Settings, greffon_id: str) -> bool:
-    """True while a compose child for this instance is still running.
-
-    The per-instance lock does not cover this on its own. ``compose.start`` and
-    ``compose.stop`` are ``subprocess.Popen`` -- they return immediately -- and
-    ``_serialize_instance_op`` releases the lock when the HANDLER returns, while
-    ``_wait_for_compose_running`` only runs on the tunnel branch. So a
-    proxy-mode start (and every stop) frees the lock while compose is still
-    pulling or recreating the container.
-
-    A StartedAt timestamp cannot see that window: during a pull the EXISTING
-    sidecar is still up with an old start time, so it reads as settled right
-    up to the moment it is replaced. Only an explicit marker written before the
-    child is spawned covers the whole span.
-    """
-    # One marker per CHILD, not one per instance. A single shared file could
-    # only ever record the latest writer, so with two children in flight -- the
-    # manager restarts an instance as stop-then-start, and the lock is released
-    # between them -- whichever exited first took the marker away from the one
-    # still working. Any live child keeps the instance marked.
-    try:
-        markers = list((settings.greffon_path / greffon_id).glob(
-            COMPOSE_INFLIGHT_PREFIX + '.*'))
-    except OSError:
-        return False
-    now = time.time()
-    for marker in markers:
-        try:
-            if now - marker.stat().st_mtime < _INFLIGHT_STALE_SECONDS:
-                return True
-        except OSError:
-            continue
-    return False
-
-
 def _sidecar_settling(greffon_id: str) -> bool:
     """True if the sidecar started so recently that a compose child may still
     be working on it.
@@ -782,14 +749,12 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(SKIPPED, None)
     host = settings.greffer_cert_probe_host
 
-    if compose_inflight(settings, greffon_id):
-        diag('cert_renewal_skipped', instance=greffon_id, reason='compose_inflight')
-        return Outcome(SKIPPED, None)
-
     if _sidecar_settling(greffon_id):
-        # Belt to the marker's braces: covers a compose child this process did
-        # not spawn (a manual `docker compose up` on the node, a restart the
-        # daemon performed under `restart: unless-stopped`).
+        # The instance LOCK is the real serializer now: start and stop hold it
+        # until their compose child exits, so a renewal can no longer overlap
+        # one this process spawned. This covers what the lock cannot see -- a
+        # compose child nobody here spawned (a manual `docker compose up`, a
+        # recreate the daemon performed under `restart: unless-stopped`).
         diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
         return Outcome(SKIPPED, None)
 
@@ -918,6 +883,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
                       token) -> PassResult:
     _load_unconfirmed(settings)
     considered = errors = renewed = skipped = 0
+    _stop.clear()
     selected = None
     capped = False
     global _blind_streak
@@ -935,6 +901,12 @@ def _renew_all_locked(settings, collect_status_map, only, force,
             # A stopped instance has no sidecar to reload, and its certificate
             # is re-minted at start anyway.
             continue
+        if _stop.is_set():
+            # Shutting down. Stop between instances rather than mid-install, so
+            # the join at exit is bounded by ONE instance instead of the fleet.
+            diag('cert_renewal_pass_interrupted', considered=considered,
+                 level=logging.WARNING)
+            break
         considered += 1
         try:
             # A failure that does not raise is still a failure. Counting only
@@ -1068,5 +1040,6 @@ async def cert_renewal_worker(app: FastAPI) -> None:
             except Exception:  # the loop outlives any one tick
                 logger.exception('cert_renewal_tick_failed')
     except asyncio.CancelledError:
+        _stop.set()
         logger.info('cert renewal worker stopped')
         raise

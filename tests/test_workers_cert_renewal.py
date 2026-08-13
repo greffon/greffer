@@ -1124,18 +1124,23 @@ def test_the_happy_path_reloads_rather_than_restarting(
     assert wired['restart'] == []
 
 
-def test_renewal_stands_off_while_compose_is_working(
+def test_renewal_stands_off_while_compose_holds_the_instance(
     settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Testing compose_inflight() alone proved nothing: deleting the CALL to it
-    left the whole suite green while renewal wrote into a sidecar compose was
-    mid-recreate."""
+    """The instance lock is the serializer, and start/stop now hold it until
+    their compose child exits -- so a renewal cannot overlap a recreate."""
+    from app.backup import _instance_lock
+
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
     monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: False)
-    monkeypatch.setattr(cert_renewal, 'compose_inflight', lambda s, g: True)
 
-    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+    held = _instance_lock('inst-1')
+    assert held.acquire(blocking=False)
+    try:
+        result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+    finally:
+        held.release()
 
     assert wired['install'] == [], 'must not write into a sidecar compose is recreating'
     assert result.status == cert_renewal.SKIPPED

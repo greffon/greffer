@@ -12,12 +12,11 @@ runs sync handlers in a threadpool automatically.
 from __future__ import annotations
 
 import functools
-import itertools
 import logging
-import subprocess
-import threading
 import os
 import shutil
+import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -26,18 +25,17 @@ from uuid import UUID
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import backup
 from app.auth import require_token
-from app.workers import cert_renewal
 from app.diagnostics import diag
 from app.log_context import instance_id_var
-from app import backup
 from app.models.controller import (
     GreffonBackupRequest,
+    GreffonBackupResponse,
     GreffonDecommissionRequest,
     GreffonDecommissionResponse,
     GreffonForgetRequest,
     GreffonRepoOpRequest,
-    GreffonBackupResponse,
     GreffonRestoreRequest,
     GreffonRestoreResponse,
     GreffonStartRequest,
@@ -67,12 +65,13 @@ from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
 
-# How often the reaper re-stamps the marker while the compose child is alive,
-# and the total time it will track one before abandoning it.
-_INFLIGHT_HEARTBEAT_SECONDS = 30
-_INFLIGHT_MAX_SECONDS = 60 * 60
-# Unique suffix per compose child, so concurrent children get distinct markers.
-_inflight_seq = itertools.count()
+# Ops in flight on this threadpool worker hand their compose children here so
+# the serializer can keep the instance locked until they exit.
+_op_local = threading.local()
+# Upper bound on holding an instance locked for a compose child. Long enough for
+# a cold multi-gigabyte pull, short enough that a wedged child cannot 409 the
+# instance forever.
+_COMPOSE_WAIT_SECONDS = 30 * 60
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
@@ -107,77 +106,54 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
-def _mark_compose_inflight(settings, greffon_id: str, proc):
-    """Publish "a compose child is working on this instance" for its lifetime.
+def defer_lock_release(proc) -> None:
+    """Keep this op's instance lock held until ``proc`` exits.
 
-    The per-instance lock cannot express this. ``compose.start`` / ``stop`` are
-    ``subprocess.Popen`` and return at once, so this decorator's lock is
-    released while the child is still pulling images or recreating containers.
-    The certificate-renewal worker writes into the instance's nginx sidecar and
-    must not do so mid-recreate: the manager cannot afterwards tell which
-    certificate is live and logs ``instance_cert_renewal_orphan`` at CRITICAL,
-    refusing to revoke either.
+    ``compose.start`` / ``compose.stop`` are ``subprocess.Popen``: they return
+    the moment the child is spawned, while it is still pulling images and
+    recreating containers. Releasing the lock at handler return therefore
+    published "this instance is free" during the exact window in which its
+    sidecar is being replaced -- and the certificate-renewal worker, which
+    writes a key and a certificate into that sidecar, took the lock and
+    proceeded. The manager cannot afterwards tell which certificate is live: it
+    logs ``instance_cert_renewal_orphan`` at CRITICAL and refuses to revoke
+    either. Its own comment names serializing renewal against start as the
+    precondition for enabling renewal at all.
 
-    Purely additive. If the marker cannot be written, or the reaper thread
-    dies, behaviour is exactly what it was before: renewal proceeds, and the
-    marker goes stale on its own (see ``_INFLIGHT_STALE_SECONDS``) so it can
-    never wedge renewal off permanently.
+    Thread-local because the decorator below and the handler it wraps run on
+    the same threadpool worker, and the lock guarantees only one op per
+    instance is ever in flight.
     """
     if proc is None:
         return
-    # A marker of this child's OWN, so a sibling that finishes first cannot
-    # unmark an instance another child is still working on. A shared file can
-    # only record the latest writer.
-    path = (Path(settings.greffon_path) / greffon_id
-            / f"{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.{next(_inflight_seq)}")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(getattr(proc, "pid", "")), encoding="utf-8")
-    except OSError:
-        logger.warning("compose_inflight_unwritable instance=%s", greffon_id)
-        return
+    getattr(_op_local, "procs", None) is None and setattr(_op_local, "procs", [])
+    _op_local.procs.append(proc)
 
-    def _reap():
-        # Heartbeat the marker while the child lives, and clear it only once the
-        # child has actually exited. A single bounded wait cleared the marker on
-        # TIMEOUT -- precisely when the child was definitively still running --
-        # reopening the race for exactly the long pulls the marker exists to
-        # cover. The touch also keeps the marker from ageing into staleness
-        # under a slow pull, so staleness now means only "the reaper is gone".
-        deadline = time.monotonic() + _INFLIGHT_MAX_SECONDS
-        while True:
-            try:
-                proc.wait(timeout=_INFLIGHT_HEARTBEAT_SECONDS)
+
+def _release_after_children(lock, procs, greffon_id: str) -> None:
+    """Wait out every compose child this op spawned, then free the instance."""
+    try:
+        deadline = time.monotonic() + _COMPOSE_WAIT_SECONDS
+        for proc in procs:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("compose_wait_abandoned instance=%s", greffon_id)
                 break
+            try:
+                proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
-                if time.monotonic() > deadline:
-                    # A compose op running this long is pathological. Give up
-                    # tracking rather than block renewal on this instance for
-                    # good -- permanent non-renewal is the bug being fixed.
-                    logger.warning("compose_inflight_abandoned instance=%s",
-                                   greffon_id)
-                    break
-                try:
-                    path.touch()
-                except OSError:
-                    # The instance directory is gone (a decommission), so there
-                    # is nothing left to protect and nothing to clear.
-                    return
-            except Exception:  # noqa: BLE001 -- stop tracking, but leave the
-                # marker: it expires on its own, and clearing it here would
-                # green-light renewal against a child we can no longer observe.
-                logger.warning("compose_inflight_reap_failed instance=%s",
-                               greffon_id)
-                return
-        path.unlink(missing_ok=True)
-
-    try:
-        threading.Thread(target=_reap, name=f"compose-inflight-{greffon_id}",
-                         daemon=True).start()
-    except Exception:  # noqa: BLE001 -- "purely additive" has to mean it
-        # Thread-limit exhaustion must not 500 a start whose compose child has
-        # already spawned. The marker then expires on its own.
-        logger.warning("compose_inflight_thread_failed instance=%s", greffon_id)
+                # Bounded on purpose: a compose op running this long is
+                # pathological, and holding the lock forever would 409 every
+                # future start, stop, backup and renewal for this instance --
+                # a worse outage than the race being closed.
+                logger.warning("compose_wait_timeout instance=%s", greffon_id)
+                break
+            except Exception:  # noqa: BLE001 -- release the lock regardless
+                logger.warning("compose_wait_failed instance=%s", greffon_id,
+                               exc_info=True)
+                break
+    finally:
+        lock.release()
 
 
 def _serialize_instance_op(handler):
@@ -185,16 +161,38 @@ def _serialize_instance_op(handler):
     it serializes against a concurrent backup/restore in the single greffer
     process (HLD section 3: the in-process lock -- NOT a file lock -- is the real
     serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
-    preserves the signature so FastAPI still parses the body + response_model."""
+    preserves the signature so FastAPI still parses the body + response_model.
+
+    "Whole duration" now includes the compose child the handler spawns: see
+    ``defer_lock_release``. The lock moves to a waiter thread rather than the
+    request blocking on it, so the API answers as promptly as it always did
+    while the instance stays marked busy until compose is actually finished.
+    """
     @functools.wraps(handler)
     def wrapper(payload, request, *args, **kwargs):
         lock = backup._instance_lock(payload.id)
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="instance_busy")
+        _op_local.procs = []
         try:
             return handler(payload, request, *args, **kwargs)
         finally:
-            lock.release()
+            procs = [p for p in getattr(_op_local, "procs", []) if p is not None]
+            _op_local.procs = []
+            if not procs:
+                lock.release()
+            else:
+                try:
+                    threading.Thread(
+                        target=_release_after_children,
+                        args=(lock, procs, payload.id),
+                        name=f"compose-wait-{payload.id}",
+                        daemon=True,
+                    ).start()
+                except Exception:  # noqa: BLE001 -- never strand the lock
+                    logger.warning("compose_wait_thread_failed instance=%s",
+                                   payload.id)
+                    lock.release()
     return wrapper
 
 
@@ -288,8 +286,7 @@ def start_greffon(
         compose.create_compose(compose_template, greffon_info)
         conf.create_nginx_conf(greffon_info)
         compose.create_volumes_then_copy_files(greffon_info)
-        _mark_compose_inflight(_settings(request), greffon_info["id"],
-                               compose.start(greffon_info))
+        defer_lock_release(compose.start(greffon_info))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="start", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
@@ -344,8 +341,7 @@ def stop_greffon(
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
     _t0 = time.monotonic()
     try:
-        _mark_compose_inflight(_settings(request), greffon.get("id"),
-                               compose.stop(greffon))
+        defer_lock_release(compose.stop(greffon))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="stop", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))

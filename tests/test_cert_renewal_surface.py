@@ -330,228 +330,6 @@ async def test_an_operator_pass_does_not_look_like_a_crashed_worker(
         await cert_renewal.cert_renewal_worker(app)
 
     assert 'cert_renewal_tick_failed' not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_the_tick_reads_the_token_fresh_each_time(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    """register.py rewrites app.state.greffer_token on rotation.
-
-    Snapshotting it at startup 403s every mint and report after any rotation,
-    and each instance then walks the backoff to the cap: silent node-wide
-    certificate expiry. monitor.py and heartbeat.py both re-read per tick.
-    """
-    from fastapi import FastAPI
-
-    app = FastAPI()
-    app.state.settings = settings
-    app.state.greffer_token = 'token-A'
-    app.state.registered = asyncio.Event()
-    app.state.registered.set()
-    seen: list = []
-    ticks: list = []
-
-    async def _sleep(n):
-        ticks.append(n)
-        if len(ticks) >= 3:
-            raise asyncio.CancelledError
-
-    def _renew(s, token, **kw):
-        seen.append(token)
-        if len(seen) > 5:
-            raise asyncio.CancelledError
-        app.state.greffer_token = 'token-B'
-        return _result()
-
-    monkeypatch.setattr(asyncio, 'sleep', _sleep)
-    monkeypatch.setattr(cert_renewal, 'renew_all', _renew)
-    with pytest.raises(asyncio.CancelledError):
-        await cert_renewal.cert_renewal_worker(app)
-
-    assert seen == ['token-A', 'token-B'], seen
-
-
-def test_renew_all_forwards_force_to_each_instance(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The flag can otherwise be dropped anywhere between argparse and the
-    per-instance guards with CI green, and the symptom is a silent no-op."""
-    seen: list = []
-    monkeypatch.setattr(
-        cert_renewal, 'renew_one',
-        lambda s, t, g, force=False: seen.append(force) or cert_renewal.Outcome(
-            cert_renewal.RENEWED, 'aa'))
-    with patch('app.workers.status_collect.collect_status_map',
-               return_value={'i1': 'running'}):
-        cert_renewal.renew_all(settings, 'tok', only='i1', force=True)
-
-    assert seen == [True]
-
-
-def test_the_owed_ledger_survives_a_greffer_restart(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The window this covers is a manager outage, and the operator's response
-    to one is often to restart or update the greffer -- dropping exactly the
-    debts accumulated during it. `greffer update` recreates the process by
-    design.
-    """
-    settings.greffon_path = tmp_path
-    monkeypatch.setattr(cert_renewal, 'renew_one',
-                        lambda s, t, g, force=False: cert_renewal.Outcome(
-                            cert_renewal.NOT_DUE, 'aa'))
-    cert_renewal._unconfirmed['i1'] = 'deadbeef'
-    with patch('app.workers.status_collect.collect_status_map',
-               return_value={'i1': 'running'}):
-        cert_renewal.renew_all(settings, 'tok')
-
-    # A fresh process: the in-memory map is gone, the file is not.
-    cert_renewal._unconfirmed.clear()
-    with patch('app.workers.status_collect.collect_status_map',
-               return_value={'i1': 'running'}):
-        cert_renewal.renew_all(settings, 'tok')
-
-    assert cert_renewal._unconfirmed.get('i1') == 'deadbeef'
-
-
-def test_a_corrupt_ledger_does_not_fail_the_pass(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stale bookkeeping is the cost of losing it; a broken pass is not."""
-    settings.greffon_path = tmp_path
-    (tmp_path / '.cert-unconfirmed.json').write_text('{not json')
-    monkeypatch.setattr(cert_renewal, 'renew_one',
-                        lambda s, t, g, force=False: cert_renewal.Outcome(
-                            cert_renewal.NOT_DUE, 'aa'))
-    with patch('app.workers.status_collect.collect_status_map',
-               return_value={'i1': 'running'}):
-        assert cert_renewal.renew_all(settings, 'tok').errors == 0
-
-
-def test_an_unwritable_volume_does_not_fail_the_pass(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    settings.greffon_path = pathlib.Path('/nonexistent-volume-xyz')
-    monkeypatch.setattr(cert_renewal, 'renew_one',
-                        lambda s, t, g, force=False: cert_renewal.Outcome(
-                            cert_renewal.RENEWED, 'aa'))
-    with patch('app.workers.status_collect.collect_status_map',
-               return_value={'i1': 'running'}):
-        assert cert_renewal.renew_all(settings, 'tok').renewed == 1
-
-
-# ---------------------------------------------------------------------------
-# The compose in-flight marker. A StartedAt timestamp cannot see this window:
-# while compose is PULLING, the existing sidecar is still up with an old start
-# time, so it reads as settled right until it is replaced.
-# ---------------------------------------------------------------------------
-
-def test_renewal_waits_for_a_running_compose_child(settings: Settings, tmp_path) -> None:
-    settings.greffon_path = tmp_path
-    inst = tmp_path / 'i1'
-    inst.mkdir()
-    (inst / f'{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.0').write_text('1234')
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is True
-
-
-def test_a_stale_marker_does_not_wedge_renewal_forever(settings: Settings, tmp_path) -> None:
-    """A greffer restart between spawning compose and reaping it would
-    otherwise block that instance permanently -- and permanent non-renewal is
-    the bug this feature exists to fix, so it must fail toward renewing."""
-    import os
-    import time as _time
-
-    settings.greffon_path = tmp_path
-    inst = tmp_path / 'i1'
-    inst.mkdir()
-    marker = inst / f'{cert_renewal.COMPOSE_INFLIGHT_PREFIX}.0'
-    marker.write_text('1234')
-    old = _time.time() - cert_renewal._INFLIGHT_STALE_SECONDS - 60
-    os.utime(marker, (old, old))
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is False
-
-
-def test_no_marker_means_no_compose_child(settings: Settings, tmp_path) -> None:
-    settings.greffon_path = tmp_path
-    assert cert_renewal.compose_inflight(settings, 'i1') is False
-
-
-def test_a_start_publishes_and_then_clears_the_marker(settings: Settings, tmp_path) -> None:
-    """The marker must span the child's whole life and not outlive it."""
-    import threading
-
-    from app.routers import controller
-
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i1').mkdir()
-    done = threading.Event()
-
-    class _Proc:
-        pid = 4321
-
-        @staticmethod
-        def wait(timeout=None):
-            done.wait(timeout)
-
-    controller._mark_compose_inflight(settings, 'i1', _Proc())
-    assert cert_renewal.compose_inflight(settings, 'i1') is True, 'not published'
-
-    done.set()
-    for _ in range(100):
-        if not cert_renewal.compose_inflight(settings, 'i1'):
-            break
-        __import__('time').sleep(0.02)
-    assert cert_renewal.compose_inflight(settings, 'i1') is False, 'never cleared'
-
-
-def test_an_unwritable_marker_does_not_break_start(settings: Settings) -> None:
-    """Purely additive: if the marker cannot be written, behaviour is exactly
-    what it was before this existed."""
-    from app.routers import controller
-
-    settings.greffon_path = pathlib.Path('/nonexistent-volume-xyz')
-
-    class _Proc:
-        pid = 1
-
-        @staticmethod
-        def wait(timeout=None):
-            return 0
-
-    controller._mark_compose_inflight(settings, 'i1', _Proc())  # must not raise
-
-
-def test_a_slow_pull_keeps_the_marker_alive(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A single bounded wait cleared the marker ON TIMEOUT -- exactly when the
-    child was definitively still running, reopening the race for the long pulls
-    the marker exists to cover."""
-    import subprocess
-    import threading
-    import time as _time
-
-    from app.routers import controller
-
-    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 0.01)
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i1').mkdir()
-    finished = threading.Event()
-
-    class _SlowProc:
-        pid = 99
-
-        @staticmethod
-        def wait(timeout=None):
-            if not finished.wait(timeout):
-                raise subprocess.TimeoutExpired('docker', timeout)
-            return 0
-
-    controller._mark_compose_inflight(settings, 'i1', _SlowProc())
-    _time.sleep(0.1)  # several heartbeats while the "pull" runs
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
-        'the marker must survive a child that outlives one wait window')
-
-    finished.set()
-    for _ in range(200):
-        if not cert_renewal.compose_inflight(settings, 'i1'):
-            break
-        _time.sleep(0.01)
-    assert cert_renewal.compose_inflight(settings, 'i1') is False
-
-
 def test_an_unauthorized_report_keeps_the_debt(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A token rotated between this pass reading app.state and the manager
     receiving the call. The next pass reads a fresh token, so dropping the debt
@@ -565,184 +343,6 @@ def test_an_unauthorized_report_keeps_the_debt(settings: Settings, tmp_path, mon
     cert_renewal._report(settings, 'stale-token', 'i1', 'aa11')
 
     assert cert_renewal._unconfirmed.get('i1') == 'aa11'
-
-
-def test_an_unobservable_sidecar_is_still_owed(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`if served_serial:` skipped the debt for exactly the case that most
-    needs chasing."""
-    settings.greffon_path = tmp_path
-    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
-    monkeypatch.setattr(
-        'requests.post',
-        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
-
-    cert_renewal._report(settings, 'tok', 'i1', None)
-
-    assert 'i1' in cert_renewal._unconfirmed
-
-
-def test_the_debt_is_written_through_before_the_pass_ends(
-    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A pass over a large fleet takes minutes; an update inside that window is
-    what loses debts held only in memory."""
-    settings.greffon_path = tmp_path
-    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
-    monkeypatch.setattr(
-        'requests.post',
-        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
-
-    cert_renewal._report(settings, 'tok', 'i1', 'aa11')
-
-    on_disk = (tmp_path / '.cert-unconfirmed.json').read_text()
-    assert 'i1' in on_disk, 'the debt only existed in memory'
-
-
-# ---------------------------------------------------------------------------
-# The marker's PRODUCER side. Deleting both publications from start and stop
-# left the whole suite green: the previous tests called
-# _mark_compose_inflight directly, never through the endpoints.
-# ---------------------------------------------------------------------------
-
-class _NeverExits:
-    """A compose child that is still working."""
-
-    pid = 4242
-
-    @staticmethod
-    def wait(timeout=None):
-        import subprocess
-        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
-
-
-def test_starting_an_instance_publishes_the_marker(
-    client, settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from tests.helpers import SAMPLE_START_PAYLOAD
-
-    payload = dict(SAMPLE_START_PAYLOAD)
-    instance_id = payload['id']
-    settings.greffon_path = tmp_path
-    (tmp_path / instance_id).mkdir()
-
-    with patch('app.routers.controller.repository') as repo, \
-            patch('app.routers.controller.compose') as compose, \
-            patch('app.routers.controller.conf'):
-        repo.get_compose_file_from_repository.return_value = {}
-        repo.get_greffon_info.return_value = {'ports': [], 'id': instance_id}
-        compose.start.return_value = _NeverExits()
-        res = client.post('/api/controller/start/', json=payload,
-                          headers={TOKEN_HEADER: 'tok'})
-
-    assert res.status_code == 200, res.text
-    assert cert_renewal.compose_inflight(settings, instance_id) is True, (
-        'start must publish the marker, or renewal can write into a sidecar '
-        'compose is still recreating'
-    )
-
-
-def test_stopping_an_instance_publishes_the_marker(
-    client, settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i2').mkdir()
-
-    with patch('app.routers.controller.repository') as repo, \
-            patch('app.routers.controller.compose') as compose:
-        repo.get_greffon_info.return_value = {'ports': [], 'id': 'i2'}
-        compose.stop.return_value = _NeverExits()
-        res = client.post('/api/controller/stop/', json={'id': 'i2'},
-                          headers={TOKEN_HEADER: 'tok'})
-
-    assert res.status_code == 200, res.text
-    assert cert_renewal.compose_inflight(settings, 'i2') is True
-
-
-def test_the_heartbeat_is_what_keeps_a_long_pull_marked(
-    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Pinned against the STALENESS bound, not just against elapsed time.
-
-    A test that checks a marker written 0.1s ago still reads in-flight passes
-    with or without the heartbeat, because the staleness bound is 15 minutes.
-    Only shrinking that bound makes the re-stamp load-bearing -- and without
-    it, any pull longer than the bound ages the marker out and renewal
-    proceeds mid-recreate.
-    """
-    import threading
-    import time as _time
-
-    from app.routers import controller
-
-    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 0.02)
-    monkeypatch.setattr(cert_renewal, '_INFLIGHT_STALE_SECONDS', 0.15)
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i1').mkdir()
-    done = threading.Event()
-
-    class _SlowPull:
-        pid = 77
-
-        @staticmethod
-        def wait(timeout=None):
-            import subprocess
-            if not done.wait(timeout):
-                raise subprocess.TimeoutExpired('docker', timeout)
-            return 0
-
-    controller._mark_compose_inflight(settings, 'i1', _SlowPull())
-    _time.sleep(0.5)  # far longer than the staleness bound
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
-        'without the heartbeat the marker ages out mid-pull')
-    done.set()
-
-
-def test_a_stop_reaper_does_not_clear_a_start_marker(
-    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The manager restarts an instance as stop-then-start, and the lock is
-    released between them. `docker-compose stop` finishes in seconds while
-    `up -d` is still pulling, so an unconditional unlink let the stop's reaper
-    delete the start's marker -- opening exactly the window it exists to close.
-    """
-    import threading
-    import time as _time
-
-    from app.routers import controller
-
-    # A SLOW heartbeat on purpose. With a fast one the surviving reaper
-    # re-creates the file within milliseconds, so the deletion is invisible to
-    # an assertion made afterwards -- which is exactly how an unconditional
-    # unlink passed this test. In production the window is up to 30s, and
-    # renewal only has to sample it once.
-    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 30)
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i1').mkdir()
-    stop_done = threading.Event()
-    pull_done = threading.Event()
-
-    class _Proc:
-        def __init__(self, pid, ev):
-            self.pid = pid
-            self._ev = ev
-
-        def wait(self, timeout=None):
-            import subprocess
-            if not self._ev.wait(timeout):
-                raise subprocess.TimeoutExpired('docker', timeout)
-            return 0
-
-    controller._mark_compose_inflight(settings, 'i1', _Proc(101, stop_done))
-    controller._mark_compose_inflight(settings, 'i1', _Proc(202, pull_done))
-    stop_done.set()          # the quick stop child exits
-    _time.sleep(0.2)         # while the pull is still running
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
-        "the stop's reaper cleared the marker the start still needs")
-    pull_done.set()
-
-
 def test_the_ledger_is_written_atomically(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rename-into-place, because the event this ledger exists to survive IS a kill.
 
@@ -866,47 +466,6 @@ async def test_the_delay_returns_to_normal_after_a_capped_tick(
 
     interval = settings.greffer_cert_renewal_interval
     assert slept == [interval, cert_renewal._CAPPED_RETRY_SECONDS, interval], slept
-
-
-def test_a_sibling_child_cannot_unmark_a_running_one(
-    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One marker per child, not one per instance.
-
-    A shared file can only record the LATEST writer, so a stop issued during a
-    cold `up -d` pull overwrote the start's marker with its own pid and then
-    removed it on exit -- while the pull was still recreating the sidecar.
-    """
-    import threading
-    import time as _time
-
-    from app.routers import controller
-
-    monkeypatch.setattr(controller, '_INFLIGHT_HEARTBEAT_SECONDS', 30)
-    settings.greffon_path = tmp_path
-    (tmp_path / 'i1').mkdir()
-    slow, quick = threading.Event(), threading.Event()
-
-    class _Proc:
-        def __init__(self, pid, ev):
-            self.pid, self._ev = pid, ev
-
-        def wait(self, timeout=None):
-            import subprocess
-            if not self._ev.wait(timeout):
-                raise subprocess.TimeoutExpired('docker', timeout)
-            return 0
-
-    controller._mark_compose_inflight(settings, 'i1', _Proc(1, slow))   # the pull
-    controller._mark_compose_inflight(settings, 'i1', _Proc(2, quick))  # the stop
-    quick.set()
-    _time.sleep(0.2)
-
-    assert cert_renewal.compose_inflight(settings, 'i1') is True, (
-        'the second child unmarked an instance the first is still working on')
-    slow.set()
-
-
 def test_the_renewal_worker_is_watched_as_fatal() -> None:
     """A renewal worker that dies silently IS the bug this feature fixes.
 
@@ -966,3 +525,332 @@ async def test_a_pass_waits_for_registration(settings: Settings, monkeypatch: py
         assert ran, 'the pass never ran after registration'
     finally:
         task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_tick_reads_the_token_fresh_each_time(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """register.py rewrites app.state.greffer_token on rotation.
+
+    Snapshotting it at startup 403s every mint and report after any rotation,
+    and each instance then walks the backoff to the cap: silent node-wide
+    certificate expiry. monitor.py and heartbeat.py both re-read per tick.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'token-A'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    seen: list = []
+    ticks: list = []
+
+    async def _sleep(n):
+        ticks.append(n)
+        if len(ticks) >= 3:
+            raise asyncio.CancelledError
+
+    def _renew(s, token, **kw):
+        seen.append(token)
+        if len(seen) > 5:
+            raise asyncio.CancelledError
+        app.state.greffer_token = 'token-B'
+        return _result()
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', _renew)
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert seen == ['token-A', 'token-B'], seen
+
+
+def test_renew_all_forwards_force_to_each_instance(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flag can otherwise be dropped anywhere between argparse and the
+    per-instance guards with CI green, and the symptom is a silent no-op."""
+    seen: list = []
+    monkeypatch.setattr(
+        cert_renewal, 'renew_one',
+        lambda s, t, g, force=False: seen.append(force) or cert_renewal.Outcome(
+            cert_renewal.RENEWED, 'aa'))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        cert_renewal.renew_all(settings, 'tok', only='i1', force=True)
+
+    assert seen == [True]
+
+
+def test_the_owed_ledger_survives_a_greffer_restart(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The window this covers is a manager outage, and the operator's response
+    to one is often to restart or update the greffer -- dropping exactly the
+    debts accumulated during it. `greffer update` recreates the process by
+    design.
+    """
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.NOT_DUE, 'aa'))
+    cert_renewal._unconfirmed['i1'] = 'deadbeef'
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        cert_renewal.renew_all(settings, 'tok')
+
+    # A fresh process: the in-memory map is gone, the file is not.
+    cert_renewal._unconfirmed.clear()
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        cert_renewal.renew_all(settings, 'tok')
+
+    assert cert_renewal._unconfirmed.get('i1') == 'deadbeef'
+
+
+def test_a_corrupt_ledger_does_not_fail_the_pass(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale bookkeeping is the cost of losing it; a broken pass is not."""
+    settings.greffon_path = tmp_path
+    (tmp_path / '.cert-unconfirmed.json').write_text('{not json')
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.NOT_DUE, 'aa'))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        assert cert_renewal.renew_all(settings, 'tok').errors == 0
+
+
+def test_an_unwritable_volume_does_not_fail_the_pass(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.greffon_path = pathlib.Path('/nonexistent-volume-xyz')
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: cert_renewal.Outcome(
+                            cert_renewal.RENEWED, 'aa'))
+    with patch('app.workers.status_collect.collect_status_map',
+               return_value={'i1': 'running'}):
+        assert cert_renewal.renew_all(settings, 'tok').renewed == 1
+
+
+# ---------------------------------------------------------------------------
+# The compose in-flight marker. A StartedAt timestamp cannot see this window:
+# while compose is PULLING, the existing sidecar is still up with an old start
+# time, so it reads as settled right until it is replaced.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unobservable_sidecar_is_still_owed(settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`if served_serial:` skipped the debt for exactly the case that most
+    needs chasing."""
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(
+        'requests.post',
+        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'i1', None)
+
+    assert 'i1' in cert_renewal._unconfirmed
+
+
+def test_the_debt_is_written_through_before_the_pass_ends(
+    settings: Settings, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass over a large fleet takes minutes; an update inside that window is
+    what loses debts held only in memory."""
+    settings.greffon_path = tmp_path
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    monkeypatch.setattr(
+        'requests.post',
+        lambda *a, **k: type('R', (), {'status_code': 503, 'text': ''})())
+
+    cert_renewal._report(settings, 'tok', 'i1', 'aa11')
+
+    on_disk = (tmp_path / '.cert-unconfirmed.json').read_text()
+    assert 'i1' in on_disk, 'the debt only existed in memory'
+
+
+# ---------------------------------------------------------------------------
+# The marker's PRODUCER side. Deleting both publications from start and stop
+# left the whole suite green: the previous tests called
+# _mark_compose_inflight directly, never through the endpoints.
+# ---------------------------------------------------------------------------
+
+class _NeverExits:
+    """A compose child that is still working."""
+
+    pid = 4242
+
+    @staticmethod
+    def wait(timeout=None):
+        import subprocess
+        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
+
+
+# ---------------------------------------------------------------------------
+# The lock now spans the compose child. This is the serialization the manager
+# names as the precondition for enabling renewal at all, and it replaces the
+# marker file that approximated it (and was wrong three times).
+# ---------------------------------------------------------------------------
+
+class _StillWorking:
+    """A compose child that has not finished."""
+
+    pid = 4242
+
+    def __init__(self, ev=None):
+        self._ev = ev
+
+    def wait(self, timeout=None):
+        import subprocess
+        if self._ev is not None and self._ev.wait(timeout):
+            return 0
+        raise subprocess.TimeoutExpired('docker-compose', timeout or 0)
+
+
+def test_the_instance_stays_locked_until_compose_finishes(
+    client, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """compose.start returns the moment the child is SPAWNED.
+
+    Releasing the lock at handler return published "this instance is free"
+    during the exact window its sidecar was being replaced, and renewal took
+    the lock and wrote into it. The manager cannot tell which certificate is
+    live afterwards -- it logs instance_cert_renewal_orphan at CRITICAL and
+    refuses to revoke either.
+    """
+    import threading
+
+    from app.backup import _instance_lock
+    from tests.helpers import SAMPLE_START_PAYLOAD
+
+    payload = dict(SAMPLE_START_PAYLOAD)
+    instance_id = payload['id']
+    finished = threading.Event()
+
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose, \
+            patch('app.routers.controller.conf'):
+        repo.get_compose_file_from_repository.return_value = {}
+        repo.get_greffon_info.return_value = {'ports': [], 'id': instance_id}
+        compose.start.return_value = _StillWorking(finished)
+        res = client.post('/api/controller/start/', json=payload,
+                          headers={TOKEN_HEADER: 'tok'})
+
+    assert res.status_code == 200, res.text
+    lock = _instance_lock(instance_id)
+    try:
+        assert lock.acquire(blocking=False) is False, (
+            'the instance was released while its compose child was still running')
+    finally:
+        finished.set()
+        for _ in range(200):
+            if lock.acquire(blocking=False):
+                lock.release()
+                break
+            __import__('time').sleep(0.02)
+
+
+def test_the_lock_is_released_once_compose_exits(
+    client, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Held forever would 409 every future start, stop, backup and renewal for
+    this instance -- a worse outage than the race it closes."""
+    import threading
+    import time as _time
+
+    from app.backup import _instance_lock
+    from tests.helpers import SAMPLE_START_PAYLOAD
+
+    payload = dict(SAMPLE_START_PAYLOAD)
+    payload['id'] = 'release-me'
+    finished = threading.Event()
+
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose, \
+            patch('app.routers.controller.conf'):
+        repo.get_compose_file_from_repository.return_value = {}
+        repo.get_greffon_info.return_value = {'ports': [], 'id': 'release-me'}
+        compose.start.return_value = _StillWorking(finished)
+        client.post('/api/controller/start/', json=payload,
+                    headers={TOKEN_HEADER: 'tok'})
+
+    finished.set()
+    lock = _instance_lock('release-me')
+    for _ in range(200):
+        if lock.acquire(blocking=False):
+            lock.release()
+            return
+        _time.sleep(0.02)
+    raise AssertionError('the lock was never released after compose exited')
+
+
+def test_a_handler_with_no_compose_child_releases_immediately(
+    client, settings: Settings
+) -> None:
+    """Only ops that actually spawn a child defer the release; anything else
+    would leak the lock on every request."""
+    from app.backup import _instance_lock
+
+    res = client.post('/api/controller/stop/', json={'id': 'nope'},
+                      headers={TOKEN_HEADER: 'tok'})
+
+    lock = _instance_lock('nope')
+    assert lock.acquire(blocking=False), f'lock leaked (status {res.status_code})'
+    lock.release()
+
+
+def test_stopping_also_holds_the_instance_until_compose_finishes(
+    client, settings: Settings
+) -> None:
+    """`compose.stop` is Popen too, and the manager restarts an instance as
+    stop-then-start -- so a stop that released early was half the race."""
+    import threading
+    import time as _time
+
+    from app.backup import _instance_lock
+
+    finished = threading.Event()
+    with patch('app.routers.controller.repository') as repo, \
+            patch('app.routers.controller.compose') as compose:
+        repo.get_greffon_info.return_value = {'ports': [], 'id': 'stop-me'}
+        compose.stop.return_value = _StillWorking(finished)
+        res = client.post('/api/controller/stop/', json={'id': 'stop-me'},
+                          headers={TOKEN_HEADER: 'tok'})
+
+    assert res.status_code == 200, res.text
+    lock = _instance_lock('stop-me')
+    try:
+        assert lock.acquire(blocking=False) is False, (
+            'the instance was released while docker-compose stop was still running')
+    finally:
+        finished.set()
+        for _ in range(200):
+            if lock.acquire(blocking=False):
+                lock.release()
+                break
+            _time.sleep(0.02)
+
+
+def test_a_cancelled_worker_stops_the_pass_between_instances(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """anyio's worker threads are NOT daemons.
+
+    `abandon_on_cancel` stops the loop WAITING on a pass without stopping the
+    pass, and the interpreter joins it at exit. The watchdog self-heals by
+    SIGTERMing its own process, so a pass grinding through a hung docker daemon
+    (60s per call, per instance) would keep the container alive for exactly as
+    long as the fault the watchdog exists to recover from.
+    """
+    seen: list = []
+
+    def _one(s, t, g, force=False):
+        seen.append(g)
+        cert_renewal._stop.set()  # shutdown begins mid-pass
+        return cert_renewal.Outcome(cert_renewal.RENEWED, 'aa')
+
+    monkeypatch.setattr(cert_renewal, 'renew_one', _one)
+    fleet = {f'i{n}': 'running' for n in range(10)}
+    try:
+        with patch('app.workers.status_collect.collect_status_map', return_value=fleet):
+            cert_renewal.renew_all(settings, 'tok')
+    finally:
+        cert_renewal._stop.clear()
+
+    assert len(seen) == 1, (
+        f'the pass ground through {len(seen)} instances after shutdown began')
