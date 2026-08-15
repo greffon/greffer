@@ -255,8 +255,46 @@ async def test_the_loop_sleeps_before_the_first_tick(settings: Settings, monkeyp
     with pytest.raises(asyncio.CancelledError):
         await cert_renewal.cert_renewal_worker(app)
 
-    assert slept == [settings.greffer_cert_renewal_interval]
     assert ticks == [], 'the loop must sleep BEFORE its first tick'
+    # Bounded by the jitter window, NOT the full interval. A greffer restart
+    # leaves sidecars serving whatever they had, so a six-hour first sleep
+    # would outlive the expiry it is meant to catch -- on the very restart
+    # that delivers this feature to the node.
+    assert len(slept) == 1
+    assert 0 <= slept[0] <= cert_renewal._STARTUP_JITTER_SECONDS
+    assert slept[0] < settings.greffer_cert_renewal_interval
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_sleep_is_shortened(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The jitter is a startup concession, not the new cadence.
+
+    Shortening every sleep would turn a 6-hour cadence into a 5-minute one
+    and walk the whole fleet into the manager's per-greffer mint cap.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', lambda *a, **kw: _result())
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept[0] <= cert_renewal._STARTUP_JITTER_SECONDS
+    assert slept[1] == settings.greffer_cert_renewal_interval
 
 
 @pytest.mark.asyncio
@@ -293,8 +331,8 @@ async def test_a_capped_tick_retries_within_the_hour(settings: Settings, monkeyp
     # The whole SEQUENCE, not just that the short delay appears somewhere.
     # Asserting slept[1] alone passed while the loop then slept another full
     # interval on top, making the real retry 7h and the log line a lie.
-    assert slept[:3] == [
-        settings.greffer_cert_renewal_interval,
+    assert slept[0] <= cert_renewal._STARTUP_JITTER_SECONDS, slept
+    assert slept[1:3] == [
         cert_renewal._CAPPED_RETRY_SECONDS,
         cert_renewal._CAPPED_RETRY_SECONDS,
     ], slept
@@ -425,7 +463,10 @@ async def test_a_short_interval_clamps_the_capped_retry(
     with pytest.raises(asyncio.CancelledError):
         await cert_renewal.cert_renewal_worker(app)
 
-    assert slept == [600, 600], slept
+    assert slept[0] <= cert_renewal._STARTUP_JITTER_SECONDS, slept
+    # The clamp is the point: _CAPPED_RETRY_SECONDS (3600) must not lengthen
+    # a 600s interval.
+    assert slept[1:] == [600], slept
 
 
 @pytest.mark.asyncio
@@ -467,7 +508,8 @@ async def test_the_delay_returns_to_normal_after_a_capped_tick(
         await cert_renewal.cert_renewal_worker(app)
 
     interval = settings.greffer_cert_renewal_interval
-    assert slept == [interval, cert_renewal._CAPPED_RETRY_SECONDS, interval], slept
+    assert slept[0] <= cert_renewal._STARTUP_JITTER_SECONDS, slept
+    assert slept[1:] == [cert_renewal._CAPPED_RETRY_SECONDS, interval], slept
 def test_the_renewal_worker_is_watched_as_fatal() -> None:
     """A renewal worker that dies silently IS the bug this feature fixes.
 

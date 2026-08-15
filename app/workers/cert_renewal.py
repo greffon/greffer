@@ -37,6 +37,7 @@ import datetime as dt
 import json
 import logging
 import os
+import random
 import socket
 import ssl
 import sys
@@ -54,6 +55,15 @@ from app.settings import Settings
 logger = logging.getLogger('greffer')
 
 _HTTP_TIMEOUT_SECONDS = 30
+# The FIRST pass runs a few jittered minutes after boot, not a full interval
+# later. "Certificates were just minted" is true of an INSTANCE start; a
+# greffer restart leaves running sidecars serving whatever they already had,
+# including certificates that expired while the process was down. Publishing an
+# image and having clients run `greffer update` is how this feature reaches a
+# node at all, so a full-interval first sleep means the 502s it exists to fix
+# survive the fix by six hours. Jittered because a fleet restarting together
+# would otherwise mint in lockstep against one manager.
+_STARTUP_JITTER_SECONDS = 300
 # The sidecar is on the host's published port; a TLS handshake to read back the
 # served certificate must not hang the tick.
 _PROBE_TIMEOUT_SECONDS = 5
@@ -1108,9 +1118,19 @@ def _renew_all_locked(settings, collect_status_map, only, force,
 async def cert_renewal_worker(app: FastAPI) -> None:
     """Periodically renew per-instance upstream certificates.
 
-    Sleep-first, matching the other workers: instance certificates are minted
-    at start, so nothing is due in the seconds after boot, and a fleet of
-    greffers restarting together must not stampede the manager's mint endpoint.
+    Sleep-first like the other workers, but only briefly. The premise that
+    made a full-interval first sleep look safe -- "certificates are minted at
+    start, so nothing is due after boot" -- is about an INSTANCE start. This
+    worker boots with the greffer process, and a greffer restart leaves every
+    running sidecar serving exactly the certificate it had before, including
+    one that expired while the process was down. Since `greffer update` is how
+    a node receives this feature, a six-hour first sleep would let the 502s it
+    exists to fix outlive the fix itself by six hours.
+
+    So the first pass waits a jittered few minutes instead: long enough that a
+    fleet restarting together does not mint in lockstep against one manager,
+    short enough that an already-expired certificate is found on the day it is
+    deployed rather than the next morning.
     """
     settings: Settings = app.state.settings
     if not settings.greffer_cert_renewal_enabled:
@@ -1124,7 +1144,11 @@ async def cert_renewal_worker(app: FastAPI) -> None:
     # anything: control returns to the top and sleeps the full interval as
     # well, so the advertised one-hour retry actually happened seven hours
     # later -- worse than no retry, because the log claimed otherwise.
-    delay = settings.greffer_cert_renewal_interval
+    # Clamped so a short configured interval is never lengthened by the
+    # jitter: the validator admits intervals as low as 60s.
+    delay = min(random.uniform(0, _STARTUP_JITTER_SECONDS),
+                settings.greffer_cert_renewal_interval)
+    diag('cert_renewal_first_pass_scheduled', delay_seconds=round(delay))
     try:
         while True:
             await asyncio.sleep(delay)
