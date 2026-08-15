@@ -1215,7 +1215,17 @@ async def cert_renewal_worker(app: FastAPI) -> None:
             except RenewalAlreadyRunning:
                 # An operator's renew_certs holds the pass. Not a crash, and
                 # logging it as one buried a real traceback in false alarms.
-                diag('cert_renewal_tick_skipped', reason='pass_in_progress')
+                #
+                # But this tick renewed NOTHING, and the pass that displaced
+                # it is usually a targeted --instance one that renews exactly
+                # its own instance. Every other due instance on the node just
+                # lost its turn, so come back like any other deferred pass
+                # rather than waiting the full interval for a collision that
+                # lasted a minute.
+                diag('cert_renewal_tick_skipped', reason='pass_in_progress',
+                     delay_seconds=_DEFERRED_RETRY_SECONDS)
+                delay = min(_DEFERRED_RETRY_SECONDS,
+                            settings.greffer_cert_renewal_interval)
             except NodeCapped:
                 # Expected on a node with more due instances than the manager's
                 # hourly budget. Retry sooner than the full interval: at 30/h

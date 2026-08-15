@@ -166,10 +166,19 @@ class Settings(BaseSettings):
         attempts, elapsed, failures = 1, 0, 0
         while attempts < _MIN_ATTEMPTS_IN_WINDOW:
             failures += 1
-            elapsed += min(
+            delay = min(
                 self.greffer_cert_renewal_interval * (2 ** (failures - 1)),
                 CERT_RENEWAL_BACKOFF_CAP_SECONDS,
             )
+            # Rounded UP to the next tick. The worker only re-examines an
+            # instance when it wakes, so a backoff deadline landing between
+            # ticks waits for the following one -- and the cap is what makes
+            # a delay stop being a whole number of ticks. Modelling the
+            # deadline instead of the tick accepted 7h/2d, whose fourth
+            # attempt the worker actually runs an hour after expiry.
+            elapsed = -(-(elapsed + delay)
+                        // self.greffer_cert_renewal_interval) \
+                * self.greffer_cert_renewal_interval
             if elapsed > window_seconds:
                 break
             attempts += 1

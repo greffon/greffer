@@ -229,3 +229,21 @@ def test_the_backoff_cap_is_applied_when_it_binds(
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "43200")
     s = Settings()
     assert s.greffer_cert_renewal_interval == 43200
+
+
+def test_a_backoff_deadline_between_ticks_waits_for_the_next_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on c79acda: attempts happen on ticks, not on deadlines.
+
+    7h interval, 2-day window. Modelling deadlines gives attempts at 0, 7,
+    21 and 45 hours -- inside 48. But the worker only re-examines an
+    instance when it wakes: the 24h backoff set at hour 21 comes due at 45,
+    the ticks at 28, 35 and 42 all skip it, and the next tick is at 49 --
+    an hour after the certificate expired.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "2")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", str(7 * 3600))
+    with pytest.raises(ValidationError, match="renewal attempt"):
+        Settings()

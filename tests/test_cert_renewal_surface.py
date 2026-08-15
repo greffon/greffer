@@ -1046,3 +1046,39 @@ async def test_a_pass_that_deferred_nothing_keeps_the_full_interval(
         await cert_renewal.cert_renewal_worker(app)
 
     assert slept[1] == settings.greffer_cert_renewal_interval, slept
+
+
+@pytest.mark.asyncio
+async def test_a_tick_displaced_by_an_operator_retries_soon(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on c79acda: the collision costs the whole fleet its turn.
+
+    An operator's targeted `renew_certs --instance X` renews X and nothing
+    else, but it holds the pass lock, so the scheduled tick it displaces is
+    discarded entirely. Every other due instance on the node then waits a
+    full interval because of a collision that lasted a minute.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    def _busy(*a, **kw):
+        raise cert_renewal.RenewalAlreadyRunning
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', _busy)
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept[1] == cert_renewal._DEFERRED_RETRY_SECONDS, slept
