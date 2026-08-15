@@ -731,10 +731,35 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         # serving", and the current handshake is always the truthful answer --
         # including None, which the manager reads as a mismatch and uses to
         # retire its dead pending mint.
-        port = _sidecar_host_port(settings, greffon_id)
-        if port is not None:
-            served_now, _ = _served_certificate(settings.greffer_cert_probe_host, port)
-            _report(settings, token, greffon_id, served_now)
+        #
+        # Guarded like the main path guards its own probe below, and for the
+        # same reason: a sidecar Compose is recreating serves the old
+        # certificate, or nothing, for a window that has nothing to do with
+        # what this instance will serve once the operation finishes. Reporting
+        # that reading retires the manager's pending mint against a value that
+        # was never true, and clears the durable debt that is the only record
+        # we still owe an answer. Deferring costs one tick and the debt
+        # survives restarts, so nothing is lost by waiting for a quiet moment.
+        from app.routers.controller import compose_inflight
+
+        busy = compose_inflight(greffon_id)
+        if not busy:
+            # Cheap non-blocking test, released immediately: holding it across
+            # the probe is the 90s hold (three attempts, 30s timeout) that
+            # moving this out of the lock existed to remove, and a held lock
+            # is a Start that is about to mint its own certificate anyway.
+            probe_lock = _instance_lock(greffon_id)
+            if probe_lock.acquire(blocking=False):
+                probe_lock.release()
+            else:
+                busy = True
+        if busy:
+            diag('cert_renewal_debt_deferred', instance=greffon_id)
+        else:
+            port = _sidecar_host_port(settings, greffon_id)
+            if port is not None:
+                served_now, _ = _served_certificate(settings.greffer_cert_probe_host, port)
+                _report(settings, token, greffon_id, served_now)
 
     lock = _instance_lock(greffon_id)
     if not lock.acquire(blocking=False):

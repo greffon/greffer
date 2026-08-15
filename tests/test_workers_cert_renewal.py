@@ -1281,3 +1281,50 @@ def test_a_disabled_manager_does_not_fail_the_tick(
     # Stopped at the first: every remaining instance would collect the same
     # 404, and asking N times is N pointless round trips per tick.
     assert asked == ['a']
+
+
+def test_a_debt_report_stands_off_while_compose_is_recreating(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sidecar mid-recreate serves nothing, and that is not an answer.
+
+    Codex P2 on 042534d: the pre-lock debt path probed and reported without
+    the compose guard the main path uses, so a start or stop overlapping an
+    unconfirmed renewal had the transient reading retire the manager's
+    pending mint and clear the durable debt that records we still owe one.
+    """
+    cert_renewal._unconfirmed['inst-1'] = OLD
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (None, None))
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: True)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        # Nothing reported: not the transient None, not anything.
+        assert wired['report'] == []
+        # Still owed, so the next quiet tick answers it.
+        assert 'inst-1' in cert_renewal._unconfirmed
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_debt_report_stands_off_while_the_instance_lock_is_held(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same standoff for a Start holding the lock rather than Compose."""
+    from app.backup import _instance_lock
+
+    cert_renewal._unconfirmed['inst-1'] = OLD
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (None, None))
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: False)
+    held = _instance_lock('inst-1')
+    assert held.acquire(blocking=False)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert wired['report'] == []
+        assert 'inst-1' in cert_renewal._unconfirmed
+    finally:
+        held.release()
+        cert_renewal._unconfirmed.pop('inst-1', None)
