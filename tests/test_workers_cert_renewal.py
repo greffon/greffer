@@ -1536,3 +1536,28 @@ def test_the_debt_exists_from_the_moment_a_certificate_is_minted(
             'the mint is outstanding at the manager with nothing owed here')
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_debt_report_stands_off_from_an_untracked_recreation(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on 17f7802: the standoff used one of the two guards.
+
+    compose_inflight only knows about operations THIS process launched, and
+    the debt path runs at the top of the first pass after a restart -- when
+    that counter is empty by definition. _sidecar_settling is what covers
+    the sidecar still coming up, so without it the retry reports a
+    transient serial and clears the debt on it.
+    """
+    cert_renewal._unconfirmed['inst-1'] = OLD
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (None, None))
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: False)
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: True)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert wired['report'] == []
+        assert 'inst-1' in cert_renewal._unconfirmed
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)

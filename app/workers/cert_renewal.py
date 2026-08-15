@@ -799,7 +799,15 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
 
         served_now = None
         probed = False
-        if not compose_inflight(greffon_id):
+        # BOTH guards the main path uses, not just the first. _sidecar_settling
+        # covers what the in-process counter cannot see -- a manual compose
+        # operation, a daemon recreate under `restart: unless-stopped`, and
+        # the moments right after a greffer restart cleared the counter. That
+        # last one IS this path: a persisted debt is retried at the top of the
+        # first pass after a restart, precisely when compose_inflight() is
+        # false because the counter is empty and the sidecar may still be
+        # coming up.
+        if not (compose_inflight(greffon_id) or _sidecar_settling(greffon_id)):
             probe_lock = _instance_lock(greffon_id)
             if probe_lock.acquire(blocking=False):
                 try:
