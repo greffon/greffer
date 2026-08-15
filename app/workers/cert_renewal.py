@@ -737,47 +737,48 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
     from app.backup import _instance_lock
 
     if greffon_id in _unconfirmed:
-        # Settled BEFORE taking the lock: it writes nothing into the sidecar,
-        # and at three attempts on a 30s timeout it is the longest thing that
-        # was happening under it. The manager chains control ops that take this
-        # same lock non-blocking -- a migration cutover step landing on a held
-        # lock gets 409 instance_busy and treats it as terminal -- so every
-        # second of hold time is a migration failure waiting for a coincidence.
+        # The PROBE is what has to be serialized, and it is the cheap half.
+        # A sidecar Compose is recreating serves the old certificate or
+        # nothing, for a window that says nothing about what this instance
+        # will serve once the operation finishes; reporting that reading
+        # retires the manager's pending mint against a value that was never
+        # true, and clears the durable debt that is the only record we still
+        # owe an answer. Reading it under the lock costs at most one connect
+        # plus one handshake, both bounded by _PROBE_TIMEOUT_SECONDS.
         #
-        # Reports what is served NOW, not the serial the debt was filed under:
-        # the debt means "the manager has not been told what this instance is
-        # serving", and the current handshake is always the truthful answer --
-        # including None, which the manager reads as a mismatch and uses to
-        # retire its dead pending mint.
-        #
-        # Guarded like the main path guards its own probe below, and for the
-        # same reason: a sidecar Compose is recreating serves the old
-        # certificate, or nothing, for a window that has nothing to do with
-        # what this instance will serve once the operation finishes. Reporting
-        # that reading retires the manager's pending mint against a value that
-        # was never true, and clears the durable debt that is the only record
-        # we still owe an answer. Deferring costs one tick and the debt
-        # survives restarts, so nothing is lost by waiting for a quiet moment.
+        # The REPORT is the expensive half -- three attempts on a 30s HTTP
+        # timeout -- and it does not need the lock: it sends a value that was
+        # true at probe time, which is the same guarantee the main path gives.
+        # Holding the lock across it is the ninety-second hold that the
+        # manager's non-blocking control ops turn into terminal 409s, and a
+        # migration cutover landing on one is a real failure for a call that
+        # is only bookkeeping.
         from app.routers.controller import compose_inflight
 
-        busy = compose_inflight(greffon_id)
-        if not busy:
-            # Cheap non-blocking test, released immediately: holding it across
-            # the probe is the 90s hold (three attempts, 30s timeout) that
-            # moving this out of the lock existed to remove, and a held lock
-            # is a Start that is about to mint its own certificate anyway.
+        served_now = None
+        probed = False
+        if not compose_inflight(greffon_id):
             probe_lock = _instance_lock(greffon_id)
             if probe_lock.acquire(blocking=False):
-                probe_lock.release()
-            else:
-                busy = True
-        if busy:
-            diag('cert_renewal_debt_deferred', instance=greffon_id)
+                try:
+                    port = _sidecar_host_port(settings, greffon_id)
+                    if port is not None:
+                        served_now, _ = _served_certificate(
+                            settings.greffer_cert_probe_host, port)
+                        probed = True
+                finally:
+                    probe_lock.release()
+        if probed:
+            # Reports what is served NOW, not the serial the debt was filed
+            # under: the debt means "the manager has not been told what this
+            # instance is serving", and the handshake is the truthful answer
+            # -- including None, which the manager reads as a mismatch and
+            # uses to retire its dead pending mint.
+            _report(settings, token, greffon_id, served_now)
         else:
-            port = _sidecar_host_port(settings, greffon_id)
-            if port is not None:
-                served_now, _ = _served_certificate(settings.greffer_cert_probe_host, port)
-                _report(settings, token, greffon_id, served_now)
+            # Deferred, not dropped. The debt survives restarts, so waiting
+            # for a quiet tick loses nothing.
+            diag('cert_renewal_debt_deferred', instance=greffon_id)
 
     lock = _instance_lock(greffon_id)
     if not lock.acquire(blocking=False):

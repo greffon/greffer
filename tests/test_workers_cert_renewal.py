@@ -1370,3 +1370,49 @@ def test_a_report_for_a_gone_instance_is_terminal(
         assert 'inst-1' not in cert_renewal._unconfirmed
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_the_debt_probe_is_serialized_but_the_report_is_not(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The split Codex's P2 on 9238527 asked for, done at the right seam.
+
+    The probe is what has to be serialized against a Compose recreate, and
+    it is bounded by _PROBE_TIMEOUT_SECONDS. The report is three attempts on
+    a 30s HTTP timeout, and holding the instance lock across it is what
+    turns a manager control op into a terminal 409. So: probe under the
+    lock, report outside it.
+
+    threading.Lock is not reentrant, so a same-thread acquire that fails is
+    proof the lock is held at that moment.
+    """
+    from app.backup import _instance_lock
+
+    cert_renewal._unconfirmed['inst-1'] = OLD
+    lock = _instance_lock('inst-1')
+    held: dict[str, list[bool]] = {'probe': [], 'report': []}
+
+    def _watch(phase):
+        got = lock.acquire(blocking=False)
+        held[phase].append(not got)
+        if got:
+            lock.release()
+
+    def _probe(host, port):
+        _watch('probe')
+        return NEW, None
+
+    def _rep(s, t, g, serial):
+        _watch('report')
+
+    monkeypatch.setattr(cert_renewal, '_served_certificate', _probe)
+    monkeypatch.setattr(cert_renewal, '_report', _rep)
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: False)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert held['probe'][0] is True, 'debt probe must run under the lock'
+        assert held['report'][0] is False, 'debt report must not hold the lock'
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
