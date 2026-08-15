@@ -1328,3 +1328,45 @@ def test_a_debt_report_stands_off_while_the_instance_lock_is_held(
     finally:
         held.release()
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_report_to_a_disabled_manager_keeps_the_debt(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on 9238527: the report endpoint is gated on the same flag.
+
+    Turning renewal off between the mint and the report had the empty 404
+    read as terminal, clearing the one record that this instance serves
+    something the manager has not been told about. A just-minted certificate
+    is not due for thirty days, so nothing would reconcile it.
+    """
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+
+    class _Res:
+        status_code = 404
+        text = '{}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda url, **kw: _Res())
+    try:
+        cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+        assert cert_renewal._unconfirmed.get('inst-1') == NEW
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_report_for_a_gone_instance_is_terminal(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other 404: nothing to reconcile, so the debt is settled."""
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+
+    class _Res:
+        status_code = 404
+        text = '{"message": "not_found"}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda url, **kw: _Res())
+    try:
+        cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+        assert 'inst-1' not in cert_renewal._unconfirmed
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)

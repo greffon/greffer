@@ -553,6 +553,24 @@ def _report(settings: Settings, token: str, greffon_id: str,
             logger.warning('cert_renewal_report_unauthorized instance=%s',
                            greffon_id)
             break
+        if (res is not None and res.status_code == 404
+                and 'not_found' not in res.text):
+            # The report endpoint is gated on CERT_RENEWAL_ENABLED exactly as
+            # the mint endpoint is, and answers a disabled manager with the
+            # same empty-bodied 404. Terminal is the wrong reading: the flag
+            # can go off between the mint and this report -- during the staged
+            # rollout, or an operator pausing renewal mid-incident -- and the
+            # debt is the ONLY record that this instance is serving something
+            # the manager has not been told about. Clearing it strands the
+            # pending mint and the stale recorded serial until the certificate
+            # comes due again, which for a just-minted one is thirty days of
+            # false expiry alarms on a healthy instance.
+            #
+            # 'not_found' still falls through to the terminal branch below:
+            # an instance the manager has forgotten has nothing to reconcile.
+            logger.warning(
+                'cert_renewal_report_unavailable instance=%s', greffon_id)
+            break
         if res is not None and res.status_code < 500:
             logger.warning(
                 'cert_renewal_report_failed instance=%s status=%s body=%s',
