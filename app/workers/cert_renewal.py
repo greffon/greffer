@@ -178,6 +178,15 @@ class InstanceNotFound(Exception):
     """An explicit --instance selector matched nothing on this node."""
 
 
+class RenewalUnavailable(Exception):
+    """The manager has renewal switched off fleet-wide (404, empty body).
+
+    Expected for the whole of a staged rollout, so it is a SKIP and never an
+    error. Node-wide by definition: every remaining instance this tick would
+    get the same answer, so the tick stops rather than asking N times.
+    """
+
+
 class NodeAuthLost(Exception):
     """The manager rejected this pass's token.
 
@@ -352,11 +361,21 @@ def _mint(settings: Settings, token: str, greffon_id: str) -> dict | None:
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
     if res.status_code == 404:
-        # CERT_RENEWAL_ENABLED is off on this manager, or the instance is gone.
-        # Both mean "do not renew", and neither is an error worth alarming on:
-        # a deployment that has not opted in must not fill its logs.
+        # Two different 404s, and the manager tells them apart by body: an
+        # empty one is CERT_RENEWAL_ENABLED being off fleet-wide, 'not_found'
+        # is this instance being gone. Only the second is about this instance.
+        #
+        # The first is the whole staged rollout -- greffers carry this code for
+        # as long as it takes to publish an image and have clients run `greffer
+        # update`, all before the manager flag is flipped. Charging that window
+        # to each instance in turn made every tick report errors it had no way
+        # to act on, and `renew_certs` exit non-zero, on a deployment where
+        # nothing is wrong.
+        if 'not_found' in res.text:
+            logger.debug('cert_renewal_instance_gone instance=%s', greffon_id)
+            return None
         logger.debug('cert_renewal_unavailable instance=%s', greffon_id)
-        return None
+        raise RenewalUnavailable
     if res.status_code == 429:
         # Two different 429s, and charging the wrong one to the wrong scope is
         # what starves a node. `renewal_cooling_down` is this instance's own
@@ -961,6 +980,18 @@ def _renew_all_locked(settings, collect_status_map, only, force,
                 renewed += 1
             elif outcome.status == SKIPPED:
                 skipped += 1
+        except RenewalUnavailable:
+            # Node-wide, so stop -- but unlike the auth and cap breaks this is
+            # not a warning: the deployment simply has not opted in yet.
+            # No flag to carry: unlike the unauthorized and capped breaks
+            # below, this one must NOT raise. Exiting non-zero because the
+            # manager has not opted in yet is the exact false alarm this
+            # branch exists to remove.
+            diag('cert_renewal_tick_unavailable', considered=considered)
+            skipped += 1
+            if greffon_id == only:
+                selected = SKIPPED
+            break
         except NodeAuthLost:
             # Every remaining instance would present the same rejected token.
             diag('cert_renewal_tick_unauthorized', considered=considered,

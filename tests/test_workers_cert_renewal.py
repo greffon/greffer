@@ -226,8 +226,11 @@ def test_an_unreadable_expiry_is_treated_as_due(settings: Settings, wired, monke
     assert wired['install'] == [NEW]
 
 
-def test_a_manager_with_renewal_off_is_not_an_error(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
-    """404 means "do not renew", and must leave the instance untouched."""
+def test_an_instance_the_manager_no_longer_knows_is_a_failure(settings: Settings, wired, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_mint returning None now means ONE thing: 'not_found', the instance is
+    gone from the manager while this node still runs it. That is a real
+    anomaly and stays FAILED. The fleet-wide 'renewal is off' 404 raises
+    RenewalUnavailable instead -- see the two tests below."""
     monkeypatch.setattr(cert_renewal, '_served_certificate', lambda h, p: (OLD, _expiring(1)))
     monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
 
@@ -1213,3 +1216,68 @@ def test_a_rejected_token_raises_node_wide(settings: Settings, monkeypatch: pyte
     with pytest.raises(cert_renewal.NodeAuthLost):
         cert_renewal._mint(settings, 'stale', 'inst-1')
     assert 'inst-1' not in cert_renewal._renewal_backoff
+
+
+def test_a_disabled_manager_raises_rather_than_failing(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The empty-bodied 404 is CERT_RENEWAL_ENABLED being off fleet-wide.
+
+    This is the entire staged rollout: the image ships, clients run `greffer
+    update`, and only then is the manager flag flipped. Treating that window
+    as a per-instance failure is a false alarm on every instance, every tick.
+    """
+    class _Res:
+        status_code = 404
+        text = '{}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda *a, **k: _Res())
+
+    with pytest.raises(cert_renewal.RenewalUnavailable):
+        cert_renewal._mint(settings, 'tok', 'inst-1')
+    # And it must not be charged to the instance: a node that renews nothing
+    # for a week of rollout would come out the far side backed off on
+    # everything, then renew nothing on the day the flag is finally flipped.
+    assert 'inst-1' not in cert_renewal._renewal_backoff
+
+
+def test_a_gone_instance_is_told_apart_from_a_disabled_manager(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same status code, different bodies, opposite meanings."""
+    class _Res:
+        status_code = 404
+        text = '{"message": "not_found"}'
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda *a, **k: _Res())
+
+    assert cert_renewal._mint(settings, 'tok', 'inst-1') is None
+
+
+def test_a_disabled_manager_does_not_fail_the_tick(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """errors=0 and a clean return, so `renew_certs` exits 0.
+
+    Codex P2 on bef2c8e: the fleet-wide pass exited non-zero and periodic
+    diagnostics reported renewal failures on a deployment whose manager had
+    simply not enabled the feature yet.
+    """
+    asked: list[str] = []
+
+    def _one(s, t, greffon_id, force=False):
+        asked.append(greffon_id)
+        raise cert_renewal.RenewalUnavailable
+
+    monkeypatch.setattr(cert_renewal, 'renew_one', _one)
+    with patch(
+        'app.workers.status_collect.collect_status_map',
+        return_value={'a': 'running', 'b': 'running'},
+    ):
+        result = cert_renewal.renew_all(settings, 'tok')
+
+    assert result.errors == 0
+    assert result.skipped == 1
+    # Stopped at the first: every remaining instance would collect the same
+    # 404, and asking N times is N pointless round trips per tick.
+    assert asked == ['a']
