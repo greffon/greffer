@@ -162,12 +162,42 @@ def test_an_interval_that_outruns_the_window_is_rejected(
 def test_a_one_day_window_is_fine_with_a_short_enough_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pair is what is rejected, not the narrow window itself."""
+    """The pair is what is rejected, not the narrow window itself.
+
+    3h leaves attempts at 0, 3, 9 and 21 hours -- four inside the day.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "1")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "10800")
+    s = Settings()
+    assert s.greffer_cert_renewal_interval == 10800
+
+
+def test_the_window_is_measured_against_the_backoff_not_even_spacing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on 5479922: retries are exponential, not periodic.
+
+    A one-day window with a 6h interval looks like four evenly spaced
+    attempts and is not: after failures the delays are 6h, 12h then 24h, so
+    the attempts land at 0, 6 and 18 hours and the fourth at 42 -- eighteen
+    hours past the expiry it was supposed to beat.
+    """
     monkeypatch.setenv("GREFFER_ID", "x")
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "1")
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "21600")
-    s = Settings()
-    assert s.greffer_cert_renewal_interval == 21600
+    with pytest.raises(ValidationError, match="renewal attempt"):
+        Settings()
+
+
+def test_the_validator_and_the_worker_share_one_backoff_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two copies would drift and the validator would start lying."""
+    from app.settings import CERT_RENEWAL_BACKOFF_CAP_SECONDS
+    from app.workers import cert_renewal
+
+    assert cert_renewal._BACKOFF_CAP_SECONDS is CERT_RENEWAL_BACKOFF_CAP_SECONDS
 
 
 def test_the_shipped_defaults_leave_room_to_retry(
@@ -178,6 +208,24 @@ def test_the_shipped_defaults_leave_room_to_retry(
     monkeypatch.delenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", raising=False)
     monkeypatch.delenv("GREFFER_CERT_RENEWAL_INTERVAL", raising=False)
     s = Settings()
-    attempts = (s.greffer_cert_renewal_window_days * 86400
-                // s.greffer_cert_renewal_interval)
-    assert attempts >= 4
+    # Under the real schedule the fourth attempt lands at 7x the interval;
+    # the shipped 7-day window clears that with room to spare.
+    assert (7 * s.greffer_cert_renewal_interval
+            <= s.greffer_cert_renewal_window_days * 86400)
+
+
+def test_the_backoff_cap_is_applied_when_it_binds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is a ceiling on the doubling, and the validator must honour it.
+
+    At a 12h interval the raw delays would be 12h, 24h, 48h (84h total), but
+    the worker caps each at 24h, so the fourth attempt actually lands at 60h
+    -- inside a 3-day window. A validator that ignored the cap would reject
+    this pair as unworkable when the worker handles it fine.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "3")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "43200")
+    s = Settings()
+    assert s.greffer_cert_renewal_interval == 43200

@@ -50,7 +50,7 @@ import requests
 from fastapi import FastAPI
 
 from app.diagnostics import diag
-from app.settings import Settings
+from app.settings import CERT_RENEWAL_BACKOFF_CAP_SECONDS, Settings
 
 logger = logging.getLogger('greffer')
 
@@ -712,7 +712,10 @@ _renewal_backoff: dict[str, tuple[int, float]] = {}
 # or the backoff itself becomes the expiry. Capped at a day: with the default
 # 7-day window that leaves ~7 tries, while a permanently stuck instance mints
 # ~8 certs over the window instead of ~28.
-_BACKOFF_CAP_SECONDS = 24 * 60 * 60
+# Single definition, in settings, because the settings validator models
+# this same schedule to decide whether a configured window can fit the
+# retries. Two copies would drift and the validator would start lying.
+_BACKOFF_CAP_SECONDS = CERT_RENEWAL_BACKOFF_CAP_SECONDS
 
 
 def _in_backoff(greffon_id: str) -> bool:

@@ -13,6 +13,10 @@ from app import __version__
 # How many renewal passes must fit inside the renewal window. Below this a
 # certificate can expire without ever having been retried.
 _MIN_ATTEMPTS_IN_WINDOW = 4
+# Ceiling on one instance's exponential renewal backoff. Defined here rather
+# than in the worker because the validator below has to model the SAME
+# schedule the worker actually runs; the worker imports it from here.
+CERT_RENEWAL_BACKOFF_CAP_SECONDS = 24 * 60 * 60
 
 
 class Settings(BaseSettings):
@@ -152,8 +156,23 @@ class Settings(BaseSettings):
         #
         # Four is the smallest number that survives losing a pass or two,
         # which is the whole reason this worker retries at all.
-        attempts = (self.greffer_cert_renewal_window_days * 86400
-                    // self.greffer_cert_renewal_interval)
+        # Counted against the schedule the worker RUNS, not against evenly
+        # spaced slots. Retries are exponential -- interval, then 2x, then 4x,
+        # capped -- so a pair that looks like four periodic attempts can
+        # deliver three before expiry and put the fourth hours the wrong side
+        # of it. Failing attempts are what the floor exists for, so the
+        # backoff is the case to size against.
+        window_seconds = self.greffer_cert_renewal_window_days * 86400
+        attempts, elapsed, failures = 1, 0, 0
+        while attempts < _MIN_ATTEMPTS_IN_WINDOW:
+            failures += 1
+            elapsed += min(
+                self.greffer_cert_renewal_interval * (2 ** (failures - 1)),
+                CERT_RENEWAL_BACKOFF_CAP_SECONDS,
+            )
+            if elapsed > window_seconds:
+                break
+            attempts += 1
         if attempts < _MIN_ATTEMPTS_IN_WINDOW:
             raise ValueError(
                 "greffer_cert_renewal_interval leaves room for "
