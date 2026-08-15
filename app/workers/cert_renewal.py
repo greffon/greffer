@@ -929,6 +929,20 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         return Outcome(FAILED, before_serial)
     wanted = cert.get('serial_number')
 
+    # Owed from the INSTANT a certificate exists, not from the first report.
+    # The manager is now holding a pending mint, and everything between here
+    # and the report -- install, reload, a 20s settle loop, the handshake --
+    # is time this process can be stopped or updated in. Without this the
+    # next process either re-mints into a pending-mint refusal, or sees the
+    # replacement already serving, reads it as not due, and leaves that mint
+    # orphaned for thirty days.
+    #
+    # The value is a placeholder: the debt path re-probes and reports what is
+    # served THEN, never the serial it was filed under. This is the last gap
+    # of its kind -- before the mint there is nothing owed.
+    _unconfirmed[greffon_id] = before_serial or ''
+    _save_unconfirmed(settings)
+
     try:
         _install(greffon_id, cert)
     except Exception:
@@ -1233,6 +1247,18 @@ async def cert_renewal_worker(app: FastAPI) -> None:
                 # lasted a minute.
                 diag('cert_renewal_tick_skipped', reason='pass_in_progress',
                      delay_seconds=_DEFERRED_RETRY_SECONDS)
+                delay = min(_DEFERRED_RETRY_SECONDS,
+                            settings.greffer_cert_renewal_interval)
+            except NodeAuthLost:
+                # The manager rejected this node's token, so the pass aborted
+                # having renewed nothing. The heartbeat and register workers
+                # install a replacement within seconds, and the wait() at the
+                # top of this loop already gates the retry on re-registration
+                # -- so the only thing a full interval buys is six hours of
+                # expiry on every instance the aborted pass skipped.
+                diag('cert_renewal_tick_unauthorized_retry',
+                     delay_seconds=_DEFERRED_RETRY_SECONDS,
+                     level=logging.WARNING)
                 delay = min(_DEFERRED_RETRY_SECONDS,
                             settings.greffer_cert_renewal_interval)
             except NodeCapped:

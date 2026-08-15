@@ -1508,3 +1508,31 @@ def test_a_terminal_report_still_clears_the_debt(
         assert 'inst-1' not in cert_renewal._unconfirmed
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_the_debt_exists_from_the_moment_a_certificate_is_minted(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on ece0864: the window starts at the mint, not at the report.
+
+    Install, reload and a 20s settle loop all run between the manager
+    issuing a certificate and this greffer reporting what is served. A stop
+    or `greffer update` in there leaves the manager holding a pending mint
+    that nothing reconciles.
+    """
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: _cert())
+    seen: dict = {}
+
+    def _install(greffon_id, cert):
+        # What a SIGKILL between mint and report would have left behind.
+        seen['debt'] = cert_renewal._unconfirmed.get('inst-1')
+
+    monkeypatch.setattr(cert_renewal, '_install', _install)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert 'debt' in seen and seen['debt'] is not None, (
+            'the mint is outstanding at the manager with nothing owed here')
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)

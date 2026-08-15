@@ -1082,3 +1082,38 @@ async def test_a_tick_displaced_by_an_operator_retries_soon(
         await cert_renewal.cert_renewal_worker(app)
 
     assert slept[1] == cert_renewal._DEFERRED_RETRY_SECONDS, slept
+
+
+@pytest.mark.asyncio
+async def test_a_token_rotation_does_not_cost_the_fleet_six_hours(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on ece0864: NodeAuthLost fell through to the generic handler.
+
+    The pass aborts having renewed nothing, but the heartbeat and register
+    workers install a replacement token within seconds and the loop already
+    waits on re-registration -- so a full interval only buys expiry.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    def _lost(*a, **kw):
+        raise cert_renewal.NodeAuthLost
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(cert_renewal, 'renew_all', _lost)
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept[1] == cert_renewal._DEFERRED_RETRY_SECONDS, slept
