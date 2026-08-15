@@ -10,12 +10,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app import __version__
 
 
-# How many renewal passes must fit inside the renewal window. Below this a
-# certificate can expire without ever having been retried.
+# How many renewal attempts must fit inside the renewal window before a
+# certificate expires. Below this one transient failure -- a stalled manager,
+# a deferred settle window, a capped tick -- is enough for it to expire having
+# never been retried.
 _MIN_ATTEMPTS_IN_WINDOW = 4
-# Ceiling on one instance's exponential renewal backoff. Defined here rather
-# than in the worker because the validator below has to model the SAME
-# schedule the worker actually runs; the worker imports it from here.
+# Ceiling on one instance's exponential renewal backoff, and therefore the
+# widest possible gap between two attempts. Defined here rather than in the
+# worker because the window floor below is derived from it; the worker imports
+# it from here so the two cannot drift apart.
 CERT_RENEWAL_BACKOFF_CAP_SECONDS = 24 * 60 * 60
 
 
@@ -145,54 +148,45 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
-    def _renewal_interval_fits_the_window(self):
-        # The two are only meaningful against each other. Each is in range on
-        # its own at window_days=1 with interval=86400, and that pair leaves
-        # room for exactly one attempt: a pass seeing slightly more than a day
-        # left skips the certificate, and the next one lands a day plus the
-        # pass's own runtime later -- after expiry. One transient failure, one
-        # deferred settle window, one capped tick, and the certificate expires
-        # having never been retried.
-        #
-        # Four is the smallest number that survives losing a pass or two,
-        # which is the whole reason this worker retries at all.
-        # Counted against the schedule the worker RUNS, not against evenly
-        # spaced slots. Retries are exponential -- interval, then 2x, then 4x,
-        # capped -- so a pair that looks like four periodic attempts can
-        # deliver three before expiry and put the fourth hours the wrong side
-        # of it. Failing attempts are what the floor exists for, so the
-        # backoff is the case to size against.
+    def _renewal_window_fits_the_retries(self):
+        """The window must outlast the worst retry schedule, whatever the
+        interval is.
+
+        A BOUND, not a simulation. The previous version of this walked the
+        worker's own schedule -- exponential delays, the cap, tick alignment,
+        the expiry boundary -- and was wrong four times in a row, each time
+        because the model and the worker disagreed about one more detail. A
+        second implementation of the scheduler drifts from the first by
+        construction, and a validator that promises four attempts and
+        silently delivers three is worse than no validator, because it is the
+        thing an operator trusts.
+
+        So it asserts something that cannot drift instead. The worst possible
+        gap between attempts is the backoff cap; three gaps separate four
+        attempts; and a certificate can enter the window just after a tick,
+        costing up to one more interval before the first attempt. Since the
+        interval is itself capped at 86400 -- which is the cap -- the whole
+        schedule fits in four caps no matter how the worker sequences it:
+
+            worst case  =  interval + 3 * CAP  <=  4 * CAP
+
+        Strictly greater, because an attempt landing exactly on notAfter is
+        an attempt on an already-invalid certificate.
+
+        The price is honest: this rejects narrow windows that a short
+        interval would in fact service, a 1-day window with a 3h interval
+        among them. Widen the window; it costs nothing but renewing earlier.
+        """
+        floor = _MIN_ATTEMPTS_IN_WINDOW * CERT_RENEWAL_BACKOFF_CAP_SECONDS
         window_seconds = self.greffer_cert_renewal_window_days * 86400
-        attempts, elapsed, failures = 1, 0, 0
-        while attempts < _MIN_ATTEMPTS_IN_WINDOW:
-            failures += 1
-            delay = min(
-                self.greffer_cert_renewal_interval * (2 ** (failures - 1)),
-                CERT_RENEWAL_BACKOFF_CAP_SECONDS,
-            )
-            # Rounded UP to the next tick. The worker only re-examines an
-            # instance when it wakes, so a backoff deadline landing between
-            # ticks waits for the following one -- and the cap is what makes
-            # a delay stop being a whole number of ticks. Modelling the
-            # deadline instead of the tick accepted 7h/2d, whose fourth
-            # attempt the worker actually runs an hour after expiry.
-            elapsed = -(-(elapsed + delay)
-                        // self.greffer_cert_renewal_interval) \
-                * self.greffer_cert_renewal_interval
-            # >=, not >. A certificate is invalid AT its notAfter, so an
-            # attempt landing exactly there is not a pre-expiry attempt --
-            # and the pass's own runtime, or entering the window between
-            # ticks, only pushes it later.
-            if elapsed >= window_seconds:
-                break
-            attempts += 1
-        if attempts < _MIN_ATTEMPTS_IN_WINDOW:
+        if window_seconds <= floor:
             raise ValueError(
-                "greffer_cert_renewal_interval leaves room for "
-                f"{attempts} renewal attempt(s) inside a "
-                f"{self.greffer_cert_renewal_window_days}-day window; "
-                f"at least {_MIN_ATTEMPTS_IN_WINDOW} are required. Shorten "
-                "the interval or widen the window."
+                f"greffer_cert_renewal_window_days="
+                f"{self.greffer_cert_renewal_window_days} is too narrow to "
+                f"guarantee {_MIN_ATTEMPTS_IN_WINDOW} renewal attempts before "
+                f"expiry: the retry backoff is capped at "
+                f"{CERT_RENEWAL_BACKOFF_CAP_SECONDS // 3600}h, so the window "
+                f"must exceed {floor // 86400} days."
             )
         return self
 
