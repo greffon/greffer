@@ -1463,3 +1463,48 @@ def test_only_transient_skips_shorten_the_next_pass(
 
     assert result.skipped == 5
     assert result.deferred == 3, 'the three that clear on their own, no more'
+
+
+def test_the_debt_is_on_disk_before_the_first_report_attempt(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on dcf9292: the retry loop is itself a ~96s window.
+
+    Against a manager that accepts the connection and then stalls, three
+    attempts on a 30s timeout run for over a minute. A `greffer update`
+    inside that window used to leave the sidecar serving a fresh
+    certificate with no debt recorded anywhere -- and nothing reconciles it,
+    because a just-installed certificate is not due again for thirty days.
+    """
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+    seen: dict = {}
+
+    def _post(url, **kw):
+        # What a SIGKILL at this instant would have left behind.
+        seen['debt'] = cert_renewal._unconfirmed.get('inst-1')
+        raise cert_renewal.requests.RequestException('manager stalled')
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', _post)
+    try:
+        cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+        assert seen['debt'] == NEW, 'nothing owed if the process dies here'
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_terminal_report_still_clears_the_debt(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writing it up front must not leave it behind on success."""
+    monkeypatch.setattr(cert_renewal, '_REPORT_RETRY_SECONDS', 0)
+
+    class _Res:
+        status_code = 200
+        text = ''
+
+    monkeypatch.setattr(cert_renewal.requests, 'post', lambda *a, **kw: _Res())
+    try:
+        cert_renewal._report(settings, 'tok', 'inst-1', NEW)
+        assert 'inst-1' not in cert_renewal._unconfirmed
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)

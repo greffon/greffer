@@ -550,6 +550,20 @@ def _report(settings: Settings, token: str, greffon_id: str,
     Sent AFTER the verification handshake, never before -- reporting the
     intended serial would confirm a certificate the sidecar may not have loaded.
     """
+    # Recorded BEFORE the first request, not after the last. The reasoning
+    # below -- a lost debt is terminal, so do not defer the write -- applies
+    # to this loop too: three attempts on a 30s timeout plus their backoff
+    # sleeps is ~96 seconds against a manager that accepts connections and
+    # then stalls. A `greffer update` landing inside THAT window left the
+    # sidecar serving a fresh certificate with nothing owed, and no later
+    # pass reconciles it, because a just-installed certificate is not due
+    # again for thirty days.
+    #
+    # Safe to write first because every terminal path below clears it: 200,
+    # the 409 the manager already acted on, a gone instance. Only the
+    # retryable exits leave it standing, which is the point.
+    _unconfirmed[greffon_id] = served_serial or ''
+    _save_unconfirmed(settings)
     for attempt in range(_REPORT_ATTEMPTS):
         try:
             res = requests.post(
@@ -617,16 +631,11 @@ def _report(settings: Settings, token: str, greffon_id: str,
         # The manager's own 503 exists so the greffer re-reports.
         if attempt + 1 < _REPORT_ATTEMPTS:
             time.sleep(_REPORT_RETRY_SECONDS * (attempt + 1))
-    # Owed, not lost. Retried at the top of the next pass, before the not-due
-    # check that would otherwise skip this instance forever.
-    #
-    # Recorded even when nothing was served: "we could not tell the manager
-    # what this instance is serving" is the debt, and an unobservable sidecar
-    # is the case that most needs chasing. Written through immediately rather
-    # than at the end of the pass -- a pass over a large fleet takes minutes,
-    # and an update or restart inside that window is exactly what loses it.
-    _unconfirmed[greffon_id] = served_serial or ''
-    _save_unconfirmed(settings)
+    # Still owed, and already on disk since before the first attempt.
+    # Retried at the top of the next pass, before the not-due check that
+    # would otherwise skip this instance forever. Recorded even when nothing
+    # was served: "we could not tell the manager what this instance is
+    # serving" is the debt, and an unobservable sidecar most needs chasing.
     diag('cert_renewal_report_unconfirmed', instance=greffon_id,
          serial=served_serial, level=logging.ERROR)
 
