@@ -15,6 +15,7 @@ import functools
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -23,17 +24,17 @@ from uuid import UUID
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import backup
 from app.auth import require_token
 from app.diagnostics import diag
 from app.log_context import instance_id_var
-from app import backup
 from app.models.controller import (
     GreffonBackupRequest,
+    GreffonBackupResponse,
     GreffonDecommissionRequest,
     GreffonDecommissionResponse,
     GreffonForgetRequest,
     GreffonRepoOpRequest,
-    GreffonBackupResponse,
     GreffonRestoreRequest,
     GreffonRestoreResponse,
     GreffonStartRequest,
@@ -62,6 +63,11 @@ from apps.utils.greffon import repository
 from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
+
+# Instances with a live compose child, read by the certificate-renewal worker.
+_inflight: dict[str, int] = {}
+_inflight_guard = threading.Lock()
+
 
 # Time budget for ``_wait_for_compose_running`` after ``compose.start``
 # returns. ``compose.start`` is fire-and-forget (``subprocess.Popen``
@@ -96,12 +102,94 @@ def _refuse_if_updating(settings) -> None:
         raise HTTPException(status_code=409, detail="update_in_progress")
 
 
+def _release_compose_child(greffon_id: str) -> None:
+    with _inflight_guard:
+        remaining = _inflight.get(greffon_id, 1) - 1
+        if remaining > 0:
+            _inflight[greffon_id] = remaining
+        else:
+            _inflight.pop(greffon_id, None)
+
+
+def compose_inflight(greffon_id: str) -> bool:
+    """True while a compose child spawned by THIS process is working on the instance."""
+    with _inflight_guard:
+        return _inflight.get(greffon_id, 0) > 0
+
+
+def track_compose_child(greffon_id: str, proc):
+    """Mark the instance as mid-compose until ``proc`` exits.
+
+    ``compose.start`` / ``compose.stop`` are ``subprocess.Popen``: they return
+    the moment the child is spawned, while it is still pulling images and
+    recreating containers. The certificate-renewal worker writes a key and a
+    certificate into the instance's nginx sidecar, and doing that mid-recreate
+    leaves the manager unable to tell which certificate is live -- it logs
+    ``instance_cert_renewal_orphan`` at CRITICAL and refuses to revoke either.
+
+    Deliberately NOT the per-instance lock, even though that is what serializes
+    start against backup/restore. The manager chains control ops back to back
+    (the migration cutover does stop then /backup/, start then /restore/) and
+    they all take that lock, so holding it across the child 409s the next step
+    and fails the migration. This signal is read only by renewal, which has no
+    such chaining and can simply wait for the next tick.
+
+    In-process because it only ever needs to be: the greffer runs --workers 1,
+    and `renew_certs` delegates to this process rather than doing the work
+    itself, so every renewal shares this dict with every start and stop. A
+    greffer restart clears it, and ``_sidecar_settling`` covers that window.
+    """
+    if proc is None:
+        return
+    with _inflight_guard:
+        _inflight[greffon_id] = _inflight.get(greffon_id, 0) + 1
+
+    def _wait():
+        try:
+            # UNBOUNDED on purpose. A bound here would decrement while the
+            # child is definitively still running -- a cold multi-gigabyte
+            # pull, or an `up -d` gated on `depends_on: service_healthy` behind
+            # a slow database init -- and renewal would then install, verify
+            # and REPORT a certificate that compose immediately replaces with
+            # the start path's own. The manager's cert_serial ends up pinned to
+            # a certificate nobody serves, and the next tick reads not-due and
+            # never corrects it.
+            #
+            # The file-marker design this replaced needed a bound because a
+            # stale marker on disk could wedge renewal for good. A counter in
+            # this process cannot: the process that owns it owns the child, and
+            # a restart clears it by construction.
+            proc.wait()
+        except Exception:  # the decrement below is the point
+            logger.warning("compose_wait_failed instance=%s", greffon_id,
+                           exc_info=True)
+        finally:
+            _release_compose_child(greffon_id)
+
+    try:
+        threading.Thread(target=_wait, name=f"compose-wait-{greffon_id}",
+                         daemon=True).start()
+    except Exception:  # noqa: BLE001 -- a stuck counter would mute renewal
+        # Decrement, never pop: popping erased the mark of a SIBLING child that
+        # is still running, which is the failure this counter exists to stop.
+        logger.warning("compose_wait_thread_failed instance=%s", greffon_id)
+        _release_compose_child(greffon_id)
+
+
 def _serialize_instance_op(handler):
     """Hold the in-process per-instance lock for a start/stop's whole duration so
     it serializes against a concurrent backup/restore in the single greffer
     process (HLD section 3: the in-process lock -- NOT a file lock -- is the real
     serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
-    preserves the signature so FastAPI still parses the body + response_model."""
+    preserves the signature so FastAPI still parses the body + response_model.
+
+    NOT extended across the compose child. The manager chains control ops
+    immediately -- the migration cutover runs stop then /backup/, and start then
+    /restore/ -- and every one of those takes this same lock, so holding it past
+    the response would 409 the next step and fail the migration. Renewal is the
+    only thing that must stand off from a running compose child, and it does
+    that through ``compose_inflight`` below rather than through this lock.
+    """
     @functools.wraps(handler)
     def wrapper(payload, request, *args, **kwargs):
         lock = backup._instance_lock(payload.id)
@@ -204,7 +292,7 @@ def start_greffon(
         compose.create_compose(compose_template, greffon_info)
         conf.create_nginx_conf(greffon_info)
         compose.create_volumes_then_copy_files(greffon_info)
-        compose.start(greffon_info)
+        track_compose_child(greffon_info["id"], compose.start(greffon_info))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="start", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
@@ -259,7 +347,7 @@ def stop_greffon(
     instance_id_var.set(greffon.get("id"))  # tag logs (Feature #4)
     _t0 = time.monotonic()
     try:
-        compose.stop(greffon)
+        track_compose_child(greffon.get("id"), compose.stop(greffon))
     except Exception:
         diag("compose_op", level=logging.WARNING, op="stop", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))
@@ -339,6 +427,74 @@ def _write_pushed_client_toml(
         logger.debug("tunnel_client_toml_pushed_for_id=%s",
                      getattr(payload, "id", "?"))
     return "ok"
+
+
+@router.post("/renew-certs/")
+def renew_certs_endpoint(request: Request, id: str | None = None,
+                         force: bool = False) -> dict:
+    """Run a certificate renewal pass now, inside THIS process.
+
+    The CLI delegates here rather than doing the work itself. Renewal writes a
+    key and a certificate into a sidecar that a concurrent Start is recreating
+    and writing its own pair into, and the serializer for that is an
+    IN-PROCESS lock (HLD section 3). A `python -m app.cli` invocation is a
+    second process, so it would take a brand-new lock this one has never seen
+    and race start/stop/backup with nothing in between -- the interleaving the
+    manager refuses to resolve and logs as instance_cert_renewal_orphan.
+    Running the pass here puts it behind the same lock as everything else.
+    """
+    from app.workers.cert_renewal import (
+        RENEWED,
+        InstanceNotFound,
+        NodeAuthLost,
+        NodeCapped,
+        RenewalAlreadyRunning,
+        renew_all,
+    )
+
+    settings = _settings(request)
+    _refuse_if_updating(settings)
+    if force and id is None:
+        # Server-side, not just in the CLI: this token is the manager's too, so
+        # a client-side-only guard is no guard. A fleet-wide force fires one
+        # mint per running instance at once and pushes everything past the
+        # manager's hourly cap into backoff, at the worst possible moment.
+        raise HTTPException(status_code=400, detail="force_requires_instance")
+    try:
+        result = renew_all(settings, request.app.state.greffer_token,
+                           only=id, force=force)
+    except InstanceNotFound:
+        raise HTTPException(status_code=404, detail="instance_not_found") from None
+    except NodeAuthLost:
+        # The manager rejected this node's token. Distinct from "nothing to do":
+        # no renewal happened and none will until the token is sorted out.
+        # 502, not 401: the CALLER authenticated fine. It is this node's own
+        # token that the manager rejected, which is an upstream failure.
+        raise HTTPException(status_code=502, detail="node_auth_lost") from None
+    except NodeCapped:
+        # The renewals asked for did not happen. Saying "0 errors" here is what
+        # tells an operator mid-incident that their recovery worked.
+        raise HTTPException(status_code=429, detail="node_rate_limited") from None
+    except RenewalAlreadyRunning:
+        # The periodic tick (or another operator call) already holds the pass.
+        # 409 rather than queueing: a pass can take minutes on a busy node, and
+        # a caller blocked behind one would hold a threadpool worker the whole
+        # time for a job that is already being done.
+        raise HTTPException(status_code=409, detail="renewal_in_progress") from None
+    if id is not None and result.selected != RENEWED:
+        # An explicitly selected instance that was skipped renewed nothing, and
+        # "0 errors" would tell an operator mid-incident that it had. A skip is
+        # legitimate (inside the compose settle window, no published port) but
+        # it is not the renewal that was asked for.
+        raise HTTPException(
+            status_code=409,
+            detail=f"instance_not_renewed:{result.selected or 'skipped'}")
+    return {
+        "errors": result.errors,
+        "renewed": result.renewed,
+        "skipped": result.skipped,
+        "considered": result.considered,
+    }
 
 
 @router.post("/backup/", status_code=202)

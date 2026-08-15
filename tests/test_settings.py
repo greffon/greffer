@@ -139,3 +139,91 @@ def test_greffer_version_truncated_to_32(monkeypatch: pytest.MonkeyPatch) -> Non
     v = get_settings().greffer_version
     assert len(v) == 32
     assert v == "0.3.3-rc1-42-gdeadbeef-dirty-2026"[:32]
+
+
+def test_the_validator_and_the_worker_share_one_backoff_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two copies would drift and the validator would start lying."""
+    from app.settings import CERT_RENEWAL_BACKOFF_CAP_SECONDS
+    from app.workers import cert_renewal
+
+    assert cert_renewal._BACKOFF_CAP_SECONDS is CERT_RENEWAL_BACKOFF_CAP_SECONDS
+
+
+def test_the_shipped_defaults_are_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validator that rejected the defaults would break every boot."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.delenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", raising=False)
+    monkeypatch.delenv("GREFFER_CERT_RENEWAL_INTERVAL", raising=False)
+    s = Settings()
+    assert s.greffer_cert_renewal_window_days == 7
+
+
+def test_a_window_at_exactly_the_floor_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4 days is the worst-case schedule EXACTLY, so it leaves the fourth
+    attempt on the expiry instant -- an attempt on an invalid certificate."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "4")
+    with pytest.raises(ValidationError, match="renewal attempts"):
+        Settings()
+
+
+def test_a_window_past_the_floor_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
+    assert Settings().greffer_cert_renewal_window_days == 5
+
+
+def test_a_narrow_window_is_rejected_even_with_a_tiny_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deliberate price of a bound over a simulation.
+
+    A 60s interval would in fact fit four attempts into a single day. The
+    bound does not know that and does not try to: modelling what the worker
+    would really do is what was wrong four times running. Widen the window.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "1")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "60")
+    with pytest.raises(ValidationError, match="renewal attempts"):
+        Settings()
+
+
+def test_a_deadline_missed_by_a_tick_is_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on afbf7e1: four caps alone is not a sound bound.
+
+    An instance is only revisited when the worker ticks, so a 24h deadline
+    landing between ticks waits up to one more interval -- the real worst
+    gap is CAP + interval. At a 20h interval a 5-day window puts the four
+    attempts at 20, 40, 80 and 120 hours, the fourth exactly on expiry, and
+    a floor of 4 * CAP (96h) accepts it.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", str(20 * 3600))
+    with pytest.raises(ValidationError, match="renewal attempts"):
+        Settings()
+
+
+def test_the_floor_moves_with_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same 5-day window is fine at the default interval.
+
+    Proves the interval term is doing work rather than the window simply
+    being rejected outright.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "21600")
+    assert Settings().greffer_cert_renewal_interval == 21600

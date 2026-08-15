@@ -1023,7 +1023,13 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
             # The DB path started the instance; a failure here leaves it running a
             # corrupt/partial DB -> STOP it (operator rolls back via safety_id).
             try:
-                compose.stop({"id": instance_id})
+                # Tracked, like every other compose child: this releases the
+                # instance lock immediately afterwards, and a renewal pass whose
+                # status map predates the abort would otherwise write a
+                # certificate into a sidecar being torn down -- a burned mint,
+                # an orphan record and a cooldown on the manager.
+                from app.routers.controller import track_compose_child
+                track_compose_child(instance_id, compose.stop({"id": instance_id}))
             except Exception:  # noqa: BLE001
                 logger.exception("restore_db_abort_stop_failed instance=%s", instance_id)
         # Durable restore-state, kept until the manager acks (boot reconciliation

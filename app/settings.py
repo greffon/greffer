@@ -4,10 +4,22 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
+
+
+# How many renewal attempts must fit inside the renewal window before a
+# certificate expires. Below this one transient failure -- a stalled manager,
+# a deferred settle window, a capped tick -- is enough for it to expire having
+# never been retried.
+_MIN_ATTEMPTS_IN_WINDOW = 4
+# Ceiling on one instance's exponential renewal backoff, and therefore the
+# widest possible gap between two attempts. Defined here rather than in the
+# worker because the window floor below is derived from it; the worker imports
+# it from here so the two cannot drift apart.
+CERT_RENEWAL_BACKOFF_CAP_SECONDS = 24 * 60 * 60
 
 
 class Settings(BaseSettings):
@@ -116,6 +128,79 @@ class Settings(BaseSettings):
         # both the register and heartbeat paths.
         return v[:32] if v else v
 
+    @field_validator("greffer_cert_renewal_interval")
+    @classmethod
+    def _cert_renewal_interval_in_range(cls, v):
+        # 0 would busy-loop the worker AND silently disarm the backoff, whose
+        # delay is a multiple of this value -- the two failures that compound
+        # into unbounded certificate issuance.
+        if not 60 <= v <= 86400:
+            raise ValueError("greffer_cert_renewal_interval must be between 60 and 86400")
+        return v
+
+    @field_validator("greffer_cert_renewal_window_days")
+    @classmethod
+    def _cert_renewal_window_sane(cls, v):
+        # Above the 30-day cert TTL every instance is permanently "due"; at or
+        # below 0 nothing ever renews.
+        if not 1 <= v <= 29:
+            raise ValueError("greffer_cert_renewal_window_days must be between 1 and 29")
+        return v
+
+    @model_validator(mode="after")
+    def _renewal_window_fits_the_retries(self):
+        """The window must outlast the worst retry schedule, whatever the
+        interval is.
+
+        A BOUND, not a simulation. The previous version of this walked the
+        worker's own schedule -- exponential delays, the cap, tick alignment,
+        the expiry boundary -- and was wrong four times in a row, each time
+        because the model and the worker disagreed about one more detail. A
+        second implementation of the scheduler drifts from the first by
+        construction, and a validator that promises four attempts and
+        silently delivers three is worse than no validator, because it is the
+        thing an operator trusts.
+
+        So it asserts an upper bound on the schedule instead of replaying
+        it. Two facts are enough, and neither depends on the sequencing:
+
+          * a backoff delay is at most CAP; and
+          * an instance is only revisited when the worker ticks, so a
+            deadline missed by a tick waits up to one more interval.
+
+        Hence any gap between attempts is under CAP + interval, three gaps
+        separate four attempts, and a certificate entering the window just
+        after a tick costs up to one interval before the first:
+
+            worst case  <  interval + 3 * (CAP + interval)
+                        =  3 * CAP + 4 * interval
+
+        The interval term is why this is not simply four caps: dropping it
+        accepts a 5-day window at a 20-hour interval, whose attempts land at
+        20, 40, 80 and 120 hours -- the fourth exactly on expiry.
+
+        The price is real: narrow windows are rejected even where a short
+        interval would in fact service them, a 1-day window among them.
+        Widening the window costs nothing but renewing earlier.
+        """
+        floor = (
+            (_MIN_ATTEMPTS_IN_WINDOW - 1) * CERT_RENEWAL_BACKOFF_CAP_SECONDS
+            + _MIN_ATTEMPTS_IN_WINDOW * self.greffer_cert_renewal_interval
+        )
+        window_seconds = self.greffer_cert_renewal_window_days * 86400
+        if window_seconds <= floor:
+            raise ValueError(
+                f"greffer_cert_renewal_window_days="
+                f"{self.greffer_cert_renewal_window_days} is too narrow to "
+                f"guarantee {_MIN_ATTEMPTS_IN_WINDOW} renewal attempts before "
+                f"expiry at greffer_cert_renewal_interval="
+                f"{self.greffer_cert_renewal_interval}: retries back off up "
+                f"to {CERT_RENEWAL_BACKOFF_CAP_SECONDS // 3600}h and are only "
+                f"picked up on a tick, so the window must exceed "
+                f"{floor // 3600}h. Widen the window or shorten the interval."
+            )
+        return self
+
     @field_validator("heartbeat_interval")
     @classmethod
     def _heartbeat_interval_in_range(cls, v):
@@ -160,6 +245,34 @@ class Settings(BaseSettings):
     docker_nginx_name: str = "greffer-nginx-1"
 
     crl_sync_interval: int = 300
+    # Per-instance upstream certificate renewal. The certs carry a 30-day TTL,
+    #
+    # ALL FOUR carry the ``greffer_`` prefix, and two of them must. pydantic-
+    # settings maps field -> env var by field NAME, so bare
+    # ``cert_renewal_enabled`` / ``cert_renewal_window_days`` would bind
+    # CERT_RENEWAL_ENABLED and CERT_RENEWAL_WINDOW_DAYS -- the manager's own
+    # Django settings, with different meanings on each side (fleet feature flag
+    # vs per-node kill switch; the manager's 10-day admission window vs this
+    # node's 7-day local one). A deployment setting the manager's
+    # CERT_RENEWAL_WINDOW_DAYS=3650 in a shared env would push a value past
+    # this validator's cap and the greffer would refuse to boot.
+    # so a 6-hour tick gives ~28 attempts inside a 7-day window -- enough that a
+    # manager outage, a rate limit, or a sidecar restart all get retried long
+    # before anything expires, without polling a mint endpoint hourly.
+    greffer_cert_renewal_enabled: bool = True
+    greffer_cert_renewal_interval: int = 6 * 60 * 60
+    greffer_cert_renewal_window_days: int = 7
+    # Where the renewal worker dials to ask a sidecar which certificate it is
+    # serving. NOT 127.0.0.1: the greffer runs in its own network namespace on
+    # the `internal` bridge, so its loopback has none of the instance ports on
+    # it -- the same mistake apps/utils/docker/l4_ports.py documents. The
+    # sidecar's port is published on the HOST, reached through the
+    # host-gateway alias this compose file already declares.
+    #
+    # Deliberately separate from greffer_public_host, which is the address
+    # BROWSERS use and which setup-dev.sh pins to 127.0.0.1 for exactly that
+    # reason. Sharing it would make the probe unreachable in dev.
+    greffer_cert_probe_host: str = "host.docker.internal"
     monitor_interval: int = 5
     # Heartbeat cadence (greffer-observability epic). Binds the unprefixed
     # HEARTBEAT_INTERVAL env, mirroring monitor_interval's MONITOR_INTERVAL

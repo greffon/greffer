@@ -25,6 +25,7 @@ import logging
 
 from fastapi import FastAPI
 
+from app.workers.cert_renewal import cert_renewal_worker
 from app.workers.crl import crl_sync_worker
 from app.workers.heartbeat import heartbeat_worker
 from app.workers.monitor import monitor_worker
@@ -43,6 +44,13 @@ def start_workers(app: FastAPI) -> list[asyncio.Task]:
         asyncio.create_task(
             reregister_worker(app), name="greffer-reregister"),
     ]
+    # Created ONLY when enabled: the task is in readiness.FATAL_WORKERS, and a
+    # task that returned immediately because the feature is off is `done()` --
+    # which would read as a dead worker and fail /readyz on every node that has
+    # renewal switched off.
+    if app.state.settings.greffer_cert_renewal_enabled:
+        tasks.append(asyncio.create_task(
+            cert_renewal_worker(app), name="greffer-cert-renewal"))
     # Self-heal watchdog (Feature #3), on by default. Appended after the others
     # so their tasks exist by the time it first evaluates readiness.
     if app.state.settings.greffer_watchdog_enabled:
