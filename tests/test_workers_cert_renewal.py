@@ -412,7 +412,8 @@ def test_a_renewal_never_races_a_start_on_the_same_sidecar(
     finally:
         held.release()
 
-    assert result == cert_renewal.Outcome(cert_renewal.SKIPPED, None), (
+    assert result == cert_renewal.Outcome(
+        cert_renewal.SKIPPED, None, 'instance_busy'), (
         'busy must honour the Outcome contract: returning None made the caller '
         'raise AttributeError, which the broad handler then counted as an '
         'error AND armed the backoff -- so a nightly backup overlapping the '
@@ -1416,3 +1417,49 @@ def test_the_debt_probe_is_serialized_but_the_report_is_not(
         assert held['report'][0] is False, 'debt report must not hold the lock'
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_the_settle_skip_says_it_is_transient(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason is what tells the loop whether waiting will help."""
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: True)
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: False)
+
+    result = cert_renewal.renew_one(settings, 'tok', 'inst-1')
+
+    assert result == cert_renewal.Outcome(
+        cert_renewal.SKIPPED, None, 'sidecar_settling')
+
+
+def test_only_transient_skips_shorten_the_next_pass(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backoff entry is a deliberate wait measured in hours and a missing
+    published port needs an operator. Counting either as deferred would have
+    the loop wake every two minutes forever, renewing nothing."""
+    # Every transient reason is represented, so dropping any ONE of them
+    # from the set fails this rather than passing on the others.
+    outcomes = {
+        'settling': cert_renewal.Outcome(cert_renewal.SKIPPED, None,
+                                         'sidecar_settling'),
+        'busy': cert_renewal.Outcome(cert_renewal.SKIPPED, None,
+                                     'instance_busy'),
+        'recreating': cert_renewal.Outcome(cert_renewal.SKIPPED, None,
+                                           'compose_inflight'),
+        'backing-off': cert_renewal.Outcome(cert_renewal.SKIPPED, None,
+                                            'backoff'),
+        'no-port': cert_renewal.Outcome(cert_renewal.SKIPPED, None,
+                                        'no_published_port'),
+    }
+    monkeypatch.setattr(cert_renewal, 'renew_one',
+                        lambda s, t, g, force=False: outcomes[g])
+    with patch(
+        'app.workers.status_collect.collect_status_map',
+        return_value={k: 'running' for k in outcomes},
+    ):
+        result = cert_renewal.renew_all(settings, 'tok')
+
+    assert result.skipped == 5
+    assert result.deferred == 3, 'the three that clear on their own, no more'

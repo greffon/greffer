@@ -64,6 +64,12 @@ _HTTP_TIMEOUT_SECONDS = 30
 # survive the fix by six hours. Jittered because a fleet restarting together
 # would otherwise mint in lockstep against one manager.
 _STARTUP_JITTER_SECONDS = 300
+# Come back just past the compose settle window when a pass deferred work.
+# The reboot case is the one that matters: an instance sidecar and the greffer
+# start together, so the early pass can land INSIDE the settle window and be
+# thrown away -- and the certificate it would have renewed survives the reboot
+# on its volume, already expired.
+_DEFERRED_RETRY_SECONDS = 120
 # The sidecar is on the host's published port; a TLS handshake to read back the
 # served certificate must not hang the tick.
 _PROBE_TIMEOUT_SECONDS = 5
@@ -229,6 +235,11 @@ class Outcome(NamedTuple):
 
     status: str
     serial: str | None
+    # Why, when the status alone cannot say whether waiting will help. A
+    # sidecar inside its settle window clears in ninety seconds; a backoff
+    # entry or a missing published port does not. Defaulted so the callers
+    # that only care about the status are unchanged.
+    reason: str | None = None
 
 
 class PassResult(NamedTuple):
@@ -246,7 +257,16 @@ class PassResult(NamedTuple):
     skipped: int
     errors: int
     selected: str | None
+    # Skipped for something that clears on its own, so the pass that follows
+    # should not be a full interval away.
+    deferred: int = 0
 
+
+# Skips that clear on their own within roughly the compose settle window.
+# `backoff` and `no_published_port` are deliberately NOT here: one is a
+# deliberate wait measured in hours, the other needs an operator.
+_TRANSIENT_SKIPS = frozenset({'instance_busy', 'compose_inflight',
+                              'sidecar_settling'})
 
 RENEWED = "renewed"
 NOT_DUE = "not_due"
@@ -797,7 +817,7 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         # Not a failure either -- whatever holds the lock (a Start, most
         # likely) mints its own certificate anyway.
         diag('cert_renewal_skipped', instance=greffon_id, reason='instance_busy')
-        return Outcome(SKIPPED, None)
+        return Outcome(SKIPPED, None, 'instance_busy')
     try:
         return _renew_locked(settings, token, greffon_id, force)
     finally:
@@ -861,7 +881,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         # sidecar. Writing a certificate into it now leaves the manager unable
         # to tell which one is live.
         diag('cert_renewal_skipped', instance=greffon_id, reason='compose_inflight')
-        return Outcome(SKIPPED, None)
+        return Outcome(SKIPPED, None, 'compose_inflight')
 
     if _sidecar_settling(greffon_id):
         # What the in-process signal cannot see: a compose child nobody here
@@ -869,7 +889,7 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         # performed under `restart: unless-stopped`), and the moments right
         # after a greffer restart cleared the counter.
         diag('cert_renewal_skipped', instance=greffon_id, reason='sidecar_settling')
-        return Outcome(SKIPPED, None)
+        return Outcome(SKIPPED, None, 'sidecar_settling')
 
     before_serial, before_expiry = _served_certificate(host, port)
     global _blind_streak
@@ -990,6 +1010,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
     considered = errors = renewed = skipped = 0
     selected = None
     capped = unauthorized = False
+    deferred = 0
     global _blind_streak
     _blind_streak = 0
     if _stop.is_set():
@@ -1034,6 +1055,8 @@ def _renew_all_locked(settings, collect_status_map, only, force,
                 renewed += 1
             elif outcome.status == SKIPPED:
                 skipped += 1
+                if outcome.reason in _TRANSIENT_SKIPS:
+                    deferred += 1
         except RenewalUnavailable:
             # Node-wide, so stop -- but unlike the auth and cap breaks this is
             # not a warning: the deployment simply has not opted in yet.
@@ -1112,7 +1135,7 @@ def _renew_all_locked(settings, collect_status_map, only, force,
         raise NodeAuthLost
     if capped:
         raise NodeCapped
-    return PassResult(considered, renewed, skipped, errors, selected)
+    return PassResult(considered, renewed, skipped, errors, selected, deferred)
 
 
 async def cert_renewal_worker(app: FastAPI) -> None:
@@ -1173,10 +1196,19 @@ async def cert_renewal_worker(app: FastAPI) -> None:
                 # thread starting, and the pass then ran on to completion with
                 # the loop already gone.
                 _stop.clear()
-                await anyio.to_thread.run_sync(
+                result = await anyio.to_thread.run_sync(
                     renew_all, settings, app.state.greffer_token,
                     abandon_on_cancel=True
                 )
+                if result is not None and result.deferred:
+                    # Something was skipped for a condition that clears on its
+                    # own. Waiting a full interval for it is how an expired
+                    # certificate survives the pass that existed to catch it.
+                    diag('cert_renewal_tick_deferred_retry',
+                         deferred=result.deferred,
+                         delay_seconds=_DEFERRED_RETRY_SECONDS)
+                    delay = min(_DEFERRED_RETRY_SECONDS,
+                                settings.greffer_cert_renewal_interval)
             except RenewalAlreadyRunning:
                 # An operator's renew_certs holds the pass. Not a crash, and
                 # logging it as one buried a real traceback in false alarms.

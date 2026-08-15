@@ -980,3 +980,69 @@ def test_a_failed_reaper_thread_does_not_unmark_a_sibling(monkeypatch: pytest.Mo
     assert controller.compose_inflight('sib') is True, (
         "the failed spawn erased a running sibling's mark")
     live.set()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_pass_comes_back_in_minutes_not_hours(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reboot case the startup jitter alone does not cover.
+
+    An instance sidecar and the greffer come up together, so the early pass
+    can land inside the sidecar's 90s settle window and be thrown away. The
+    certificate it would have renewed survived the reboot on its volume,
+    already expired, so waiting a full interval for the next attempt puts
+    the node right back where the startup jitter was meant to rescue it.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(
+        cert_renewal, 'renew_all',
+        lambda *a, **kw: _result(renewed=0, skipped=1, deferred=1))
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept[1] == cert_renewal._DEFERRED_RETRY_SECONDS, slept
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_deferred_nothing_keeps_the_full_interval(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backoff or a missing published port is not a reason to come back in
+    two minutes -- one is a deliberate wait, the other needs an operator."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.state.settings = settings
+    app.state.greffer_token = 'tok'
+    app.state.registered = asyncio.Event()
+    app.state.registered.set()
+    slept: list = []
+
+    async def _sleep(n):
+        slept.append(n)
+        if len(slept) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    monkeypatch.setattr(
+        cert_renewal, 'renew_all',
+        lambda *a, **kw: _result(renewed=0, skipped=1, deferred=0))
+    with pytest.raises(asyncio.CancelledError):
+        await cert_renewal.cert_renewal_worker(app)
+
+    assert slept[1] == settings.greffer_cert_renewal_interval, slept
