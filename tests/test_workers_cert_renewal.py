@@ -1561,3 +1561,70 @@ def test_a_debt_report_stands_off_from_an_untracked_recreation(
         assert 'inst-1' in cert_renewal._unconfirmed
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_mint_whose_response_is_lost_still_leaves_a_debt(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 on afbf7e1: the last loss window is inside _mint itself.
+
+    The manager can commit the issuance and the response still be dropped or
+    arrive unparseable. Locally that is indistinguishable from a mint that
+    never happened -- but the manager is holding a pending mint, later
+    attempts collect its outstanding-mint refusal, and the served
+    certificate expires while nothing reconciles it.
+    """
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (OLD, _expiring(1)))
+
+    def _mint(*a, **kw):
+        raise cert_renewal.requests.RequestException('response dropped')
+
+    monkeypatch.setattr(cert_renewal, '_mint', _mint)
+    try:
+        with pytest.raises(cert_renewal.requests.RequestException):
+            cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert 'inst-1' in cert_renewal._unconfirmed, (
+            'the manager may hold a pending mint and nothing here owes a report')
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_definitive_refusal_leaves_no_speculative_debt(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal issued nothing, so a debt invented here would have the next
+    pass report a serial against a pending mint that does not exist."""
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert 'inst-1' not in cert_renewal._unconfirmed
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+def test_a_refusal_does_not_discard_a_debt_that_was_already_owed(
+    settings: Settings, wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing debt is a real one. Clearing it on an unrelated refusal
+    would drop a report we still owe, which is how a serial goes unreported
+    for the thirty days until the certificate is due again."""
+    monkeypatch.setattr(cert_renewal, '_served_certificate',
+                        lambda h, p: (OLD, _expiring(1)))
+    monkeypatch.setattr(cert_renewal, '_mint', lambda s, t, g: None)
+    # The debt path RUNS -- it must reach the mint for the branch under test
+    # to execute at all. `wired` stubs _report, which therefore does not
+    # clear, so the debt is still owed when the refusal lands. (Deferring the
+    # debt path instead returns at the settle guard, well before the mint,
+    # and the test passes without ever reaching the code it names.)
+    monkeypatch.setattr('app.routers.controller.compose_inflight',
+                        lambda g: False)
+    monkeypatch.setattr(cert_renewal, '_sidecar_settling', lambda g: False)
+    cert_renewal._unconfirmed['inst-1'] = OLD
+    try:
+        cert_renewal.renew_one(settings, 'tok', 'inst-1')
+        assert cert_renewal._unconfirmed.get('inst-1') == OLD
+    finally:
+        cert_renewal._unconfirmed.pop('inst-1', None)

@@ -161,32 +161,43 @@ class Settings(BaseSettings):
         silently delivers three is worse than no validator, because it is the
         thing an operator trusts.
 
-        So it asserts something that cannot drift instead. The worst possible
-        gap between attempts is the backoff cap; three gaps separate four
-        attempts; and a certificate can enter the window just after a tick,
-        costing up to one more interval before the first attempt. Since the
-        interval is itself capped at 86400 -- which is the cap -- the whole
-        schedule fits in four caps no matter how the worker sequences it:
+        So it asserts an upper bound on the schedule instead of replaying
+        it. Two facts are enough, and neither depends on the sequencing:
 
-            worst case  =  interval + 3 * CAP  <=  4 * CAP
+          * a backoff delay is at most CAP; and
+          * an instance is only revisited when the worker ticks, so a
+            deadline missed by a tick waits up to one more interval.
 
-        Strictly greater, because an attempt landing exactly on notAfter is
-        an attempt on an already-invalid certificate.
+        Hence any gap between attempts is under CAP + interval, three gaps
+        separate four attempts, and a certificate entering the window just
+        after a tick costs up to one interval before the first:
 
-        The price is honest: this rejects narrow windows that a short
-        interval would in fact service, a 1-day window with a 3h interval
-        among them. Widen the window; it costs nothing but renewing earlier.
+            worst case  <  interval + 3 * (CAP + interval)
+                        =  3 * CAP + 4 * interval
+
+        The interval term is why this is not simply four caps: dropping it
+        accepts a 5-day window at a 20-hour interval, whose attempts land at
+        20, 40, 80 and 120 hours -- the fourth exactly on expiry.
+
+        The price is real: narrow windows are rejected even where a short
+        interval would in fact service them, a 1-day window among them.
+        Widening the window costs nothing but renewing earlier.
         """
-        floor = _MIN_ATTEMPTS_IN_WINDOW * CERT_RENEWAL_BACKOFF_CAP_SECONDS
+        floor = (
+            (_MIN_ATTEMPTS_IN_WINDOW - 1) * CERT_RENEWAL_BACKOFF_CAP_SECONDS
+            + _MIN_ATTEMPTS_IN_WINDOW * self.greffer_cert_renewal_interval
+        )
         window_seconds = self.greffer_cert_renewal_window_days * 86400
         if window_seconds <= floor:
             raise ValueError(
                 f"greffer_cert_renewal_window_days="
                 f"{self.greffer_cert_renewal_window_days} is too narrow to "
                 f"guarantee {_MIN_ATTEMPTS_IN_WINDOW} renewal attempts before "
-                f"expiry: the retry backoff is capped at "
-                f"{CERT_RENEWAL_BACKOFF_CAP_SECONDS // 3600}h, so the window "
-                f"must exceed {floor // 86400} days."
+                f"expiry at greffer_cert_renewal_interval="
+                f"{self.greffer_cert_renewal_interval}: retries back off up "
+                f"to {CERT_RENEWAL_BACKOFF_CAP_SECONDS // 3600}h and are only "
+                f"picked up on a tick, so the window must exceed "
+                f"{floor // 3600}h. Widen the window or shorten the interval."
             )
         return self
 

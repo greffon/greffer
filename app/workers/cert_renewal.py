@@ -929,27 +929,43 @@ def _renew_locked(settings: Settings, token: str, greffon_id: str,
         diag('cert_renewal_skipped', instance=greffon_id, reason='not_due')
         return Outcome(NOT_DUE, before_serial)
 
-    cert = _mint(settings, token, greffon_id)
+    # Owed from BEFORE the request, not after it returns. A mint whose
+    # response is dropped, or arrives unparseable, is indistinguishable here
+    # from one that never happened -- and the manager may well have committed
+    # the issuance. Without this the pass records only a local backoff, later
+    # mints collect the outstanding-mint refusal, _report is never reached,
+    # and the pending sits unresolved while the served certificate expires.
+    #
+    # It also covers everything after a SUCCESSFUL mint -- install, reload,
+    # the 20s settle loop, the handshake -- all of which this process can be
+    # stopped or updated in.
+    #
+    # The value is a placeholder: the debt path re-probes and reports what is
+    # served THEN, never the serial it was filed under. Widened only for an
+    # instance that owed nothing already, because an existing debt is a real
+    # one and overwriting it would lose a report we still owe.
+    owed_before = greffon_id in _unconfirmed
+    if not owed_before:
+        _unconfirmed[greffon_id] = before_serial or ''
+        _save_unconfirmed(settings)
+    try:
+        cert = _mint(settings, token, greffon_id)
+    except (RenewalUnavailable, _NodeRateLimited, NodeAuthLost):
+        # The manager REFUSED, which is definitive: nothing was issued, so a
+        # debt invented here would have the next pass report a serial against
+        # a pending mint that does not exist.
+        if not owed_before:
+            _clear_debt(settings, greffon_id)
+        raise
     if cert is None:
         # 404 (renewal off / instance gone), 429 cooling down, or a permanent
         # 409. Nothing was issued, so there is nothing to install and nothing
         # to report; _mint arms the backoff for the cases that warrant one.
+        # Definitive like the refusals above, so the speculative debt goes.
+        if not owed_before:
+            _clear_debt(settings, greffon_id)
         return Outcome(FAILED, before_serial)
     wanted = cert.get('serial_number')
-
-    # Owed from the INSTANT a certificate exists, not from the first report.
-    # The manager is now holding a pending mint, and everything between here
-    # and the report -- install, reload, a 20s settle loop, the handshake --
-    # is time this process can be stopped or updated in. Without this the
-    # next process either re-mints into a pending-mint refusal, or sees the
-    # replacement already serving, reads it as not due, and leaves that mint
-    # orphaned for thirty days.
-    #
-    # The value is a placeholder: the debt path re-probes and reports what is
-    # served THEN, never the serial it was filed under. This is the last gap
-    # of its kind -- before the mint there is nothing owed.
-    _unconfirmed[greffon_id] = before_serial or ''
-    _save_unconfirmed(settings)
 
     try:
         _install(greffon_id, cert)

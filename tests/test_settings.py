@@ -197,19 +197,33 @@ def test_a_narrow_window_is_rejected_even_with_a_tiny_interval(
         Settings()
 
 
-def test_the_bound_rests_on_the_interval_being_capped_at_the_backoff_cap(
+def test_a_deadline_missed_by_a_tick_is_counted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The load-bearing assumption, asserted so it cannot rot.
+    """Codex P2 on afbf7e1: four caps alone is not a sound bound.
 
-    `interval + 3 * CAP <= 4 * CAP` holds ONLY because the interval's own
-    range check tops out at the cap. Raise that ceiling without revisiting
-    this floor and the bound silently stops being a bound.
+    An instance is only revisited when the worker ticks, so a 24h deadline
+    landing between ticks waits up to one more interval -- the real worst
+    gap is CAP + interval. At a 20h interval a 5-day window puts the four
+    attempts at 20, 40, 80 and 120 hours, the fourth exactly on expiry, and
+    a floor of 4 * CAP (96h) accepts it.
     """
-    from app.settings import CERT_RENEWAL_BACKOFF_CAP_SECONDS
-
     monkeypatch.setenv("GREFFER_ID", "x")
-    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "86401")
-    with pytest.raises(ValidationError):
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", str(20 * 3600))
+    with pytest.raises(ValidationError, match="renewal attempts"):
         Settings()
-    assert CERT_RENEWAL_BACKOFF_CAP_SECONDS >= 86400
+
+
+def test_the_floor_moves_with_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same 5-day window is fine at the default interval.
+
+    Proves the interval term is doing work rather than the window simply
+    being rejected outright.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "21600")
+    assert Settings().greffer_cert_renewal_interval == 21600
