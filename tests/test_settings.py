@@ -139,3 +139,45 @@ def test_greffer_version_truncated_to_32(monkeypatch: pytest.MonkeyPatch) -> Non
     v = get_settings().greffer_version
     assert len(v) == 32
     assert v == "0.3.3-rc1-42-gdeadbeef-dirty-2026"[:32]
+
+
+def test_an_interval_that_outruns_the_window_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on 4f5bd5b: each value is in range on its own.
+
+    A one-day window with a one-day interval leaves room for a single
+    attempt, so one transient failure -- a deferred settle window, a capped
+    tick, an unreachable manager -- and the certificate expires having never
+    been retried. That is the outage this feature exists to prevent,
+    reachable through configuration the validators accepted.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "1")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "86400")
+    with pytest.raises(ValidationError, match="renewal attempt"):
+        Settings()
+
+
+def test_a_one_day_window_is_fine_with_a_short_enough_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pair is what is rejected, not the narrow window itself."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "1")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "21600")
+    s = Settings()
+    assert s.greffer_cert_renewal_interval == 21600
+
+
+def test_the_shipped_defaults_leave_room_to_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validator that rejected the defaults would break every boot."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.delenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", raising=False)
+    monkeypatch.delenv("GREFFER_CERT_RENEWAL_INTERVAL", raising=False)
+    s = Settings()
+    attempts = (s.greffer_cert_renewal_window_days * 86400
+                // s.greffer_cert_renewal_interval)
+    assert attempts >= 4

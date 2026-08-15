@@ -4,10 +4,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
+
+
+# How many renewal passes must fit inside the renewal window. Below this a
+# certificate can expire without ever having been retried.
+_MIN_ATTEMPTS_IN_WINDOW = 4
 
 
 class Settings(BaseSettings):
@@ -134,6 +139,30 @@ class Settings(BaseSettings):
         if not 1 <= v <= 29:
             raise ValueError("greffer_cert_renewal_window_days must be between 1 and 29")
         return v
+
+    @model_validator(mode="after")
+    def _renewal_interval_fits_the_window(self):
+        # The two are only meaningful against each other. Each is in range on
+        # its own at window_days=1 with interval=86400, and that pair leaves
+        # room for exactly one attempt: a pass seeing slightly more than a day
+        # left skips the certificate, and the next one lands a day plus the
+        # pass's own runtime later -- after expiry. One transient failure, one
+        # deferred settle window, one capped tick, and the certificate expires
+        # having never been retried.
+        #
+        # Four is the smallest number that survives losing a pass or two,
+        # which is the whole reason this worker retries at all.
+        attempts = (self.greffer_cert_renewal_window_days * 86400
+                    // self.greffer_cert_renewal_interval)
+        if attempts < _MIN_ATTEMPTS_IN_WINDOW:
+            raise ValueError(
+                "greffer_cert_renewal_interval leaves room for "
+                f"{attempts} renewal attempt(s) inside a "
+                f"{self.greffer_cert_renewal_window_days}-day window; "
+                f"at least {_MIN_ATTEMPTS_IN_WINDOW} are required. Shorten "
+                "the interval or widen the window."
+            )
+        return self
 
     @field_validator("heartbeat_interval")
     @classmethod
