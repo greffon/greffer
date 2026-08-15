@@ -179,7 +179,11 @@ class Settings(BaseSettings):
             elapsed = -(-(elapsed + delay)
                         // self.greffer_cert_renewal_interval) \
                 * self.greffer_cert_renewal_interval
-            if elapsed > window_seconds:
+            # >=, not >. A certificate is invalid AT its notAfter, so an
+            # attempt landing exactly there is not a pre-expiry attempt --
+            # and the pass's own runtime, or entering the window between
+            # ticks, only pushes it later.
+            if elapsed >= window_seconds:
                 break
             attempts += 1
         if attempts < _MIN_ATTEMPTS_IN_WINDOW:

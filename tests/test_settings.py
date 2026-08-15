@@ -247,3 +247,18 @@ def test_a_backoff_deadline_between_ticks_waits_for_the_next_one(
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", str(7 * 3600))
     with pytest.raises(ValidationError, match="renewal attempt"):
         Settings()
+
+
+def test_a_fourth_attempt_exactly_at_expiry_is_not_enough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on 8aecb33: equality is not an in-window retry.
+
+    8h interval, 2-day window: attempts at 0, 8, 24 and 48 hours, the last
+    landing precisely on notAfter, when the certificate is already invalid.
+    """
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "2")
+    monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", str(8 * 3600))
+    with pytest.raises(ValidationError, match="renewal attempt"):
+        Settings()
