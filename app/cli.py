@@ -167,6 +167,17 @@ def _renew_certs(args: argparse.Namespace) -> int:
         print("--force requires --instance", file=sys.stderr)
         return 2
 
+    if args.timeout <= 0:
+        # requests raises ValueError while BUILDING the timeout, before any
+        # I/O, and ValueError is not a RequestException -- so it escapes both
+        # handlers below and the operator gets a traceback instead of the
+        # documented usage exit. Checked here rather than via an argparse
+        # `type=`, to match --force above and keep main() returning its code
+        # instead of raising SystemExit.
+        print(f"--timeout must be a positive number of seconds, got "
+              f"{args.timeout}", file=sys.stderr)
+        return 2
+
     settings = get_settings()
     # load_persisted_token, NOT resolve_token: the latter MINTS and persists a
     # new token when none exists. This process is a client, not the node's

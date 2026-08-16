@@ -1174,3 +1174,21 @@ def test_the_wait_is_overridable(
                        ['renew_certs', '--timeout', '5400'])
 
     assert seen['timeout'] == 5400
+
+
+@pytest.mark.parametrize('bad', ['0', '-30'])
+def test_a_non_positive_wait_is_a_usage_error_not_a_traceback(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture, bad: str
+) -> None:
+    """Codex P2 on 5be24ae: requests raises ValueError building the timeout,
+    before any I/O, and ValueError is not a RequestException -- so it escaped
+    both handlers and printed a traceback where the CLI documents exit 2.
+    """
+    code, seen = _run_cli(monkeypatch, settings, _Res(200, '{}', {'errors': 0}),
+                          ['renew_certs', '--timeout', bad])
+
+    assert code == 2
+    assert 'positive' in capsys.readouterr().err
+    # Refused before reaching the greffer at all.
+    assert 'url' not in seen
