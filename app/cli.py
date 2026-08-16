@@ -28,9 +28,20 @@ from app.settings import get_settings
 from apps.utils.ops_migrations import operations, runner
 
 # A renewal pass walks every running instance, each with its own HTTP calls and
-# settle window, so it can legitimately take minutes on a busy node.
+# settle window, so it can legitimately take minutes on a busy node -- and on a
+# large enough one it can outlast any fixed deadline: an unresponsive manager
+# that still accepts connections costs 30s per instance in _mint alone, so ~61
+# due instances already exceed this.
+#
+# This is a CLIENT deadline and nothing more. It does not cancel the pass, which
+# runs inside the greffer and keeps the pass lock until it finishes. Overridable
+# with --timeout for a fleet that legitimately needs longer.
 _RENEW_TIMEOUT_SECONDS = 1800
 from apps.utils.ops_migrations.registry import all_migrations
+
+# The pass was still running when we stopped waiting: not a success, not a
+# failure, and a wrapper must be able to tell it from both.
+_EXIT_STILL_RUNNING = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,8 +100,10 @@ def main(argv: list[str] | None = None) -> int:
             "Runs one renewal pass over this node's running instances: mint a "
             "replacement from the manager, install it into the instance's nginx "
             "sidecar, reload, then verify over TLS that the sidecar is actually "
-            "serving the new serial (restarting it if not). Exit code is the "
-            "number of instances that errored."
+            "serving the new serial (restarting it if not). Exits 0 when "
+            "nothing errored, 1 on a failure or refusal, 2 on bad usage, and "
+            f"{_EXIT_STILL_RUNNING} when the pass outlasted the wait and is "
+            "still running."
         ),
     )
     r.add_argument(
@@ -108,6 +121,17 @@ def main(argv: list[str] | None = None) -> int:
             "backoff to elapse. Requires --instance. The manager still applies "
             "its own window, cooldown and rate limit, so this grants nothing "
             "extra."
+        ),
+    )
+    r.add_argument(
+        "--timeout",
+        type=int,
+        metavar="SECONDS",
+        default=_RENEW_TIMEOUT_SECONDS,
+        help=(
+            "How long to WAIT for the pass, not how long to let it run "
+            f"(default: {_RENEW_TIMEOUT_SECONDS}). Giving up here leaves the "
+            "pass running inside the greffer; it does not cancel it."
         ),
     )
     r.set_defaults(func=_renew_certs)
@@ -162,9 +186,31 @@ def _renew_certs(args: argparse.Namespace) -> int:
             "http://127.0.0.1:8000/api/controller/renew-certs/",
             params=params,
             headers={TOKEN_HEADER: token},
-            timeout=_RENEW_TIMEOUT_SECONDS,
+            timeout=args.timeout,
         )
+    except requests.ReadTimeout:
+        # We REACHED the greffer and it accepted the request -- this deadline
+        # is ours, not its. Reporting "cannot reach" here sent operators
+        # looking for a down greffer while the pass they asked for was running
+        # normally, and it is exactly the large or degraded fleet (where a
+        # pass legitimately outlasts the wait) that hits it.
+        #
+        # The pass holds the pass lock until it finishes, so a retry answers
+        # "already running" until then. That is the honest state to report,
+        # and it is neither success nor failure.
+        print(
+            f"still running after {args.timeout}s: the greffer accepted the "
+            "request and the pass is continuing inside it -- this deadline "
+            "was ours and does NOT cancel it.\n"
+            "  A retry will report 'already running' until it finishes.\n"
+            "  The outcome lands in the greffer log as cert_renewal_tick "
+            "(considered/renewed/errors).\n"
+            "  Use --timeout to wait longer on a large fleet.",
+            file=sys.stderr,
+        )
+        return _EXIT_STILL_RUNNING
     except requests.RequestException as exc:
+        # Connect failures included: those genuinely did not reach it.
         print(f"cannot reach the local greffer API: {exc}", file=sys.stderr)
         return 1
     if res.status_code == 409 and 'renewal_in_progress' in res.text:

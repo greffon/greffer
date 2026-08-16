@@ -155,6 +155,8 @@ def _run_cli(monkeypatch, settings, response, argv):
     def _post(url, **kw):
         seen['url'] = url
         seen.update(kw)
+        if isinstance(response, Exception):
+            raise response
         return response
 
     monkeypatch.setattr('requests.post', _post)
@@ -1117,3 +1119,58 @@ async def test_a_token_rotation_does_not_cost_the_fleet_six_hours(
         await cert_renewal.cert_renewal_worker(app)
 
     assert slept[1] == cert_renewal._DEFERRED_RETRY_SECONDS, slept
+
+
+def test_a_pass_that_outlasts_the_wait_is_not_reported_as_unreachable(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture
+) -> None:
+    """Codex P2 on greffer#131: a ReadTimeout is a RequestException, so the
+    generic handler announced "cannot reach the local greffer API".
+
+    We reached it. It accepted the request. The deadline is the CLIENT's and
+    does not cancel the pass, which keeps running inside the greffer holding
+    the pass lock. On a large or degraded fleet -- ~61 due instances against a
+    manager that accepts connections and stalls is already 30 minutes in _mint
+    alone -- that is the EXPECTED outcome, and it sent operators hunting a
+    down greffer while the renewal they asked for was running normally.
+    """
+    import requests
+
+    from app import cli as cli_mod
+
+    code, _ = _run_cli(monkeypatch, settings, requests.ReadTimeout('timed out'),
+                       ['renew_certs'])
+
+    assert code == cli_mod._EXIT_STILL_RUNNING
+    err = capsys.readouterr().err
+    assert 'cannot reach' not in err, 'the greffer was reached and is working'
+    assert 'still running' in err
+    # The operator needs the next move, not just the news.
+    assert 'cert_renewal_tick' in err
+
+
+def test_a_connect_failure_is_still_reported_as_unreachable(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture
+) -> None:
+    """The other half: never having reached it is a different fact, and must
+    not be laundered into 'still running' by the new branch."""
+    import requests
+
+    code, _ = _run_cli(monkeypatch, settings,
+                       requests.ConnectionError('connection refused'),
+                       ['renew_certs'])
+
+    assert code == 1
+    assert 'cannot reach' in capsys.readouterr().err
+
+
+def test_the_wait_is_overridable(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fleet that legitimately needs longer must not have to patch the CLI."""
+    _, seen = _run_cli(monkeypatch, settings, _Res(200, '{}', {'errors': 0}),
+                       ['renew_certs', '--timeout', '5400'])
+
+    assert seen['timeout'] == 5400
