@@ -1142,12 +1142,17 @@ def test_a_pass_that_outlasts_the_wait_is_not_reported_as_unreachable(
     code, _ = _run_cli(monkeypatch, settings, requests.ReadTimeout('timed out'),
                        ['renew_certs'])
 
-    assert code == cli_mod._EXIT_STILL_RUNNING
+    assert code == cli_mod._EXIT_OUTCOME_UNKNOWN
     err = capsys.readouterr().err
-    assert 'cannot reach' not in err, 'the greffer was reached and is working'
-    assert 'still running' in err
-    # The operator needs the next move, not just the news.
+    # Not "cannot reach": we may well have reached it.
+    assert 'cannot reach' not in err
+    # And not a promise that it is still going: it may have finished.
+    assert 'UNKNOWN' in err
+    assert 'may still be running' in err
+    # The operator needs the next move, and the trap: retrying after the pass
+    # finished starts another one.
     assert 'cert_renewal_tick' in err
+    assert 'starts a NEW one' in err
 
 
 def test_a_connect_failure_is_still_reported_as_unreachable(
