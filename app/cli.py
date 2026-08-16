@@ -28,9 +28,20 @@ from app.settings import get_settings
 from apps.utils.ops_migrations import operations, runner
 
 # A renewal pass walks every running instance, each with its own HTTP calls and
-# settle window, so it can legitimately take minutes on a busy node.
+# settle window, so it can legitimately take minutes on a busy node -- and on a
+# large enough one it can outlast any fixed deadline: an unresponsive manager
+# that still accepts connections costs 30s per instance in _mint alone, so ~61
+# due instances already exceed this.
+#
+# This is a CLIENT deadline and nothing more. It does not cancel the pass, which
+# runs inside the greffer and keeps the pass lock until it finishes. Overridable
+# with --timeout for a fleet that legitimately needs longer.
 _RENEW_TIMEOUT_SECONDS = 1800
 from apps.utils.ops_migrations.registry import all_migrations
+
+# We stopped waiting without an answer. NOT a success, NOT a failure, and not
+# a claim about what the greffer is doing -- see the ReadTimeout branch.
+_EXIT_OUTCOME_UNKNOWN = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,8 +100,10 @@ def main(argv: list[str] | None = None) -> int:
             "Runs one renewal pass over this node's running instances: mint a "
             "replacement from the manager, install it into the instance's nginx "
             "sidecar, reload, then verify over TLS that the sidecar is actually "
-            "serving the new serial (restarting it if not). Exit code is the "
-            "number of instances that errored."
+            "serving the new serial (restarting it if not). Exits 0 when "
+            "nothing errored, 1 on a failure or refusal, 2 on bad usage, and "
+            f"{_EXIT_OUTCOME_UNKNOWN} when no answer arrived within the "
+            "wait and the outcome is unknown."
         ),
     )
     r.add_argument(
@@ -108,6 +121,17 @@ def main(argv: list[str] | None = None) -> int:
             "backoff to elapse. Requires --instance. The manager still applies "
             "its own window, cooldown and rate limit, so this grants nothing "
             "extra."
+        ),
+    )
+    r.add_argument(
+        "--timeout",
+        type=int,
+        metavar="SECONDS",
+        default=_RENEW_TIMEOUT_SECONDS,
+        help=(
+            "How long to WAIT for the pass, not how long to let it run "
+            f"(default: {_RENEW_TIMEOUT_SECONDS}). Giving up here cancels "
+            "nothing, and leaves the outcome unknown rather than failed."
         ),
     )
     r.set_defaults(func=_renew_certs)
@@ -143,6 +167,17 @@ def _renew_certs(args: argparse.Namespace) -> int:
         print("--force requires --instance", file=sys.stderr)
         return 2
 
+    if args.timeout <= 0:
+        # requests raises ValueError while BUILDING the timeout, before any
+        # I/O, and ValueError is not a RequestException -- so it escapes both
+        # handlers below and the operator gets a traceback instead of the
+        # documented usage exit. Checked here rather than via an argparse
+        # `type=`, to match --force above and keep main() returning its code
+        # instead of raising SystemExit.
+        print(f"--timeout must be a positive number of seconds, got "
+              f"{args.timeout}", file=sys.stderr)
+        return 2
+
     settings = get_settings()
     # load_persisted_token, NOT resolve_token: the latter MINTS and persists a
     # new token when none exists. This process is a client, not the node's
@@ -162,9 +197,36 @@ def _renew_certs(args: argparse.Namespace) -> int:
             "http://127.0.0.1:8000/api/controller/renew-certs/",
             params=params,
             headers={TOKEN_HEADER: token},
-            timeout=_RENEW_TIMEOUT_SECONDS,
+            timeout=args.timeout,
         )
+    except requests.ReadTimeout:
+        # All this establishes is that no response arrived in time. It does
+        # NOT establish that the request was dispatched, nor that a pass is
+        # running now: the greffer may have stalled before reaching the
+        # endpoint, or finished the pass just as we gave up.
+        #
+        # So the outcome is genuinely unknown, and saying anything stronger
+        # repeats the defect this branch exists to fix. "Cannot reach" was
+        # wrong because we may well have reached it; "still running" would be
+        # wrong because it may well have finished -- and an operator who
+        # believes it will retry expecting "already running" and can instead
+        # start a SECOND pass.
+        #
+        # What IS true: this deadline is the client's and cancels nothing.
+        print(
+            f"no answer within {args.timeout}s -- outcome UNKNOWN.\n"
+            "  This deadline is the client's and does NOT cancel anything: a "
+            "pass may still be running inside the greffer, may have finished, "
+            "or may never have started.\n"
+            "  Read the greffer log before retrying -- cert_renewal_tick "
+            "(considered/renewed/errors) is the outcome, and a retry against "
+            "a pass that already finished starts a NEW one.\n"
+            "  Use --timeout to wait longer on a large fleet.",
+            file=sys.stderr,
+        )
+        return _EXIT_OUTCOME_UNKNOWN
     except requests.RequestException as exc:
+        # Connect failures included: those genuinely did not reach it.
         print(f"cannot reach the local greffer API: {exc}", file=sys.stderr)
         return 1
     if res.status_code == 409 and 'renewal_in_progress' in res.text:
