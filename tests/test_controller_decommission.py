@@ -152,6 +152,53 @@ async def test_decommission_refuses_during_self_update(client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
+async def test_the_serializer_never_waits_for_the_lock(client: AsyncClient) -> None:
+    """_serialize_instance_op's acquire must stay NON-BLOCKING.
+
+    A bounded wait was tried on this branch and reverted: /start/ and /stop/ only
+    SPAWN their compose child, so a waiter that wins the lock the instant the
+    handler returns runs against a live one -- a waiting /decommission/ would
+    `down -v` an instance whose `up -d` is still pulling. Only a docstring stood
+    against re-adding it. Asserted on call shape, not wall clock, so it cannot
+    flake.
+    """
+    import threading as _t
+
+    from app import backup
+
+    class _Recording:
+        def __init__(self):
+            self._inner = _t.Lock()
+            self.acquires = []
+
+        def acquire(self, *a, **kw):
+            self.acquires.append((a, kw))
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    rec = _Recording()
+    assert rec.acquire(blocking=False)
+    rec.acquires.clear()
+    with patch.object(backup, "_instance_lock", lambda _id: rec):
+        try:
+            with patch("app.routers.controller.compose"), patch(
+                "app.routers.controller.volume"
+            ), patch("app.routers.controller.shutil"):
+                r = await client.post(
+                    "/api/controller/decommission/", json={"id": _ID}, headers=_AUTH)
+        finally:
+            rec.release()
+
+    assert r.status_code == 409
+    assert len(rec.acquires) == 1
+    args, kwargs = rec.acquires[0]
+    assert kwargs.get("blocking") is False and "timeout" not in kwargs, (
+        f"the serializer waited for the lock: acquire(*{args}, **{kwargs})")
+
+
+@pytest.mark.asyncio
 async def test_decommission_409_when_instance_busy(client: AsyncClient) -> None:
     """A start/stop/backup holding the per-instance lock -> 409 instance_busy
     (the decommission must not race a concurrent op on the same instance)."""

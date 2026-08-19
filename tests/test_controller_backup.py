@@ -648,6 +648,53 @@ def test_a_managed_backup_holds_the_lock_through_its_metering_scan(monkeypatch):
     assert seen["payloads"]["backup-result"]["repo_bytes"] == 4242
 
 
+class _RecordingLock:
+    """Delegates to a real lock and records how ``acquire`` was called."""
+
+    def __init__(self):
+        self._inner = threading.Lock()
+        self.acquires = []
+
+    def acquire(self, *a, **kw):
+        self.acquires.append((a, kw))
+        return self._inner.acquire(*a, **kw)
+
+    def release(self):
+        return self._inner.release()
+
+    def locked(self):
+        return self._inner.locked()
+
+
+def test_the_spawn_gate_never_waits_for_the_lock(monkeypatch):
+    """The acquire must stay NON-BLOCKING, and nothing else pins that.
+
+    A bounded wait was tried on this branch and reverted: it does not beat the
+    30-96s a cert-renewal pass holds this lock, and it admits a waiter into a
+    live compose child -- /start/ and /stop/ only SPAWN theirs, so an op that
+    wins the lock the instant the handler returns runs against one still going.
+    The revert left only a docstring standing against re-adding it, and the
+    residual renewal race gives a maintainer a standing motive to try. So assert
+    the call shape directly rather than a wall clock, which would be flaky.
+    """
+    rec = _RecordingLock()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: rec)
+    assert rec.acquire(blocking=False)
+    rec.acquires.clear()
+    try:
+        with pytest.raises(backup.BusyError):
+            backup.spawn_backup(_settings(), "nb", "b1")
+        with pytest.raises(backup.BusyError):
+            backup.spawn_restore(_settings(), "nb", "snap-1", "r1")
+    finally:
+        rec.release()
+
+    assert len(rec.acquires) == 2
+    for args, kwargs in rec.acquires:
+        assert kwargs.get("blocking") is False and "timeout" not in kwargs, (
+            f"the spawn gate waited for the lock: acquire(*{args}, **{kwargs})")
+
+
 def test_a_late_second_release_cannot_steal_a_later_ops_lock(monkeypatch):
     """The one-shot has to be a genuine no-op the second time, NOT a release that
     swallows the RuntimeError. The two are indistinguishable until something else
