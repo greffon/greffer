@@ -329,7 +329,10 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False):
     def _write_json(_path, _data):
         _mark("write_json")
 
-    monkeypatch.setattr(backup, "_forget", mock.Mock())
+    def _forget(*_a, **_k):
+        _mark("forget")
+
+    monkeypatch.setattr(backup, "_forget", _forget)
     monkeypatch.setattr(backup, "_write_json", _write_json)
     monkeypatch.setattr(backup, "_remove", mock.Mock())
     return seen
@@ -371,6 +374,9 @@ def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeyp
     assert seen["compose.stop"] is False, "the stop ran with the lock free"
     assert seen["restic:backup"] is False, "the safety snapshot ran unlocked"
     assert seen["restic:restore"] is False, "the --delete overwrite ran unlocked"
+    assert seen["forget"] is False, (
+        "retention ran with the lock free -- _forget is unbounded and takes "
+        "restic's exclusive repo lock")
     assert seen["write_json"] is False, (
         "the durable restore-state file was written after the release -- it must "
         "exist before anyone can act on the callback, or a crash loses the "
@@ -406,6 +412,9 @@ def test_backup_holds_the_lock_through_its_restart_then_frees_the_callback(monke
 
     assert seen["compose.stop"] is False, "the stop ran with the lock free"
     assert seen["restart"] is False, "the cold-path restart ran with the lock free"
+    assert seen["forget"] is False, (
+        "retention ran with the lock free -- _forget is unbounded and takes "
+        "restic's exclusive repo lock")
     assert seen["backup-result"] is True
     assert seen["payloads"]["backup-result"]["status"] == "success"
 
@@ -512,6 +521,35 @@ def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
     with pytest.raises(backup.BusyError):
         backup.spawn_restore(_settings(), "dead-r", "snap-1", "r1")
     assert _lock_is_free("dead-r"), "spawn_restore stranded the lock"
+
+
+def test_a_late_second_release_cannot_steal_a_later_ops_lock(monkeypatch):
+    """The one-shot has to be a genuine no-op the second time, NOT a release that
+    swallows the RuntimeError. The two are indistinguishable until something else
+    holds the lock -- and by design something else does.
+
+    The sequence is reachable: the job releases early and posts its callback; the
+    manager answers it by calling /start/, which takes this lock; the greffer's
+    callback POST then hits its 30s timeout (shorter than the manager's 60s
+    actuation budget), the job returns, and ``_locked_job``'s finally fires the
+    SECOND release while that start is still holding the lock. A swallowing
+    release would free the start's lock -- a third op then runs against a live
+    ``up -d``, and the start's own release raises RuntimeError -> 500 ->
+    ``restored_start_failed``, the exact outcome this change exists to remove.
+    """
+    lock = backup._instance_lock("steal")
+    assert lock.acquire(blocking=False)
+    release = backup._release_once(lock)
+    release()                                    # the job's early release
+
+    assert lock.acquire(blocking=False)          # a LATER op takes it
+    try:
+        release()                                # _locked_job's finally, late
+        assert lock.locked(), (
+            "the second release freed a lock this job no longer owns -- it stole "
+            "the later op's lock")
+    finally:
+        lock.release()
 
 
 def test_lock_is_released_once_when_the_job_raises(monkeypatch):

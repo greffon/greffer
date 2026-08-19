@@ -834,12 +834,15 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         # served instead of being refused 409 instance_busy for the length of a
         # manager round trip.
         #
-        # NOT justified by the migration cutover, whatever symmetry suggests:
-        # ``_run_cutover`` stops the SOURCE before the backstop backup and every
-        # step after it targets G2, so G1 sees no chained op here. The cutover's
-        # real exposure is on the restore side (see ``restore_instance``), where
-        # ``_cold_restore_and_wait`` polls restore-status and then immediately
-        # starts the instance on G2.
+        # NOT justified by the migration cutover, whatever symmetry suggests.
+        # ``_run_cutover`` stops the SOURCE before the backstop backup and the
+        # steps that follow drive G2. G1 can still see a chained start -- ``_abort``
+        # calls ``_start_greffon(instance)`` while the FK still points at it -- but
+        # never INLINE with this callback: the cutover only reaches that through a
+        # 5s poll loop, by which time this job has long returned. So the release is
+        # not load-bearing for G1 either way. The cutover's real exposure is on the
+        # restore side (see ``restore_instance``), where ``_cold_restore_and_wait``
+        # polls restore-status and then immediately starts the instance on G2.
         #
         # Every compose action this job performs -- including the cold-path
         # restart above -- is done by now.
