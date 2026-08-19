@@ -835,12 +835,13 @@ def backup_instance(settings, instance_id: str, backup_id: str,
         # manager round trip.
         #
         # NOT justified by the migration cutover, whatever symmetry suggests.
-        # ``_run_cutover`` stops the SOURCE before the backstop backup and the
-        # steps that follow drive G2. G1 can still see a chained start -- ``_abort``
-        # calls ``_start_greffon(instance)`` while the FK still points at it -- but
-        # never INLINE with this callback: the cutover only reaches that through a
-        # 5s poll loop, by which time this job has long returned. So the release is
-        # not load-bearing for G1 either way. The cutover's real exposure is on the
+        # ``_run_cutover`` stops the SOURCE before the backstop backup, and the
+        # provisioning / restore / start that follow all target G2. G1 IS touched
+        # again -- ``_abort``'s ``_start_greffon(instance)`` pre-repoint, and
+        # ``post_greffer_decommission(source, ...)`` after the FK flip, which takes
+        # this very lock -- but never INLINE with this callback: every one of those
+        # is reached through a 5s poll loop, by which time this job has long
+        # returned. So the release is not load-bearing for G1 either way. The cutover's real exposure is on the
         # restore side (see ``restore_instance``), where ``_cold_restore_and_wait``
         # polls restore-status and then immediately starts the instance on G2.
         #

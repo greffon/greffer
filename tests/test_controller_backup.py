@@ -263,7 +263,7 @@ def _lock_is_free(instance_id: str) -> bool:
 _REAL_LOCKED_JOB = backup._locked_job
 
 
-def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
+def _drain(monkeypatch, spawn, instance_id, *args, settings=None, **kwargs):
     """Run ``spawn`` and block until its background job has finished, re-raising
     anything that job raised.
 
@@ -284,14 +284,16 @@ def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
             done.set()
 
     monkeypatch.setattr(backup, "_locked_job", _job)
-    spawn(_settings(), instance_id, *args, **kwargs)
+    spawn(settings if settings is not None else _settings(),
+          instance_id, *args, **kwargs)
     assert done.wait(20), "background job hung"
     if failures:
         raise AssertionError(
             f"the background job raised: {failures[0]!r}") from failures[0]
 
 
-def _observe_lock(monkeypatch, instance_id, *, safety_fails=False):
+def _observe_lock(monkeypatch, instance_id, *, safety_fails=False,
+                  wait_stopped=None):
     """Record the lock state at every point the job passes through, plus the
     payload it finally sends.
 
@@ -302,10 +304,11 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False):
 
     Patches over ``_patch_common``, so call it after.
     """
-    seen = {}
+    seen = {"order": []}
 
     def _mark(name):
         seen[name] = _lock_is_free(instance_id)
+        seen["order"].append(name)
 
     def _cb(settings, iid, action, payload):
         _mark(action)
@@ -337,6 +340,19 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False):
 
     def _forget(*_a, **_k):
         _mark("forget")
+
+    def _repo_stats(*_a, **_k):
+        _mark("repo_stats")
+        return 4242
+
+    if wait_stopped is not None:
+        def _wait(iid, timeout):
+            _mark("wait_stopped")
+            seen.setdefault("wait_timeouts", []).append(timeout)
+            return wait_stopped
+
+        monkeypatch.setattr(backup, "_wait_stopped", _wait)
+    monkeypatch.setattr(backup, "_repo_stats", _repo_stats)
 
     monkeypatch.setattr(backup, "_forget", _forget)
     monkeypatch.setattr(backup, "_write_json", _write_json)
@@ -381,9 +397,8 @@ def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeyp
     assert seen["restic:backup"] is False, "the safety snapshot ran unlocked"
     assert seen["restic:restore"] is False, "the --delete overwrite ran unlocked"
     assert seen["forget"] is False, (
-        "retention ran with the lock free -- _forget is the last restic work the "
-        "job does, and the release must come after ALL of the job's work, not "
-        "just after its compose actions")
+        "retention ran with the lock free -- the release must come after ALL of "
+        "the job's work, not just after its compose actions")
     assert seen["write_json"] is False, (
         "the durable restore-state file was written after the release -- it must "
         "exist before anyone can act on the callback, or a crash loses the "
@@ -420,9 +435,8 @@ def test_backup_holds_the_lock_through_its_restart_then_frees_the_callback(monke
     assert seen["compose.stop"] is False, "the stop ran with the lock free"
     assert seen["restart"] is False, "the cold-path restart ran with the lock free"
     assert seen["forget"] is False, (
-        "retention ran with the lock free -- _forget is the last restic work the "
-        "job does, and the release must come after ALL of the job's work, not "
-        "just after its compose actions")
+        "retention ran with the lock free -- the release must come after ALL of "
+        "the job's work, not just after its compose actions")
     assert seen["backup-result"] is True
     assert seen["payloads"]["backup-result"]["status"] == "success"
 
@@ -570,16 +584,12 @@ def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypat
     import app.routers.controller as controller
 
     _patch_common(monkeypatch, volumes=("dbab_files", "dbab_db"))
-    seen = _observe_lock(monkeypatch, "dbab")
+    seen = _observe_lock(monkeypatch, "dbab", wait_stopped=True)
     tracked = []
     monkeypatch.setattr(controller, "track_compose_child",
                         lambda iid, proc: tracked.append(iid))
     monkeypatch.setattr(backup, "_start_services", mock.Mock())
     monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: False)  # db_not_ready
-    waits = []
-    monkeypatch.setattr(
-        backup, "_wait_stopped",
-        lambda iid, timeout: (waits.append((_lock_is_free(iid), timeout)), True)[1])
     container = mock.Mock(id="pgc", status="running")
     container.labels = {"com.docker.compose.service": "postgres",
                         "com.greffon.backup.restore": "pg_restore -d app"}
@@ -589,21 +599,53 @@ def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypat
                         lambda _id: [container])
 
     _drain(monkeypatch, backup.spawn_restore, "dbab", "snap-1", "r1",
+           settings=_settings(backup_stop_timeout_seconds=17),
            manifest={"data": "DATA", "db:postgres": "DUMP"},
            volume_classes={"files": "data", "db": "database"})
 
     assert seen["compose.stop"] is False, "the abort teardown ran unlocked"
-    # Two waits (entry stop, abort teardown), each UNDER the lock and each
-    # actually bounded by the configured timeout. Counting calls alone was not
-    # enough: it passed both a release slipped in before the second wait and a
-    # wait with timeout=0, which are the two ways to reintroduce the defect.
-    assert waits == [(False, 5), (False, 5)], (
-        "the abort teardown must be waited for, under the lock, with the real "
-        "stop timeout -- otherwise the lock frees while the teardown is still "
-        f"running and a /start/ can serve the half-restored database; got {waits}")
+    assert seen["wait_stopped"] is False, "the wait itself ran with the lock free"
+    # ORDER is the property, and a per-call snapshot was not enough: counting two
+    # waits under the lock also passed a wait HOISTED ABOVE the teardown stop, and
+    # passed two waits at the ENTRY stop with none on the teardown. Both leave the
+    # lock free over a live teardown, which is the whole defect. So: find the
+    # teardown's stop and require a wait immediately after it.
+    order = seen["order"]
+    teardown = len(order) - 1 - order[::-1].index("compose.stop")
+    assert order[teardown + 1] == "wait_stopped", (
+        "the abort teardown's stop is not immediately followed by a wait -- the "
+        "lock frees while the teardown is still running and a /start/ can serve "
+        f"the half-restored database; order was {order}")
+    assert seen["wait_timeouts"] == [17, 17], (
+        "the waits must read the CONFIGURED stop timeout -- 17 here precisely so "
+        "a hardcoded literal or a 0 cannot pass; "
+        f"got {seen['wait_timeouts']}")
     assert tracked == ["dbab"], "the abort stop must stay inflight-tracked"
     assert seen["restore-result"] is True
     assert seen["payloads"]["restore-result"]["error_code"] == "db_not_ready"
+
+
+def test_a_managed_backup_holds_the_lock_through_its_metering_scan(monkeypatch):
+    """With a brokered destination the finally runs _repo_stats AFTER _forget --
+    a `restic stats` bounded at 120s, and its own docstring justifies that bound
+    BY the lock being held. So it is the job's real last restic work, and the
+    release has to follow it. Every other release test passes no destination, so
+    this branch had nothing holding it."""
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(backup, "_effective_settings",
+                        lambda settings, dest, iid: settings)
+    seen = _observe_lock(monkeypatch, "rel-managed")
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-managed", "b1",
+           destination={"kind": "managed"})
+
+    assert seen["forget"] is False, "retention ran with the lock free"
+    assert seen["repo_stats"] is False, (
+        "the metering scan ran with the lock free -- _repo_stats is bounded at "
+        "120s precisely because the lock is held across it")
+    assert seen["order"].index("repo_stats") < seen["order"].index("backup-result")
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["repo_bytes"] == 4242
 
 
 def test_a_late_second_release_cannot_steal_a_later_ops_lock(monkeypatch):
