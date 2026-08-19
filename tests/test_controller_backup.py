@@ -381,8 +381,9 @@ def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeyp
     assert seen["restic:backup"] is False, "the safety snapshot ran unlocked"
     assert seen["restic:restore"] is False, "the --delete overwrite ran unlocked"
     assert seen["forget"] is False, (
-        "retention ran with the lock free -- _forget is unbounded and takes "
-        "restic's exclusive repo lock")
+        "retention ran with the lock free -- _forget is the last restic work the "
+        "job does, and the release must come after ALL of the job's work, not "
+        "just after its compose actions")
     assert seen["write_json"] is False, (
         "the durable restore-state file was written after the release -- it must "
         "exist before anyone can act on the callback, or a crash loses the "
@@ -419,8 +420,9 @@ def test_backup_holds_the_lock_through_its_restart_then_frees_the_callback(monke
     assert seen["compose.stop"] is False, "the stop ran with the lock free"
     assert seen["restart"] is False, "the cold-path restart ran with the lock free"
     assert seen["forget"] is False, (
-        "retention ran with the lock free -- _forget is unbounded and takes "
-        "restic's exclusive repo lock")
+        "retention ran with the lock free -- _forget is the last restic work the "
+        "job does, and the release must come after ALL of the job's work, not "
+        "just after its compose actions")
     assert seen["backup-result"] is True
     assert seen["payloads"]["backup-result"]["status"] == "success"
 
@@ -575,8 +577,9 @@ def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypat
     monkeypatch.setattr(backup, "_start_services", mock.Mock())
     monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: False)  # db_not_ready
     waits = []
-    monkeypatch.setattr(backup, "_wait_stopped",
-                        lambda iid, timeout: (waits.append(iid), True)[1])
+    monkeypatch.setattr(
+        backup, "_wait_stopped",
+        lambda iid, timeout: (waits.append((_lock_is_free(iid), timeout)), True)[1])
     container = mock.Mock(id="pgc", status="running")
     container.labels = {"com.docker.compose.service": "postgres",
                         "com.greffon.backup.restore": "pg_restore -d app"}
@@ -590,10 +593,14 @@ def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypat
            volume_classes={"files": "data", "db": "database"})
 
     assert seen["compose.stop"] is False, "the abort teardown ran unlocked"
-    assert len(waits) == 2, (
-        "the abort teardown was not waited for -- one wait is the entry stop; "
-        "without the second, the lock frees while the teardown is still running "
-        "and a /start/ can serve the half-restored database")
+    # Two waits (entry stop, abort teardown), each UNDER the lock and each
+    # actually bounded by the configured timeout. Counting calls alone was not
+    # enough: it passed both a release slipped in before the second wait and a
+    # wait with timeout=0, which are the two ways to reintroduce the defect.
+    assert waits == [(False, 5), (False, 5)], (
+        "the abort teardown must be waited for, under the lock, with the real "
+        "stop timeout -- otherwise the lock frees while the teardown is still "
+        f"running and a /start/ can serve the half-restored database; got {waits}")
     assert tracked == ["dbab"], "the abort stop must stay inflight-tracked"
     assert seen["restore-result"] is True
     assert seen["payloads"]["restore-result"]["error_code"] == "db_not_ready"
