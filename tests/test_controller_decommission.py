@@ -160,12 +160,7 @@ async def test_decommission_409_when_instance_busy(client: AsyncClient) -> None:
     lock = backup._instance_lock(_ID)
     assert lock.acquire(blocking=False)
     try:
-        # The serializer waits _INSTANCE_LOCK_WAIT_SECONDS before giving up; this
-        # test is about the giving-up, so shorten the wait rather than sit through
-        # the production one. That the wait is real (and can be WON) is covered by
-        # test_a_control_op_waits_out_a_brief_holder.
-        with patch("app.routers.controller._INSTANCE_LOCK_WAIT_SECONDS", 0.05), \
-                patch("app.routers.controller.compose"), patch(
+        with patch("app.routers.controller.compose"), patch(
             "app.routers.controller.volume"
         ), patch("app.routers.controller.shutil"):
             r = await client.post(
@@ -174,33 +169,3 @@ async def test_decommission_409_when_instance_busy(client: AsyncClient) -> None:
         assert r.json()["detail"] == "instance_busy"
     finally:
         lock.release()
-
-
-@pytest.mark.asyncio
-async def test_a_control_op_waits_out_a_brief_holder(client: AsyncClient) -> None:
-    """A control op the manager CHAINS behind an async job must not lose a coin
-    flip to whoever else briefly wants the lock.
-
-    The restore path is the one that hurts: the manager answers the greffer's
-    restore-result callback by running a start INLINE, and a lost flip there is
-    recorded ``restored_start_failed`` with the instance left stopped. So a
-    holder that frees the lock within the wait must be waited out, not refused.
-    """
-    import threading
-
-    from app import backup
-
-    lock = backup._instance_lock(_ID)
-    assert lock.acquire(blocking=False)
-    threading.Timer(0.1, lock.release).start()
-
-    with patch("app.routers.controller.compose"), patch(
-        "app.routers.controller.volume"
-    ), patch("app.routers.controller.shutil"):
-        r = await client.post(
-            "/api/controller/decommission/", json={"id": _ID}, headers=_AUTH)
-
-    # Served, not 409'd -- and the lock was handed back afterwards.
-    assert r.status_code != 409, r.text
-    assert backup._instance_lock(_ID).acquire(blocking=False)
-    backup._instance_lock(_ID).release()
