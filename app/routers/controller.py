@@ -176,12 +176,30 @@ def track_compose_child(greffon_id: str, proc):
         _release_compose_child(greffon_id)
 
 
+# How long a start/stop waits for the per-instance lock before giving up with
+# 409. It was a bare non-blocking acquire, which made every control op the
+# manager chains behind an async job a coin flip against whoever else wants the
+# lock -- most often this node's own cert-renewal worker, which takes the SAME
+# lock and can hold it across a mint, an install, a reload and a 20s serial
+# settle. The manager's restore-result handler runs a start INLINE, so losing
+# that flip costs a restore: it is recorded restored_start_failed and the
+# instance stays stopped.
+#
+# Bounded, and deliberately well under the manager's 60s actuation timeout, so a
+# genuinely long holder still returns this node's honest 409 rather than timing
+# the manager out into the INDETERMINATE branch (which does not release the
+# pre-allocated port and does not claim the instance started). Short collisions
+# -- the common case, a manager round trip plus a CA mint -- now succeed.
+_INSTANCE_LOCK_WAIT_SECONDS = 10
+
+
 def _serialize_instance_op(handler):
     """Hold the in-process per-instance lock for a start/stop's whole duration so
     it serializes against a concurrent backup/restore in the single greffer
     process (HLD section 3: the in-process lock -- NOT a file lock -- is the real
-    serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
-    preserves the signature so FastAPI still parses the body + response_model.
+    serializer). Waits up to ``_INSTANCE_LOCK_WAIT_SECONDS`` for it, then 409
+    instance_busy. ``functools.wraps`` preserves the signature so FastAPI still
+    parses the body + response_model.
 
     NOT extended across the compose child. The manager chains control ops
     immediately -- the migration cutover runs stop then /backup/, and start then
@@ -193,7 +211,7 @@ def _serialize_instance_op(handler):
     @functools.wraps(handler)
     def wrapper(payload, request, *args, **kwargs):
         lock = backup._instance_lock(payload.id)
-        if not lock.acquire(blocking=False):
+        if not lock.acquire(timeout=_INSTANCE_LOCK_WAIT_SECONDS):
             raise HTTPException(status_code=409, detail="instance_busy")
         try:
             return handler(payload, request, *args, **kwargs)

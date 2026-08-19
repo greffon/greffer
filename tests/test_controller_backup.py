@@ -245,38 +245,93 @@ def test_restore_overwrite_failure_keeps_safety_pointer(monkeypatch):
 
 # ---- locking ---------------------------------------------------------------
 
+def _lock_is_free(instance_id: str) -> bool:
+    """Whether the per-instance lock could be taken right now -- i.e. whether a
+    manager control op arriving at this instant is served or refused 409
+    instance_busy."""
+    lock = backup._instance_lock(instance_id)
+    if lock.acquire(blocking=False):
+        lock.release()
+        return True
+    return False
+
+
 def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
-    """Run ``spawn`` and block until its background job has finished, so the
-    assertions below see the job's final lock state rather than a race."""
+    """Run ``spawn`` and block until its background job has finished, re-raising
+    anything that job raised.
+
+    The re-raise is load-bearing. Without it a job thread that dies -- on a double
+    release, say -- still passes: the exception goes to ``threading.excepthook``,
+    pytest downgrades it to a warning, and CI runs a bare ``pytest -q``. A
+    regression that raised on every backup and restore would ship green.
+    """
     done = threading.Event()
+    failures = []
     real_job = backup._locked_job
 
     def _job(release, fn, *a, **kw):
         try:
             real_job(release, fn, *a, **kw)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised below
+            failures.append(exc)
         finally:
             done.set()
 
     monkeypatch.setattr(backup, "_locked_job", _job)
     spawn(_settings(), instance_id, *args, **kwargs)
     assert done.wait(20), "background job hung"
+    if failures:
+        raise AssertionError(
+            f"the background job raised: {failures[0]!r}") from failures[0]
 
 
-def _lock_state_at_callback(monkeypatch):
-    """Record whether the per-instance lock is free while the result callback is
-    in flight -- i.e. whether the manager's inline follow-up call would be served
-    or refused 409 instance_busy."""
+def _observe_lock(monkeypatch, instance_id, *, safety_fails=False):
+    """Record the lock state at every point the job passes through, plus the
+    payload it finally sends.
+
+    Two properties, not one. The lock must be HELD while the job touches compose
+    and restic -- releasing early would let a start (or a renewal tick) run
+    compose against volumes mid-overwrite -- and FREE by the callback, because the
+    manager answers that callback by calling straight back into /start/.
+
+    Patches over ``_patch_common``, so call it after.
+    """
     seen = {}
 
+    def _mark(name):
+        seen[name] = _lock_is_free(instance_id)
+
     def _cb(settings, iid, action, payload):
-        lock = backup._instance_lock(iid)
-        free = lock.acquire(blocking=False)
-        if free:
-            lock.release()
-        seen[action] = free
+        _mark(action)
+        seen.setdefault("payloads", {})[action] = payload
         return True
 
+    def _stop(_spec):
+        _mark("compose.stop")
+        return mock.Mock()
+
+    def _restic(settings, args, mounts, **kw):
+        _mark(f"restic:{args[0]}")
+        if args[0] == "backup":
+            if safety_fails:
+                return (1, "", "no space left on device")
+            return (0, '{"message_type":"summary","snapshot_id":"SAFE",'
+                       '"data_added":7}', "")
+        return (0, "", "")
+
+    def _restart(*_a, **_k):
+        _mark("restart")
+
     monkeypatch.setattr(backup, "_post_callback", _cb)
+    monkeypatch.setattr(backup.compose, "stop", _stop)
+    monkeypatch.setattr(backup, "_run_restic", _restic)
+    monkeypatch.setattr(backup, "_restart", _restart)
+    def _write_json(_path, _data):
+        _mark("write_json")
+
+    monkeypatch.setattr(backup, "_forget", mock.Mock())
+    monkeypatch.setattr(backup, "_write_json", _write_json)
+    monkeypatch.setattr(backup, "_remove", mock.Mock())
     return seen
 
 
@@ -290,50 +345,161 @@ def test_spawn_backup_busy_raises(monkeypatch):
         lock.release()
 
 
-def test_restore_releases_the_lock_before_its_callback(monkeypatch):
+def test_spawn_restore_busy_raises(monkeypatch):
+    """The 409 that stops a restore landing on an instance already mid-op. The
+    backup side had this; the restore side never did."""
+    lock = backup._instance_lock("busy-r")
+    lock.acquire()
+    try:
+        with pytest.raises(backup.BusyError):
+            backup.spawn_restore(_settings(), "busy-r", "snap-1", "r1")
+    finally:
+        lock.release()
+
+
+def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeypatch):
     """The manager answers a successful restore-result INLINE by POSTing back to
     /api/controller/start/, which takes this same per-instance lock. Holding the
     lock across the callback made that start a guaranteed 409 instance_busy, so
     every data-path restore landed as ``restored_start_failed`` with the instance
-    left stopped."""
+    left stopped and the data perfectly fine."""
     _patch_common(monkeypatch)
-    monkeypatch.setattr(
-        backup, "_run_restic",
-        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"SAFE"}', ""))
-    monkeypatch.setattr(backup, "_restart", mock.Mock())
-    monkeypatch.setattr(backup, "_forget", mock.Mock())
-    monkeypatch.setattr(backup, "_write_json", mock.Mock())
-    monkeypatch.setattr(backup, "_remove", mock.Mock())
-    seen = _lock_state_at_callback(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-restore")
 
     _drain(monkeypatch, backup.spawn_restore, "rel-restore", "snap-1", "r1")
 
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["restic:backup"] is False, "the safety snapshot ran unlocked"
+    assert seen["restic:restore"] is False, "the --delete overwrite ran unlocked"
+    assert seen["write_json"] is False, (
+        "the durable restore-state file was written after the release -- it must "
+        "exist before anyone can act on the callback, or a crash loses the "
+        "safety-snapshot rollback pointer")
     assert seen["restore-result"] is True, (
         "the restore job still held the per-instance lock while calling back -- "
         "the manager's inline start would be refused 409 instance_busy")
-    # And the job still gave the lock back exactly once.
-    assert backup._instance_lock("rel-restore").acquire(blocking=False)
-    backup._instance_lock("rel-restore").release()
+    assert seen["payloads"]["restore-result"]["status"] == "success"
 
 
-def test_backup_releases_the_lock_before_its_callback(monkeypatch):
-    """Same rule on the backup side: the migration cutover polls the snapshot to
-    terminal -- which this callback is what makes it -- and then acts on the
-    instance immediately."""
+def test_failed_restore_holds_the_lock_through_its_abort_restart(monkeypatch):
+    """A pre-overwrite failure restarts the instance from the finally to restore
+    service. That restart is compose work and must run under the lock; only the
+    callback after it may run free."""
     _patch_common(monkeypatch)
-    monkeypatch.setattr(
-        backup, "_run_restic",
-        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"S","data_added":7}', ""))
-    monkeypatch.setattr(backup, "_restart", mock.Mock())
-    monkeypatch.setattr(backup, "_forget", mock.Mock())
-    monkeypatch.setattr(backup, "_remove", mock.Mock())
-    seen = _lock_state_at_callback(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-abort", safety_fails=True)
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-abort", "snap-1", "r1")
+
+    assert seen["restart"] is False, "the abort restart ran with the lock free"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["status"] == "failed"
+
+
+def test_backup_holds_the_lock_through_its_restart_then_frees_the_callback(monkeypatch):
+    """Same rule on the backup side. The manager does not start an instance off a
+    backup-result, but the migration cutover polls the snapshot to terminal --
+    which this callback is what makes it -- and then acts on the instance."""
+    _patch_common(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-backup")
 
     _drain(monkeypatch, backup.spawn_backup, "rel-backup", "b1")
 
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["restart"] is False, "the cold-path restart ran with the lock free"
     assert seen["backup-result"] is True
-    assert backup._instance_lock("rel-backup").acquire(blocking=False)
-    backup._instance_lock("rel-backup").release()
+    assert seen["payloads"]["backup-result"]["status"] == "success"
+
+
+def test_hot_backup_frees_the_lock_for_its_callback(monkeypatch):
+    """HOT never stops or restarts, so it exercises a different route to the same
+    callback."""
+    _patch_common(monkeypatch, status="running", volumes=("rel-hot_db",))
+    seen = _observe_lock(monkeypatch, "rel-hot")
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-hot", "b1",
+           volume_classes={"db": "data"})
+
+    assert seen["restic:backup"] is False, "the hot snapshot ran unlocked"
+    assert "restart" not in seen, "HOT must never restart"
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["status"] == "success"
+
+
+def test_db_restore_frees_the_lock_for_its_callback(monkeypatch):
+    """The multi-artifact path leaves the instance RUNNING and reports
+    ``already_running``, so the manager skips the start -- but the lock must still
+    be free, because the manager is free to act on the instance either way."""
+    _patch_common(monkeypatch, volumes=("rel-db_files", "rel-db_db"))
+    seen = _observe_lock(monkeypatch, "rel-db")
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: True)
+    monkeypatch.setattr(backup, "_restore_database", mock.Mock())
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "healthy"}},
+                       "Mounts": [{"Type": "volume", "Name": "rel-db_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-db", "snap-1", "r1",
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert seen["restart"] is False, "the final full restart ran unlocked"
+    assert seen["restore-result"] is True
+    payload = seen["payloads"]["restore-result"]
+    assert payload["status"] == "success"
+    assert payload["already_running"] is True
+
+
+def test_the_stop_child_is_tracked_so_renewal_stands_off(monkeypatch):
+    """``compose.stop`` is a fire-and-forget Popen, and on the stop_timeout path
+    it is BY DEFINITION still running. ``compose_inflight`` is what stands the
+    cert-renewal worker off a live compose child, and it was blind to these two
+    stops -- which matters more now the per-instance lock is released before the
+    callback rather than after it."""
+    import app.routers.controller as controller
+
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "trk")
+    tracked = []
+    monkeypatch.setattr(controller, "track_compose_child",
+                        lambda iid, proc: tracked.append(iid))
+
+    _drain(monkeypatch, backup.spawn_restore, "trk", "snap-1", "r1")
+    assert tracked == ["trk"], "the restore's stop child was not tracked"
+
+    tracked.clear()
+    _drain(monkeypatch, backup.spawn_backup, "trk", "b1")
+    assert tracked == ["trk"], "the cold backup's stop child was not tracked"
+
+
+def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
+    """The lock is acquired BEFORE the thread exists. A ``start()`` that raises
+    used to leave it held forever -- every later start / stop / backup / restore
+    on that instance answering 409 instance_busy until the greffer restarted,
+    because the owner that would have released it never existed."""
+    class _DeadThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    # Swap only the module reference backup.py holds, not the real threading
+    # module -- Lock still has to work, and other tests still need real threads.
+    monkeypatch.setattr(
+        backup, "threading",
+        SimpleNamespace(Thread=_DeadThread, Lock=threading.Lock))
+
+    with pytest.raises(RuntimeError):
+        backup.spawn_backup(_settings(), "dead-b", "b1")
+    assert _lock_is_free("dead-b"), "spawn_backup stranded the lock"
+
+    with pytest.raises(RuntimeError):
+        backup.spawn_restore(_settings(), "dead-r", "snap-1", "r1")
+    assert _lock_is_free("dead-r"), "spawn_restore stranded the lock"
 
 
 def test_lock_is_released_once_when_the_job_raises(monkeypatch):

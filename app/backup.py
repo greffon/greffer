@@ -776,7 +776,9 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                 # stopped instance if a crash skips the finally restart).
                 _write_json(_backup_marker(settings, instance_id),
                             {"backup_id": backup_id})
-                compose.stop({"id": instance_id})
+                # Tracked -- see the sibling call in restore_instance.
+                from app.routers.controller import track_compose_child
+                track_compose_child(instance_id, compose.stop({"id": instance_id}))
                 stopped_for_backup = True
                 if not _wait_stopped(
                         instance_id, settings.backup_stop_timeout_seconds):
@@ -828,11 +830,20 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                     payload["repo_bytes"] = repo_bytes
         # Drop the per-instance lock BEFORE the callback -- same rule as the
         # restore path below, and for the same reason: the manager acts on this
-        # instance the moment the callback lands. The migration cutover polls the
-        # snapshot to terminal (which this POST is what makes it) and then stops /
-        # starts the instance; holding the lock through the POST leaves that a
-        # window to be refused 409 instance_busy. Every compose action this job
-        # performs -- including the cold-path restart above -- is done by now.
+        # instance the moment the callback lands, and this POST is what tells it
+        # to. A scheduled backup or an operator start queued behind this one is
+        # served instead of being refused 409 instance_busy for the length of a
+        # manager round trip.
+        #
+        # NOT justified by the migration cutover, whatever symmetry suggests:
+        # ``_run_cutover`` stops the SOURCE before the backstop backup and every
+        # step after it targets G2, so G1 sees no chained op here. The cutover's
+        # real exposure is on the restore side (see ``restore_instance``), where
+        # ``_cold_restore_and_wait`` polls restore-status and then immediately
+        # starts the instance on G2.
+        #
+        # Every compose action this job performs -- including the cold-path
+        # restart above -- is done by now.
         if release_lock is not None:
             release_lock()
         _post_callback(settings, instance_id, "backup-result", payload)
@@ -938,7 +949,14 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                     if k.startswith("db:")}
     try:
         if started_stopped:
-            compose.stop({"id": instance_id})
+            # Tracked like every other compose child: this is a fire-and-forget
+            # Popen, and on the stop_timeout path below it is BY DEFINITION still
+            # running. compose_inflight is what stands the cert-renewal worker off
+            # a live compose child, and it was blind to this one -- which matters
+            # more now the per-instance lock is released before the callback
+            # rather than after.
+            from app.routers.controller import track_compose_child
+            track_compose_child(instance_id, compose.stop({"id": instance_id}))
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return
@@ -1123,13 +1141,24 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
     release = _release_once(lock)
-    threading.Thread(
+    thread = threading.Thread(
         target=_locked_job,
         args=(release, backup_instance, settings, instance_id, backup_id,
               destination, volume_classes),
         kwargs={"release_lock": release},
         daemon=True,
-    ).start()
+    )
+    try:
+        thread.start()
+    except Exception:  # noqa: BLE001 -- a stranded lock wedges the instance
+        # The lock is already ACQUIRED at this point. A thread that never starts
+        # used to leave it held forever, so every later start / stop / backup /
+        # restore on this instance answered 409 instance_busy until the greffer
+        # was restarted. Nothing else ever releases it -- the owner that would
+        # have is the thread that failed to exist.
+        release()
+        logger.exception("backup_thread_start_failed instance=%s", instance_id)
+        raise
 
 
 def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
@@ -1139,13 +1168,24 @@ def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
     release = _release_once(lock)
-    threading.Thread(
+    thread = threading.Thread(
         target=_locked_job,
         args=(release, restore_instance, settings, instance_id, restic_snapshot_id,
               restore_id, destination, manifest, volume_classes),
         kwargs={"release_lock": release},
         daemon=True,
-    ).start()
+    )
+    try:
+        thread.start()
+    except Exception:  # noqa: BLE001 -- a stranded lock wedges the instance
+        # The lock is already ACQUIRED at this point. A thread that never starts
+        # used to leave it held forever, so every later start / stop / backup /
+        # restore on this instance answered 409 instance_busy until the greffer
+        # was restarted. Nothing else ever releases it -- the owner that would
+        # have is the thread that failed to exist.
+        release()
+        logger.exception("restore_thread_start_failed instance=%s", instance_id)
+        raise
 
 
 def _locked_job(release, fn, *args, **kwargs) -> None:
