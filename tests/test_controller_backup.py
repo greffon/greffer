@@ -256,6 +256,13 @@ def _lock_is_free(instance_id: str) -> bool:
     return False
 
 
+# Captured at import, BEFORE any test can patch it. A second _drain inside one
+# test used to capture the first drain's wrapper, nesting them -- so a job that
+# raised landed in the FIRST drain's failures list, which had already returned
+# unchecked, and the re-raise below silently did nothing.
+_REAL_LOCKED_JOB = backup._locked_job
+
+
 def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
     """Run ``spawn`` and block until its background job has finished, re-raising
     anything that job raised.
@@ -267,11 +274,10 @@ def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
     """
     done = threading.Event()
     failures = []
-    real_job = backup._locked_job
 
     def _job(release, fn, *a, **kw):
         try:
-            real_job(release, fn, *a, **kw)
+            _REAL_LOCKED_JOB(release, fn, *a, **kw)
         except BaseException as exc:  # noqa: BLE001 -- re-raised below
             failures.append(exc)
         finally:
@@ -521,6 +527,76 @@ def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
     with pytest.raises(backup.BusyError):
         backup.spawn_restore(_settings(), "dead-r", "snap-1", "r1")
     assert _lock_is_free("dead-r"), "spawn_restore stranded the lock"
+
+
+def test_a_backup_that_times_out_stopping_still_frees_the_lock(monkeypatch):
+    """The release must not be gated on success. A failed backup that kept the
+    lock across its callback holds it for a manager round trip -- sub-second
+    normally, a full 30s when the manager is unreachable, which is exactly when
+    something else wants the instance."""
+    _patch_common(monkeypatch, wait=False)          # the stop never quiesces
+    seen = _observe_lock(monkeypatch, "to-backup")
+
+    _drain(monkeypatch, backup.spawn_backup, "to-backup", "b1")
+
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["error_code"] == "stop_timeout"
+
+
+def test_a_restore_that_times_out_stopping_still_frees_the_lock(monkeypatch):
+    """Same on the restore side -- and here it is worse, because the manager
+    answers the callback inline."""
+    _patch_common(monkeypatch, wait=False)
+    seen = _observe_lock(monkeypatch, "to-restore")
+
+    _drain(monkeypatch, backup.spawn_restore, "to-restore", "snap-1", "r1")
+
+    assert seen["restart"] is False, "the abort restart ran with the lock free"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["error_code"] == "stop_timeout"
+
+
+def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypatch):
+    """The multi-artifact abort branch STARTED the instance for pg_restore, so its
+    teardown is real compose work on a live instance -- and it is the one branch
+    whose stop is genuinely fire-and-forget. The job must hold the lock across it
+    AND wait for it, or a /start/ admitted the instant the lock frees serves the
+    half-restored database this branch exists to take down. It stays
+    inflight-tracked too, unlike its two siblings, because renewal is not covered
+    by the lock once we release."""
+    import app.routers.controller as controller
+
+    _patch_common(monkeypatch, volumes=("dbab_files", "dbab_db"))
+    seen = _observe_lock(monkeypatch, "dbab")
+    tracked = []
+    monkeypatch.setattr(controller, "track_compose_child",
+                        lambda iid, proc: tracked.append(iid))
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: False)  # db_not_ready
+    waits = []
+    monkeypatch.setattr(backup, "_wait_stopped",
+                        lambda iid, timeout: (waits.append(iid), True)[1])
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "starting"}},
+                       "Mounts": [{"Type": "volume", "Name": "dbab_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "dbab", "snap-1", "r1",
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert seen["compose.stop"] is False, "the abort teardown ran unlocked"
+    assert len(waits) == 2, (
+        "the abort teardown was not waited for -- one wait is the entry stop; "
+        "without the second, the lock frees while the teardown is still running "
+        "and a /start/ can serve the half-restored database")
+    assert tracked == ["dbab"], "the abort stop must stay inflight-tracked"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["error_code"] == "db_not_ready"
 
 
 def test_a_late_second_release_cannot_steal_a_later_ops_lock(monkeypatch):

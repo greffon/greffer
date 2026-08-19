@@ -1089,6 +1089,20 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 # an orphan record and a cooldown on the manager.
                 from app.routers.controller import track_compose_child
                 track_compose_child(instance_id, compose.stop({"id": instance_id}))
+                # And WAIT for it, still under the lock. compose.stop is
+                # fire-and-forget, and track_compose_child only stands off cert
+                # renewal -- /start/ and /decommission/ are gated by this lock
+                # alone. Releasing while the teardown is still running would let a
+                # start admitted an instant later serve the half-restored database
+                # this branch exists to take down. Bounded by the same timeout the
+                # entry stop uses; on a timeout we log and release anyway, because
+                # the alternative is holding the lock indefinitely.
+                if not _wait_stopped(instance_id,
+                                     settings.backup_stop_timeout_seconds):
+                    logger.warning(
+                        "restore_db_abort_stop_timeout instance=%s -- teardown "
+                        "outlasted %ss; releasing the lock with it still running",
+                        instance_id, settings.backup_stop_timeout_seconds)
             except Exception:  # noqa: BLE001
                 logger.exception("restore_db_abort_stop_failed instance=%s", instance_id)
         # Durable restore-state, kept until the manager acks (boot reconciliation
@@ -1166,9 +1180,12 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
         release()
         logger.exception("backup_thread_start_failed instance=%s", instance_id)
         # BusyError -> 409, not the 500 a re-raise would give. The job provably
-        # never began, so a retry is safe -- and 409 is the only class the
-        # manager rolls its ledger row back on (400 <= status < 500). A 500 left
-        # the RestoreRun RUNNING forever, and there is no restore reaper.
+        # never began, so a retry is safe -- and 409 is the only class the manager
+        # rolls its ledger row back on (400 <= status < 500), which deletes the
+        # BackupSnapshot immediately. A 500 instead leaves it RUNNING until
+        # reap_stuck_backups gets to it (2h by default), and _has_inflight_op bars
+        # every op on the instance for that whole window. The restore side is
+        # worse -- see spawn_restore.
         raise BusyError(instance_id) from exc
 
 
