@@ -60,7 +60,7 @@ def _patch_common(monkeypatch, status="running", wait=True, volumes=("i_db",)):
     monkeypatch.setattr(backup.compose, "get_status",
                         lambda _id: {"status": status})
     monkeypatch.setattr(backup.compose, "stop", mock.Mock())
-    monkeypatch.setattr(backup, "_wait_stopped", lambda *a: wait)
+    monkeypatch.setattr(backup, "_wait_stopped", lambda *a, **k: wait)
     monkeypatch.setattr(backup, "_data_volumes", lambda _id: list(volumes))
     # ensure_repo (init/unlock) is separately tested; no-op it here so it does
     # not pollute the mocked _run_restic call sequences.
@@ -346,9 +346,10 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False,
         return 4242
 
     if wait_stopped is not None:
-        def _wait(iid, timeout):
+        def _wait(iid, timeout, **kw):
             _mark("wait_stopped")
             seen.setdefault("wait_timeouts", []).append(timeout)
+            seen.setdefault("wait_kwargs", []).append(kw)
             return wait_stopped
 
         monkeypatch.setattr(backup, "_wait_stopped", _wait)
@@ -620,6 +621,12 @@ def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypat
         "the waits must read the CONFIGURED stop timeout -- 17 here precisely so "
         "a hardcoded literal or a 0 cannot pass; "
         f"got {seen['wait_timeouts']}")
+    # The entry stop stays strict; only the teardown accepts a gone instance,
+    # because there containers-gone IS the teardown complete and waiting the full
+    # timeout would hold the lock and 409 every control op for nothing.
+    assert seen["wait_kwargs"] == [{}, {"missing_is_stopped": True}], (
+        "the abort teardown must wait with missing_is_stopped, and the entry stop "
+        f"must not; got {seen['wait_kwargs']}")
     assert tracked == ["dbab"], "the abort stop must stay inflight-tracked"
     assert seen["restore-result"] is True
     assert seen["payloads"]["restore-result"]["error_code"] == "db_not_ready"
@@ -664,6 +671,32 @@ class _RecordingLock:
 
     def locked(self):
         return self._inner.locked()
+
+
+def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatch):
+    """`get_status` reports `unknow` for BOTH an empty container set and a mixed
+    one, so the abort teardown cannot just accept `unknow`.
+
+    Empty must be accepted: containers gone IS the teardown complete, and waiting
+    the full stop timeout there holds the per-instance lock and 409s every control
+    op to wait for something that already happened. Mixed must NOT be: something
+    is still running, which is the whole reason this wait exists.
+    """
+    states = {}
+    monkeypatch.setattr(backup.compose, "get_status", lambda _id: states)
+
+    states.update(status="unknow", containers=[])
+    assert backup._wait_stopped("i", 0, missing_is_stopped=True) is True
+    assert backup._wait_stopped("i", 0) is False, "the entry stops stay strict"
+
+    states.update(status="unknow", containers=[{"status": "running"},
+                                               {"status": "stopped"}])
+    assert backup._wait_stopped("i", 0, missing_is_stopped=True) is False, (
+        "a MIXED container set was accepted as quiesced -- something is still "
+        "running and the teardown is not done")
+
+    states.update(status="stopped", containers=[{"status": "stopped"}])
+    assert backup._wait_stopped("i", 0) is True
 
 
 def test_the_spawn_gate_never_waits_for_the_lock(monkeypatch):

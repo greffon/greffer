@@ -634,15 +634,35 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
             "bytes_added": total_bytes, "manifest": manifest}
 
 
-def _wait_stopped(instance_id: str, timeout: int) -> bool:
+def _wait_stopped(instance_id: str, timeout: int, *,
+                  missing_is_stopped: bool = False) -> bool:
     """Poll until all the instance's containers are stopped (``compose.stop`` is
-    fire-and-forget). Returns True if quiesced within the deadline."""
+    fire-and-forget). Returns True if quiesced within the deadline.
+
+    ``missing_is_stopped`` additionally accepts an instance with NO containers at
+    all. Only the DB-abort teardown passes it: there, containers gone IS the
+    teardown complete, and burning the whole timeout would hold the per-instance
+    lock -- 409ing every control op -- to wait for something that already
+    happened. The entry stops keep the strict check.
+
+    Note ``get_status`` conflates two states under ``unknow``: an EMPTY container
+    set and a MIXED one (some running, some not). Only the empty one is
+    quiescent; a mix still has something running, which is precisely what this
+    wait exists to catch. So the container list is checked, not just the status.
+    """
+    def _quiesced() -> bool:
+        st = compose.get_status(instance_id)
+        if st.get("status") == "stopped":
+            return True
+        return (missing_is_stopped and st.get("status") == "unknow"
+                and not st.get("containers"))
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if compose.get_status(instance_id).get("status") == "stopped":
+        if _quiesced():
             return True
         time.sleep(1.0)
-    return compose.get_status(instance_id).get("status") == "stopped"
+    return _quiesced()
 
 
 def _restart(settings, instance_id: str) -> None:
@@ -1099,7 +1119,8 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 # entry stop uses; on a timeout we log and release anyway, because
                 # the alternative is holding the lock indefinitely.
                 if not _wait_stopped(instance_id,
-                                     settings.backup_stop_timeout_seconds):
+                                     settings.backup_stop_timeout_seconds,
+                                     missing_is_stopped=True):
                     logger.warning(
                         "restore_db_abort_stop_timeout instance=%s -- teardown "
                         "outlasted %ss; releasing the lock with it still running",
