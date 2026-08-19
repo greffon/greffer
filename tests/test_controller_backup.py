@@ -453,12 +453,21 @@ def test_db_restore_frees_the_lock_for_its_callback(monkeypatch):
     assert payload["already_running"] is True
 
 
-def test_the_stop_child_is_tracked_so_renewal_stands_off(monkeypatch):
-    """``compose.stop`` is a fire-and-forget Popen, and on the stop_timeout path
-    it is BY DEFINITION still running. ``compose_inflight`` is what stands the
-    cert-renewal worker off a live compose child, and it was blind to these two
-    stops -- which matters more now the per-instance lock is released before the
-    callback rather than after it."""
+def test_the_backup_and_restore_stops_are_not_inflight_tracked(monkeypatch):
+    """Deliberate, and the reason is easy to lose.
+
+    ``compose_inflight``'s only reader is the cert-renewal worker, and renewal is
+    ALREADY stood off through the whole of these jobs by the per-instance lock
+    (the tests above assert it is held at ``compose.stop``). So tracking buys
+    nothing here -- and it costs: ``track_compose_child`` waits on the child with
+    an unbounded ``proc.wait()``, so a hung docker daemon pins the counter
+    forever, permanently skipping renewal for this instance (cert expiry -> 502)
+    and collapsing the node's tick to the 120s deferred cadence. Backups run on a
+    manager cadence, so that would be a per-cycle exposure.
+
+    The DB-abort branch DOES track its stop, and should: it releases the lock
+    immediately afterwards, so the lock is not covering that child.
+    """
     import app.routers.controller as controller
 
     _patch_common(monkeypatch)
@@ -468,11 +477,10 @@ def test_the_stop_child_is_tracked_so_renewal_stands_off(monkeypatch):
                         lambda iid, proc: tracked.append(iid))
 
     _drain(monkeypatch, backup.spawn_restore, "trk", "snap-1", "r1")
-    assert tracked == ["trk"], "the restore's stop child was not tracked"
+    assert tracked == [], "the restore's stop child must not be inflight-tracked"
 
-    tracked.clear()
     _drain(monkeypatch, backup.spawn_backup, "trk", "b1")
-    assert tracked == ["trk"], "the cold backup's stop child was not tracked"
+    assert tracked == [], "the cold backup's stop child must not be inflight-tracked"
 
 
 def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
@@ -493,11 +501,15 @@ def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
         backup, "threading",
         SimpleNamespace(Thread=_DeadThread, Lock=threading.Lock))
 
-    with pytest.raises(RuntimeError):
+    # BusyError (-> 409), not the raw error (-> 500). The job provably never
+    # began, so a retry is safe, and 409 is the only class the manager rolls its
+    # ledger row back on -- a 500 left the RestoreRun RUNNING forever, and there
+    # is no restore reaper.
+    with pytest.raises(backup.BusyError):
         backup.spawn_backup(_settings(), "dead-b", "b1")
     assert _lock_is_free("dead-b"), "spawn_backup stranded the lock"
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(backup.BusyError):
         backup.spawn_restore(_settings(), "dead-r", "snap-1", "r1")
     assert _lock_is_free("dead-r"), "spawn_restore stranded the lock"
 

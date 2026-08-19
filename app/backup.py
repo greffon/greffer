@@ -776,9 +776,8 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                 # stopped instance if a crash skips the finally restart).
                 _write_json(_backup_marker(settings, instance_id),
                             {"backup_id": backup_id})
-                # Tracked -- see the sibling call in restore_instance.
-                from app.routers.controller import track_compose_child
-                track_compose_child(instance_id, compose.stop({"id": instance_id}))
+                # NOT tracked -- see the sibling call in restore_instance.
+                compose.stop({"id": instance_id})
                 stopped_for_backup = True
                 if not _wait_stopped(
                         instance_id, settings.backup_stop_timeout_seconds):
@@ -949,14 +948,19 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                     if k.startswith("db:")}
     try:
         if started_stopped:
-            # Tracked like every other compose child: this is a fire-and-forget
-            # Popen, and on the stop_timeout path below it is BY DEFINITION still
-            # running. compose_inflight is what stands the cert-renewal worker off
-            # a live compose child, and it was blind to this one -- which matters
-            # more now the per-instance lock is released before the callback
-            # rather than after.
-            from app.routers.controller import track_compose_child
-            track_compose_child(instance_id, compose.stop({"id": instance_id}))
+            # Deliberately NOT track_compose_child'd, unlike /stop/ and the
+            # DB-abort branch below. The only reader of compose_inflight is the
+            # cert-renewal worker, and it is ALREADY stood off here by the
+            # per-instance lock, which this job holds across the whole stop (see
+            # tests asserting the lock is held at compose.stop). Tracking would
+            # add nothing and cost something real: track_compose_child waits on
+            # the child with an unbounded proc.wait(), so a hung docker daemon
+            # would pin the inflight counter forever -- permanently skipping
+            # renewal for this instance (cert expiry, 502: the exact incident the
+            # renewal worker exists to prevent) and collapsing the node's whole
+            # tick to the 120s deferred-retry cadence. Backups run on a manager
+            # cadence, so that would be a per-cycle exposure, not a rare one.
+            compose.stop({"id": instance_id})
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
                 return
@@ -1150,7 +1154,7 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
     )
     try:
         thread.start()
-    except Exception:  # noqa: BLE001 -- a stranded lock wedges the instance
+    except Exception as exc:  # noqa: BLE001 -- a stranded lock wedges the instance
         # The lock is already ACQUIRED at this point. A thread that never starts
         # used to leave it held forever, so every later start / stop / backup /
         # restore on this instance answered 409 instance_busy until the greffer
@@ -1158,7 +1162,11 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
         # have is the thread that failed to exist.
         release()
         logger.exception("backup_thread_start_failed instance=%s", instance_id)
-        raise
+        # BusyError -> 409, not the 500 a re-raise would give. The job provably
+        # never began, so a retry is safe -- and 409 is the only class the
+        # manager rolls its ledger row back on (400 <= status < 500). A 500 left
+        # the RestoreRun RUNNING forever, and there is no restore reaper.
+        raise BusyError(instance_id) from exc
 
 
 def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
@@ -1177,7 +1185,7 @@ def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
     )
     try:
         thread.start()
-    except Exception:  # noqa: BLE001 -- a stranded lock wedges the instance
+    except Exception as exc:  # noqa: BLE001 -- a stranded lock wedges the instance
         # The lock is already ACQUIRED at this point. A thread that never starts
         # used to leave it held forever, so every later start / stop / backup /
         # restore on this instance answered 409 instance_busy until the greffer
@@ -1185,7 +1193,11 @@ def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
         # have is the thread that failed to exist.
         release()
         logger.exception("restore_thread_start_failed instance=%s", instance_id)
-        raise
+        # BusyError -> 409, not the 500 a re-raise would give. The job provably
+        # never began, so a retry is safe -- and 409 is the only class the
+        # manager rolls its ledger row back on (400 <= status < 500). A 500 left
+        # the RestoreRun RUNNING forever, and there is no restore reaper.
+        raise BusyError(instance_id) from exc
 
 
 def _locked_job(release, fn, *args, **kwargs) -> None:
