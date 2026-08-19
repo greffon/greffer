@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -244,6 +245,41 @@ def test_restore_overwrite_failure_keeps_safety_pointer(monkeypatch):
 
 # ---- locking ---------------------------------------------------------------
 
+def _drain(monkeypatch, spawn, instance_id, *args, **kwargs):
+    """Run ``spawn`` and block until its background job has finished, so the
+    assertions below see the job's final lock state rather than a race."""
+    done = threading.Event()
+    real_job = backup._locked_job
+
+    def _job(release, fn, *a, **kw):
+        try:
+            real_job(release, fn, *a, **kw)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(backup, "_locked_job", _job)
+    spawn(_settings(), instance_id, *args, **kwargs)
+    assert done.wait(20), "background job hung"
+
+
+def _lock_state_at_callback(monkeypatch):
+    """Record whether the per-instance lock is free while the result callback is
+    in flight -- i.e. whether the manager's inline follow-up call would be served
+    or refused 409 instance_busy."""
+    seen = {}
+
+    def _cb(settings, iid, action, payload):
+        lock = backup._instance_lock(iid)
+        free = lock.acquire(blocking=False)
+        if free:
+            lock.release()
+        seen[action] = free
+        return True
+
+    monkeypatch.setattr(backup, "_post_callback", _cb)
+    return seen
+
+
 def test_spawn_backup_busy_raises(monkeypatch):
     lock = backup._instance_lock("busy-i")
     lock.acquire()
@@ -252,6 +288,75 @@ def test_spawn_backup_busy_raises(monkeypatch):
             backup.spawn_backup(_settings(), "busy-i", "b1")
     finally:
         lock.release()
+
+
+def test_restore_releases_the_lock_before_its_callback(monkeypatch):
+    """The manager answers a successful restore-result INLINE by POSTing back to
+    /api/controller/start/, which takes this same per-instance lock. Holding the
+    lock across the callback made that start a guaranteed 409 instance_busy, so
+    every data-path restore landed as ``restored_start_failed`` with the instance
+    left stopped."""
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"SAFE"}', ""))
+    monkeypatch.setattr(backup, "_restart", mock.Mock())
+    monkeypatch.setattr(backup, "_forget", mock.Mock())
+    monkeypatch.setattr(backup, "_write_json", mock.Mock())
+    monkeypatch.setattr(backup, "_remove", mock.Mock())
+    seen = _lock_state_at_callback(monkeypatch)
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-restore", "snap-1", "r1")
+
+    assert seen["restore-result"] is True, (
+        "the restore job still held the per-instance lock while calling back -- "
+        "the manager's inline start would be refused 409 instance_busy")
+    # And the job still gave the lock back exactly once.
+    assert backup._instance_lock("rel-restore").acquire(blocking=False)
+    backup._instance_lock("rel-restore").release()
+
+
+def test_backup_releases_the_lock_before_its_callback(monkeypatch):
+    """Same rule on the backup side: the migration cutover polls the snapshot to
+    terminal -- which this callback is what makes it -- and then acts on the
+    instance immediately."""
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(
+        backup, "_run_restic",
+        lambda *a, **k: (0, '{"message_type":"summary","snapshot_id":"S","data_added":7}', ""))
+    monkeypatch.setattr(backup, "_restart", mock.Mock())
+    monkeypatch.setattr(backup, "_forget", mock.Mock())
+    monkeypatch.setattr(backup, "_remove", mock.Mock())
+    seen = _lock_state_at_callback(monkeypatch)
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-backup", "b1")
+
+    assert seen["backup-result"] is True
+    assert backup._instance_lock("rel-backup").acquire(blocking=False)
+    backup._instance_lock("rel-backup").release()
+
+
+def test_lock_is_released_once_when_the_job_raises(monkeypatch):
+    """The early release is one-shot: a job that drops the lock and THEN raises
+    must not have ``_locked_job`` release it a second time (RuntimeError on an
+    unlocked lock), and a job that never reaches the callback must still get the
+    lock released by the wrapper."""
+    lock = backup._instance_lock("once-i")
+    assert lock.acquire(blocking=False)
+    release = backup._release_once(lock)
+    release()
+    release()                                   # no-op, not RuntimeError
+    assert lock.acquire(blocking=False)         # genuinely free, released once
+    lock.release()
+
+    # A job that raises before any early release: the wrapper still frees it.
+    lock2 = backup._instance_lock("once-j")
+    assert lock2.acquire(blocking=False)
+    with pytest.raises(ValueError):
+        backup._locked_job(backup._release_once(lock2),
+                           mock.Mock(side_effect=ValueError("boom")))
+    assert lock2.acquire(blocking=False)
+    lock2.release()
 
 
 # ---- callback ack + crash recovery ----------------------------------------

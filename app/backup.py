@@ -66,6 +66,29 @@ def _instance_lock(instance_id: str) -> threading.Lock:
         return lock
 
 
+def _release_once(lock: threading.Lock):
+    """A one-shot release for ``lock``, callable from two places safely.
+
+    The backup/restore jobs drop the per-instance lock EARLY -- just before they
+    post their result callback to the manager (see the note in
+    ``restore_instance``) -- while ``_locked_job`` still has to release it for
+    every path that never reaches that point (a raise, a job that returns first).
+    Both call this. The second call is a no-op instead of the RuntimeError a
+    plain ``lock.release()`` raises on an already-unlocked lock.
+    """
+    guard = threading.Lock()
+    held = True
+
+    def release() -> None:
+        nonlocal held
+        with guard:
+            if held:
+                held = False
+                lock.release()
+
+    return release
+
+
 # A single process-wide lock serializing repo-WIDE ops (prune / check) so two
 # triggers never spawn redundant sidecars. restic's own exclusive repo lock is the
 # CROSS-PROCESS guarantee against a running backup sidecar; this only dedupes ours.
@@ -723,7 +746,8 @@ def reconcile_on_boot(settings) -> None:
 
 
 def backup_instance(settings, instance_id: str, backup_id: str,
-                    destination=None, volume_classes=None) -> None:
+                    destination=None, volume_classes=None,
+                    release_lock=None) -> None:
     """Backup background job. COLD (stop -> snapshot -> start) by default; HOT (no
     stop, restic-live the data-class volumes) when ``volume_classes`` is given
     (Phase 3). A cold backup that stopped a running instance always restarts it
@@ -802,6 +826,15 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                 repo_bytes = _repo_stats(settings)
                 if repo_bytes is not None:
                     payload["repo_bytes"] = repo_bytes
+        # Drop the per-instance lock BEFORE the callback -- same rule as the
+        # restore path below, and for the same reason: the manager acts on this
+        # instance the moment the callback lands. The migration cutover polls the
+        # snapshot to terminal (which this POST is what makes it) and then stops /
+        # starts the instance; holding the lock through the POST leaves that a
+        # window to be refused 409 instance_busy. Every compose action this job
+        # performs -- including the cold-path restart above -- is done by now.
+        if release_lock is not None:
+            release_lock()
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
@@ -884,7 +917,8 @@ def _start_services(settings, instance_id: str, services: list[str]) -> None:
 
 def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                      restore_id: str, destination=None,
-                     manifest=None, volume_classes=None) -> None:
+                     manifest=None, volume_classes=None,
+                     release_lock=None) -> None:
     """Restore-in-place background job. DATA-only (cold / single-snapshot): stop ->
     wait -> SAFETY snapshot -> restore volumes -> leave stopped -> callback (the
     manager runs the start). MULTI-ARTIFACT (manifest carries ``db:<service>``
@@ -1036,6 +1070,22 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
         # re-posts a lost callback so an overwritten instance is never stranded).
         state_path = _restore_state_path(settings, instance_id, restore_id)
         _write_json(state_path, payload)
+        # Drop the per-instance lock BEFORE the callback, not when this job
+        # returns. The manager answers a SUCCESSFUL restore-result by running the
+        # normal start flow INLINE, inside the callback request: it mints a cert
+        # and POSTs back to /api/controller/start/, which takes THIS lock
+        # non-blocking. Holding it across the callback made that start a
+        # guaranteed 409 instance_busy -- so the data-path restore finished as
+        # ``restored_start_failed`` with the instance left stopped every single
+        # time, even though the data was perfectly restored.
+        #
+        # Same rule ``_serialize_instance_op`` already documents for start/stop:
+        # the manager chains control ops immediately, so this lock must not
+        # outlive the compose work it protects. It doesn't here -- the abort
+        # branches above are the last thing this job touches compose for, and the
+        # durable state file is already written.
+        if release_lock is not None:
+            release_lock()
         if _post_callback(settings, instance_id, "restore-result", payload):
             _remove(state_path)
 
@@ -1072,10 +1122,12 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
+    release = _release_once(lock)
     threading.Thread(
         target=_locked_job,
-        args=(lock, backup_instance, settings, instance_id, backup_id,
+        args=(release, backup_instance, settings, instance_id, backup_id,
               destination, volume_classes),
+        kwargs={"release_lock": release},
         daemon=True,
     ).start()
 
@@ -1086,19 +1138,25 @@ def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
+    release = _release_once(lock)
     threading.Thread(
         target=_locked_job,
-        args=(lock, restore_instance, settings, instance_id, restic_snapshot_id,
+        args=(release, restore_instance, settings, instance_id, restic_snapshot_id,
               restore_id, destination, manifest, volume_classes),
+        kwargs={"release_lock": release},
         daemon=True,
     ).start()
 
 
-def _locked_job(lock: threading.Lock, fn, *args) -> None:
+def _locked_job(release, fn, *args, **kwargs) -> None:
+    """Run the job, then release the per-instance lock. ``release`` is the
+    one-shot from ``_release_once``, not ``lock.release``: the job itself drops
+    the lock early on the paths that end in a manager callback, and this finally
+    must then be a no-op rather than a double release."""
     try:
-        fn(*args)
+        fn(*args, **kwargs)
     finally:
-        lock.release()
+        release()
 
 
 def _repo_op_error_code(stderr: str) -> str:
