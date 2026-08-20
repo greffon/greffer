@@ -199,6 +199,35 @@ async def test_the_serializer_never_waits_for_the_lock(client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
+async def test_a_refused_control_op_does_not_consume_the_handoff(
+        client: AsyncClient) -> None:
+    """Only an op that actually RAN may end the standoff.
+
+    The reservation is cleared after the acquire succeeds, deliberately. Clearing
+    it before would let an op that was refused 409 -- and therefore did nothing --
+    consume a reservation the manager still needs, handing the lock straight to
+    the next renewal pass.
+    """
+    from app import backup
+
+    lock = backup._instance_lock(_ID)
+    assert lock.acquire(blocking=False)          # something else holds it
+    backup.reserve_handoff(_ID)
+    try:
+        with patch("app.routers.controller.compose"), patch(
+            "app.routers.controller.volume"
+        ), patch("app.routers.controller.shutil"):
+            r = await client.post(
+                "/api/controller/decommission/", json={"id": _ID}, headers=_AUTH)
+        assert r.status_code == 409
+        assert backup.handoff_pending(_ID) is True, (
+            "a refused op consumed the reservation without doing anything")
+    finally:
+        lock.release()
+        backup.clear_handoff(_ID)
+
+
+@pytest.mark.asyncio
 async def test_decommission_409_when_instance_busy(client: AsyncClient) -> None:
     """A start/stop/backup holding the per-instance lock -> 409 instance_busy
     (the decommission must not race a concurrent op on the same instance)."""

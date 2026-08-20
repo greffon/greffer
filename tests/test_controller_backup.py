@@ -713,6 +713,45 @@ def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatc
     assert backup._wait_stopped("i", 0) is True
 
 
+def test_the_acquire_path_itself_expires_a_stale_reservation(monkeypatch):
+    """Driven through ``acquire_unless_handoff``, the function production ACTUALLY
+    calls -- not through the public predicate, which production never calls.
+
+    That split is how a severe hole hid: every window and expiry assertion drove
+    ``handoff_pending``, so deleting the acquire path's own deadline check left
+    the entire suite green while one lost manager callback muted renewal for that
+    instance forever -- cert expiry, 502, the incident the renewal worker exists
+    to prevent. The two now share one implementation, and this drives the real one.
+    """
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+
+    backup.reserve_handoff("acq")
+    got, reason = backup.acquire_unless_handoff("acq")
+    assert got is None and reason == "handoff"
+
+    clock.now += 65.0                      # a slow but legal manager
+    got, reason = backup.acquire_unless_handoff("acq")
+    assert got is None and reason == "handoff", "expired before the manager could answer"
+
+    clock.now += 300.0                     # long past any plausible handoff
+    got, reason = backup.acquire_unless_handoff("acq")
+    try:
+        assert got is not None and reason is None, (
+            "a stale reservation still blocks the acquire -- renewal is muted for "
+            "this instance until the process restarts")
+    finally:
+        if got is not None:
+            got.release()
+    assert "acq" not in backup._handoff, "the expired entry was not dropped"
+
+
 def test_the_handoff_check_and_the_acquire_are_one_atomic_step(monkeypatch):
     """Check-then-acquire is a TOCTOU, so the acquire must happen while the
     handoff guard is HELD.

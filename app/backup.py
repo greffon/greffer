@@ -78,15 +78,25 @@ def _instance_lock(instance_id: str) -> threading.Lock:
 _handoff: dict[str, float] = {}
 _handoff_guard = threading.Lock()
 
-# Upper bound on "the manager is answering our callback": one round trip plus a
-# CA mint. Sized ABOVE the manager's own limits rather than equal to them -- its
-# restore-result handler runs the whole mint-and-start inline under a gunicorn
-# worker timeout of 60s (backend/gunicorn.conf.py), so a 60s window would have
-# exactly zero headroom against a handler that is allowed to take all 60.
+# How long "the manager is answering our callback" is allowed to take: one round
+# trip plus a CA mint, normally about a second.
 #
-# Erring long is close to free and erring short is not: renewal runs on a 6h
-# cadence, so an over-long window costs one instance one skipped pass, while an
-# under-short one silently reopens the race this whole mechanism exists to close.
+# It is a heuristic, not a derived bound, and it is worth being honest about why.
+# There is no ceiling to derive it from: the manager runs gunicorn with
+# worker_class 'gthread', where `timeout` is worker LIVENESS, not a request
+# deadline -- a handler blocked for minutes is never killed -- and its
+# restore-result handler runs the whole mint-and-start inline behind its own HTTP
+# timeouts plus two unbounded select_for_update waits.
+#
+# So this cannot guarantee the handoff; it covers the normal one with a wide
+# margin. If the manager exceeds it the reservation simply expires and we are back
+# to the pre-reservation behaviour -- a rare lost race, not a regression.
+#
+# Erring long is cheap and erring short is not: against a 6h renewal cadence and a
+# 30-day certificate, an over-long window costs one instance one skipped pass,
+# while an under-short one silently reopens the race this exists to close. (On a
+# node tuned to the 60s floor for greffer_cert_renewal_interval it may cost more
+# than one pass -- still bounded, and still far short of an expiry.)
 _HANDOFF_WINDOW_SECONDS = 90
 
 
@@ -96,16 +106,29 @@ def reserve_handoff(instance_id: str) -> None:
         _handoff[instance_id] = time.monotonic() + _HANDOFF_WINDOW_SECONDS
 
 
+def _pending_locked(instance_id: str) -> bool:
+    """Expiry, in ONE place. Caller must hold ``_handoff_guard``.
+
+    Both the public predicate and ``acquire_unless_handoff`` route through here
+    deliberately. They were separate implementations, and the acquire path -- the
+    only one production actually calls -- had no test of its own: deleting its
+    deadline check left the whole suite green while a single lost manager callback
+    muted renewal for that instance forever, which is precisely the failure the
+    deadline exists to prevent.
+    """
+    deadline = _handoff.get(instance_id)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        del _handoff[instance_id]       # self-expiring; never needs a sweeper
+        return False
+    return True
+
+
 def handoff_pending(instance_id: str) -> bool:
     """True while a manager-chained control op is still expected."""
     with _handoff_guard:
-        deadline = _handoff.get(instance_id)
-        if deadline is None:
-            return False
-        if time.monotonic() >= deadline:
-            del _handoff[instance_id]   # self-expiring; never needs a sweeper
-            return False
-        return True
+        return _pending_locked(instance_id)
 
 
 def acquire_unless_handoff(instance_id: str):
@@ -132,11 +155,8 @@ def acquire_unless_handoff(instance_id: str):
     """
     lock = _instance_lock(instance_id)
     with _handoff_guard:
-        deadline = _handoff.get(instance_id)
-        if deadline is not None:
-            if time.monotonic() < deadline:
-                return None, 'handoff'
-            del _handoff[instance_id]
+        if _pending_locked(instance_id):
+            return None, 'handoff'
         if lock.acquire(blocking=False):
             return lock, None
         return None, 'instance_busy'

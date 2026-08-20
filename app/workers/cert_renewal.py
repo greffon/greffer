@@ -839,12 +839,16 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
     # non-blocking, so taking it here even momentarily 409s the start and lands a
     # good restore as restored_start_failed.
     #
-    # Deliberately NOT in _TRANSIENT_SKIPS. Not because the start mints a
-    # certificate for us -- the manager mints on every start but only RECORDS it
-    # after the greffer returns 200, so a start we 409 delivers nothing and
-    # nothing retries it (there is no restore reaper). The reason is simpler: the
-    # instance is stopped through this whole window, so the pass would skip it
-    # anyway, and one window against a 6h cadence cannot expire a certificate.
+    # Deliberately NOT in _TRANSIENT_SKIPS, and the reason is narrower than it
+    # first looks. NOT "the start mints a certificate for us": the manager mints on
+    # every start but only RECORDS it after the greffer returns 200, so a start we
+    # 409 delivers nothing and nothing retries it (there is no restore reaper).
+    # NOT "the pass would skip this instance anyway" either -- reaching here at all
+    # means the pass's status map said `running`, i.e. it did NOT skip it.
+    #
+    # The reason is just the arithmetic: one 90s window against a 6h renewal
+    # cadence and a 30-day certificate cannot expire anything. A deferral would
+    # mean "come back soon, there is work here", and there is not.
     lock, refusal = acquire_unless_handoff(greffon_id)
     if lock is None:
         diag('cert_renewal_skipped', instance=greffon_id, reason=refusal)
