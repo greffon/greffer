@@ -699,6 +699,68 @@ def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatc
     assert backup._wait_stopped("i", 0) is True
 
 
+def test_the_wait_loop_polls_until_quiesced_and_never_short_circuits(monkeypatch):
+    """The polling LOOP, not just the degenerate timeout=0 path.
+
+    Production always calls with the configured timeout (default 120), so the loop
+    is the only path that runs there -- yet the cases above all pass 0, which
+    skips it entirely. Three regressions live only in the loop: a strict loop with
+    a lenient tail makes a gone instance wait the FULL timeout (the delay this was
+    changed to remove, holding the lock and 409ing every control op); a loop that
+    accepts any `unknow` frees the lock over a RUNNING container (the trap the
+    empty-vs-mixed check exists for); and a loop that returns True unconditionally
+    makes the wait a no-op.
+
+    A fake clock keeps it deterministic and instant -- patching only sleep would
+    busy-spin for the real timeout.
+    """
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+    states = {}
+    monkeypatch.setattr(backup.compose, "get_status", lambda _id: states)
+
+    # A gone instance is accepted on the FIRST look, never slept on.
+    states.update(status="unknow", containers=[])
+    assert backup._wait_stopped("i", 120, missing_is_stopped=True) is True
+    assert clock.sleeps == [], (
+        "a gone instance was waited on -- that is the full-stop-timeout delay it "
+        "is accepted to avoid, holding the lock and 409ing every control op")
+
+    # A MIXED set is never accepted, however long we poll.
+    states.update(status="unknow",
+                  containers=[{"status": "running"}, {"status": "stopped"}])
+    assert backup._wait_stopped("i", 5, missing_is_stopped=True) is False, (
+        "a MIXED set was accepted mid-loop -- a container is still running")
+    assert clock.sleeps, "the loop never ran"
+
+    # And it really polls: quiesces on the third look, not the first or the last.
+    clock.sleeps.clear()
+    looks = []
+
+    def _late(_id):
+        looks.append(1)
+        if len(looks) < 3:
+            return {"status": "running", "containers": [{"status": "running"}]}
+        return {"status": "stopped", "containers": [{"status": "stopped"}]}
+
+    monkeypatch.setattr(backup.compose, "get_status", _late)
+    assert backup._wait_stopped("i", 120) is True
+    assert clock.sleeps == [1.0, 1.0], (
+        f"the loop did not poll until quiesced; slept {clock.sleeps}")
+
+
 def test_the_spawn_gate_never_waits_for_the_lock(monkeypatch):
     """The acquire must stay NON-BLOCKING, and nothing else pins that.
 
