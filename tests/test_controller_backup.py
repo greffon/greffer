@@ -341,6 +341,12 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False,
     def _forget(*_a, **_k):
         _mark("forget")
 
+    real_reserve = backup.reserve_handoff
+
+    def _reserve(iid):
+        _mark("reserve_handoff")
+        real_reserve(iid)
+
     def _repo_stats(*_a, **_k):
         _mark("repo_stats")
         return 4242
@@ -354,6 +360,7 @@ def _observe_lock(monkeypatch, instance_id, *, safety_fails=False,
 
         monkeypatch.setattr(backup, "_wait_stopped", _wait)
     monkeypatch.setattr(backup, "_repo_stats", _repo_stats)
+    monkeypatch.setattr(backup, "reserve_handoff", _reserve)
 
     monkeypatch.setattr(backup, "_forget", _forget)
     monkeypatch.setattr(backup, "_write_json", _write_json)
@@ -408,6 +415,13 @@ def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeyp
         "the restore job still held the per-instance lock while calling back -- "
         "the manager's inline start would be refused 409 instance_busy")
     assert seen["payloads"]["restore-result"]["status"] == "success"
+    # The handoff is claimed while the lock is STILL HELD. Reserving after the
+    # release would race the very gap it exists to close.
+    assert seen["reserve_handoff"] is False, (
+        "the handoff was reserved after the lock was already free -- a renewal "
+        "tick could have taken it in between")
+    assert backup.handoff_pending("rel-restore"), "no handoff was reserved"
+    backup.clear_handoff("rel-restore")
 
 
 def test_failed_restore_holds_the_lock_through_its_abort_restart(monkeypatch):
@@ -697,6 +711,82 @@ def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatc
 
     states.update(status="stopped", containers=[{"status": "stopped"}])
     assert backup._wait_stopped("i", 0) is True
+
+
+def test_the_handoff_reservation_expires_and_can_be_consumed(monkeypatch):
+    """A monotonic deadline, not a flag: nothing can pin it.
+
+    That is the whole reason for this shape. `track_compose_child` was tried in
+    this role and reverted, because its unbounded `proc.wait()` let a hung docker
+    daemon hold the mark forever -- permanently muting renewal for an instance
+    (cert expiry, 502). The worst a lost manager can do here is delay one
+    instance's renewal by one window.
+    """
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+
+    assert backup.handoff_pending("h") is False
+    backup.reserve_handoff("h")
+    assert backup.handoff_pending("h") is True
+
+    clock.now += backup._HANDOFF_WINDOW_SECONDS - 0.01
+    assert backup.handoff_pending("h") is True, "expired early"
+    clock.now += 0.02
+    assert backup.handoff_pending("h") is False, "the reservation did not expire"
+    assert "h" not in backup._handoff, "an expired entry was left behind"
+
+    backup.reserve_handoff("h")
+    backup.clear_handoff("h")
+    assert backup.handoff_pending("h") is False, "clear did not consume it"
+
+
+def test_a_db_restore_does_not_reserve_a_handoff_the_manager_will_not_use(monkeypatch):
+    """The DB path reports already_running and finalize_restore skips start_fn, so
+    no start is chained and standing renewal off would be pure loss."""
+    _patch_common(monkeypatch, volumes=("nores_files", "nores_db"))
+    _observe_lock(monkeypatch, "nores")
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: True)
+    monkeypatch.setattr(backup, "_restore_database", mock.Mock())
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "healthy"}},
+                       "Mounts": [{"Type": "volume", "Name": "nores_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "nores", "snap-1", "r1",
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert backup.handoff_pending("nores") is False
+
+
+def test_a_failed_restore_does_not_reserve_a_handoff(monkeypatch):
+    """No start is chained off a failure either."""
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "failres", safety_fails=True)
+
+    _drain(monkeypatch, backup.spawn_restore, "failres", "snap-1", "r1")
+
+    assert backup.handoff_pending("failres") is False
+
+
+def test_a_backup_does_not_reserve_a_handoff(monkeypatch):
+    """The manager starts nothing off a backup-result."""
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "bkres")
+
+    _drain(monkeypatch, backup.spawn_backup, "bkres", "b1")
+
+    assert backup.handoff_pending("bkres") is False
 
 
 def test_the_wait_loop_polls_until_quiesced_and_never_short_circuits(monkeypatch):

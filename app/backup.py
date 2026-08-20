@@ -66,6 +66,48 @@ def _instance_lock(instance_id: str) -> threading.Lock:
         return lock
 
 
+# Instances whose manager is about to chain a control op off a callback we just
+# sent. Renewal stands off these, because the lock we release for that op is
+# otherwise fair game to whoever asks first.
+#
+# The value is a monotonic DEADLINE, deliberately, not a flag or a counter. An
+# event-driven mark is what a hung docker daemon pinned forever when
+# track_compose_child was tried here, permanently muting renewal for an instance.
+# A deadline cannot be pinned: the worst a lost manager can do is delay this
+# instance's renewal by one window.
+_handoff: dict[str, float] = {}
+_handoff_guard = threading.Lock()
+
+# Generous upper bound on "the manager is answering our callback": one round trip
+# plus a CA mint, sized against the manager's own 60s actuation budget. Renewal
+# runs on a 6h cadence, so standing it off this long costs nothing.
+_HANDOFF_WINDOW_SECONDS = 60
+
+
+def reserve_handoff(instance_id: str) -> None:
+    """Claim the per-instance lock for the manager op this callback will trigger."""
+    with _handoff_guard:
+        _handoff[instance_id] = time.monotonic() + _HANDOFF_WINDOW_SECONDS
+
+
+def handoff_pending(instance_id: str) -> bool:
+    """True while a manager-chained control op is still expected."""
+    with _handoff_guard:
+        deadline = _handoff.get(instance_id)
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            del _handoff[instance_id]   # self-expiring; never needs a sweeper
+            return False
+        return True
+
+
+def clear_handoff(instance_id: str) -> None:
+    """The awaited op arrived (or another one did) -- stop standing renewal off."""
+    with _handoff_guard:
+        _handoff.pop(instance_id, None)
+
+
 def _release_once(lock: threading.Lock):
     """A one-shot release for ``lock``, callable from two places safely.
 
@@ -1145,6 +1187,17 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
         # outlive the compose work it protects. It doesn't here -- the abort
         # branches above are the last thing this job touches compose for, and the
         # durable state file is already written.
+        # Reserve BEFORE releasing, never after: the gap this closes is exactly
+        # the moment between the two, so a reservation taken afterwards would be
+        # racing the thing it exists to prevent.
+        #
+        # Only where the manager will actually chain a start: the data-path
+        # success case. The DB path reports already_running and finalize_restore
+        # skips start_fn; a failure runs no start at all. Reserving on those would
+        # stand renewal off for nothing.
+        if (payload.get("status") == "success"
+                and not payload.get("already_running")):
+            reserve_handoff(instance_id)
         if release_lock is not None:
             release_lock()
         if _post_callback(settings, instance_id, "restore-result", payload):

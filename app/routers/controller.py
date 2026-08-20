@@ -205,6 +205,11 @@ def _serialize_instance_op(handler):
         lock = backup._instance_lock(payload.id)
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="instance_busy")
+        # The manager op a restore handoff was holding the lock for has arrived
+        # (or another one has, which is just as good a reason to stop standing
+        # renewal off). Consume the reservation rather than waiting out its
+        # window.
+        backup.clear_handoff(payload.id)
         try:
             return handler(payload, request, *args, **kwargs)
         finally:
