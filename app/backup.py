@@ -66,6 +66,131 @@ def _instance_lock(instance_id: str) -> threading.Lock:
         return lock
 
 
+# Instances whose manager is about to chain a control op off a callback we just
+# sent. Renewal stands off these, because the lock we release for that op is
+# otherwise fair game to whoever asks first.
+#
+# The value is a monotonic DEADLINE, deliberately, not a flag or a counter. An
+# event-driven mark is what a hung docker daemon pinned forever when
+# track_compose_child was tried here, permanently muting renewal for an instance.
+# A deadline cannot be pinned: the worst a lost manager can do is delay this
+# instance's renewal by one window.
+_handoff: dict[str, float] = {}
+_handoff_guard = threading.Lock()
+
+# How long "the manager is answering our callback" is allowed to take: one round
+# trip plus a CA mint, normally about a second.
+#
+# It is a heuristic, not a derived bound, and it is worth being honest about why.
+# There is no ceiling to derive it from: the manager runs gunicorn with
+# worker_class 'gthread', where `timeout` is worker LIVENESS, not a request
+# deadline -- a handler blocked for minutes is never killed -- and its
+# restore-result handler runs the whole mint-and-start inline behind its own HTTP
+# timeouts plus roughly seven unbounded select_for_update waits.
+#
+# So this cannot guarantee the handoff; it covers the normal one with a wide
+# margin. If the manager exceeds it the reservation simply expires and we are back
+# to the pre-reservation behaviour -- a rare lost race, not a regression.
+#
+# Erring long is cheap and erring short is not: against a 6h renewal cadence and a
+# 30-day certificate, an over-long window costs one instance one skipped pass,
+# while an under-short one silently reopens the race this exists to close. (On a
+# node tuned to the 60s floor for greffer_cert_renewal_interval it may cost more
+# than one pass -- still bounded, and still far short of an expiry.)
+_HANDOFF_WINDOW_SECONDS = 90
+
+
+def reserve_handoff(instance_id: str) -> None:
+    """Claim the per-instance lock for the manager op this callback will trigger."""
+    with _handoff_guard:
+        _handoff[instance_id] = time.monotonic() + _HANDOFF_WINDOW_SECONDS
+
+
+def _pending_locked(instance_id: str) -> bool:
+    """Expiry, in ONE place. Caller must hold ``_handoff_guard``.
+
+    Both the public predicate and ``acquire_unless_handoff`` route through here
+    deliberately. They were separate implementations, and the acquire path -- the
+    only one production actually calls -- had no test of its own: deleting its
+    deadline check left the whole suite green while a single lost manager callback
+    muted renewal for that instance forever, which is precisely the failure the
+    deadline exists to prevent.
+    """
+    deadline = _handoff.get(instance_id)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        del _handoff[instance_id]       # self-expiring; never needs a sweeper
+        return False
+    return True
+
+
+def handoff_pending(instance_id: str) -> bool:
+    """True while a manager-chained control op is still expected."""
+    with _handoff_guard:
+        return _pending_locked(instance_id)
+
+
+def acquire_unless_handoff(instance_id: str):
+    """Take the per-instance lock unless a manager handoff is reserved.
+
+    Returns ``(lock, None)`` on success, else ``(None, reason)`` where reason is
+    ``'handoff'`` or ``'instance_busy'``.
+
+    The check and the acquire are ONE step under the guard ``reserve_handoff``
+    also takes, and that is the entire point. Done separately they are a TOCTOU:
+    a caller reads "no handoff" while the restore still holds the lock, and by the
+    time it acquires, the restore has reserved AND released -- so it wins the lock
+    that was just claimed for the manager's start, and the restore lands
+    restored_start_failed anyway.
+
+    Atomically, that window cannot exist. The reservation is always taken while
+    the lock is STILL HELD (see restore_instance), so a caller holding this guard
+    observes either the lock held or the reservation present. There is no third
+    state.
+
+    No deadlock: the acquire is non-blocking, so this never holds the guard
+    waiting on the lock, while a job holding the lock and calling
+    ``reserve_handoff`` only ever waits on the guard.
+    """
+    lock = _instance_lock(instance_id)
+    with _handoff_guard:
+        if _pending_locked(instance_id):
+            return None, 'handoff'
+        if lock.acquire(blocking=False):
+            return lock, None
+        return None, 'instance_busy'
+
+
+def clear_handoff(instance_id: str) -> None:
+    """The awaited op arrived (or another one did) -- stop standing renewal off."""
+    with _handoff_guard:
+        _handoff.pop(instance_id, None)
+
+
+def _release_once(lock: threading.Lock):
+    """A one-shot release for ``lock``, callable from two places safely.
+
+    The backup/restore jobs drop the per-instance lock EARLY -- just before they
+    post their result callback to the manager (see the note in
+    ``restore_instance``) -- while ``_locked_job`` still has to release it for
+    every path that never reaches that point (a raise, a job that returns first).
+    Both call this. The second call is a no-op instead of the RuntimeError a
+    plain ``lock.release()`` raises on an already-unlocked lock.
+    """
+    guard = threading.Lock()
+    held = True
+
+    def release() -> None:
+        nonlocal held
+        with guard:
+            if held:
+                held = False
+                lock.release()
+
+    return release
+
+
 # A single process-wide lock serializing repo-WIDE ops (prune / check) so two
 # triggers never spawn redundant sidecars. restic's own exclusive repo lock is the
 # CROSS-PROCESS guarantee against a running backup sidecar; this only dedupes ours.
@@ -611,15 +736,35 @@ def _run_hot_backup(settings, instance_id: str, backup_id: str,
             "bytes_added": total_bytes, "manifest": manifest}
 
 
-def _wait_stopped(instance_id: str, timeout: int) -> bool:
+def _wait_stopped(instance_id: str, timeout: int, *,
+                  missing_is_stopped: bool = False) -> bool:
     """Poll until all the instance's containers are stopped (``compose.stop`` is
-    fire-and-forget). Returns True if quiesced within the deadline."""
+    fire-and-forget). Returns True if quiesced within the deadline.
+
+    ``missing_is_stopped`` additionally accepts an instance with NO containers at
+    all. Only the DB-abort teardown passes it: there, containers gone IS the
+    teardown complete, and burning the whole timeout would hold the per-instance
+    lock -- 409ing every control op -- to wait for something that already
+    happened. The entry stops keep the strict check.
+
+    Note ``get_status`` conflates two states under ``unknow``: an EMPTY container
+    set and a MIXED one (some running, some not). Only the empty one is
+    quiescent; a mix still has something running, which is precisely what this
+    wait exists to catch. So the container list is checked, not just the status.
+    """
+    def _quiesced() -> bool:
+        st = compose.get_status(instance_id)
+        if st.get("status") == "stopped":
+            return True
+        return (missing_is_stopped and st.get("status") == "unknow"
+                and not st.get("containers"))
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if compose.get_status(instance_id).get("status") == "stopped":
+        if _quiesced():
             return True
         time.sleep(1.0)
-    return compose.get_status(instance_id).get("status") == "stopped"
+    return _quiesced()
 
 
 def _restart(settings, instance_id: str) -> None:
@@ -723,7 +868,8 @@ def reconcile_on_boot(settings) -> None:
 
 
 def backup_instance(settings, instance_id: str, backup_id: str,
-                    destination=None, volume_classes=None) -> None:
+                    destination=None, volume_classes=None,
+                    release_lock=None) -> None:
     """Backup background job. COLD (stop -> snapshot -> start) by default; HOT (no
     stop, restic-live the data-class volumes) when ``volume_classes`` is given
     (Phase 3). A cold backup that stopped a running instance always restarts it
@@ -752,6 +898,7 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                 # stopped instance if a crash skips the finally restart).
                 _write_json(_backup_marker(settings, instance_id),
                             {"backup_id": backup_id})
+                # NOT tracked -- see the sibling call in restore_instance.
                 compose.stop({"id": instance_id})
                 stopped_for_backup = True
                 if not _wait_stopped(
@@ -802,6 +949,28 @@ def backup_instance(settings, instance_id: str, backup_id: str,
                 repo_bytes = _repo_stats(settings)
                 if repo_bytes is not None:
                     payload["repo_bytes"] = repo_bytes
+        # Drop the per-instance lock BEFORE the callback -- same rule as the
+        # restore path below, and for the same reason: the manager acts on this
+        # instance the moment the callback lands, and this POST is what tells it
+        # to. A scheduled backup or an operator start queued behind this one is
+        # served instead of being refused 409 instance_busy for the length of a
+        # manager round trip.
+        #
+        # NOT justified by the migration cutover, whatever symmetry suggests.
+        # ``_run_cutover`` stops the SOURCE before the backstop backup, and the
+        # provisioning / restore / start that follow all target G2. G1 IS touched
+        # again -- ``_abort``'s ``_start_greffon(instance)`` pre-repoint, and
+        # ``post_greffer_decommission(source, ...)`` after the FK flip, which takes
+        # this very lock -- but never INLINE with this callback: every one of those
+        # is reached through a 5s poll loop, by which time this job has long
+        # returned. So the release is not load-bearing for G1 either way. The cutover's real exposure is on the
+        # restore side (see ``restore_instance``), where ``_cold_restore_and_wait``
+        # polls restore-status and then immediately starts the instance on G2.
+        #
+        # Every compose action this job performs -- including the cold-path
+        # restart above -- is done by now.
+        if release_lock is not None:
+            release_lock()
         _post_callback(settings, instance_id, "backup-result", payload)
 
 
@@ -884,7 +1053,8 @@ def _start_services(settings, instance_id: str, services: list[str]) -> None:
 
 def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                      restore_id: str, destination=None,
-                     manifest=None, volume_classes=None) -> None:
+                     manifest=None, volume_classes=None,
+                     release_lock=None) -> None:
     """Restore-in-place background job. DATA-only (cold / single-snapshot): stop ->
     wait -> SAFETY snapshot -> restore volumes -> leave stopped -> callback (the
     manager runs the start). MULTI-ARTIFACT (manifest carries ``db:<service>``
@@ -904,6 +1074,18 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                     if k.startswith("db:")}
     try:
         if started_stopped:
+            # Deliberately NOT track_compose_child'd, unlike /stop/ and the
+            # DB-abort branch below. The only reader of compose_inflight is the
+            # cert-renewal worker, and it is ALREADY stood off here by the
+            # per-instance lock, which this job holds across the whole stop (see
+            # tests asserting the lock is held at compose.stop). Tracking would
+            # add nothing and cost something real: track_compose_child waits on
+            # the child with an unbounded proc.wait(), so a hung docker daemon
+            # would pin the inflight counter forever -- permanently skipping
+            # renewal for this instance (cert expiry, 502: the exact incident the
+            # renewal worker exists to prevent) and collapsing the node's whole
+            # tick to the 120s deferred-retry cadence. Backups run on a manager
+            # cadence, so that would be a per-cycle exposure, not a rare one.
             compose.stop({"id": instance_id})
             if not _wait_stopped(instance_id, settings.backup_stop_timeout_seconds):
                 payload["error_code"] = "stop_timeout"
@@ -1030,12 +1212,54 @@ def restore_instance(settings, instance_id: str, restic_snapshot_id: str,
                 # an orphan record and a cooldown on the manager.
                 from app.routers.controller import track_compose_child
                 track_compose_child(instance_id, compose.stop({"id": instance_id}))
+                # And WAIT for it, still under the lock. compose.stop is
+                # fire-and-forget, and track_compose_child only stands off cert
+                # renewal -- /start/ and /decommission/ are gated by this lock
+                # alone. Releasing while the teardown is still running would let a
+                # start admitted an instant later serve the half-restored database
+                # this branch exists to take down. Bounded by the same timeout the
+                # entry stop uses; on a timeout we log and release anyway, because
+                # the alternative is holding the lock indefinitely.
+                if not _wait_stopped(instance_id,
+                                     settings.backup_stop_timeout_seconds,
+                                     missing_is_stopped=True):
+                    logger.warning(
+                        "restore_db_abort_stop_timeout instance=%s -- teardown "
+                        "outlasted %ss; releasing the lock with it still running",
+                        instance_id, settings.backup_stop_timeout_seconds)
             except Exception:  # noqa: BLE001
                 logger.exception("restore_db_abort_stop_failed instance=%s", instance_id)
         # Durable restore-state, kept until the manager acks (boot reconciliation
         # re-posts a lost callback so an overwritten instance is never stranded).
         state_path = _restore_state_path(settings, instance_id, restore_id)
         _write_json(state_path, payload)
+        # Drop the per-instance lock BEFORE the callback, not when this job
+        # returns. The manager answers a SUCCESSFUL restore-result by running the
+        # normal start flow INLINE, inside the callback request: it mints a cert
+        # and POSTs back to /api/controller/start/, which takes THIS lock
+        # non-blocking. Holding it across the callback made that start a
+        # guaranteed 409 instance_busy -- so the data-path restore finished as
+        # ``restored_start_failed`` with the instance left stopped every single
+        # time, even though the data was perfectly restored.
+        #
+        # Same rule ``_serialize_instance_op`` already documents for start/stop:
+        # the manager chains control ops immediately, so this lock must not
+        # outlive the compose work it protects. It doesn't here -- the abort
+        # branches above are the last thing this job touches compose for, and the
+        # durable state file is already written.
+        # Reserve BEFORE releasing, never after: the gap this closes is exactly
+        # the moment between the two, so a reservation taken afterwards would be
+        # racing the thing it exists to prevent.
+        #
+        # Only where the manager will actually chain a start: the data-path
+        # success case. The DB path reports already_running and finalize_restore
+        # skips start_fn; a failure runs no start at all. Reserving on those would
+        # stand renewal off for nothing.
+        if (payload.get("status") == "success"
+                and not payload.get("already_running")):
+            reserve_handoff(instance_id)
+        if release_lock is not None:
+            release_lock()
         if _post_callback(settings, instance_id, "restore-result", payload):
             _remove(state_path)
 
@@ -1072,12 +1296,32 @@ def spawn_backup(settings, instance_id: str, backup_id: str,
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
-    threading.Thread(
+    release = _release_once(lock)
+    thread = threading.Thread(
         target=_locked_job,
-        args=(lock, backup_instance, settings, instance_id, backup_id,
+        args=(release, backup_instance, settings, instance_id, backup_id,
               destination, volume_classes),
+        kwargs={"release_lock": release},
         daemon=True,
-    ).start()
+    )
+    try:
+        thread.start()
+    except Exception as exc:  # noqa: BLE001 -- a stranded lock wedges the instance
+        # The lock is already ACQUIRED at this point. A thread that never starts
+        # used to leave it held forever, so every later start / stop / backup /
+        # restore on this instance answered 409 instance_busy until the greffer
+        # was restarted. Nothing else ever releases it -- the owner that would
+        # have is the thread that failed to exist.
+        release()
+        logger.exception("backup_thread_start_failed instance=%s", instance_id)
+        # BusyError -> 409, not the 500 a re-raise would give. The job provably
+        # never began, so a retry is safe -- and 409 is the only class the manager
+        # rolls its ledger row back on (400 <= status < 500), which deletes the
+        # BackupSnapshot immediately. A 500 instead leaves it RUNNING until
+        # reap_stuck_backups gets to it (2h by default), and _has_inflight_op bars
+        # every op on the instance for that whole window. The restore side is
+        # worse -- see spawn_restore.
+        raise BusyError(instance_id) from exc
 
 
 def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
@@ -1086,19 +1330,40 @@ def spawn_restore(settings, instance_id: str, restic_snapshot_id: str,
     lock = _instance_lock(instance_id)
     if not lock.acquire(blocking=False):
         raise BusyError(instance_id)
-    threading.Thread(
+    release = _release_once(lock)
+    thread = threading.Thread(
         target=_locked_job,
-        args=(lock, restore_instance, settings, instance_id, restic_snapshot_id,
+        args=(release, restore_instance, settings, instance_id, restic_snapshot_id,
               restore_id, destination, manifest, volume_classes),
+        kwargs={"release_lock": release},
         daemon=True,
-    ).start()
-
-
-def _locked_job(lock: threading.Lock, fn, *args) -> None:
+    )
     try:
-        fn(*args)
+        thread.start()
+    except Exception as exc:  # noqa: BLE001 -- a stranded lock wedges the instance
+        # The lock is already ACQUIRED at this point. A thread that never starts
+        # used to leave it held forever, so every later start / stop / backup /
+        # restore on this instance answered 409 instance_busy until the greffer
+        # was restarted. Nothing else ever releases it -- the owner that would
+        # have is the thread that failed to exist.
+        release()
+        logger.exception("restore_thread_start_failed instance=%s", instance_id)
+        # BusyError -> 409, not the 500 a re-raise would give. The job provably
+        # never began, so a retry is safe -- and 409 is the only class the
+        # manager rolls its ledger row back on (400 <= status < 500). A 500 left
+        # the RestoreRun RUNNING forever, and there is no restore reaper.
+        raise BusyError(instance_id) from exc
+
+
+def _locked_job(release, fn, *args, **kwargs) -> None:
+    """Run the job, then release the per-instance lock. ``release`` is the
+    one-shot from ``_release_once``, not ``lock.release``: the job itself drops
+    the lock early on the paths that end in a manager callback, and this finally
+    must then be a no-op rather than a double release."""
+    try:
+        fn(*args, **kwargs)
     finally:
-        lock.release()
+        release()
 
 
 def _repo_op_error_code(stderr: str) -> str:

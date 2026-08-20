@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -59,7 +60,7 @@ def _patch_common(monkeypatch, status="running", wait=True, volumes=("i_db",)):
     monkeypatch.setattr(backup.compose, "get_status",
                         lambda _id: {"status": status})
     monkeypatch.setattr(backup.compose, "stop", mock.Mock())
-    monkeypatch.setattr(backup, "_wait_stopped", lambda *a: wait)
+    monkeypatch.setattr(backup, "_wait_stopped", lambda *a, **k: wait)
     monkeypatch.setattr(backup, "_data_volumes", lambda _id: list(volumes))
     # ensure_repo (init/unlock) is separately tested; no-op it here so it does
     # not pollute the mocked _run_restic call sequences.
@@ -244,6 +245,129 @@ def test_restore_overwrite_failure_keeps_safety_pointer(monkeypatch):
 
 # ---- locking ---------------------------------------------------------------
 
+def _lock_is_free(instance_id: str) -> bool:
+    """Whether the per-instance lock could be taken right now -- i.e. whether a
+    manager control op arriving at this instant is served or refused 409
+    instance_busy."""
+    lock = backup._instance_lock(instance_id)
+    if lock.acquire(blocking=False):
+        lock.release()
+        return True
+    return False
+
+
+# Captured at import, BEFORE any test can patch it. A second _drain inside one
+# test used to capture the first drain's wrapper, nesting them -- so a job that
+# raised landed in the FIRST drain's failures list, which had already returned
+# unchecked, and the re-raise below silently did nothing.
+_REAL_LOCKED_JOB = backup._locked_job
+
+
+def _drain(monkeypatch, spawn, instance_id, *args, settings=None, **kwargs):
+    """Run ``spawn`` and block until its background job has finished, re-raising
+    anything that job raised.
+
+    The re-raise is load-bearing. Without it a job thread that dies -- on a double
+    release, say -- still passes: the exception goes to ``threading.excepthook``,
+    pytest downgrades it to a warning, and CI runs a bare ``pytest -q``. A
+    regression that raised on every backup and restore would ship green.
+    """
+    done = threading.Event()
+    failures = []
+
+    def _job(release, fn, *a, **kw):
+        try:
+            _REAL_LOCKED_JOB(release, fn, *a, **kw)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised below
+            failures.append(exc)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(backup, "_locked_job", _job)
+    spawn(settings if settings is not None else _settings(),
+          instance_id, *args, **kwargs)
+    assert done.wait(20), "background job hung"
+    if failures:
+        raise AssertionError(
+            f"the background job raised: {failures[0]!r}") from failures[0]
+
+
+def _observe_lock(monkeypatch, instance_id, *, safety_fails=False,
+                  wait_stopped=None):
+    """Record the lock state at every point the job passes through, plus the
+    payload it finally sends.
+
+    Two properties, not one. The lock must be HELD while the job touches compose
+    and restic -- releasing early would let a start (or a renewal tick) run
+    compose against volumes mid-overwrite -- and FREE by the callback, because the
+    manager answers that callback by calling straight back into /start/.
+
+    Patches over ``_patch_common``, so call it after.
+    """
+    seen = {"order": []}
+
+    def _mark(name):
+        seen[name] = _lock_is_free(instance_id)
+        seen["order"].append(name)
+
+    def _cb(settings, iid, action, payload):
+        _mark(action)
+        seen.setdefault("payloads", {})[action] = payload
+        return True
+
+    def _stop(_spec):
+        _mark("compose.stop")
+        return mock.Mock()
+
+    def _restic(settings, args, mounts, **kw):
+        _mark(f"restic:{args[0]}")
+        if args[0] == "backup":
+            if safety_fails:
+                return (1, "", "no space left on device")
+            return (0, '{"message_type":"summary","snapshot_id":"SAFE",'
+                       '"data_added":7}', "")
+        return (0, "", "")
+
+    def _restart(*_a, **_k):
+        _mark("restart")
+
+    monkeypatch.setattr(backup, "_post_callback", _cb)
+    monkeypatch.setattr(backup.compose, "stop", _stop)
+    monkeypatch.setattr(backup, "_run_restic", _restic)
+    monkeypatch.setattr(backup, "_restart", _restart)
+    def _write_json(_path, _data):
+        _mark("write_json")
+
+    def _forget(*_a, **_k):
+        _mark("forget")
+
+    real_reserve = backup.reserve_handoff
+
+    def _reserve(iid):
+        _mark("reserve_handoff")
+        real_reserve(iid)
+
+    def _repo_stats(*_a, **_k):
+        _mark("repo_stats")
+        return 4242
+
+    if wait_stopped is not None:
+        def _wait(iid, timeout, **kw):
+            _mark("wait_stopped")
+            seen.setdefault("wait_timeouts", []).append(timeout)
+            seen.setdefault("wait_kwargs", []).append(kw)
+            return wait_stopped
+
+        monkeypatch.setattr(backup, "_wait_stopped", _wait)
+    monkeypatch.setattr(backup, "_repo_stats", _repo_stats)
+    monkeypatch.setattr(backup, "reserve_handoff", _reserve)
+
+    monkeypatch.setattr(backup, "_forget", _forget)
+    monkeypatch.setattr(backup, "_write_json", _write_json)
+    monkeypatch.setattr(backup, "_remove", mock.Mock())
+    return seen
+
+
 def test_spawn_backup_busy_raises(monkeypatch):
     lock = backup._instance_lock("busy-i")
     lock.acquire()
@@ -252,6 +376,725 @@ def test_spawn_backup_busy_raises(monkeypatch):
             backup.spawn_backup(_settings(), "busy-i", "b1")
     finally:
         lock.release()
+
+
+def test_spawn_restore_busy_raises(monkeypatch):
+    """The 409 that stops a restore landing on an instance already mid-op. The
+    backup side had this; the restore side never did."""
+    lock = backup._instance_lock("busy-r")
+    lock.acquire()
+    try:
+        with pytest.raises(backup.BusyError):
+            backup.spawn_restore(_settings(), "busy-r", "snap-1", "r1")
+    finally:
+        lock.release()
+
+
+def test_restore_holds_the_lock_through_its_work_then_frees_the_callback(monkeypatch):
+    """The manager answers a successful restore-result INLINE by POSTing back to
+    /api/controller/start/, which takes this same per-instance lock. Holding the
+    lock across the callback made that start a guaranteed 409 instance_busy, so
+    every data-path restore landed as ``restored_start_failed`` with the instance
+    left stopped and the data perfectly fine."""
+    _patch_common(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-restore")
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-restore", "snap-1", "r1")
+
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["restic:backup"] is False, "the safety snapshot ran unlocked"
+    assert seen["restic:restore"] is False, "the --delete overwrite ran unlocked"
+    assert seen["forget"] is False, (
+        "retention ran with the lock free -- the release must come after ALL of "
+        "the job's work, not just after its compose actions")
+    assert seen["write_json"] is False, (
+        "the durable restore-state file was written after the release -- it must "
+        "exist before anyone can act on the callback, or a crash loses the "
+        "safety-snapshot rollback pointer")
+    assert seen["restore-result"] is True, (
+        "the restore job still held the per-instance lock while calling back -- "
+        "the manager's inline start would be refused 409 instance_busy")
+    assert seen["payloads"]["restore-result"]["status"] == "success"
+    # The handoff is claimed while the lock is STILL HELD. Reserving after the
+    # release would race the very gap it exists to close.
+    assert seen["reserve_handoff"] is False, (
+        "the handoff was reserved after the lock was already free -- a renewal "
+        "tick could have taken it in between")
+    assert backup.handoff_pending("rel-restore"), "no handoff was reserved"
+    backup.clear_handoff("rel-restore")
+
+
+def test_failed_restore_holds_the_lock_through_its_abort_restart(monkeypatch):
+    """A pre-overwrite failure restarts the instance from the finally to restore
+    service. That restart is compose work and must run under the lock; only the
+    callback after it may run free."""
+    _patch_common(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-abort", safety_fails=True)
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-abort", "snap-1", "r1")
+
+    assert seen["restart"] is False, "the abort restart ran with the lock free"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["status"] == "failed"
+
+
+def test_backup_holds_the_lock_through_its_restart_then_frees_the_callback(monkeypatch):
+    """Same rule on the backup side. The manager does not start an instance off a
+    backup-result, but the migration cutover polls the snapshot to terminal --
+    which this callback is what makes it -- and then acts on the instance."""
+    _patch_common(monkeypatch)
+    seen = _observe_lock(monkeypatch, "rel-backup")
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-backup", "b1")
+
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["restart"] is False, "the cold-path restart ran with the lock free"
+    assert seen["forget"] is False, (
+        "retention ran with the lock free -- the release must come after ALL of "
+        "the job's work, not just after its compose actions")
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["status"] == "success"
+
+
+def test_hot_backup_frees_the_lock_for_its_callback(monkeypatch):
+    """HOT never stops or restarts, so it exercises a different route to the same
+    callback."""
+    _patch_common(monkeypatch, status="running", volumes=("rel-hot_db",))
+    seen = _observe_lock(monkeypatch, "rel-hot")
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-hot", "b1",
+           volume_classes={"db": "data"})
+
+    assert seen["restic:backup"] is False, "the hot snapshot ran unlocked"
+    assert "restart" not in seen, "HOT must never restart"
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["status"] == "success"
+
+
+def test_db_restore_frees_the_lock_for_its_callback(monkeypatch):
+    """The multi-artifact path leaves the instance RUNNING and reports
+    ``already_running``, so the manager skips the start -- but the lock must still
+    be free, because the manager is free to act on the instance either way."""
+    _patch_common(monkeypatch, volumes=("rel-db_files", "rel-db_db"))
+    seen = _observe_lock(monkeypatch, "rel-db")
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: True)
+    monkeypatch.setattr(backup, "_restore_database", mock.Mock())
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "healthy"}},
+                       "Mounts": [{"Type": "volume", "Name": "rel-db_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "rel-db", "snap-1", "r1",
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert seen["restart"] is False, "the final full restart ran unlocked"
+    assert seen["restore-result"] is True
+    payload = seen["payloads"]["restore-result"]
+    assert payload["status"] == "success"
+    assert payload["already_running"] is True
+
+
+def test_the_backup_and_restore_stops_are_not_inflight_tracked(monkeypatch):
+    """Deliberate, and the reason is easy to lose.
+
+    ``compose_inflight``'s only reader is the cert-renewal worker, and renewal is
+    ALREADY stood off through the whole of these jobs by the per-instance lock
+    (the tests above assert it is held at ``compose.stop``). So tracking buys
+    nothing here -- and it costs: ``track_compose_child`` waits on the child with
+    an unbounded ``proc.wait()``, so a hung docker daemon pins the counter
+    forever, permanently skipping renewal for this instance (cert expiry -> 502)
+    and collapsing the node's tick to the 120s deferred cadence. Backups run on a
+    manager cadence, so that would be a per-cycle exposure.
+
+    The DB-abort branch DOES track its stop, and should: it releases the lock
+    immediately afterwards, so the lock is not covering that child.
+    """
+    import app.routers.controller as controller
+
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "trk")
+    tracked = []
+    monkeypatch.setattr(controller, "track_compose_child",
+                        lambda iid, proc: tracked.append(iid))
+
+    _drain(monkeypatch, backup.spawn_restore, "trk", "snap-1", "r1")
+    assert tracked == [], "the restore's stop child must not be inflight-tracked"
+
+    _drain(monkeypatch, backup.spawn_backup, "trk", "b1")
+    assert tracked == [], "the cold backup's stop child must not be inflight-tracked"
+
+
+def test_a_thread_that_never_starts_does_not_strand_the_lock(monkeypatch):
+    """The lock is acquired BEFORE the thread exists. A ``start()`` that raises
+    used to leave it held forever -- every later start / stop / backup / restore
+    on that instance answering 409 instance_busy until the greffer restarted,
+    because the owner that would have released it never existed."""
+    class _DeadThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    # Swap only the module reference backup.py holds, not the real threading
+    # module -- Lock still has to work, and other tests still need real threads.
+    monkeypatch.setattr(
+        backup, "threading",
+        SimpleNamespace(Thread=_DeadThread, Lock=threading.Lock))
+
+    # BusyError (-> 409), not the raw error (-> 500). The job provably never
+    # began, so a retry is safe, and 409 is the only class the manager rolls its
+    # ledger row back on -- a 500 left the RestoreRun RUNNING forever, and there
+    # is no restore reaper.
+    with pytest.raises(backup.BusyError):
+        backup.spawn_backup(_settings(), "dead-b", "b1")
+    assert _lock_is_free("dead-b"), "spawn_backup stranded the lock"
+
+    with pytest.raises(backup.BusyError):
+        backup.spawn_restore(_settings(), "dead-r", "snap-1", "r1")
+    assert _lock_is_free("dead-r"), "spawn_restore stranded the lock"
+
+
+def test_a_backup_that_times_out_stopping_still_frees_the_lock(monkeypatch):
+    """The release must not be gated on success. A failed backup that kept the
+    lock across its callback holds it for a manager round trip -- sub-second
+    normally, a full 30s when the manager is unreachable, which is exactly when
+    something else wants the instance."""
+    _patch_common(monkeypatch, wait=False)          # the stop never quiesces
+    seen = _observe_lock(monkeypatch, "to-backup")
+
+    _drain(monkeypatch, backup.spawn_backup, "to-backup", "b1")
+
+    assert seen["compose.stop"] is False, "the stop ran with the lock free"
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["error_code"] == "stop_timeout"
+
+
+def test_a_restore_that_times_out_stopping_still_frees_the_lock(monkeypatch):
+    """Same on the restore side -- and here it is worse, because the manager
+    answers the callback inline."""
+    _patch_common(monkeypatch, wait=False)
+    seen = _observe_lock(monkeypatch, "to-restore")
+
+    _drain(monkeypatch, backup.spawn_restore, "to-restore", "snap-1", "r1")
+
+    assert seen["restart"] is False, "the abort restart ran with the lock free"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["error_code"] == "stop_timeout"
+
+
+def test_a_failed_db_restore_holds_the_lock_through_its_abort_teardown(monkeypatch):
+    """The multi-artifact abort branch STARTED the instance for pg_restore, so its
+    teardown is real compose work on a live instance -- and it is the one branch
+    whose stop is genuinely fire-and-forget. The job must hold the lock across it
+    AND wait for it, or a /start/ admitted the instant the lock frees serves the
+    half-restored database this branch exists to take down. It stays
+    inflight-tracked too, unlike its two siblings, because renewal is not covered
+    by the lock once we release."""
+    import app.routers.controller as controller
+
+    _patch_common(monkeypatch, volumes=("dbab_files", "dbab_db"))
+    seen = _observe_lock(monkeypatch, "dbab", wait_stopped=True)
+    tracked = []
+    monkeypatch.setattr(controller, "track_compose_child",
+                        lambda iid, proc: tracked.append(iid))
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: False)  # db_not_ready
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "starting"}},
+                       "Mounts": [{"Type": "volume", "Name": "dbab_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "dbab", "snap-1", "r1",
+           settings=_settings(backup_stop_timeout_seconds=17),
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert seen["compose.stop"] is False, "the abort teardown ran unlocked"
+    assert seen["wait_stopped"] is False, "the wait itself ran with the lock free"
+    # ORDER is the property, and a per-call snapshot was not enough: counting two
+    # waits under the lock also passed a wait HOISTED ABOVE the teardown stop, and
+    # passed two waits at the ENTRY stop with none on the teardown. Both leave the
+    # lock free over a live teardown, which is the whole defect. So: find the
+    # teardown's stop and require a wait immediately after it.
+    order = seen["order"]
+    teardown = len(order) - 1 - order[::-1].index("compose.stop")
+    assert order[teardown + 1] == "wait_stopped", (
+        "the abort teardown's stop is not immediately followed by a wait -- the "
+        "lock frees while the teardown is still running and a /start/ can serve "
+        f"the half-restored database; order was {order}")
+    assert seen["wait_timeouts"] == [17, 17], (
+        "the waits must read the CONFIGURED stop timeout -- 17 here precisely so "
+        "a hardcoded literal or a 0 cannot pass; "
+        f"got {seen['wait_timeouts']}")
+    # The entry stop stays strict; only the teardown accepts a gone instance,
+    # because there containers-gone IS the teardown complete and waiting the full
+    # timeout would hold the lock and 409 every control op for nothing.
+    assert seen["wait_kwargs"] == [{}, {"missing_is_stopped": True}], (
+        "the abort teardown must wait with missing_is_stopped, and the entry stop "
+        f"must not; got {seen['wait_kwargs']}")
+    assert tracked == ["dbab"], "the abort stop must stay inflight-tracked"
+    assert seen["restore-result"] is True
+    assert seen["payloads"]["restore-result"]["error_code"] == "db_not_ready"
+
+
+def test_a_managed_backup_holds_the_lock_through_its_metering_scan(monkeypatch):
+    """With a brokered destination the finally runs _repo_stats AFTER _forget --
+    a `restic stats` bounded at 120s, and its own docstring justifies that bound
+    BY the lock being held. So it is the job's real last restic work, and the
+    release has to follow it. Every other release test passes no destination, so
+    this branch had nothing holding it."""
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(backup, "_effective_settings",
+                        lambda settings, dest, iid: settings)
+    seen = _observe_lock(monkeypatch, "rel-managed")
+
+    _drain(monkeypatch, backup.spawn_backup, "rel-managed", "b1",
+           destination={"kind": "managed"})
+
+    assert seen["forget"] is False, "retention ran with the lock free"
+    assert seen["repo_stats"] is False, (
+        "the metering scan ran with the lock free -- _repo_stats is bounded at "
+        "120s precisely because the lock is held across it")
+    assert seen["order"].index("repo_stats") < seen["order"].index("backup-result")
+    assert seen["backup-result"] is True
+    assert seen["payloads"]["backup-result"]["repo_bytes"] == 4242
+
+
+class _RecordingLock:
+    """Delegates to a real lock and records how ``acquire`` was called."""
+
+    def __init__(self):
+        self._inner = threading.Lock()
+        self.acquires = []
+
+    def acquire(self, *a, **kw):
+        self.acquires.append((a, kw))
+        return self._inner.acquire(*a, **kw)
+
+    def release(self):
+        return self._inner.release()
+
+    def locked(self):
+        return self._inner.locked()
+
+
+def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatch):
+    """`get_status` reports `unknow` for BOTH an empty container set and a mixed
+    one, so the abort teardown cannot just accept `unknow`.
+
+    Empty must be accepted: containers gone IS the teardown complete, and waiting
+    the full stop timeout there holds the per-instance lock and 409s every control
+    op to wait for something that already happened. Mixed must NOT be: something
+    is still running, which is the whole reason this wait exists.
+    """
+    states = {}
+    monkeypatch.setattr(backup.compose, "get_status", lambda _id: states)
+
+    states.update(status="unknow", containers=[])
+    assert backup._wait_stopped("i", 0, missing_is_stopped=True) is True
+    assert backup._wait_stopped("i", 0) is False, "the entry stops stay strict"
+
+    states.update(status="unknow", containers=[{"status": "running"},
+                                               {"status": "stopped"}])
+    assert backup._wait_stopped("i", 0, missing_is_stopped=True) is False, (
+        "a MIXED container set was accepted as quiesced -- something is still "
+        "running and the teardown is not done")
+
+    states.update(status="stopped", containers=[{"status": "stopped"}])
+    assert backup._wait_stopped("i", 0) is True
+
+
+def test_the_acquire_path_itself_expires_a_stale_reservation(monkeypatch):
+    """Driven through ``acquire_unless_handoff``, the function production ACTUALLY
+    calls -- not through the public predicate, which production never calls.
+
+    That split is how a severe hole hid: every window and expiry assertion drove
+    ``handoff_pending``, so deleting the acquire path's own deadline check left
+    the entire suite green while one lost manager callback muted renewal for that
+    instance forever -- cert expiry, 502, the incident the renewal worker exists
+    to prevent. The two now share one implementation, and this drives the real one.
+    """
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+
+    backup.reserve_handoff("acq")
+    got, reason = backup.acquire_unless_handoff("acq")
+    assert got is None and reason == "handoff"
+
+    clock.now += 65.0                      # a slow but legal manager
+    got, reason = backup.acquire_unless_handoff("acq")
+    assert got is None and reason == "handoff", "expired before the manager could answer"
+
+    clock.now += 300.0                     # long past any plausible handoff
+    got, reason = backup.acquire_unless_handoff("acq")
+    try:
+        assert got is not None and reason is None, (
+            "a stale reservation still blocks the acquire -- renewal is muted for "
+            "this instance until the process restarts")
+    finally:
+        if got is not None:
+            got.release()
+    assert "acq" not in backup._handoff, "the expired entry was not dropped"
+
+
+def test_every_write_to_the_handoff_map_happens_under_the_guard(monkeypatch):
+    """The read side is pinned by the atomicity test; these are the writes.
+
+    Unguarded they are both plausible edits -- "dict writes are atomic under the
+    GIL, the guard is redundant" -- and both cause real harm. An unguarded
+    ``reserve_handoff`` can land between a competitor's expiry read and its
+    acquire, which is the whole race back at full strength: the competitor takes
+    the lock and the manager's chained start gets 409. An unguarded
+    ``clear_handoff`` can pop between ``_pending_locked``'s get and its del,
+    raising KeyError out into the renewal pass, which counts it an error and arms
+    the backoff.
+
+    Observed at the dict itself, so it holds wherever the writes move to.
+    """
+    class _Watched(dict):
+        def __init__(self):
+            super().__init__()
+            self.writes = []
+
+        def __setitem__(self, key, value):
+            self.writes.append(("set", backup._handoff_guard.locked()))
+            super().__setitem__(key, value)
+
+        def pop(self, *a, **k):
+            self.writes.append(("pop", backup._handoff_guard.locked()))
+            return super().pop(*a, **k)
+
+        def __delitem__(self, key):
+            self.writes.append(("del", backup._handoff_guard.locked()))
+            super().__delitem__(key)
+
+    watched = _Watched()
+    monkeypatch.setattr(backup, "_handoff", watched)
+
+    backup.reserve_handoff("w")
+    backup.clear_handoff("w")
+
+    assert watched.writes == [("set", True), ("pop", True)], (
+        "a write to the handoff map happened outside the guard; got "
+        f"{watched.writes}")
+
+
+def test_the_handoff_check_and_the_acquire_are_one_atomic_step(monkeypatch):
+    """Check-then-acquire is a TOCTOU, so the acquire must happen while the
+    handoff guard is HELD.
+
+    Split, the race is: a competitor reads "no handoff" while the restore still
+    holds the lock; by the time it acquires, the restore has reserved AND
+    released; so it takes the lock claimed for the manager's start and the restore
+    lands restored_start_failed anyway. Under one guard that window cannot exist,
+    because the reservation is always taken while the lock is still held -- the
+    competitor sees either the lock held or the reservation, never neither.
+
+    Asserted structurally, by observing whether the guard is held at the moment
+    the lock is acquired. A timing-based version of this test would pass on the
+    broken code, which is exactly how the first attempt at it failed.
+    """
+    guard_held_at_acquire = []
+
+    class _Probe:
+        def __init__(self):
+            self._inner = threading.Lock()
+
+        def acquire(self, *a, **kw):
+            guard_held_at_acquire.append(backup._handoff_guard.locked())
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    probe = _Probe()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: probe)
+
+    got, reason = backup.acquire_unless_handoff("atomic")
+    try:
+        assert got is not None and reason is None
+    finally:
+        if got is not None:
+            got.release()
+
+    assert guard_held_at_acquire == [True], (
+        "the lock was acquired OUTSIDE the handoff guard -- check-then-acquire is "
+        "a TOCTOU, and a competitor can take the lock reserved for the manager's "
+        "chained start")
+
+
+def test_the_handoff_reservation_expires_and_can_be_consumed(monkeypatch):
+    """A monotonic deadline, not a flag: nothing can pin it.
+
+    That is the whole reason for this shape. `track_compose_child` was tried in
+    this role and reverted, because its unbounded `proc.wait()` let a hung docker
+    daemon hold the mark forever -- permanently muting renewal for an instance
+    (cert expiry, 502). The worst a lost manager can do here is delay one
+    instance's renewal by one window.
+    """
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+
+    assert backup.handoff_pending("h") is False
+    backup.reserve_handoff("h")
+    assert backup.handoff_pending("h") is True
+
+    # Pinned in BOTH directions against real durations, not against the constant
+    # itself -- asserting `_HANDOFF_WINDOW_SECONDS - 0.01` is self-referential and
+    # passes for any value, including a 0.05s window that makes the mechanism a
+    # no-op and a 24h one that mutes renewal after every restore.
+    clock.now += 65.0          # a slow manager: mint + start, inside its 60s worker timeout
+    assert backup.handoff_pending("h") is True, (
+        "the reservation expired before a slow-but-legal manager could answer -- "
+        "the chained start would arrive to an unreserved lock")
+    clock.now += 300.0
+    assert backup.handoff_pending("h") is False, (
+        "the reservation outlived any plausible handoff -- renewal is being stood "
+        "off long after the manager could still be coming")
+    assert "h" not in backup._handoff, "an expired entry was left behind"
+
+    backup.reserve_handoff("h")
+    backup.clear_handoff("h")
+    assert backup.handoff_pending("h") is False, "clear did not consume it"
+
+
+def test_a_db_restore_does_not_reserve_a_handoff_the_manager_will_not_use(monkeypatch):
+    """The DB path reports already_running and finalize_restore skips start_fn, so
+    no start is chained and standing renewal off would be pure loss."""
+    _patch_common(monkeypatch, volumes=("nores_files", "nores_db"))
+    _observe_lock(monkeypatch, "nores")
+    monkeypatch.setattr(backup, "_start_services", mock.Mock())
+    monkeypatch.setattr(backup, "_wait_db_healthy", lambda *a: True)
+    monkeypatch.setattr(backup, "_restore_database", mock.Mock())
+    container = mock.Mock(id="pgc", status="running")
+    container.labels = {"com.docker.compose.service": "postgres",
+                        "com.greffon.backup.restore": "pg_restore -d app"}
+    container.attrs = {"State": {"Health": {"Status": "healthy"}},
+                       "Mounts": [{"Type": "volume", "Name": "nores_db"}]}
+    monkeypatch.setattr(backup.observe, "list_instance_containers",
+                        lambda _id: [container])
+
+    _drain(monkeypatch, backup.spawn_restore, "nores", "snap-1", "r1",
+           manifest={"data": "DATA", "db:postgres": "DUMP"},
+           volume_classes={"files": "data", "db": "database"})
+
+    assert backup.handoff_pending("nores") is False
+
+
+def test_a_failed_restore_does_not_reserve_a_handoff(monkeypatch):
+    """No start is chained off a failure either."""
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "failres", safety_fails=True)
+
+    _drain(monkeypatch, backup.spawn_restore, "failres", "snap-1", "r1")
+
+    assert backup.handoff_pending("failres") is False
+
+
+def test_a_backup_does_not_reserve_a_handoff(monkeypatch):
+    """The manager starts nothing off a backup-result."""
+    _patch_common(monkeypatch)
+    _observe_lock(monkeypatch, "bkres")
+
+    _drain(monkeypatch, backup.spawn_backup, "bkres", "b1")
+
+    assert backup.handoff_pending("bkres") is False
+
+
+def test_the_wait_loop_polls_until_quiesced_and_never_short_circuits(monkeypatch):
+    """The polling LOOP, not just the degenerate timeout=0 path.
+
+    Production always calls with the configured timeout (default 120), so the loop
+    is the only path that runs there -- yet the cases above all pass 0, which
+    skips it entirely. Three regressions live only in the loop: a strict loop with
+    a lenient tail makes a gone instance wait the FULL timeout (the delay this was
+    changed to remove, holding the lock and 409ing every control op); a loop that
+    accepts any `unknow` frees the lock over a RUNNING container (the trap the
+    empty-vs-mixed check exists for); and a loop that returns True unconditionally
+    makes the wait a no-op.
+
+    A fake clock keeps it deterministic and instant -- patching only sleep would
+    busy-spin for the real timeout.
+    """
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    clock = _Clock()
+    monkeypatch.setattr(backup, "time", clock)
+    states = {}
+    monkeypatch.setattr(backup.compose, "get_status", lambda _id: states)
+
+    # A gone instance is accepted on the FIRST look, never slept on.
+    states.update(status="unknow", containers=[])
+    assert backup._wait_stopped("i", 120, missing_is_stopped=True) is True
+    assert clock.sleeps == [], (
+        "a gone instance was waited on -- that is the full-stop-timeout delay it "
+        "is accepted to avoid, holding the lock and 409ing every control op")
+
+    # A MIXED set is never accepted, however long we poll.
+    states.update(status="unknow",
+                  containers=[{"status": "running"}, {"status": "stopped"}])
+    assert backup._wait_stopped("i", 5, missing_is_stopped=True) is False, (
+        "a MIXED set was accepted mid-loop -- a container is still running")
+    assert clock.sleeps, "the loop never ran"
+
+    # And it really polls: quiesces on the third look, not the first or the last.
+    clock.sleeps.clear()
+    looks = []
+
+    def _late(_id):
+        looks.append(1)
+        if len(looks) < 3:
+            return {"status": "running", "containers": [{"status": "running"}]}
+        return {"status": "stopped", "containers": [{"status": "stopped"}]}
+
+    monkeypatch.setattr(backup.compose, "get_status", _late)
+    assert backup._wait_stopped("i", 120) is True
+    assert clock.sleeps == [1.0, 1.0], (
+        f"the loop did not poll until quiesced; slept {clock.sleeps}")
+
+
+def test_the_handoff_aware_acquire_never_waits_for_the_lock(monkeypatch):
+    """The third acquire site, and the one where waiting is worst.
+
+    The other two are pinned non-blocking for the reasons in their own tests. This
+    one waits while holding the process-wide ``_handoff_guard``, so a bounded wait
+    here stalls EVERY instance's reservation rather than just the contended one --
+    and a fully blocking acquire is a permanent cycle: renewal holds the guard and
+    waits on the lock while the restore holds the lock and waits on the guard to
+    reserve, wedging that instance's control ops for good.
+
+    Neither shows up as a failure without this. A `timeout=5` variant leaves the
+    suite fully green (three existing tests silently absorb the wait and still
+    assert the right outcome), and a blocking variant makes the suite hang rather
+    than fail.
+    """
+    rec = _RecordingLock()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: rec)
+
+    got, reason = backup.acquire_unless_handoff("nb-acq")
+    try:
+        assert got is not None and reason is None
+    finally:
+        if got is not None:
+            got.release()
+
+    assert len(rec.acquires) == 1
+    args, kwargs = rec.acquires[0]
+    assert kwargs.get("blocking") is False and "timeout" not in kwargs, (
+        "the handoff-aware acquire waited for the lock, and it does so holding "
+        f"the process-wide guard: acquire(*{args}, **{kwargs})")
+
+
+def test_the_spawn_gate_never_waits_for_the_lock(monkeypatch):
+    """The acquire must stay NON-BLOCKING, and nothing else pins that.
+
+    A bounded wait was tried on this branch and reverted: it does not beat the
+    30-96s a cert-renewal pass holds this lock, and it admits a waiter into a
+    live compose child -- /start/ and /stop/ only SPAWN theirs, so an op that
+    wins the lock the instant the handler returns runs against one still going.
+    The revert left only a docstring standing against re-adding it, and the
+    residual renewal race gives a maintainer a standing motive to try. So assert
+    the call shape directly rather than a wall clock, which would be flaky.
+    """
+    rec = _RecordingLock()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: rec)
+    assert rec.acquire(blocking=False)
+    rec.acquires.clear()
+    try:
+        with pytest.raises(backup.BusyError):
+            backup.spawn_backup(_settings(), "nb", "b1")
+        with pytest.raises(backup.BusyError):
+            backup.spawn_restore(_settings(), "nb", "snap-1", "r1")
+    finally:
+        rec.release()
+
+    assert len(rec.acquires) == 2
+    for args, kwargs in rec.acquires:
+        assert kwargs.get("blocking") is False and "timeout" not in kwargs, (
+            f"the spawn gate waited for the lock: acquire(*{args}, **{kwargs})")
+
+
+def test_a_late_second_release_cannot_steal_a_later_ops_lock(monkeypatch):
+    """The one-shot has to be a genuine no-op the second time, NOT a release that
+    swallows the RuntimeError. The two are indistinguishable until something else
+    holds the lock -- and by design something else does.
+
+    The sequence is reachable: the job releases early and posts its callback; the
+    manager answers it by calling /start/, which takes this lock; the greffer's
+    callback POST then hits its 30s timeout (shorter than the manager's 60s
+    actuation budget), the job returns, and ``_locked_job``'s finally fires the
+    SECOND release while that start is still holding the lock. A swallowing
+    release would free the start's lock -- a third op then runs against a live
+    ``up -d``, and the start's own release raises RuntimeError -> 500 ->
+    ``restored_start_failed``, the exact outcome this change exists to remove.
+    """
+    lock = backup._instance_lock("steal")
+    assert lock.acquire(blocking=False)
+    release = backup._release_once(lock)
+    release()                                    # the job's early release
+
+    assert lock.acquire(blocking=False)          # a LATER op takes it
+    try:
+        release()                                # _locked_job's finally, late
+        assert lock.locked(), (
+            "the second release freed a lock this job no longer owns -- it stole "
+            "the later op's lock")
+    finally:
+        lock.release()
+
+
+def test_lock_is_released_once_when_the_job_raises(monkeypatch):
+    """The early release is one-shot: a job that drops the lock and THEN raises
+    must not have ``_locked_job`` release it a second time (RuntimeError on an
+    unlocked lock), and a job that never reaches the callback must still get the
+    lock released by the wrapper."""
+    lock = backup._instance_lock("once-i")
+    assert lock.acquire(blocking=False)
+    release = backup._release_once(lock)
+    release()
+    release()                                   # no-op, not RuntimeError
+    assert lock.acquire(blocking=False)         # genuinely free, released once
+    lock.release()
+
+    # A job that raises before any early release: the wrapper still frees it.
+    lock2 = backup._instance_lock("once-j")
+    assert lock2.acquire(blocking=False)
+    with pytest.raises(ValueError):
+        backup._locked_job(backup._release_once(lock2),
+                           mock.Mock(side_effect=ValueError("boom")))
+    assert lock2.acquire(blocking=False)
+    lock2.release()
 
 
 # ---- callback ack + crash recovery ----------------------------------------

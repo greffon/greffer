@@ -183,6 +183,16 @@ def _serialize_instance_op(handler):
     serializer). 409 instance_busy if an op already holds it. ``functools.wraps``
     preserves the signature so FastAPI still parses the body + response_model.
 
+    The acquire stays NON-BLOCKING, and a bounded wait was tried and reverted.
+    It does not help against the holder that matters -- a cert-renewal pass holds
+    this lock for 30-96s, far past any wait short enough to stay inside the
+    manager's 60s actuation budget -- and it breaks a property this refusal
+    quietly provides: /start/ and /stop/ only SPAWN a compose child, so a waiter
+    that wins the lock the instant the handler returns runs against a child that
+    is still live. A waiting /decommission/ would `down -v` an instance whose
+    `up -d` is still pulling, then return 200 on a host the pull repopulates.
+    Refusing immediately is what keeps that from happening.
+
     NOT extended across the compose child. The manager chains control ops
     immediately -- the migration cutover runs stop then /backup/, and start then
     /restore/ -- and every one of those takes this same lock, so holding it past
@@ -195,6 +205,11 @@ def _serialize_instance_op(handler):
         lock = backup._instance_lock(payload.id)
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="instance_busy")
+        # The manager op a restore handoff was holding the lock for has arrived
+        # (or another one has, which is just as good a reason to stop standing
+        # renewal off). Consume the reservation rather than waiting out its
+        # window.
+        backup.clear_handoff(payload.id)
         try:
             return handler(payload, request, *args, **kwargs)
         finally:

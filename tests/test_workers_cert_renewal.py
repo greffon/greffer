@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1628,3 +1629,126 @@ def test_a_refusal_does_not_discard_a_debt_that_was_already_owed(
         assert cert_renewal._unconfirmed.get('inst-1') == OLD
     finally:
         cert_renewal._unconfirmed.pop('inst-1', None)
+
+
+# ---- the restore -> start handoff -----------------------------------------
+
+def test_renewal_stands_off_a_pending_handoff_without_touching_the_lock(
+        settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A restore releases the per-instance lock so the manager's chained start can
+    take it. That start's acquire is NON-BLOCKING, so renewal must not touch the
+    lock at all during the handoff -- even a momentary grab 409s the start and
+    lands the restore as ``restored_start_failed``.
+
+    So the check has to sit BEFORE the acquire, not inside the lock like
+    compose_inflight and sidecar_settling.
+    """
+    from app import backup
+
+    acquires = []
+
+    class _Spy:
+        def __init__(self):
+            self._inner = __import__("threading").Lock()
+
+        def acquire(self, *a, **kw):
+            acquires.append((a, kw))
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: _Spy())
+    monkeypatch.setattr(cert_renewal, "_renew_locked",
+                        lambda *a, **k: pytest.fail("renewal ran mid-handoff"))
+
+    backup.reserve_handoff("hx")
+    try:
+        out = cert_renewal.renew_one(settings, "tok", "hx")
+    finally:
+        backup.clear_handoff("hx")
+
+    assert out.status == cert_renewal.SKIPPED
+    assert out.reason == "handoff"
+    assert acquires == [], "renewal took the lock the chained start needs"
+
+
+def test_the_handoff_standoff_also_covers_the_debt_probe(
+        settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard has to sit above the DEBT block, not merely above the renewal
+    acquire.
+
+    An instance that owes the manager a confirmation goes through the debt path
+    first, and that path takes the SAME per-instance lock for its probe. A guard
+    placed after it -- which is where this one first went -- is bypassed entirely
+    for exactly those instances, and the race is back.
+    """
+    from app import backup
+
+    acquires = []
+
+    class _Spy:
+        def __init__(self):
+            self._inner = __import__("threading").Lock()
+
+        def acquire(self, *a, **kw):
+            acquires.append((a, kw))
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: _Spy())
+    monkeypatch.setattr(cert_renewal, "_renew_locked",
+                        lambda *a, **k: pytest.fail("renewal ran mid-handoff"))
+    monkeypatch.setattr(cert_renewal, "_served_certificate",
+                        lambda *a, **k: pytest.fail("debt probe ran mid-handoff"))
+
+    cert_renewal._unconfirmed["hz"] = "serial-owed"
+    backup.reserve_handoff("hz")
+    try:
+        out = cert_renewal.renew_one(settings, "tok", "hz")
+    finally:
+        backup.clear_handoff("hz")
+        cert_renewal._unconfirmed.pop("hz", None)
+
+    assert out.status == cert_renewal.SKIPPED
+    assert out.reason == "handoff"
+    assert acquires == [], (
+        "the debt probe took the lock the chained start needs -- the guard is "
+        "below the debt block")
+
+
+def test_a_handoff_skip_is_not_a_deferral(settings: Settings) -> None:
+    """Deliberately NOT in _TRANSIENT_SKIPS.
+
+    A deferral means "come back soon, there is work here", and there is not. NOT
+    because the start mints a certificate for us -- the manager only records a
+    mint after the greffer returns 200, so a start we 409 delivers nothing. The
+    reason is the arithmetic: one 90s window against a 6h cadence and a 30-day
+    certificate cannot expire anything. Counting it would also drop the node's
+    next tick from 6h to the 120s deferred-retry cadence after every restore.
+    """
+    assert "handoff" not in cert_renewal._TRANSIENT_SKIPS
+    assert "instance_busy" in cert_renewal._TRANSIENT_SKIPS   # calibration
+
+
+def test_a_control_op_consumes_the_handoff_reservation() -> None:
+    """The awaited op arriving ends the standoff immediately, rather than leaving
+    renewal blocked for the rest of the window."""
+    from app import backup
+    from app.routers import controller
+
+    backup.reserve_handoff("hy")
+    assert backup.handoff_pending("hy") is True
+
+    lock = backup._instance_lock("hy")
+
+    @controller._serialize_instance_op
+    def _op(payload, request):
+        return "ran"
+
+    assert _op(SimpleNamespace(id="hy"), None) == "ran"
+    assert backup.handoff_pending("hy") is False, (
+        "the reservation outlived the op it was held for")
+    assert not lock.locked()

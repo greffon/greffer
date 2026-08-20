@@ -34,3 +34,14 @@ async def client(settings: Settings) -> AsyncIterator[AsyncClient]:
         base_url="http://test",
     ) as ac:
         yield ac
+
+
+@pytest.fixture(autouse=True)
+def _clear_handoff_reservations():
+    """Reservations are process-global, so a test that leaves one behind can mute
+    renewal in a later test that shares the instance id. Nothing collides today
+    (CI runs plain sequential pytest), which is exactly why it would be found the
+    hard way."""
+    yield
+    from app import backup
+    backup._handoff.clear()
