@@ -1722,10 +1722,12 @@ def test_the_handoff_standoff_also_covers_the_debt_probe(
 def test_a_handoff_skip_is_not_a_deferral(settings: Settings) -> None:
     """Deliberately NOT in _TRANSIENT_SKIPS.
 
-    A deferral means "come back soon, there is work here", and there is not: the
-    start being stood off mints its own certificate, which is this pass's whole
-    job. Counting it would also drop the node's next tick from 6h to the 120s
-    deferred-retry cadence after every single restore.
+    A deferral means "come back soon, there is work here", and there is not. NOT
+    because the start mints a certificate for us -- the manager only records a
+    mint after the greffer returns 200, so a start we 409 delivers nothing. The
+    reason is the arithmetic: one 90s window against a 6h cadence and a 30-day
+    certificate cannot expire anything. Counting it would also drop the node's
+    next tick from 6h to the 120s deferred-retry cadence after every restore.
     """
     assert "handoff" not in cert_renewal._TRANSIENT_SKIPS
     assert "instance_busy" in cert_renewal._TRANSIENT_SKIPS   # calibration

@@ -752,6 +752,48 @@ def test_the_acquire_path_itself_expires_a_stale_reservation(monkeypatch):
     assert "acq" not in backup._handoff, "the expired entry was not dropped"
 
 
+def test_every_write_to_the_handoff_map_happens_under_the_guard(monkeypatch):
+    """The read side is pinned by the atomicity test; these are the writes.
+
+    Unguarded they are both plausible edits -- "dict writes are atomic under the
+    GIL, the guard is redundant" -- and both cause real harm. An unguarded
+    ``reserve_handoff`` can land between a competitor's expiry read and its
+    acquire, which is the whole race back at full strength: the competitor takes
+    the lock and the manager's chained start gets 409. An unguarded
+    ``clear_handoff`` can pop between ``_pending_locked``'s get and its del,
+    raising KeyError out into the renewal pass, which counts it an error and arms
+    the backoff.
+
+    Observed at the dict itself, so it holds wherever the writes move to.
+    """
+    class _Watched(dict):
+        def __init__(self):
+            super().__init__()
+            self.writes = []
+
+        def __setitem__(self, key, value):
+            self.writes.append(("set", backup._handoff_guard.locked()))
+            super().__setitem__(key, value)
+
+        def pop(self, *a, **k):
+            self.writes.append(("pop", backup._handoff_guard.locked()))
+            return super().pop(*a, **k)
+
+        def __delitem__(self, key):
+            self.writes.append(("del", backup._handoff_guard.locked()))
+            super().__delitem__(key)
+
+    watched = _Watched()
+    monkeypatch.setattr(backup, "_handoff", watched)
+
+    backup.reserve_handoff("w")
+    backup.clear_handoff("w")
+
+    assert watched.writes == [("set", True), ("pop", True)], (
+        "a write to the handoff map happened outside the guard; got "
+        f"{watched.writes}")
+
+
 def test_the_handoff_check_and_the_acquire_are_one_atomic_step(monkeypatch):
     """Check-then-acquire is a TOCTOU, so the acquire must happen while the
     handoff guard is HELD.
