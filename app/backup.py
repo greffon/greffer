@@ -86,7 +86,7 @@ _handoff_guard = threading.Lock()
 # worker_class 'gthread', where `timeout` is worker LIVENESS, not a request
 # deadline -- a handler blocked for minutes is never killed -- and its
 # restore-result handler runs the whole mint-and-start inline behind its own HTTP
-# timeouts plus two unbounded select_for_update waits.
+# timeouts plus roughly seven unbounded select_for_update waits.
 #
 # So this cannot guarantee the handoff; it covers the normal one with a wide
 # margin. If the manager exceeds it the reservation simply expires and we are back

@@ -942,6 +942,38 @@ def test_the_wait_loop_polls_until_quiesced_and_never_short_circuits(monkeypatch
         f"the loop did not poll until quiesced; slept {clock.sleeps}")
 
 
+def test_the_handoff_aware_acquire_never_waits_for_the_lock(monkeypatch):
+    """The third acquire site, and the one where waiting is worst.
+
+    The other two are pinned non-blocking for the reasons in their own tests. This
+    one waits while holding the process-wide ``_handoff_guard``, so a bounded wait
+    here stalls EVERY instance's reservation rather than just the contended one --
+    and a fully blocking acquire is a permanent cycle: renewal holds the guard and
+    waits on the lock while the restore holds the lock and waits on the guard to
+    reserve, wedging that instance's control ops for good.
+
+    Neither shows up as a failure without this. A `timeout=5` variant leaves the
+    suite fully green (three existing tests silently absorb the wait and still
+    assert the right outcome), and a blocking variant makes the suite hang rather
+    than fail.
+    """
+    rec = _RecordingLock()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: rec)
+
+    got, reason = backup.acquire_unless_handoff("nb-acq")
+    try:
+        assert got is not None and reason is None
+    finally:
+        if got is not None:
+            got.release()
+
+    assert len(rec.acquires) == 1
+    args, kwargs = rec.acquires[0]
+    assert kwargs.get("blocking") is False and "timeout" not in kwargs, (
+        "the handoff-aware acquire waited for the lock, and it does so holding "
+        f"the process-wide guard: acquire(*{args}, **{kwargs})")
+
+
 def test_the_spawn_gate_never_waits_for_the_lock(monkeypatch):
     """The acquire must stay NON-BLOCKING, and nothing else pins that.
 
