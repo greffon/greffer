@@ -779,10 +779,18 @@ def test_the_handoff_reservation_expires_and_can_be_consumed(monkeypatch):
     backup.reserve_handoff("h")
     assert backup.handoff_pending("h") is True
 
-    clock.now += backup._HANDOFF_WINDOW_SECONDS - 0.01
-    assert backup.handoff_pending("h") is True, "expired early"
-    clock.now += 0.02
-    assert backup.handoff_pending("h") is False, "the reservation did not expire"
+    # Pinned in BOTH directions against real durations, not against the constant
+    # itself -- asserting `_HANDOFF_WINDOW_SECONDS - 0.01` is self-referential and
+    # passes for any value, including a 0.05s window that makes the mechanism a
+    # no-op and a 24h one that mutes renewal after every restore.
+    clock.now += 65.0          # a slow manager: mint + start, inside its 60s worker timeout
+    assert backup.handoff_pending("h") is True, (
+        "the reservation expired before a slow-but-legal manager could answer -- "
+        "the chained start would arrive to an unreserved lock")
+    clock.now += 300.0
+    assert backup.handoff_pending("h") is False, (
+        "the reservation outlived any plausible handoff -- renewal is being stood "
+        "off long after the manager could still be coming")
     assert "h" not in backup._handoff, "an expired entry was left behind"
 
     backup.reserve_handoff("h")

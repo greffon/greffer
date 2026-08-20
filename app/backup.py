@@ -78,10 +78,16 @@ def _instance_lock(instance_id: str) -> threading.Lock:
 _handoff: dict[str, float] = {}
 _handoff_guard = threading.Lock()
 
-# Generous upper bound on "the manager is answering our callback": one round trip
-# plus a CA mint, sized against the manager's own 60s actuation budget. Renewal
-# runs on a 6h cadence, so standing it off this long costs nothing.
-_HANDOFF_WINDOW_SECONDS = 60
+# Upper bound on "the manager is answering our callback": one round trip plus a
+# CA mint. Sized ABOVE the manager's own limits rather than equal to them -- its
+# restore-result handler runs the whole mint-and-start inline under a gunicorn
+# worker timeout of 60s (backend/gunicorn.conf.py), so a 60s window would have
+# exactly zero headroom against a handler that is allowed to take all 60.
+#
+# Erring long is close to free and erring short is not: renewal runs on a 6h
+# cadence, so an over-long window costs one instance one skipped pass, while an
+# under-short one silently reopens the race this whole mechanism exists to close.
+_HANDOFF_WINDOW_SECONDS = 90
 
 
 def reserve_handoff(instance_id: str) -> None:
