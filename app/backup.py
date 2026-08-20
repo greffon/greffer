@@ -102,6 +102,40 @@ def handoff_pending(instance_id: str) -> bool:
         return True
 
 
+def acquire_unless_handoff(instance_id: str):
+    """Take the per-instance lock unless a manager handoff is reserved.
+
+    Returns ``(lock, None)`` on success, else ``(None, reason)`` where reason is
+    ``'handoff'`` or ``'instance_busy'``.
+
+    The check and the acquire are ONE step under the guard ``reserve_handoff``
+    also takes, and that is the entire point. Done separately they are a TOCTOU:
+    a caller reads "no handoff" while the restore still holds the lock, and by the
+    time it acquires, the restore has reserved AND released -- so it wins the lock
+    that was just claimed for the manager's start, and the restore lands
+    restored_start_failed anyway.
+
+    Atomically, that window cannot exist. The reservation is always taken while
+    the lock is STILL HELD (see restore_instance), so a caller holding this guard
+    observes either the lock held or the reservation present. There is no third
+    state.
+
+    No deadlock: the acquire is non-blocking, so this never holds the guard
+    waiting on the lock, while a job holding the lock and calling
+    ``reserve_handoff`` only ever waits on the guard.
+    """
+    lock = _instance_lock(instance_id)
+    with _handoff_guard:
+        deadline = _handoff.get(instance_id)
+        if deadline is not None:
+            if time.monotonic() < deadline:
+                return None, 'handoff'
+            del _handoff[instance_id]
+        if lock.acquire(blocking=False):
+            return lock, None
+        return None, 'instance_busy'
+
+
 def clear_handoff(instance_id: str) -> None:
     """The awaited op arrived (or another one did) -- stop standing renewal off."""
     with _handoff_guard:

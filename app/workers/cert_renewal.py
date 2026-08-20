@@ -776,28 +776,7 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
     a forced call that is genuinely not due just collects a 409. It does NOT
     drop the instance lock.
     """
-    from app.backup import _instance_lock
-    from app.backup import handoff_pending
-
-    # FIRST, before the debt block below and before any acquire. A restore just
-    # released the per-instance lock so the manager's chained start can take it,
-    # and that start is one round trip away. Its acquire is non-blocking, so
-    # anything here holding the lock even momentarily 409s it and lands a good
-    # restore as restored_start_failed.
-    #
-    # Position is the whole point: the debt path takes the SAME lock for its
-    # probe, so a guard placed after it (as this one first was) is bypassed
-    # entirely whenever this instance owes a confirmation.
-    #
-    # Deliberately NOT in _TRANSIENT_SKIPS: a deferral means "come back soon,
-    # there is work here", and there is not. The start being stood off mints its
-    # own certificate, which is this pass's whole job -- the same reason the
-    # instance_busy branch below calls a lost race "not a failure".
-    if handoff_pending(greffon_id):
-        diag('cert_renewal_skipped', instance=greffon_id, reason='handoff')
-        return Outcome(SKIPPED, None, 'handoff')
-
-
+    from app.backup import acquire_unless_handoff
     if greffon_id in _unconfirmed:
         # The PROBE is what has to be serialized, and it is the cheap half.
         # A sidecar Compose is recreating serves the old certificate or
@@ -828,8 +807,8 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
         # false because the counter is empty and the sidecar may still be
         # coming up.
         if not (compose_inflight(greffon_id) or _sidecar_settling(greffon_id)):
-            probe_lock = _instance_lock(greffon_id)
-            if probe_lock.acquire(blocking=False):
+            probe_lock, _refusal = acquire_unless_handoff(greffon_id)
+            if probe_lock is not None:
                 try:
                     port = _sidecar_host_port(settings, greffon_id)
                     if port is not None:
@@ -850,14 +829,21 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
             # for a quiet tick loses nothing.
             diag('cert_renewal_debt_deferred', instance=greffon_id)
 
-    lock = _instance_lock(greffon_id)
-    if not lock.acquire(blocking=False):
-        # Non-blocking: a renewal is never urgent enough to queue behind a
-        # restore, and holding the tick here would stall every later instance.
-        # Not a failure either -- whatever holds the lock (a Start, most
-        # likely) mints its own certificate anyway.
-        diag('cert_renewal_skipped', instance=greffon_id, reason='instance_busy')
-        return Outcome(SKIPPED, None, 'instance_busy')
+    # Non-blocking, and handoff-aware in the SAME step. Non-blocking because a
+    # renewal is never urgent enough to queue behind a restore, and holding the
+    # tick here would stall every later instance. Not a failure either -- whatever
+    # holds the lock (a Start, most likely) mints its own certificate anyway.
+    #
+    # `handoff` is the sharper case: a restore released this lock specifically so
+    # the manager's chained start could take it, and that start's own acquire is
+    # non-blocking, so taking it here even momentarily 409s the start and lands a
+    # good restore as restored_start_failed. Deliberately NOT in _TRANSIENT_SKIPS:
+    # a deferral means "come back soon, there is work here", and there is not --
+    # the start being stood off mints the certificate this pass would have.
+    lock, refusal = acquire_unless_handoff(greffon_id)
+    if lock is None:
+        diag('cert_renewal_skipped', instance=greffon_id, reason=refusal)
+        return Outcome(SKIPPED, None, refusal)
     try:
         return _renew_locked(settings, token, greffon_id, force)
     finally:

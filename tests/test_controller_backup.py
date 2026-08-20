@@ -713,6 +713,50 @@ def test_the_abort_wait_accepts_a_gone_instance_but_never_a_mixed_one(monkeypatc
     assert backup._wait_stopped("i", 0) is True
 
 
+def test_the_handoff_check_and_the_acquire_are_one_atomic_step(monkeypatch):
+    """Check-then-acquire is a TOCTOU, so the acquire must happen while the
+    handoff guard is HELD.
+
+    Split, the race is: a competitor reads "no handoff" while the restore still
+    holds the lock; by the time it acquires, the restore has reserved AND
+    released; so it takes the lock claimed for the manager's start and the restore
+    lands restored_start_failed anyway. Under one guard that window cannot exist,
+    because the reservation is always taken while the lock is still held -- the
+    competitor sees either the lock held or the reservation, never neither.
+
+    Asserted structurally, by observing whether the guard is held at the moment
+    the lock is acquired. A timing-based version of this test would pass on the
+    broken code, which is exactly how the first attempt at it failed.
+    """
+    guard_held_at_acquire = []
+
+    class _Probe:
+        def __init__(self):
+            self._inner = threading.Lock()
+
+        def acquire(self, *a, **kw):
+            guard_held_at_acquire.append(backup._handoff_guard.locked())
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    probe = _Probe()
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: probe)
+
+    got, reason = backup.acquire_unless_handoff("atomic")
+    try:
+        assert got is not None and reason is None
+    finally:
+        if got is not None:
+            got.release()
+
+    assert guard_held_at_acquire == [True], (
+        "the lock was acquired OUTSIDE the handoff guard -- check-then-acquire is "
+        "a TOCTOU, and a competitor can take the lock reserved for the manager's "
+        "chained start")
+
+
 def test_the_handoff_reservation_expires_and_can_be_consumed(monkeypatch):
     """A monotonic deadline, not a flag: nothing can pin it.
 
