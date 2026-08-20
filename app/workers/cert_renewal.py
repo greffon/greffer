@@ -777,6 +777,26 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
     drop the instance lock.
     """
     from app.backup import _instance_lock
+    from app.backup import handoff_pending
+
+    # FIRST, before the debt block below and before any acquire. A restore just
+    # released the per-instance lock so the manager's chained start can take it,
+    # and that start is one round trip away. Its acquire is non-blocking, so
+    # anything here holding the lock even momentarily 409s it and lands a good
+    # restore as restored_start_failed.
+    #
+    # Position is the whole point: the debt path takes the SAME lock for its
+    # probe, so a guard placed after it (as this one first was) is bypassed
+    # entirely whenever this instance owes a confirmation.
+    #
+    # Deliberately NOT in _TRANSIENT_SKIPS: a deferral means "come back soon,
+    # there is work here", and there is not. The start being stood off mints its
+    # own certificate, which is this pass's whole job -- the same reason the
+    # instance_busy branch below calls a lost race "not a failure".
+    if handoff_pending(greffon_id):
+        diag('cert_renewal_skipped', instance=greffon_id, reason='handoff')
+        return Outcome(SKIPPED, None, 'handoff')
+
 
     if greffon_id in _unconfirmed:
         # The PROBE is what has to be serialized, and it is the cheap half.
@@ -829,22 +849,6 @@ def renew_one(settings: Settings, token: str, greffon_id: str,
             # Deferred, not dropped. The debt survives restarts, so waiting
             # for a quiet tick loses nothing.
             diag('cert_renewal_debt_deferred', instance=greffon_id)
-
-    from app.backup import handoff_pending
-
-    if handoff_pending(greffon_id):
-        # The manager is mid-handoff: a restore just released this lock so the
-        # manager's chained start can take it, and that start is one round trip
-        # away. Checked BEFORE the acquire, not inside the lock -- the start's
-        # acquire is non-blocking, so even holding it momentarily 409s the start
-        # and lands the restore as restored_start_failed.
-        #
-        # Deliberately NOT in _TRANSIENT_SKIPS: a deferral means "come back soon,
-        # there is work here", and there is not. The start we are standing off
-        # mints its own certificate, which is this pass's whole job -- the same
-        # reason the instance_busy branch below calls a lost race "not a failure".
-        diag('cert_renewal_skipped', instance=greffon_id, reason='handoff')
-        return Outcome(SKIPPED, None, 'handoff')
 
     lock = _instance_lock(greffon_id)
     if not lock.acquire(blocking=False):

@@ -1673,6 +1673,52 @@ def test_renewal_stands_off_a_pending_handoff_without_touching_the_lock(
     assert acquires == [], "renewal took the lock the chained start needs"
 
 
+def test_the_handoff_standoff_also_covers_the_debt_probe(
+        settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard has to sit above the DEBT block, not merely above the renewal
+    acquire.
+
+    An instance that owes the manager a confirmation goes through the debt path
+    first, and that path takes the SAME per-instance lock for its probe. A guard
+    placed after it -- which is where this one first went -- is bypassed entirely
+    for exactly those instances, and the race is back.
+    """
+    from app import backup
+
+    acquires = []
+
+    class _Spy:
+        def __init__(self):
+            self._inner = __import__("threading").Lock()
+
+        def acquire(self, *a, **kw):
+            acquires.append((a, kw))
+            return self._inner.acquire(*a, **kw)
+
+        def release(self):
+            return self._inner.release()
+
+    monkeypatch.setattr(backup, "_instance_lock", lambda _id: _Spy())
+    monkeypatch.setattr(cert_renewal, "_renew_locked",
+                        lambda *a, **k: pytest.fail("renewal ran mid-handoff"))
+    monkeypatch.setattr(cert_renewal, "_served_certificate",
+                        lambda *a, **k: pytest.fail("debt probe ran mid-handoff"))
+
+    cert_renewal._unconfirmed["hz"] = "serial-owed"
+    backup.reserve_handoff("hz")
+    try:
+        out = cert_renewal.renew_one(settings, "tok", "hz")
+    finally:
+        backup.clear_handoff("hz")
+        cert_renewal._unconfirmed.pop("hz", None)
+
+    assert out.status == cert_renewal.SKIPPED
+    assert out.reason == "handoff"
+    assert acquires == [], (
+        "the debt probe took the lock the chained start needs -- the guard is "
+        "below the debt block")
+
+
 def test_a_handoff_skip_is_not_a_deferral(settings: Settings) -> None:
     """Deliberately NOT in _TRANSIENT_SKIPS.
 
