@@ -69,6 +69,35 @@ def _entries():
 _ENTRIES = _entries()
 
 
+def _ports_for(version_dir: pathlib.Path):
+    """The manager's start-request port map, keyed ``<service>_<container>``.
+
+    Exposure is manager-authoritative: create_greffon_info reads
+    ``greffon['ports'][port_name]`` and defaults to http/tcp when it is absent
+    (repository.py:239). Omitting it silently downgrades the catalog's L4/UDP
+    entries (visio, wireguard) to HTTP, so their snapshots would place UDP
+    ports behind nginx, leave instance_l4_* empty, and never exercise the L4
+    render path at all."""
+    meta_path = version_dir / "metadata.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        meta = json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    ports = {}
+    for entry in meta.get("ports", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        ports[name] = {
+            "exposure_tier": entry.get("exposure_tier", "http"),
+            "protocol": entry.get("protocol", "tcp"),
+            "same_port": bool(entry.get("same_port", False)),
+        }
+    return ports
+
+
 def _configurations_for(version_dir: pathlib.Path):
     """Feed each config its catalog default, the way a freshly-created
     instance does before the user edits anything."""
@@ -99,6 +128,7 @@ def _greffon_info(instance_id: str, version_dir: pathlib.Path):
                  "private_key": "-----BEGIN PRIVATE KEY-----\nsnapshot\n"
                                 "-----END PRIVATE KEY-----\n"},
         "configurations": _configurations_for(version_dir),
+        "ports": _ports_for(version_dir),
         # Field names are the manager's contract (SMTPConfigSerializer in
         # apps/integrations/types/smtp.py): host, port, username, password,
         # from_address, tls_mode. Getting this wrong is not cosmetic -- 15
@@ -147,10 +177,20 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
     prev = os.environ.get("GREFFON_PATH")
     os.environ["GREFFON_PATH"] = str(tmp_path)
     try:
+        # Two stubs, both for determinism rather than convenience:
+        # get_free_ports probes real sockets, and the L4 reservation asks the
+        # docker daemon which host ports are occupied. Neither answer is
+        # stable, and a snapshot that moves on its own proves nothing. The
+        # allocation LOGIC (sticky reuse, same_port pinning, per-protocol
+        # namespacing) still runs for real against an empty host.
         with mock.patch(
             "apps.utils.greffon.repository.get_free_ports",
             side_effect=lambda host="127.0.0.1", numbers=1, protocol="tcp": (
                 list(range(20000, 20000 + numbers))),
+        ), mock.patch(
+            "apps.utils.docker.l4_ports.published_l4_ports", return_value={},
+        ), mock.patch(
+            "apps.utils.docker.l4_ports.pending_and_prune", return_value={},
         ):
             info = repository.get_greffon_info(parsed, info_seed)
         # The manager assigns each port its public URL and sends it in the
@@ -158,7 +198,8 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
         # instance_url is derived from ports[0].url. Assign deterministically
         # so the snapshot pins real URL interpolation rather than a fallback.
         for idx, port in enumerate(info.get("ports", [])):
-            port["url"] = f"https://{instance_id}-{idx}.my.example.test"
+            if port.get("exposure_tier") != "l4":
+                port["url"] = f"https://{instance_id}-{idx}.my.example.test"
         compose_mod.build_render_context(info)
         template = compose_mod.get_compose_template(parsed, info)
         compose_mod.apply_configuration(info, parsed)

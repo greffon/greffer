@@ -173,7 +173,6 @@ services:
     - greffon_internal_network
     ports:
     - '20000:8083'
-    - '20000:7882'
     restart: unless-stopped
     volumes:
     - regress-visio_nginx_volume:/etc/nginx/
@@ -213,7 +212,8 @@ services:
         max-size: 10m
     networks:
     - greffon_internal_network
-    ports: []
+    ports:
+    - 0.0.0.0:20000:20000/udp
     restart: on-failure
     volumes:
     - regress-visio_livekit_conf:/etc

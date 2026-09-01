@@ -12,7 +12,6 @@ services:
     - greffon_internal_network
     ports:
     - '20000:51821'
-    - '20000:51820'
     restart: unless-stopped
     volumes:
     - regress-wireguard_nginx_volume:/etc/nginx/
@@ -27,9 +26,9 @@ services:
     environment:
       DISABLE_IPV6: 'true'
       INIT_ENABLED: 'true'
-      INIT_HOST: ''
+      INIT_HOST: 'host.docker.internal'
       INIT_PASSWORD: ''
-      INIT_PORT: ''
+      INIT_PORT: '20000'
       INIT_USERNAME: admin
       INSECURE: 'true'
       PORT: '51821'
@@ -41,7 +40,8 @@ services:
         max-size: 10m
     networks:
     - greffon_internal_network
-    ports: []
+    ports:
+    - 0.0.0.0:20000:20000/udp
     restart: unless-stopped
     sysctls:
     - net.ipv4.ip_forward=1
