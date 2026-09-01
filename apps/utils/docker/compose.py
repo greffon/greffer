@@ -154,10 +154,35 @@ def get_greffon_path(greffon_info):
 
 # Feature #4 (integrations): the set of integration types the catalog
 # may reference via `{{ <type>.<field> }}` in compose YAML AND via
-# `destination.type: <type>` in metadata.json. V1 ships SMTP only; new
-# types slot in additively here AND in the manager (per-type FK on
-# GreffonInstance) AND in the catalog validator.
-KNOWN_INTEGRATION_TYPES = ('smtp',)
+# `destination.type: <type>` in metadata.json. New types slot in
+# additively here AND in the manager (per-type FK on GreffonInstance)
+# AND in the catalog validator.
+#
+# `oidc` is listed here BEFORE anything in the catalog references it,
+# and that order is deliberate. This tuple is the gate on both passes
+# below: a type absent from it is never lifted into the Jinja context,
+# so a catalog entry containing `{{ oidc.issuer }}` shipped first would
+# raise `UndefinedError: 'oidc' is undefined` at render and the instance
+# would never deploy -- the same failure class as the known-broken
+# `nextcloud/1.0`. Listing the type first makes an unset OIDC integration
+# strip those env keys instead.
+#
+# That covers `services[*].environment` and ONLY that. Be precise about
+# the limit, because it is the half Feature #3 will need: a baked config
+# file (`_render_baked_file`) renders under `StrictUndefined`, where
+# `oidc = {}` still raises on `{{ oidc.issuer }}` -- verified, it gives
+# `'dict object' has no attribute 'issuer'` and a 422. Only the bare
+# `{{ oidc }}` goes from raising to rendering `{}`. So a Keycloak-style
+# realm file referencing `{{ oidc.* }}` is NOT made deployable by this
+# change, and whoever writes the client-injection half needs a real
+# value there rather than an empty default.
+#
+# Note this greffer half is independent of how the manager REGISTERS an
+# OIDC client (platform-identity Feature #3, manager side). All the
+# greffer does is thread whatever per-type blob the manager sends into
+# the render; it holds no provider credential and makes no call to the
+# provider.
+KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
 def _is_integration_set(value):
@@ -346,35 +371,174 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # Jinja, semantically identical to ``smtp.from_address`` for our
     # purposes — Codex P2 on PR #35).
     #
-    # Cheap + robust: require both ``{{`` and a word-bounded ``<type>``
-    # immediately followed by ``.`` (attr) or ``[`` (bracket) in the
-    # value. ``\b`` before the type prevents ``foo_smtp.bar`` false
-    # positives.
+    # A key is popped when an UNSET type is referenced somewhere Jinja
+    # will actually evaluate. Getting that right needs a scanner rather
+    # than a regex, and the reason is worth stating, because two earlier
+    # regex spellings each shipped a different bug:
+    #
+    #   whole-string match       popped a value whose `{{ }}` was unrelated
+    #                            to a literal `oidc.<host>` beside it
+    #   `{{ }}` bodies only      missed statement blocks, which render too,
+    #                            so `{% if oidc.issuer.startswith(..) %}`
+    #                            survived and raised UndefinedError -- the
+    #                            exact failure this tuple entry prevents
+    #   non-greedy body match    stopped at the first `}}`, INCLUDING one
+    #                            inside a string literal, so everything
+    #                            after it was scanned by nothing:
+    #                            `{{ "}}" ~ oidc.issuer }}` survived and raised
+    #
+    # The last one is why this walks the string tracking quote state: a
+    # delimiter inside a literal does not end a construct, and a literal
+    # is data rather than a reference. Comments and `{% raw %}` bodies are
+    # skipped because Jinja never evaluates them -- `{% raw %}` in
+    # particular is the documented way to ship a literal
+    # `{{ oidc.issuer }}` through to a downstream config file.
     import re
+    # Inside an evaluated body, with string literals already blanked, a
+    # bare mention of the type IS a reference to the variable. Requiring
+    # a `.` or `[` immediately after the token looked tighter and was
+    # simply wrong: every one of these renders and RAISES with the type
+    # bound to `{}`, and every one of them slipped through --
+    #
+    #     {{ oidc . issuer.host }}        (spaces around the dot)
+    #     {{ (oidc).issuer.host }}        (parenthesised)
+    #     {{ oidc|attr("issuer").host }}  (attr filter)
+    #     {% set x = oidc %}{{ x.issuer.host }}   (aliased)
+    #
+    # and the aliased form cannot be caught by ANY adjacency rule, so
+    # tightening the pattern was chasing a boundary that does not exist.
+    # Matching the bare token instead covers all four.
+    #
+    # It does pop a few values that would have rendered without raising,
+    # `{{ oidc.get("issuer") }}` among them. That is the intended
+    # semantic rather than a regression: an env key that references an
+    # unset integration should not reach the greffon, and rendering
+    # `None` or an empty string into it is worse than removing it.
     type_patterns = {
-        t: re.compile(r'\b' + re.escape(t) + r'(?:\.\w|\[)')
+        t: re.compile(r'\b' + re.escape(t) + r'\b')
         for t in unset_types
     }
+    # Escapes consumed so an escaped quote does not close the literal.
+    string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
+    openers = {'{{': '}}', '{%': '%}', '{#': '#}'}
+    # Jinja accepts `+` as well as `-` for whitespace control, in either
+    # position. Accepting only `-` meant `{%+ endraw %}` was not found,
+    # and the `else n` fallback then swallowed the whole rest of the
+    # value unscanned. `{% raw +%}` is not legal Jinja, so only the
+    # closing tag needs `+` on the opening side.
+    endraw_re = re.compile(r'\{%[-+]?\s*endraw\s*[-+]?%\}')
 
-    def value_references_unset(value):
+    def evaluated_bodies(value):
+        """Source of each construct in `value` that Jinja evaluates."""
+        bodies = []
+        i, n = 0, len(value)
+        while i < n:
+            found = [(value.find(o, i), o) for o in openers]
+            found = [(pos, o) for pos, o in found if pos != -1]
+            if not found:
+                break
+            start_at, opener = min(found)
+            closer = openers[opener]
+            j = start_at + 2
+            quote = None
+            while j < n:
+                ch = value[j]
+                # A comment has no expression syntax, so quotes inside one
+                # are just text and must not swallow the terminator.
+                if opener != '{#':
+                    if quote is not None:
+                        if ch == '\\':
+                            j += 2
+                            continue
+                        if ch == quote:
+                            quote = None
+                        j += 1
+                        continue
+                    if ch in '\'"':
+                        quote = ch
+                        j += 1
+                        continue
+                if value.startswith(closer, j):
+                    break
+                j += 1
+            if j >= n:
+                # Unterminated. The value is a TemplateSyntaxError either
+                # way, but scanning the remainder lets a reference in it
+                # still pop the key, which costs one env var instead of
+                # letting `Template(yaml.dump(compose))` fail the whole
+                # start.
+                bodies.append(value[start_at + 2:])
+                break
+            body = value[start_at + 2:j]
+            i = j + 2
+            if opener == '{#':
+                continue
+            if opener == '{%' and body.strip().strip('-+').strip() == 'raw':
+                # Skip to the matching endraw TAG. Searching for the bare
+                # word closed the region early on raw content that merely
+                # contained it, e.g.
+                # `{% raw %}literal endraw %} {{ oidc.issuer }}{% endraw %}`,
+                # which renders perfectly well as literal text and was
+                # having its key dropped.
+                end = endraw_re.search(value, i)
+                i = end.end() if end else n
+                continue
+            bodies.append(body)
+        return bodies
+
+    def matching_unset_types(value):
+        """Which unset types `value` actually references, in tuple order."""
         if not isinstance(value, str):
-            return False
-        if '{{' not in value:
-            return False
-        return any(p.search(value) for p in type_patterns.values())
+            return ()
+        if '{{' not in value and '{%' not in value:
+            return ()
+        matched = []
+        for body in evaluated_bodies(value):
+            expression = string_re.sub('', body)
+            for t, pattern in type_patterns.items():
+                if t not in matched and pattern.search(expression):
+                    matched.append(t)
+        return tuple(matched)
 
-    for service in services.values():
+    # Log every pass-2 pop. This pass infers intent from the template
+    # text rather than reading a declared destination, so when it gets it
+    # wrong the greffon simply boots without the variable and fails at
+    # runtime with nothing on the greffer connecting the two. Naming the
+    # service and key is what makes that diagnosable.
+    def _log_pop(key, name, matched):
+        # The types that MATCHED, not every unset type: on a fresh
+        # instance both smtp and oidc are unset, so naming the whole set
+        # would report a key that references only oidc as
+        # "unset type: smtp, oidc" and make the field noise.
+        logger.info(
+            'integrations: dropping env %s from service %s '
+            '(references unset type: %s)',
+            key, name, ', '.join(matched),
+        )
+
+    for name, service in services.items():
         if not isinstance(service, dict):
             continue
         env = service.get('environment')
         if isinstance(env, dict):
-            for key in [k for k, v in env.items() if value_references_unset(v)]:
-                env.pop(key, None)
+            for key, value in list(env.items()):
+                matched = matching_unset_types(value)
+                if matched:
+                    _log_pop(key, name, matched)
+                    env.pop(key, None)
         elif isinstance(env, list):
-            service['environment'] = [
-                e for e in env
-                if not (isinstance(e, str) and '=' in e and value_references_unset(e.split('=', 1)[1]))
-            ]
+            kept = []
+            for e in env:
+                matched = (
+                    matching_unset_types(e.split('=', 1)[1])
+                    if isinstance(e, str) and '=' in e
+                    else ()
+                )
+                if matched:
+                    _log_pop(e.split('=', 1)[0], name, matched)
+                    continue
+                kept.append(e)
+            service['environment'] = kept
     return compose
 
 
