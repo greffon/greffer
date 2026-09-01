@@ -376,6 +376,47 @@ class ReferenceFormTests(TestCase):
         self.assertTrue(self._survives('{{ KEYCLOAK_OIDC }}'))
 
 
+class GuardedFallbackTests(TestCase):
+    """A value whose author HANDLED the unset case must survive.
+
+    These are the idioms an entry uses to degrade gracefully. Their
+    intended output is the fallback, not an absent env var, and a rule
+    that popped them regressed `smtp` -- which has been shipping since
+    Feature #4 -- on every instance with no SMTP configured.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_truthiness_guard_survives(self):
+        self.assertTrue(self._survives('{% if oidc %}on{% else %}off{% endif %}'))
+        self.assertTrue(self._survives('{% if smtp %}on{% else %}off{% endif %}'))
+
+    def test_default_filter_survives(self):
+        self.assertTrue(self._survives("{{ oidc|default('none') }}"))
+        self.assertTrue(self._survives("{{ smtp|default('none') }}"))
+
+    def test_is_defined_survives(self):
+        self.assertTrue(self._survives("{{ 'y' if smtp is defined else 'n' }}"))
+
+    def test_a_shadowing_binding_is_not_a_reference(self):
+        # The name is being BOUND here, not read from the context.
+        self.assertTrue(self._survives("{% set oidc = 'x' %}{{ oidc }}"))
+        self.assertTrue(self._survives("{% for oidc in ['a'] %}{{ oidc }}{% endfor %}"))
+
+    def test_a_field_of_that_name_on_another_object_is_not_a_reference(self):
+        # `oidc` here belongs to `keycloak`, not to the context.
+        self.assertTrue(self._survives('{{ keycloak.oidc.issuer }}'))
+
+    def test_chained_access_still_pops(self):
+        # The other side: these RAISE, so they must go.
+        self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
+        self.assertFalse(self._survives('{{ smtp.from_address.split("@")[0] }}'))
+
+
 class PopLoggingTests(TestCase):
     """The pop is inferred from template text, so when it is wrong the
     greffon boots without the variable and fails at runtime. The log line

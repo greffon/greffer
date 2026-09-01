@@ -394,30 +394,47 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # particular is the documented way to ship a literal
     # `{{ oidc.issuer }}` through to a downstream config file.
     import re
-    # Inside an evaluated body, with string literals already blanked, a
-    # bare mention of the type IS a reference to the variable. Requiring
-    # a `.` or `[` immediately after the token looked tighter and was
-    # simply wrong: every one of these renders and RAISES with the type
-    # bound to `{}`, and every one of them slipped through --
+    # What counts as a reference worth popping. With the type bound to
+    # `{}`, a SINGLE level of access renders empty and is harmless; it is
+    # CHAINED access that raises, and chaining is exactly the shape the
+    # catalog already ships (`smtp.from_address.split('@')[0]`).
     #
-    #     {{ oidc . issuer.host }}        (spaces around the dot)
-    #     {{ (oidc).issuer.host }}        (parenthesised)
-    #     {{ oidc|attr("issuer").host }}  (attr filter)
-    #     {% set x = oidc %}{{ x.issuer.host }}   (aliased)
+    # A bare mention of the token is NOT enough. An earlier version used
+    # one and regressed the type that was already shipping: all of these
+    # render their intended fallback and must survive --
     #
-    # and the aliased form cannot be caught by ANY adjacency rule, so
-    # tightening the pattern was chasing a boundary that does not exist.
-    # Matching the bare token instead covers all four.
+    #     {% if smtp %}on{% else %}off{% endif %}    -> 'off'
+    #     {{ smtp|default('none') }}
+    #     {{ 'y' if smtp is defined else 'n' }}
     #
-    # It does pop a few values that would have rendered without raising,
-    # `{{ oidc.get("issuer") }}` among them. That is the intended
-    # semantic rather than a regression: an env key that references an
-    # unset integration should not reach the greffon, and rendering
-    # `None` or an empty string into it is worse than removing it.
+    # Their author HANDLED the unset case; the intended output is the
+    # fallback, not an absent env var. Equally, a name that merely
+    # SHADOWS the type is not a reference to it --
+    #
+    #     {% set oidc = 'x' %}{{ oidc }}
+    #     {% for oidc in xs %}{{ oidc }}{% endfor %}
+    #
+    # So pop on member access, on the `attr` filter (which raises the
+    # same way a chain does), and on aliasing through `{% set %}`. That
+    # last one is why no pure adjacency rule can work: the access then
+    # happens on an entirely different name.
+    def _member_access(t):
+        # `oidc.x`, `oidc ['x']`, `(oidc).x`. The lookbehind keeps
+        # `keycloak.oidc.issuer` out -- there the token is a field on
+        # something else, not our variable.
+        return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\)*\s*(?:\.|\[)')
+
+    def _attr_filter(t):
+        return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\|\s*attr\b')
+
+    def _bare(t):
+        return re.compile(r'(?<![.\w])' + re.escape(t) + r'(?![\w])')
+
     type_patterns = {
-        t: re.compile(r'\b' + re.escape(t) + r'\b')
+        t: (_member_access(t), _attr_filter(t), _bare(t))
         for t in unset_types
     }
+
     # Escapes consumed so an escaped quote does not close the literal.
     string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
     openers = {'{{': '}}', '{%': '%}', '{#': '#}'}
@@ -486,6 +503,18 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             bodies.append(body)
         return bodies
 
+    def _aliases(expression, bare):
+        """True if a `{% set %}` binds ANOTHER name to the type.
+
+        Only the right-hand side counts: `{% set oidc = 'x' %}` binds the
+        type's own name to something else, which is shadowing rather than
+        aliasing, and its RHS holds no reference.
+        """
+        head = expression.strip()
+        if not head.startswith('set ') or '=' not in head:
+            return False
+        return bool(bare.search(head.split('=', 1)[1]))
+
     def matching_unset_types(value):
         """Which unset types `value` actually references, in tuple order."""
         if not isinstance(value, str):
@@ -495,8 +524,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         matched = []
         for body in evaluated_bodies(value):
             expression = string_re.sub('', body)
-            for t, pattern in type_patterns.items():
-                if t not in matched and pattern.search(expression):
+            for t, (member, attr, bare) in type_patterns.items():
+                if t in matched:
+                    continue
+                if (member.search(expression)
+                        or attr.search(expression)
+                        or _aliases(expression, bare)):
                     matched.append(t)
         return tuple(matched)
 
