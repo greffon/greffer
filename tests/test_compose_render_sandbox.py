@@ -27,11 +27,18 @@ def _info(instance_id="sandbox-test"):
                    "url": f"https://{instance_id}.my.example.test"}],
         "configurations": [],
         "integrations": {},
+        # Present because the real create_greffon_info builds it, and because
+        # it is the mutation target the immutability tests below exercise:
+        # entries here become `docker create -v <value>:/root` mounts.
+        "volumes": {"data": {"name": f"{instance_id}_data", "value": f"{instance_id}_data"}},
     }
 
 
-def _render(compose_dict, tmp_path, instance_id="sandbox-test"):
-    os.environ["GREFFON_PATH"] = str(tmp_path)
+def _render(compose_dict, tmp_path, monkeypatch, instance_id="sandbox-test"):
+    # monkeypatch, never a bare os.environ assignment: pytest runs the suite in
+    # one process, so a leaked GREFFON_PATH follows later tests out of this file
+    # (test_settings.py asserts the unset default of /data and would fail).
+    monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
     compose_mod.create_compose(compose_dict, _info(instance_id))
     return (tmp_path / instance_id / "docker-compose.yml").read_text()
 
@@ -58,13 +65,13 @@ _ESCAPES = [
 
 
 @pytest.mark.parametrize("payload", _ESCAPES)
-def test_attribute_walk_to_the_interpreter_is_refused(payload, tmp_path):
+def test_attribute_walk_to_the_interpreter_is_refused(payload, tmp_path, monkeypatch):
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"EVIL": payload}}}}
     # SecurityError specifically, not "any exception": a payload that merely
     # fails to parse is not evidence the sandbox did anything.
     with pytest.raises(SecurityError):
-        _render(compose, tmp_path)
+        _render(compose, tmp_path, monkeypatch)
 
 
 def test_the_escape_would_have_worked_before_the_sandbox(tmp_path):
@@ -83,16 +90,16 @@ def test_the_escape_would_have_worked_before_the_sandbox(tmp_path):
         "tests below would pass vacuously -- rewrite them")
 
 
-def test_ordinary_templating_still_works(tmp_path):
+def test_ordinary_templating_still_works(tmp_path, monkeypatch):
     """The sandbox must not cost the catalog its legitimate references."""
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"URL": "{{ instance_url }}"}}}}
-    rendered = yaml.safe_load(_render(compose, tmp_path))
+    rendered = yaml.safe_load(_render(compose, tmp_path, monkeypatch))
     assert rendered["services"]["app"]["environment"]["URL"] == \
         "https://sandbox-test.my.example.test"
 
 
-def test_a_missing_variable_still_renders_empty(tmp_path):
+def test_a_missing_variable_still_renders_empty(tmp_path, monkeypatch):
     """The undefined policy is deliberately UNCHANGED by the sandbox swap.
 
     Lenient undefined is the status quo for the compose body. Tightening it is
@@ -100,5 +107,29 @@ def test_a_missing_variable_still_renders_empty(tmp_path):
     means that decision has to be made on purpose."""
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"X": "[{{ nope }}]"}}}}
-    rendered = yaml.safe_load(_render(compose, tmp_path))
+    rendered = yaml.safe_load(_render(compose, tmp_path, monkeypatch))
     assert rendered["services"]["app"]["environment"]["X"] == "[]"
+
+
+def test_a_template_cannot_mutate_the_live_deployment_context(tmp_path, monkeypatch):
+    """The sandbox must refuse MUTATION, not only attribute traversal.
+
+    ``greffon_info`` is passed to render() by reference, and its ``volumes``
+    entries become ``docker container create -v <value>:/root`` mounts in
+    ``create_volumes_then_copy_files``. A plain SandboxedEnvironment allows
+    ``dict.update``/``list.append``, so a template could inject a volume whose
+    value is ``/`` and get attacker content written into the host filesystem --
+    a host-write primitive that survives blocking the dunder walk. Immutable
+    environments refuse it."""
+    payload = '{{ volumes.update({"evil": {"value": "/"}}) }}'
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"X": payload}}}}
+    with pytest.raises(SecurityError):
+        _render(compose, tmp_path, monkeypatch)
+
+
+def test_a_template_cannot_append_to_a_live_list(tmp_path, monkeypatch):
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"X": '{{ ports.append(1) }}'}}}}
+    with pytest.raises(SecurityError):
+        _render(compose, tmp_path, monkeypatch)

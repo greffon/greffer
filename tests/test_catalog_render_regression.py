@@ -32,14 +32,20 @@ _UPDATE = os.getenv("CATALOG_RENDER_UPDATE") == "1"
 
 
 def _catalog_root() -> pathlib.Path | None:
+    """Find the catalog, or return None.
+
+    Walk every ancestor rather than guessing a fixed depth: a direct
+    ``greffer/`` checkout, a ``greffer-worktrees/<x>`` worktree and a CI
+    checkout all sit at different depths, and a hard-coded range silently
+    finds nothing -- which would skip this whole oracle while still reporting
+    green. ``GREFFON_CATALOG_DIR`` overrides for layouts we cannot guess."""
     env = os.getenv("GREFFON_CATALOG_DIR")
     if env:
         p = pathlib.Path(env)
         return p if p.is_dir() else None
-    # Default layout: <monorepo>/greffer/... and <monorepo>/greffon-catalog
-    for up in (4, 5, 6):
-        cand = _HERE.parents[up] / "greffon-catalog" if up < len(_HERE.parents) else None
-        if cand and cand.is_dir():
+    for ancestor in _HERE.parents:
+        cand = ancestor / "greffon-catalog"
+        if (cand / "_template").is_dir() or list(cand.glob("*/*/docker-compose.yml"))[:1]:
             return cand
     return None
 
@@ -115,11 +121,19 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
     instance_id = "regress-" + compose_path.parent.parent.name.replace("_", "-")
     info = _greffon_info(instance_id, compose_path.parent)
 
+    prev = os.environ.get("GREFFON_PATH")
     os.environ["GREFFON_PATH"] = str(tmp_path)
     try:
         compose_mod.create_compose(parsed, info)
     except Exception as exc:  # noqa: BLE001 -- pinning today's failure modes
         return f"<<RENDER FAILED {type(exc).__name__}>>"
+    finally:
+        # Never leak GREFFON_PATH out of this helper: the suite shares one
+        # process and test_settings.py asserts the unset default.
+        if prev is None:
+            os.environ.pop("GREFFON_PATH", None)
+        else:
+            os.environ["GREFFON_PATH"] = prev
     written = tmp_path / instance_id / "docker-compose.yml"
     if not written.is_file():
         return "<<NO OUTPUT WRITTEN>>"
@@ -145,10 +159,23 @@ def test_catalog_entry_render_is_unchanged(name, compose_path, tmp_path):
         f"with CATALOG_RENDER_UPDATE=1 and review every moved byte.")
 
 
-@pytest.mark.skipif(not _ENTRIES, reason="greffon-catalog checkout not found")
 def test_the_oracle_actually_covers_the_catalog():
     """A harness that silently covers nothing is worse than none: it reads as
-    proof. Fail if the catalog shrank below the count this was built against."""
+    proof.
+
+    This test deliberately does NOT skip when the catalog is missing. A skip
+    here is indistinguishable from green, and the failure mode it would hide is
+    the whole suite gating nothing -- which is exactly what happens in a CI job
+    that checks out only the greffer repo. Set GREFFON_CATALOG_OPTIONAL=1 to
+    opt out deliberately, and point GREFFON_CATALOG_DIR at a pinned catalog
+    checkout in CI."""
+    if not _ENTRIES and os.getenv("GREFFON_CATALOG_OPTIONAL") == "1":
+        pytest.skip("catalog absent and explicitly marked optional")
+    assert _ENTRIES, (
+        "no greffon-catalog checkout found, so the catalog render oracle "
+        "covered NOTHING. Point GREFFON_CATALOG_DIR at a catalog checkout "
+        "(CI must fetch one), or set GREFFON_CATALOG_OPTIONAL=1 to accept "
+        "the reduced coverage on purpose.")
     assert len(_ENTRIES) >= 25, (
         f"only {len(_ENTRIES)} catalog entries discovered; the oracle is "
         f"supposed to cover the whole catalog (30 at time of writing)")

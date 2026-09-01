@@ -5,7 +5,7 @@ import logging
 from datauri import DataURI
 from jinja2 import StrictUndefined
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
-from jinja2.sandbox import SandboxedEnvironment
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
 # it is NOT an SSTI gate — the sandbox is what stops injection.
 # ``autoescape=False`` because these are config files (JSON/conf), not HTML.
-_FILE_RENDER_ENV = SandboxedEnvironment(
+_FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
 )
 
@@ -56,7 +56,16 @@ _FILE_RENDER_ENV = SandboxedEnvironment(
 # above, but with the LENIENT undefined the body has always had -- see the
 # comment in ``create_compose``. Split from _FILE_RENDER_ENV so neither
 # policy can be changed by accident while editing the other.
-_COMPOSE_RENDER_ENV = SandboxedEnvironment(autoescape=False)
+#
+# IMMUTABLE, not merely sandboxed. A plain SandboxedEnvironment blocks the
+# attribute walk to the interpreter but still permits mutating calls on the
+# objects passed to ``render()`` -- and those are the LIVE deployment dicts.
+# ``{{ volumes.update({"x": {"value": "/"}}) }}`` renders as empty output
+# while adding a volume, and ``create_volumes_then_copy_files`` then runs
+# ``docker container create -v /:/root`` (volume.py) and copies attacker
+# content into the host filesystem. Blocking dunder traversal alone leaves
+# that write primitive open, so both envs refuse mutation.
+_COMPOSE_RENDER_ENV = ImmutableSandboxedEnvironment(autoescape=False)
 
 
 class ConfigRenderError(Exception):
