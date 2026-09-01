@@ -1,0 +1,60 @@
+services:
+  db:
+    environment:
+      MYSQL_DATABASE: ghost
+      MYSQL_ROOT_PASSWORD: ''
+    healthcheck:
+      interval: 5s
+      retries: 30
+      start_period: 30s
+      test:
+      - CMD
+      - mysqladmin
+      - ping
+      - -h
+      - 127.0.0.1
+      - -uroot
+      - -p$$MYSQL_ROOT_PASSWORD
+      timeout: 5s
+    image: mysql:8
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: unless-stopped
+    volumes:
+    - db_data:/var/lib/mysql
+  ghost:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      database__client: mysql
+      database__connection__database: ghost
+      database__connection__host: db
+      database__connection__password: ''
+      database__connection__user: root
+      mail__from: 'noreply@example.test'
+      mail__options__auth__pass: 'pw'
+      mail__options__auth__user: ''
+      mail__options__host: 'smtp.example.test'
+      mail__options__port: '587'
+      mail__transport: SMTP
+      url: 'https://regress-ghost.my.example.test'
+    image: ghost:5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 2368:2368
+    restart: unless-stopped
+    volumes:
+    - ghost_content:/var/lib/ghost/content
+version: '3'
+volumes:
+  db_data: null
+  ghost_content: null

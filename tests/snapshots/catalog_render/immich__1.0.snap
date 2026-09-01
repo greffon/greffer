@@ -1,0 +1,64 @@
+services:
+  immich:
+    depends_on:
+    - immich_redis
+    - immich_database
+    environment:
+      DB_DATABASE_NAME: immich
+      DB_HOSTNAME: immich_database
+      DB_PASSWORD: 'regress-immich'
+      DB_USERNAME: immich
+      REDIS_HOSTNAME: immich_redis
+    image: ghcr.io/immich-app/immich-server:v2.7.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 2283:2283
+    restart: on-failure
+    volumes:
+    - immich_upload:/data
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:v2.7.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - immich_model_cache:/cache
+  immich_database:
+    environment:
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_PASSWORD: 'regress-immich'
+      POSTGRES_USER: immich
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    shm_size: 128mb
+    volumes:
+    - immich_db_data:/var/lib/postgresql/data
+  immich_redis:
+    image: redis:6.2-bookworm
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - immich_redis_data:/data
+version: '3'
+volumes:
+  immich_db_data: null
+  immich_model_cache: null
+  immich_redis_data: null
+  immich_upload: null

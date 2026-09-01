@@ -1,0 +1,31 @@
+services:
+  forgejo:
+    environment:
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__mailer__ENABLED: 'true'
+      FORGEJO__mailer__FROM: 'noreply@example.test'
+      FORGEJO__mailer__PASSWD: 'pw'
+      FORGEJO__mailer__PROTOCOL: 'smtp+starttls'
+      FORGEJO__mailer__SMTP_ADDR: 'smtp.example.test'
+      FORGEJO__mailer__SMTP_PORT: '587'
+      FORGEJO__mailer__USER: ''
+      FORGEJO__security__INSTALL_LOCK: 'true'
+      FORGEJO__server__DISABLE_SSH: 'true'
+      FORGEJO__server__DOMAIN: 'regress-forgejo.my.example.test'
+      FORGEJO__server__ROOT_URL: 'https://regress-forgejo.my.example.test'
+      USER_GID: '1000'
+      USER_UID: '1000'
+    image: codeberg.org/forgejo/forgejo:15
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3000:3000
+    restart: on-failure
+    volumes:
+    - forgejo_data:/data
+version: '3'
+volumes:
+  forgejo_data: null

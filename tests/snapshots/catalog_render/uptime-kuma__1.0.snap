@@ -1,0 +1,16 @@
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3001:3001
+    restart: on-failure
+    volumes:
+    - uptime_kuma_data:/app/data
+version: '3'
+volumes:
+  uptime_kuma_data: null

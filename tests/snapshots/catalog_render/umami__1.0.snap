@@ -1,0 +1,34 @@
+services:
+  umami:
+    depends_on:
+    - umami_db
+    environment:
+      APP_SECRET: ''
+      DATABASE_TYPE: postgresql
+      DATABASE_URL: postgresql://umami:regress-umami@umami_db:5432/umami
+    image: ghcr.io/umami-software/umami:3.1.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3000:3000
+    restart: on-failure
+  umami_db:
+    environment:
+      POSTGRES_DB: umami
+      POSTGRES_PASSWORD: 'regress-umami'
+      POSTGRES_USER: umami
+    image: postgres:16-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - umami_db_data:/var/lib/postgresql/data
+version: '3'
+volumes:
+  umami_db_data: null

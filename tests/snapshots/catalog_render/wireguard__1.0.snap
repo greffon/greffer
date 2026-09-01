@@ -1,0 +1,36 @@
+services:
+  wg-easy:
+    cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    cap_drop:
+    - ALL
+    devices:
+    - /dev/net/tun:/dev/net/tun
+    environment:
+      DISABLE_IPV6: 'true'
+      INIT_ENABLED: 'true'
+      INIT_HOST: ''
+      INIT_PASSWORD: ''
+      INIT_PORT: ''
+      INIT_USERNAME: admin
+      INSECURE: 'true'
+      PORT: '51821'
+    image: ghcr.io/wg-easy/wg-easy:15
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 51821:51821
+    - 51820:51820/udp
+    restart: unless-stopped
+    sysctls:
+    - net.ipv4.ip_forward=1
+    - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+    - wg_easy_config:/etc/wireguard
+version: '3'
+volumes:
+  wg_easy_config: null

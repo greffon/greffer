@@ -1,0 +1,24 @@
+services:
+  stirling-pdf:
+    environment:
+      SECURITY_ENABLELOGIN: 'false'
+    image: stirlingtools/stirling-pdf:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 8080:8080
+    restart: on-failure
+    volumes:
+    - stirling_configs:/configs
+    - stirling_logs:/logs
+    - stirling_pipeline:/pipeline
+    - stirling_custom_files:/customFiles
+version: '3'
+volumes:
+  stirling_configs: null
+  stirling_custom_files: null
+  stirling_logs: null
+  stirling_pipeline: null

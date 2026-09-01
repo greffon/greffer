@@ -1,0 +1,21 @@
+services:
+  freshrss:
+    environment:
+      CRON_MIN: '*/20'
+      TZ: UTC
+    image: freshrss/freshrss:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 80:80
+    restart: on-failure
+    volumes:
+    - freshrss_data:/var/www/FreshRSS/data
+    - freshrss_extensions:/var/www/FreshRSS/extensions
+version: '3'
+volumes:
+  freshrss_data: null
+  freshrss_extensions: null

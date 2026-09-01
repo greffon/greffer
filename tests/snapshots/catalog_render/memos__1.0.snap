@@ -1,0 +1,16 @@
+services:
+  memos:
+    image: ghcr.io/usememos/memos:stable
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 5230:5230
+    restart: on-failure
+    volumes:
+    - memos_data:/var/opt/memos
+version: '3'
+volumes:
+  memos_data: null

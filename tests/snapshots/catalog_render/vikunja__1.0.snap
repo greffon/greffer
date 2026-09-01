@@ -1,0 +1,31 @@
+services:
+  vikunja:
+    environment:
+      VIKUNJA_DATABASE_PATH: /db/vikunja.db
+      VIKUNJA_DATABASE_TYPE: sqlite
+      VIKUNJA_MAILER_ENABLED: 'true'
+      VIKUNJA_MAILER_FORCESSL: 'false'
+      VIKUNJA_MAILER_FROMEMAIL: 'noreply@example.test'
+      VIKUNJA_MAILER_HOST: 'smtp.example.test'
+      VIKUNJA_MAILER_PASSWORD: 'pw'
+      VIKUNJA_MAILER_PORT: '587'
+      VIKUNJA_MAILER_USERNAME: ''
+      VIKUNJA_SERVICE_PUBLICURL: 'https://regress-vikunja.my.example.test'
+      VIKUNJA_SERVICE_SECRET: ''
+    image: vikunja/vikunja:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3456:3456
+    restart: on-failure
+    user: 0:0
+    volumes:
+    - vikunja_files:/app/vikunja/files
+    - vikunja_db:/db
+version: '3'
+volumes:
+  vikunja_db: null
+  vikunja_files: null

@@ -1,0 +1,20 @@
+services:
+  linkding:
+    environment:
+      LD_CSRF_TRUSTED_ORIGINS: 'https://regress-linkding.my.example.test'
+      LD_SUPERUSER_NAME: admin
+      LD_SUPERUSER_PASSWORD: ''
+    image: sissbruecker/linkding:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 9090:9090
+    restart: on-failure
+    volumes:
+    - linkding_data:/etc/linkding/data
+version: '3'
+volumes:
+  linkding_data: null

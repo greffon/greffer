@@ -1,0 +1,58 @@
+services:
+  plausible:
+    command: 'sh -c "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh
+      run"
+
+      '
+    depends_on:
+    - plausible_db
+    - plausible_events_db
+    environment:
+      CLICKHOUSE_DATABASE_URL: http://plausible_events_db:8123/plausible_events_db
+      DATABASE_URL: postgres://postgres:postgres@plausible_db:5432/plausible
+      DISABLE_REGISTRATION: 'false'
+      MAILER_EMAIL: 'noreply@example.test'
+      SMTP_HOST_ADDR: 'smtp.example.test'
+      SMTP_HOST_PORT: '587'
+      SMTP_HOST_SSL_ENABLED: 'false'
+      SMTP_USER_NAME: ''
+      SMTP_USER_PWD: 'pw'
+    image: plausible/analytics:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 8000:8000
+    restart: on-failure
+  plausible_db:
+    environment:
+      POSTGRES_DB: plausible
+      POSTGRES_PASSWORD: postgres
+    image: postgres:14-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    volumes:
+    - db_data:/var/lib/postgresql/data
+  plausible_events_db:
+    environment:
+      CLICKHOUSE_DB: plausible_events_db
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: ''
+      CLICKHOUSE_USER: default
+    image: clickhouse/clickhouse-server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    volumes:
+    - event_data:/var/lib/clickhouse
+version: '3'
+volumes:
+  db_data: null
+  event_data: null

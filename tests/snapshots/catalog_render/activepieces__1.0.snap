@@ -1,0 +1,63 @@
+services:
+  activepieces:
+    depends_on:
+    - activepieces_db
+    - activepieces_redis
+    environment:
+      AP_DB_TYPE: POSTGRES
+      AP_ENCRYPTION_KEY: ''
+      AP_EXECUTION_MODE: UNSANDBOXED
+      AP_FRONTEND_URL: 'https://regress-activepieces.my.example.test'
+      AP_JWT_SECRET: ''
+      AP_POSTGRES_DATABASE: activepieces
+      AP_POSTGRES_HOST: activepieces_db
+      AP_POSTGRES_PASSWORD: 'regress-activepieces'
+      AP_POSTGRES_PORT: '5432'
+      AP_POSTGRES_USERNAME: activepieces
+      AP_QUEUE_MODE: REDIS
+      AP_REDIS_HOST: activepieces_redis
+      AP_REDIS_PORT: '6379'
+      AP_REDIS_TYPE: STANDALONE
+      AP_SMTP_HOST: 'smtp.example.test'
+      AP_SMTP_PASSWORD: 'pw'
+      AP_SMTP_PORT: '587'
+      AP_SMTP_SENDER_EMAIL: 'noreply@example.test'
+      AP_SMTP_USERNAME: ''
+      AP_TELEMETRY_ENABLED: 'false'
+    image: ghcr.io/activepieces/activepieces:0.83.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 80:80
+    restart: on-failure
+  activepieces_db:
+    environment:
+      POSTGRES_DB: activepieces
+      POSTGRES_PASSWORD: 'regress-activepieces'
+      POSTGRES_USER: activepieces
+    image: pgvector/pgvector:0.8.0-pg14
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - activepieces_postgres:/var/lib/postgresql/data
+  activepieces_redis:
+    image: redis:7.0.7
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - activepieces_redis:/data
+version: '3'
+volumes:
+  activepieces_postgres: null
+  activepieces_redis: null

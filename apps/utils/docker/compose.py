@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined, Template
+from jinja2 import StrictUndefined
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 _FILE_RENDER_ENV = SandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
 )
+
+# The compose BODY render. Sandboxed for the same reason as the file render
+# above, but with the LENIENT undefined the body has always had -- see the
+# comment in ``create_compose``. Split from _FILE_RENDER_ENV so neither
+# policy can be changed by accident while editing the other.
+_COMPOSE_RENDER_ENV = SandboxedEnvironment(autoescape=False)
 
 
 class ConfigRenderError(Exception):
@@ -571,7 +577,25 @@ def create_compose(compose, greffon_info):
     greffon_info = _compute_integrations_context(greffon_info)
     _delete_unset_integration_env_keys(compose, greffon_info)
     _inject_instance_log_rotation(compose)
-    t = Template(yaml.dump(compose))
+    # Render the compose BODY in a sandbox, not the stock ``Template``.
+    #
+    # The body is attacker-reachable the moment its author is not a reviewer:
+    # a value of ``{{ cycler.__init__.__globals__.os.popen('id').read() }}``
+    # executes in this process, which holds the manager token, the Docker
+    # socket and every instance's TLS private key. That is host root. The
+    # catalog is PR-reviewed, so this is latent rather than live today -- but
+    # the catalog is community-contributed, and custom app deploy would hand
+    # this path unreviewed input by design.
+    #
+    # ``_COMPOSE_RENDER_ENV`` deliberately keeps the LENIENT undefined that
+    # the stock ``Template`` had: a missing ``{{ config.X }}`` still renders
+    # empty here. Tightening that to StrictUndefined is a separate, visible
+    # behaviour change (it would start failing catalog entries that rely on
+    # an empty render) and it belongs to the undefined-policy decision, not
+    # to closing the injection hole. Baked files keep their own STRICT env --
+    # a silently-empty secret in a config file is a security failure, whereas
+    # a silently-empty compose value is the status quo this change preserves.
+    t = _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose))
     compose_file = t.render(**greffon_info)
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)

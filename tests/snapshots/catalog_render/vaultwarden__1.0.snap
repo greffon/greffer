@@ -1,0 +1,26 @@
+services:
+  vaultwarden:
+    environment:
+      ADMIN_TOKEN: ''
+      DOMAIN: 'https://regress-vaultwarden.my.example.test'
+      SIGNUPS_ALLOWED: 'true'
+      SMTP_FROM: 'noreply@example.test'
+      SMTP_HOST: 'smtp.example.test'
+      SMTP_PASSWORD: 'pw'
+      SMTP_PORT: '587'
+      SMTP_SECURITY: 'starttls'
+      SMTP_USERNAME: ''
+    image: vaultwarden/server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 80:80
+    restart: on-failure
+    volumes:
+    - vw_data:/data
+version: '3'
+volumes:
+  vw_data: null

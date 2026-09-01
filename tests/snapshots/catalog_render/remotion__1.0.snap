@@ -1,0 +1,17 @@
+services:
+  studio:
+    image: ghcr.io/greffon/remotion-studio:1.0
+    labels:
+      com.greffon.proxy.streaming: 'true'
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3000:3000
+    volumes:
+    - project_data:/home/remotion/app
+version: '3'
+volumes:
+  project_data: null

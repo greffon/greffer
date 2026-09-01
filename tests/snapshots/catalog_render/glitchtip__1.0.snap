@@ -1,0 +1,103 @@
+services:
+  glitchtip:
+    depends_on:
+      glitchtip_db:
+        condition: service_healthy
+      glitchtip_migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
+      EMAIL_URL: smtp+tls://:pw@smtp.example.test:587
+      REDIS_URL: redis://redis:6379/0
+    image: glitchtip/glitchtip:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 8000:8000
+  glitchtip_db:
+    environment:
+      POSTGRES_DB: glitchtip
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      interval: 5s
+      retries: 20
+      start_period: 10s
+      test:
+      - CMD-SHELL
+      - pg_isready -U postgres -d glitchtip
+      timeout: 5s
+    image: postgres:14-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    volumes:
+    - db_data:/var/lib/postgresql/data
+  glitchtip_migrate:
+    command: ./manage.py migrate --noinput
+    depends_on:
+      glitchtip_db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
+    image: glitchtip/glitchtip:latest
+    labels:
+      com.greffon.status: ignore
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+  glitchtip_seed:
+    command: sh -c "./manage.py createsuperuser --noinput || true; exit 0"
+    depends_on:
+      glitchtip_db:
+        condition: service_healthy
+      glitchtip_migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
+    image: glitchtip/glitchtip:latest
+    labels:
+      com.greffon.status: ignore
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: 'no'
+  glitchtip_worker:
+    command: ./bin/run-celery-with-beat.sh
+    depends_on:
+      glitchtip_db:
+        condition: service_healthy
+      glitchtip_migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
+      EMAIL_URL: smtp+tls://:pw@smtp.example.test:587
+      REDIS_URL: redis://redis:6379/0
+    image: glitchtip/glitchtip:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+  redis:
+    image: redis:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+version: '3'
+volumes:
+  db_data: null

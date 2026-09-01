@@ -1,0 +1,45 @@
+services:
+  metabase:
+    depends_on:
+    - metabase_db
+    environment:
+      MB_DB_DBNAME: metabase
+      MB_DB_HOST: metabase_db
+      MB_DB_PASS: 'regress-metabase'
+      MB_DB_PORT: '5432'
+      MB_DB_TYPE: postgres
+      MB_DB_USER: metabase
+      MB_EMAIL_FROM_ADDRESS: 'noreply@example.test'
+      MB_EMAIL_SMTP_HOST: 'smtp.example.test'
+      MB_EMAIL_SMTP_PASSWORD: 'pw'
+      MB_EMAIL_SMTP_PORT: '587'
+      MB_EMAIL_SMTP_SECURITY: 'starttls'
+      MB_EMAIL_SMTP_USERNAME: ''
+      MB_ENCRYPTION_SECRET_KEY: ''
+      MB_SITE_URL: 'https://regress-metabase.my.example.test'
+    image: metabase/metabase:v0.61.2
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3000:3000
+    restart: on-failure
+  metabase_db:
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_PASSWORD: 'regress-metabase'
+      POSTGRES_USER: metabase
+    image: postgres:16
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - metabase_db_data:/var/lib/postgresql/data
+version: '3'
+volumes:
+  metabase_db_data: null

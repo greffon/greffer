@@ -1,0 +1,15 @@
+services:
+  code-server:
+    image: gitpod/openvscode-server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 3000:3000
+    volumes:
+    - project_data:/home/workspace
+version: '3'
+volumes:
+  project_data: null

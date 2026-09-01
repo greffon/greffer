@@ -1,0 +1,206 @@
+services:
+  backend:
+    command: "sh -c \"python manage.py migrate --no-input &&\n       exec gunicorn\
+      \ -c /usr/local/etc/gunicorn/meet.py meet.wsgi:application\"\n"
+    depends_on:
+    - postgresql
+    - redis
+    - minio
+    - keycloak
+    - livekit
+    environment:
+      ALLOW_UNREGISTERED_ROOMS: 'true'
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_STORAGE_BUCKET_NAME: meet-media-storage
+      CELERY_BROKER_URL: redis://redis:6379/1
+      DB_HOST: postgresql
+      DB_NAME: meet
+      DB_PORT: '5432'
+      DB_USER: meet
+      DJANGO_ALLOWED_HOSTS: 'regress-visio.my.example.test,localhost,backend,gateway'
+      DJANGO_CONFIGURATION: Production
+      DJANGO_CSRF_TRUSTED_ORIGINS: 'https://regress-visio.my.example.test'
+      DJANGO_EMAIL_FROM: 'noreply@example.test'
+      DJANGO_EMAIL_HOST: 'smtp.example.test'
+      DJANGO_EMAIL_HOST_PASSWORD: 'pw'
+      DJANGO_EMAIL_HOST_USER: ''
+      DJANGO_EMAIL_PORT: '587'
+      DJANGO_EMAIL_USE_SSL: 'false'
+      DJANGO_EMAIL_USE_TLS: 'true'
+      DJANGO_SETTINGS_MODULE: meet.settings
+      LIVEKIT_API_KEY: meet
+      LIVEKIT_API_URL: wss://regress-visio.my.example.test/livekit
+      LIVEKIT_VERIFY_SSL: 'false'
+      LOGIN_REDIRECT_URL: 'https://regress-visio.my.example.test'
+      LOGIN_REDIRECT_URL_FAILURE: 'https://regress-visio.my.example.test'
+      LOGOUT_REDIRECT_URL: 'https://regress-visio.my.example.test'
+      MEDIA_BASE_URL: 'https://regress-visio.my.example.test'
+      MEET_BASE_URL: 'https://regress-visio.my.example.test'
+      OIDC_OP_AUTHORIZATION_ENDPOINT: 'https://regress-visio.my.example.test/identity/realms/meet/protocol/openid-connect/auth'
+      OIDC_OP_JWKS_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/certs
+      OIDC_OP_LOGOUT_ENDPOINT: 'https://regress-visio.my.example.test/identity/realms/meet/protocol/openid-connect/logout'
+      OIDC_OP_TOKEN_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/token
+      OIDC_OP_USER_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/userinfo
+      OIDC_REDIRECT_ALLOWED_HOSTS: '["https://regress-visio.my.example.test"]'
+      OIDC_RP_CLIENT_ID: meet
+      OIDC_RP_SCOPES: openid email
+      OIDC_RP_SIGN_ALGO: RS256
+      OIDC_VERIFY_SSL: 'false'
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+    image: lasuite/meet-backend:v1.19.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  celery:
+    command:
+    - celery
+    - -A
+    - meet.celery_app
+    - worker
+    - -l
+    - INFO
+    depends_on:
+    - backend
+    environment:
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_STORAGE_BUCKET_NAME: meet-media-storage
+      CELERY_BROKER_URL: redis://redis:6379/1
+      DB_HOST: postgresql
+      DB_NAME: meet
+      DB_PORT: '5432'
+      DB_USER: meet
+      DJANGO_CONFIGURATION: Production
+      DJANGO_SETTINGS_MODULE: meet.settings
+      LIVEKIT_API_KEY: meet
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+    image: lasuite/meet-backend:v1.19.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  createbuckets:
+    depends_on:
+    - minio
+    entrypoint: 'sh -c " until /usr/bin/mc alias set meet http://minio:9000 "$$MINIO_ROOT_USER"
+      "$$MINIO_ROOT_PASSWORD"; do sleep 2; done && /usr/bin/mc mb --ignore-existing
+      meet/meet-media-storage && exit 0;"
+
+      '
+    image: minio/mc
+    labels:
+      com.greffon.status: ignore
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  frontend:
+    depends_on:
+    - backend
+    image: lasuite/meet-frontend:v1.19.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  gateway:
+    depends_on:
+    - backend
+    - frontend
+    - keycloak
+    - minio
+    - livekit
+    image: nginx:1.25
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 8083:8083
+    restart: on-failure
+    volumes:
+    - gateway_conf:/etc/nginx/conf.d
+  keycloak:
+    command:
+    - start-dev
+    - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_HOSTNAME: 'https://regress-visio.my.example.test/identity'
+      KC_HOSTNAME_STRICT: 'false'
+      KC_HTTP_ENABLED: 'true'
+      KC_HTTP_RELATIVE_PATH: /identity
+      KC_PROXY_HEADERS: xforwarded
+    image: quay.io/keycloak/keycloak:26.3
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - keycloak_import:/opt/keycloak/data/import
+  livekit:
+    command:
+    - --config
+    - /etc/livekit.yaml
+    image: livekit/livekit-server:v1.10.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 7882:7882/udp
+    restart: on-failure
+    volumes:
+    - livekit_conf:/etc
+  minio:
+    command: minio server --console-address ":9001" /data
+    image: minio/minio
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - minio_data:/data
+  postgresql:
+    environment:
+      POSTGRES_DB: meet
+      POSTGRES_USER: meet
+    image: postgres:16
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+  redis:
+    image: redis:5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+version: '3'
+volumes:
+  gateway_conf: null
+  keycloak_import: null
+  livekit_conf: null
+  minio_data: null
+  postgres_data: null

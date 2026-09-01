@@ -1,0 +1,104 @@
+"""The compose body render must not execute arbitrary Python.
+
+Before this suite, ``create_compose`` rendered the compose body through the
+stock ``jinja2.Template``. Jinja templates are not data: a value of
+``{{ cycler.__init__.__globals__.os.popen('id').read() }}`` reaches the
+interpreter, and this process holds the manager token, the Docker socket and
+every instance's TLS private key -- so it is host root, not a sandbox escape.
+
+Latent, not live, while the catalog is the only input and is PR-reviewed.
+These tests exist so it cannot come back when it stops being the only input.
+"""
+from __future__ import annotations
+
+import os
+
+import pytest
+import yaml
+from jinja2.exceptions import SecurityError
+
+from apps.utils.docker import compose as compose_mod
+
+
+def _info(instance_id="sandbox-test"):
+    return {
+        "id": instance_id,
+        "ports": [{"port_host": 10001,
+                   "url": f"https://{instance_id}.my.example.test"}],
+        "configurations": [],
+        "integrations": {},
+    }
+
+
+def _render(compose_dict, tmp_path, instance_id="sandbox-test"):
+    os.environ["GREFFON_PATH"] = str(tmp_path)
+    compose_mod.create_compose(compose_dict, _info(instance_id))
+    return (tmp_path / instance_id / "docker-compose.yml").read_text()
+
+
+# The classic Jinja escape chains: each reaches interpreter state through an
+# attribute walk that SandboxedEnvironment refuses with SecurityError.
+#
+# Inner literals are DOUBLE-quoted on purpose. ``create_compose`` does
+# ``yaml.dump`` before rendering, and yaml.dump re-quotes strings in
+# single-quoted style, escaping an inner ``'`` as ``''`` -- which corrupts the
+# Jinja expression into a TemplateSyntaxError. A single-quoted payload is
+# therefore stopped by that round-trip bug rather than by the sandbox, and
+# would pass this suite while proving nothing. (Verified: the single-quoted
+# form raises TemplateSyntaxError even through the stock Template, while the
+# double-quoted form executes and returns real ``uid=`` output.) Keep these
+# double-quoted, or the mutation check below silently stops biting.
+_ESCAPES = [
+    '{{ cycler.__init__.__globals__.os.popen("id").read() }}',
+    '{{ joiner.__init__.__globals__.os.popen("id").read() }}',
+    '{{ namespace.__init__.__globals__.os.popen("id").read() }}',
+    '{{ "".__class__.__mro__[1].__subclasses__() }}',
+    "{{ self.__init__.__globals__ }}",
+]
+
+
+@pytest.mark.parametrize("payload", _ESCAPES)
+def test_attribute_walk_to_the_interpreter_is_refused(payload, tmp_path):
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"EVIL": payload}}}}
+    # SecurityError specifically, not "any exception": a payload that merely
+    # fails to parse is not evidence the sandbox did anything.
+    with pytest.raises(SecurityError):
+        _render(compose, tmp_path)
+
+
+def test_the_escape_would_have_worked_before_the_sandbox(tmp_path):
+    """Pin the counterfactual, so this suite cannot quietly become a no-op.
+
+    If someone reverts the render to a stock ``Template``, the payload below
+    executes and this test fails -- which is the whole point. Rendering the
+    same payload through the unsandboxed environment here proves the payload
+    is genuinely dangerous rather than merely malformed."""
+    from jinja2 import Template
+    out = Template(
+        '{{ cycler.__init__.__globals__.os.popen("echo pwned").read() }}'
+    ).render()
+    assert "pwned" in out, (
+        "the payload no longer executes even unsandboxed, so the sandbox "
+        "tests below would pass vacuously -- rewrite them")
+
+
+def test_ordinary_templating_still_works(tmp_path):
+    """The sandbox must not cost the catalog its legitimate references."""
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"URL": "{{ instance_url }}"}}}}
+    rendered = yaml.safe_load(_render(compose, tmp_path))
+    assert rendered["services"]["app"]["environment"]["URL"] == \
+        "https://sandbox-test.my.example.test"
+
+
+def test_a_missing_variable_still_renders_empty(tmp_path):
+    """The undefined policy is deliberately UNCHANGED by the sandbox swap.
+
+    Lenient undefined is the status quo for the compose body. Tightening it is
+    a separate decision with its own catalog blast radius; pinning it here
+    means that decision has to be made on purpose."""
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"X": "[{{ nope }}]"}}}}
+    rendered = yaml.safe_load(_render(compose, tmp_path))
+    assert rendered["services"]["app"]["environment"]["X"] == "[]"

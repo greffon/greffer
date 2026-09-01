@@ -1,0 +1,32 @@
+services:
+  n8n:
+    environment:
+      N8N_EDITOR_BASE_URL: 'https://regress-n8n.my.example.test'
+      N8N_EMAIL_MODE: 'smtp'
+      N8N_ENCRYPTION_KEY: ''
+      N8N_HOST: 'regress-n8n.my.example.test'
+      N8N_PORT: '5678'
+      N8N_PROTOCOL: https
+      N8N_PROXY_HOPS: '1'
+      N8N_SMTP_HOST: 'smtp.example.test'
+      N8N_SMTP_PASS: 'pw'
+      N8N_SMTP_PORT: '587'
+      N8N_SMTP_SENDER: 'noreply@example.test'
+      N8N_SMTP_SSL: 'false'
+      N8N_SMTP_STARTTLS: 'true'
+      N8N_SMTP_USER: ''
+      WEBHOOK_URL: 'https://regress-n8n.my.example.test'
+    image: docker.n8n.io/n8nio/n8n:2.22.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 5678:5678
+    restart: on-failure
+    volumes:
+    - n8n_data:/home/node/.n8n
+version: '3'
+volumes:
+  n8n_data: null

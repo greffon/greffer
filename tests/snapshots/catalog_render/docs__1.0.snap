@@ -1,0 +1,204 @@
+services:
+  backend:
+    command: "sh -c \"python manage.py migrate --no-input &&\n       exec uvicorn\
+      \ --app-dir=/app --host=0.0.0.0 --port=8000 --lifespan=off impress.asgi:application\"\
+      \n"
+    depends_on:
+    - postgresql
+    - redis
+    - minio
+    - keycloak
+    environment:
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_STORAGE_BUCKET_NAME: docs-media-storage
+      CELERY_BROKER_URL: redis://redis:6379/1
+      COLLABORATION_API_URL: http://y-provider:4444/collaboration/api/
+      COLLABORATION_BACKEND_BASE_URL: http://backend:8000
+      COLLABORATION_SERVER_ORIGIN: 'https://regress-docs.my.example.test'
+      COLLABORATION_WS_URL: wss://regress-docs.my.example.test/collaboration/ws/
+      DB_HOST: postgresql
+      DB_NAME: docs
+      DB_PORT: '5432'
+      DB_USER: docs
+      DJANGO_ALLOWED_HOSTS: 'regress-docs.my.example.test,localhost,backend'
+      DJANGO_CONFIGURATION: Production
+      DJANGO_CSRF_TRUSTED_ORIGINS: 'https://regress-docs.my.example.test'
+      DJANGO_EMAIL_FROM: 'noreply@example.test'
+      DJANGO_EMAIL_HOST: 'smtp.example.test'
+      DJANGO_EMAIL_HOST_PASSWORD: 'pw'
+      DJANGO_EMAIL_HOST_USER: ''
+      DJANGO_EMAIL_PORT: '587'
+      DJANGO_EMAIL_USE_SSL: 'false'
+      DJANGO_EMAIL_USE_TLS: 'true'
+      DJANGO_SETTINGS_MODULE: impress.settings
+      LOGIN_REDIRECT_URL: 'https://regress-docs.my.example.test'
+      LOGIN_REDIRECT_URL_FAILURE: 'https://regress-docs.my.example.test'
+      LOGOUT_REDIRECT_URL: 'https://regress-docs.my.example.test'
+      MEDIA_BASE_URL: 'https://regress-docs.my.example.test'
+      OIDC_AUTH_REQUEST_EXTRA_PARAMS: '{"login_hint": "demo"}'
+      OIDC_OP_AUTHORIZATION_ENDPOINT: 'https://regress-docs.my.example.test/identity/realms/docs/protocol/openid-connect/auth'
+      OIDC_OP_JWKS_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/certs
+      OIDC_OP_LOGOUT_ENDPOINT: 'https://regress-docs.my.example.test/identity/realms/docs/protocol/openid-connect/logout'
+      OIDC_OP_TOKEN_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/token
+      OIDC_OP_USER_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/userinfo
+      OIDC_REDIRECT_ALLOWED_HOSTS: '["https://regress-docs.my.example.test"]'
+      OIDC_RP_CLIENT_ID: docs
+      OIDC_RP_SCOPES: openid email
+      OIDC_RP_SIGN_ALGO: RS256
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      Y_PROVIDER_API_BASE_URL: http://y-provider:4444/api/
+    image: lasuite/impress-backend:v5.2.1
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  celery:
+    command:
+    - celery
+    - -A
+    - impress.celery_app
+    - worker
+    - -l
+    - INFO
+    depends_on:
+    - backend
+    environment:
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_STORAGE_BUCKET_NAME: docs-media-storage
+      CELERY_BROKER_URL: redis://redis:6379/1
+      DB_HOST: postgresql
+      DB_NAME: docs
+      DB_PORT: '5432'
+      DB_USER: docs
+      DJANGO_CONFIGURATION: Production
+      DJANGO_SETTINGS_MODULE: impress.settings
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+    image: lasuite/impress-backend:v5.2.1
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  createbuckets:
+    depends_on:
+    - minio
+    entrypoint: 'sh -c " until /usr/bin/mc alias set docs http://minio:9000 "$$MINIO_ROOT_USER"
+      "$$MINIO_ROOT_PASSWORD"; do sleep 2; done && /usr/bin/mc mb --ignore-existing
+      docs/docs-media-storage && /usr/bin/mc version enable docs/docs-media-storage
+      && exit 0;"
+
+      '
+    image: minio/mc
+    labels:
+      com.greffon.status: ignore
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  frontend:
+    depends_on:
+    - backend
+    image: lasuite/impress-frontend:v5.2.1
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  gateway:
+    depends_on:
+    - backend
+    - frontend
+    - y-provider
+    - keycloak
+    - minio
+    image: nginx:1.25
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    ports:
+    - 8083:8083
+    restart: on-failure
+    volumes:
+    - gateway_conf:/etc/nginx/conf.d
+  keycloak:
+    command:
+    - start-dev
+    - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_HOSTNAME: 'https://regress-docs.my.example.test/identity'
+      KC_HOSTNAME_STRICT: 'false'
+      KC_HTTP_ENABLED: 'true'
+      KC_HTTP_RELATIVE_PATH: /identity
+      KC_PROXY_HEADERS: xforwarded
+    image: quay.io/keycloak/keycloak:26.3
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - keycloak_import:/opt/keycloak/data/import
+  minio:
+    command: minio server --console-address ":9001" /data
+    image: minio/minio
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - minio_data:/data
+  postgresql:
+    environment:
+      POSTGRES_DB: docs
+      POSTGRES_USER: docs
+    image: postgres:16
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+  redis:
+    image: redis:5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+  y-provider:
+    environment:
+      COLLABORATION_API_URL: http://y-provider:4444/collaboration/api/
+      COLLABORATION_BACKEND_BASE_URL: http://backend:8000
+      COLLABORATION_LOGGING: 'true'
+      COLLABORATION_SERVER_ORIGIN: 'https://regress-docs.my.example.test'
+      Y_PROVIDER_API_BASE_URL: http://y-provider:4444/api/
+    image: lasuite/impress-y-provider:v5.2.1
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    restart: on-failure
+version: '3'
+volumes:
+  gateway_conf: null
+  keycloak_import: null
+  minio_data: null
+  postgres_data: null
