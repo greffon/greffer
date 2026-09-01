@@ -15,6 +15,8 @@ import logging
 from unittest import TestCase
 from unittest.mock import mock_open, patch
 
+import yaml
+
 from jinja2 import Template, UndefinedError
 
 from apps.utils.docker.compose import (
@@ -679,6 +681,56 @@ class DumpMangledValuesTests(TestCase):
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
         self.assertIn('X', compose['services']['a']['environment'])
+
+
+class SharedEnvironmentBlockTests(TestCase):
+    """A compose may share one `environment:` between services.
+
+    `x-env: &env` / `environment: *env` is an ordinary docker-compose
+    idiom, and `yaml.safe_load` hands back the SAME dict object for every
+    alias. Anything that walks services and mutates env therefore visits
+    one slot more than once.
+    """
+
+    SRC = (
+        "services:\n"
+        "  a:\n"
+        "    image: x\n"
+        "    environment: &env\n"
+        "      OIDC_ISSUER: \"{% if oidc %}{{ 'set' }}{% endif %}\"\n"
+        "      KEEP: plain\n"
+        "  b:\n"
+        "    image: y\n"
+        "    environment: *env\n"
+    )
+
+    def _stripped(self):
+        compose = yaml.safe_load(self.SRC)
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose
+
+    def test_the_alias_really_is_the_same_object(self):
+        compose = yaml.safe_load(self.SRC)
+        self.assertIs(
+            compose['services']['a']['environment'],
+            compose['services']['b']['environment'],
+        )
+
+    def test_a_shared_block_does_not_raise(self):
+        # A bare `env.pop(key)` raised KeyError on the second visit --
+        # straight out of `create_compose` as an uncaught 500, the exact
+        # failure class the rescue exists to prevent.
+        compose = self._stripped()
+        self.assertEqual(compose['services']['a']['environment'], {'KEEP': 'plain'})
+
+    def test_both_services_see_the_result_and_stay_shared(self):
+        compose = self._stripped()
+        self.assertIs(
+            compose['services']['a']['environment'],
+            compose['services']['b']['environment'],
+        )
+        self.assertNotIn('OIDC_ISSUER', compose['services']['b']['environment'])
 
 
 class PopLoggingTests(TestCase):

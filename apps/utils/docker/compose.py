@@ -708,10 +708,22 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
     dumped text for each construct, which passed whenever an identical
     construct appeared under some OTHER key.
 
-    Candidates are only values that name an unset integration type, i.e.
-    the ones the guard chose to keep and `main` would have popped.
-    Everything else is main's pre-existing hazard and is left exactly as
-    it was.
+    Candidates are values naming ANY known integration type, set or
+    unset -- the membership test is a substring check over
+    `KNOWN_INTEGRATION_TYPES`, not a check against the unset ones.
+
+    That is deliberate but worth stating, because it has a consequence:
+    on an instance where smtp IS configured, a value the dump mangles is
+    now dropped where `main` raised TemplateSyntaxError and 500'd. `main`
+    is fully broken in that case, so this is not a regression, but a loud
+    failure has become a quiet missing env var. Reachable only because
+    `KNOWN_INTEGRATION_TYPES` now always has an unset member, so the
+    `if not unset_types: return` early exit no longer fires for
+    smtp-only instances.
+
+    A value naming no integration type at all is left exactly as it was:
+    that is main's pre-existing hazard, and deleting someone else's key
+    to work around it would be a much bigger change than this one.
     """
 
     def _parses(text):
@@ -748,9 +760,27 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
     # when more than one value is mangled: neither removal alone fixes
     # the document, so each looks innocent and both are kept -- which is
     # exactly how the first version of this failed.
+    # Keyed by the env dict's IDENTITY, not the service name. A compose
+    # may share one `environment:` block between services through a YAML
+    # anchor (`&env` / `*env`), which is an ordinary docker-compose
+    # idiom, and `yaml.safe_load` then hands back the SAME dict object
+    # for both. `_candidates` yields it once per service, so the second
+    # pop of the same slot found nothing -- a bare `env.pop(key)` raised
+    # KeyError straight out of `create_compose` as an uncaught 500, which
+    # is the exact failure class this function exists to prevent.
+    seen = set()
+    unique = []
+    for name, env, key in candidates:
+        slot = (id(env), key)
+        if slot in seen:
+            continue
+        seen.add(slot)
+        unique.append((name, env, key))
+    candidates = unique
+
     removed = {}
     for name, env, key in candidates:
-        removed[(name, key)] = env.pop(key)
+        removed[(id(env), key)] = env.pop(key, None)
 
     if not _parses(yaml.dump(compose)):
         # The breakage is in a value that names no integration type, so
@@ -759,11 +789,11 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
         # exactly as it was: deleting someone else's key to work around
         # it would be a far bigger change than this one is entitled to.
         for name, env, key in candidates:
-            env[key] = removed[(name, key)]
+            env[key] = removed[(id(env), key)]
         return compose
 
     for name, env, key in candidates:
-        env[key] = removed[(name, key)]
+        env[key] = removed[(id(env), key)]
         if _parses(yaml.dump(compose)):
             continue
         env.pop(key, None)
