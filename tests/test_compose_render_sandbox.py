@@ -133,3 +133,48 @@ def test_a_template_cannot_append_to_a_live_list(tmp_path, monkeypatch):
                                     "environment": {"X": '{{ ports.append(1) }}'}}}}
     with pytest.raises(SecurityError):
         _render(compose, tmp_path, monkeypatch)
+
+
+# The bound-mutator tests above are not enough on their own: an UNBOUND call
+# reaches the same primitive while the sandbox inspects the wrong object.
+_UNBOUND_MUTATORS = [
+    '{{ dict.update(volumes.data, {"value": "/"}) }}',
+    '{{ dict.setdefault(volumes.data, "value", "/") }}',
+    '{{ dict.pop(volumes.data, "value") }}',
+    '{{ dict.clear(volumes.data) }}',
+]
+
+
+@pytest.mark.parametrize("payload", _UNBOUND_MUTATORS)
+def test_unbound_mutators_cannot_reach_the_live_context(payload, tmp_path,
+                                                        monkeypatch):
+    """``dict`` is a Jinja global, and ImmutableSandboxedEnvironment decides
+    mutability from the object a method is BOUND to -- so
+    ``dict.update(target, ...)`` inspects the ``dict`` class, not the live
+    mapping, and used to render clean while rewriting the context. That is the
+    same host-write primitive as the bound case: a volume whose value becomes
+    "/" is mounted by create_volumes_then_copy_files as ``-v /:/root``.
+
+    Verified before the fix: the bound form raised SecurityError while this
+    form succeeded and set the value to "/". The environment now drops the
+    mutable-type globals entirely."""
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"EVIL": payload}}}}
+    with pytest.raises(Exception) as exc:
+        _render(compose, tmp_path, monkeypatch)
+    # Whatever the failure, it must not be a silent success.
+    assert exc.value is not None
+
+
+def test_the_escape_globals_are_gone(tmp_path, monkeypatch):
+    """Pin the mechanism, not just the symptom: if a future edit restores
+    Jinja's default globals, the payload tests above could pass for the wrong
+    reason (a typo'd payload also raises), so assert the surface directly."""
+    from apps.utils.docker.compose import (_COMPOSE_RENDER_ENV,
+                                           _FILE_RENDER_ENV)
+    for env in (_COMPOSE_RENDER_ENV, _FILE_RENDER_ENV):
+        for unsafe in ("dict", "cycler", "joiner", "namespace", "range",
+                       "lipsum"):
+            assert unsafe not in env.globals, (
+                f"{unsafe} is reachable again; the unbound-mutator and "
+                f"attribute-walk surfaces are re-opened")

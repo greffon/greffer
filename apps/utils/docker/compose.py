@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ``autoescape=False`` because these are config files (JSON/conf), not HTML.
 _FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
-)
+)  # globals hardened below, once _harden is defined
 
 # The compose BODY render. Sandboxed for the same reason as the file render
 # above, but with the LENIENT undefined the body has always had -- see the
@@ -65,7 +65,30 @@ _FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
 # ``docker container create -v /:/root`` (volume.py) and copies attacker
 # content into the host filesystem. Blocking dunder traversal alone leaves
 # that write primitive open, so both envs refuse mutation.
-_COMPOSE_RENDER_ENV = ImmutableSandboxedEnvironment(autoescape=False)
+def _harden(env):
+    """Drop Jinja's default globals that re-open what the sandbox closes.
+
+    ImmutableSandboxedEnvironment refuses a MUTATING call on an immutable
+    target -- but it decides that from the object the method is bound to, so
+    an UNBOUND call slips past: ``dict`` is a Jinja global, and
+    ``{{ dict.update(volumes.x, {"value": "/"}) }}`` checks ``dict`` (the
+    class) rather than the live mapping, renders clean, and rewrites the
+    context. Verified: the bound form raises SecurityError while the unbound
+    form succeeded and set a volume's value to "/", which
+    create_volumes_then_copy_files then mounts as ``-v /:/root``.
+
+    ``cycler``/``joiner``/``namespace`` are the documented first hops of the
+    classic escape chains, and ``lipsum``/``range`` are of no use to a compose
+    file (``range`` also invites a cheap memory blowup). The catalog uses none
+    of them -- verified across every pinned entry -- so removing them costs
+    nothing and shrinks the surface to what a compose actually needs."""
+    for unsafe in ('dict', 'range', 'lipsum', 'cycler', 'joiner', 'namespace'):
+        env.globals.pop(unsafe, None)
+    return env
+
+
+_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(autoescape=False))
+_harden(_FILE_RENDER_ENV)
 
 
 class ConfigRenderError(Exception):
