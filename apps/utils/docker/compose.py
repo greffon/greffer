@@ -528,11 +528,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     break
                 j += 1
             if j >= n:
-                # Unterminated. The value is a TemplateSyntaxError either
-                # way, but scanning the remainder lets a reference in it
-                # still pop the key, which costs one env var instead of
-                # letting `Template(yaml.dump(compose))` fail the whole
-                # start.
+                # Unterminated. Which slice is scanned no longer decides
+                # anything: the value is a TemplateSyntaxError either
+                # way, so `_pop_keys_the_dump_mangles` pops the key
+                # whatever this returns. Kept as the narrower of the two
+                # equivalent choices.
                 bodies.append(value[start_at + 2:])
                 break
             body = value[start_at + 2:j]
@@ -815,7 +815,12 @@ def _compose_render_context(greffon_info):
     integrations = greffon_info.get('integrations') or {}
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
-        if not _is_integration_set(integrations.get(t)) and context.get(t) == {}:
+        # `== {}` alone. `_compute_integrations_context` always runs
+        # first and writes the config when set and `{}` when unset, so
+        # an `_is_integration_set` term here would be a redundant
+        # conjunct dressed as a second safeguard -- no input
+        # distinguishes them.
+        if context.get(t) == {}:
             # No constructor args: this is a dict, so a kwarg would
             # become real CONTENT -- making it truthy (every
             # `{% if oidc %}` guard would take the wrong branch) and

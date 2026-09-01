@@ -302,7 +302,11 @@ class DelimiterInsideStringLiteralTests(TestCase):
         )
 
     def test_escaped_quote_does_not_end_the_literal(self):
-        self.assertFalse(self._survives('{{ "a\\"b" ~ oidc.issuer }}'))
+        # The escape must HIDE a closing delimiter, or the assertion
+        # holds with escape handling removed entirely. The first version
+        # of this test used `{{ "a\\"b" ~ oidc.issuer }}`, where the
+        # escaped quote hides nothing, and survived that mutation.
+        self.assertFalse(self._survives('{{ "a\\"}}b" ~ oidc.issuer }}'))
 
     def test_a_quoted_delimiter_alone_still_does_not_pop(self):
         # The other direction: the literal `oidc.` host here is outside
@@ -681,6 +685,126 @@ class DumpMangledValuesTests(TestCase):
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
         self.assertIn('X', compose['services']['a']['environment'])
+
+
+class ScannerRulesTheCommentsAssertTests(TestCase):
+    """Rules the implementation states in prose and nothing checked.
+
+    Each of these survived mutation: the code could be changed to
+    contradict its own comment and the suite stayed green.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_aliasing_needs_the_set_or_with_keyword(self):
+        # A comparison is not a binding.
+        self.assertTrue(self._survives('{% if x == oidc %}y{% endif %}'))
+
+    def test_a_with_block_without_an_assignment_does_not_crash(self):
+        # `{% with oidc %}` has no `=`; splitting on one regardless
+        # raised IndexError.
+        try:
+            self._survives('{% with oidc %}y{% endwith %}')
+        except Exception as exc:  # pragma: no cover - the failure we prevent
+            self.fail(f'must not raise: {exc!r}')
+
+    def test_the_guard_is_anchored_at_the_token(self):
+        # `_guards` matches member access AT the token, not anywhere in
+        # the body: a bare use elsewhere still guards the value.
+        self.assertTrue(self._survives('{{ oidc if oidc.issuer else 1 }}'))
+        self.assertTrue(self._survives('{{ oidc and oidc.issuer }}'))
+
+    def test_a_quote_inside_a_comment_does_not_swallow_the_terminator(self):
+        # A comment has no expression syntax, so an apostrophe in it is
+        # text. Tracking quotes there let it eat the `#}`.
+        self.assertTrue(self._survives("{# don't {{ oidc.issuer }} #}x"))
+
+
+class RescuePassRobustnessTests(TestCase):
+    """Shapes that made `_pop_keys_the_dump_mangles` itself 500."""
+
+    def test_a_list_form_env_alongside_a_mangled_one_is_survivable(self):
+        # The rescue only walks dict-form env blocks. Without that filter
+        # it called `.items()` on a list and raised AttributeError
+        # straight out of `create_compose`.
+        compose = {'services': {
+            'a': {'environment': {'BAD': "{{ smtp|default('localhost') }}"}},
+            'b': {'environment': ['PLAIN=1', 'OTHER=2']},
+        }}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        try:
+            _delete_unset_integration_env_keys(compose, info)
+        except Exception as exc:  # pragma: no cover - the failure we prevent
+            self.fail(f'must not raise: {exc!r}')
+        self.assertEqual(compose['services']['b']['environment'], ['PLAIN=1', 'OTHER=2'])
+
+    def test_someone_elses_breakage_does_not_cost_us_our_keys(self):
+        # `{{ instance_id|default('x') }}` mangles too, and is not ours.
+        # When it is the reason the document will not parse, the
+        # integration key must still be left alone rather than sacrificed
+        # to a document we cannot fix anyway.
+        compose = {'services': {'a': {'environment': {
+            'X': "{{ instance_id|default('x') }}",
+            'J': "{{ smtp|default('h') }}",
+        }}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('X', compose['services']['a']['environment'])
+        self.assertIn('J', compose['services']['a']['environment'])
+
+
+class BindingIsWiredIntoTheRenderTests(TestCase):
+    """That the binding is actually REACHED by `create_compose`.
+
+    Everything else about `_UnsetIntegration` was testable by
+    instantiating it directly, which meant the whole safety net could be
+    unwired -- rendering with the raw `greffon_info` instead of
+    `_compose_render_context` -- and every test still passed. Mutation
+    testing found that; nothing else would have.
+
+    The value below is the one case that distinguishes wired from
+    unwired: the strip pass KEEPS it (the bare `oidc` reads as a guard,
+    and the dereference happens on a macro parameter it cannot follow),
+    so the binding is the only thing standing between it and
+    `UndefinedError` out of the render.
+    """
+
+    MACRO = '{% macro m(o) %}{{ o.issuer.host }}{% endmacro %}{{ m(oidc) }}'
+
+    def test_the_strip_pass_keeps_it(self):
+        # If this ever starts being popped the test below stops testing
+        # the binding, so it is asserted rather than assumed.
+        compose = {'services': {'a': {'environment': {'K': self.MACRO}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('K', compose['services']['a']['environment'])
+
+    def test_create_compose_renders_it_instead_of_raising(self):
+        compose = {'services': {'a': {'environment': {'K': self.MACRO}}}}
+        info = {
+            'id': 'inst-1',
+            'configurations': [],
+            'integrations': {},
+            'ports': [{'port_host': 4242}],
+        }
+        with patch('apps.utils.docker.compose.os.makedirs'), \
+             patch('apps.utils.docker.compose.os.path.exists', return_value=True), \
+             patch('builtins.open', mock_open()) as m:
+            create_compose(compose, info)
+        rendered = m().write.call_args[0][0]
+        self.assertIn('K:', rendered)
+
+
+class CallerPopulatedKeysAreNotClobberedTests(TestCase):
+    def test_a_preset_value_wins_over_the_binding(self):
+        # Same non-clobbering rule `_compute_integrations_context`
+        # follows: a caller that deliberately populated the key keeps it.
+        info = {'id': 'i1', 'integrations': {}, 'oidc': {'preset': 1}}
+        self.assertEqual(_compose_render_context(info)['oidc'], {'preset': 1})
 
 
 class SharedEnvironmentBlockTests(TestCase):
