@@ -50,6 +50,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The catalog render oracle (tests/test_catalog_render_regression.py)
+      # renders every catalog entry and diffs it against committed snapshots,
+      # which is the merge gate for any change to the compose render path.
+      # Without this checkout the oracle covers NOTHING and still reports
+      # green, so its coverage guard fails the run rather than skipping.
+      #
+      # PINNED to a SHA, deliberately, not tracked to @main: the snapshots are
+      # artifacts of one specific catalog state, so following main would turn
+      # THIS repo's CI red whenever the catalog adds or edits a greffon -- a
+      # failure caused by a change in another repository. Bump on purpose,
+      # regenerating snapshots with CATALOG_RENDER_UPDATE=1 and reviewing the
+      # diff. greffon-catalog is public, so this needs no token.
+      - name: Check out greffon-catalog (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: greffon/greffon-catalog
+          ref: 5652a755b86b8fb0848a7134efc4dc119238be57
+          path: .greffon-catalog
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -82,6 +101,8 @@ jobs:
       - name: Run tests
         # ~8.5s locally for 717 tests; the job is dominated by setup, not by
         # the suite. No -x: a full run reports every failure at once.
+        env:
+          GREFFON_CATALOG_DIR: ${{ github.workspace }}/.greffon-catalog
         run: poetry run pytest tests/ -q
 
       # cli/ is a SEPARATE poetry project with its own lockfile and testpaths,

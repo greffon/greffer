@@ -31,7 +31,18 @@ services:
       POSTGRES_DB: metabase
       POSTGRES_PASSWORD: 'regress-metabase'
       POSTGRES_USER: metabase
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -U metabase -d metabase
+      timeout: 5s
     image: postgres:16
+    labels:
+      com.greffon.backup.dump: pg_dump -U metabase -d metabase -Fc
+      com.greffon.backup.restore: pg_restore -U metabase -d metabase --clean --if-exists
+        --no-owner --single-transaction
     logging:
       driver: json-file
       options:

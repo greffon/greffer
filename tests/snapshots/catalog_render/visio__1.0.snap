@@ -17,7 +17,7 @@ services:
       DB_NAME: meet
       DB_PORT: '5432'
       DB_USER: meet
-      DJANGO_ALLOWED_HOSTS: 'regress-visio.my.example.test,localhost,backend,gateway'
+      DJANGO_ALLOWED_HOSTS: 'regress-visio.my.example.test,regress-visio.my.example.test,localhost,backend,gateway'
       DJANGO_CONFIGURATION: Production
       DJANGO_CSRF_TRUSTED_ORIGINS: 'https://regress-visio.my.example.test'
       DJANGO_EMAIL_FROM: 'noreply@example.test'
@@ -180,7 +180,18 @@ services:
     environment:
       POSTGRES_DB: meet
       POSTGRES_USER: meet
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -h 127.0.0.1 -U meet -d meet
+      timeout: 5s
     image: postgres:16
+    labels:
+      com.greffon.backup.dump: pg_dump -U meet -d meet -Fc
+      com.greffon.backup.restore: pg_restore -U meet -d meet --clean --if-exists --no-owner
+        --single-transaction
     logging:
       driver: json-file
       options:

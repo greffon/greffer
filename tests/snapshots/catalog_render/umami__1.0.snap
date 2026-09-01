@@ -20,7 +20,18 @@ services:
       POSTGRES_DB: umami
       POSTGRES_PASSWORD: 'regress-umami'
       POSTGRES_USER: umami
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -U umami -d umami
+      timeout: 5s
     image: postgres:16-alpine
+    labels:
+      com.greffon.backup.dump: pg_dump -U umami -d umami -Fc
+      com.greffon.backup.restore: pg_restore -U umami -d umami --clean --if-exists
+        --no-owner --single-transaction
     logging:
       driver: json-file
       options:
