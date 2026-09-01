@@ -191,6 +191,16 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
             "apps.utils.docker.l4_ports.published_l4_ports", return_value={},
         ), mock.patch(
             "apps.utils.docker.l4_ports.pending_and_prune", return_value={},
+        ), mock.patch(
+            # mark_pending records the reservation in a MODULE-GLOBAL set that
+            # outlives this test. Without stubbing it, rendering visio and
+            # wireguard leaves udp/20000 reserved, and
+            # test_l4_network_exposure.py (same pytest process) then allocates
+            # 20001 while asserting 20000 -- so the oracle would turn the whole
+            # suite red, including the release gate. Same class of bug as a
+            # leaked env var: a test that mutates global state for everyone
+            # after it.
+            "apps.utils.docker.l4_ports.mark_pending",
         ):
             info = repository.get_greffon_info(parsed, info_seed)
         # The manager assigns each port its public URL and sends it in the
