@@ -23,8 +23,10 @@ import pathlib
 
 import pytest
 import yaml
+from unittest import mock
 
 from apps.utils.docker import compose as compose_mod
+from apps.utils.greffon import repository
 
 _HERE = pathlib.Path(__file__).resolve().parent
 _SNAP_DIR = _HERE / "snapshots" / "catalog_render"
@@ -87,17 +89,27 @@ def _configurations_for(version_dir: pathlib.Path):
 
 
 def _greffon_info(instance_id: str, version_dir: pathlib.Path):
+    """The START-REQUEST shape (what the manager POSTs), not the derived
+    greffon_info: get_greffon_info builds the ports/volumes/networks itself,
+    which is the point of routing through it."""
     return {
         "id": instance_id,
-        # Pinned, not allocated: see module docstring.
-        "ports": [{"port_host": 10001,
-                   "url": f"https://{instance_id}.my.example.test"}],
+        "cert": {"certificate": "-----BEGIN CERTIFICATE-----\nsnapshot\n"
+                                "-----END CERTIFICATE-----\n",
+                 "private_key": "-----BEGIN PRIVATE KEY-----\nsnapshot\n"
+                                "-----END PRIVATE KEY-----\n"},
         "configurations": _configurations_for(version_dir),
+        # Field names are the manager's contract (SMTPConfigSerializer in
+        # apps/integrations/types/smtp.py): host, port, username, password,
+        # from_address, tls_mode. Getting this wrong is not cosmetic -- 15
+        # catalog composes reference {{ smtp.username }}, and a fixture that
+        # spells it "user" renders them EMPTY, so the snapshots would bless an
+        # impossible configured-SMTP state and never exercise interpolation.
         "integrations": {
             "smtp": {
                 "host": "smtp.example.test",
                 "port": 587,
-                "user": "mailer",
+                "username": "mailer@example.test",
                 "password": "pw",
                 "from_address": "noreply@example.test",
                 "tls_mode": "starttls",
@@ -107,9 +119,20 @@ def _greffon_info(instance_id: str, version_dir: pathlib.Path):
 
 
 def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
-    """Drive the real render and return the rendered compose, or a stable
-    marker describing how it failed. A catalog entry that cannot render today
-    is itself a fact worth pinning -- nextcloud/1.0 is exactly that case."""
+    """Drive the REAL start-flow render and return the rendered compose, or a
+    stable marker describing how it failed.
+
+    The order here mirrors app/routers/controller.py exactly:
+    get_greffon_info -> build_render_context -> get_compose_template ->
+    apply_configuration -> create_compose. Calling create_compose alone would
+    snapshot raw catalog ports and volumes with no greffon_nginx sidecar and
+    no config destinations applied -- i.e. not the bytes a deployment actually
+    renders, so a regression in the real input could pass this gate.
+
+    Only host-port allocation is stubbed, because it probes real sockets and a
+    snapshot that moves on its own proves nothing. Everything else is
+    production code. A catalog entry that cannot render today is itself a fact
+    worth pinning."""
     raw = compose_path.read_text()
     try:
         parsed = yaml.safe_load(raw)
@@ -119,12 +142,27 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
         return "<<NO SERVICES KEY>>"
 
     instance_id = "regress-" + compose_path.parent.parent.name.replace("_", "-")
-    info = _greffon_info(instance_id, compose_path.parent)
+    info_seed = _greffon_info(instance_id, compose_path.parent)
 
     prev = os.environ.get("GREFFON_PATH")
     os.environ["GREFFON_PATH"] = str(tmp_path)
     try:
-        compose_mod.create_compose(parsed, info)
+        with mock.patch(
+            "apps.utils.greffon.repository.get_free_ports",
+            side_effect=lambda host="127.0.0.1", numbers=1, protocol="tcp": (
+                list(range(20000, 20000 + numbers))),
+        ):
+            info = repository.get_greffon_info(parsed, info_seed)
+        # The manager assigns each port its public URL and sends it in the
+        # start request; get_greffon_info leaves url=None without it, and
+        # instance_url is derived from ports[0].url. Assign deterministically
+        # so the snapshot pins real URL interpolation rather than a fallback.
+        for idx, port in enumerate(info.get("ports", [])):
+            port["url"] = f"https://{instance_id}-{idx}.my.example.test"
+        compose_mod.build_render_context(info)
+        template = compose_mod.get_compose_template(parsed, info)
+        compose_mod.apply_configuration(info, parsed)
+        compose_mod.create_compose(template, info)
     except Exception as exc:  # noqa: BLE001 -- pinning today's failure modes
         return f"<<RENDER FAILED {type(exc).__name__}>>"
     finally:

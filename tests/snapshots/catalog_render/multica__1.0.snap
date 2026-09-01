@@ -1,30 +1,49 @@
+networks:
+  greffon_internal_network: {}
 services:
   backend:
     depends_on:
     - multica_db
     environment:
-      CORS_ALLOWED_ORIGINS: 'https://regress-multica.my.example.test'
+      CORS_ALLOWED_ORIGINS: 'https://regress-multica-0.my.example.test'
       DATABASE_URL: postgres://multica:regress-multica@multica_db:5432/multica?sslmode=disable
-      FRONTEND_ORIGIN: 'https://regress-multica.my.example.test'
+      FRONTEND_ORIGIN: 'https://regress-multica-0.my.example.test'
       JWT_SECRET: ''
-      MULTICA_APP_URL: 'https://regress-multica.my.example.test'
-      MULTICA_PUBLIC_URL: 'https://regress-multica.my.example.test'
+      MULTICA_APP_URL: 'https://regress-multica-0.my.example.test'
+      MULTICA_PUBLIC_URL: 'https://regress-multica-0.my.example.test'
       PORT: '8080'
       RESEND_FROM_EMAIL: 'noreply@example.test'
       SMTP_HOST: 'smtp.example.test'
       SMTP_PASSWORD: 'pw'
       SMTP_PORT: '587'
       SMTP_TLS: 'starttls'
-      SMTP_USERNAME: ''
+      SMTP_USERNAME: 'mailer@example.test'
     image: ghcr.io/multica-ai/multica-backend:v0.3.13
     logging:
       driver: json-file
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - multica_uploads:/app/data/uploads
+    - regress-multica_multica_uploads:/app/data/uploads
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-multica_nginx_volume:/etc/nginx/
   multica:
     depends_on:
     - backend
@@ -36,9 +55,11 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 3000:3000
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
+    volumes: []
   multica_db:
     environment:
       POSTGRES_DB: multica
@@ -50,10 +71,17 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - multica_db_data:/var/lib/postgresql/data
+    - regress-multica_multica_db_data:/var/lib/postgresql/data
 version: '3'
 volumes:
-  multica_db_data: null
-  multica_uploads: null
+  regress-multica_multica_db_data:
+    name: regress-multica_multica_db_data
+  regress-multica_multica_uploads:
+    name: regress-multica_multica_uploads
+  regress-multica_nginx_volume:
+    name: regress-multica_nginx_volume

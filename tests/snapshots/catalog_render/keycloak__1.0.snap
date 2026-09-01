@@ -1,4 +1,20 @@
+networks:
+  greffon_internal_network: {}
 services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8080'
+    restart: unless-stopped
+    volumes:
+    - regress-keycloak_nginx_volume:/etc/nginx/
   keycloak:
     command:
     - start
@@ -12,7 +28,7 @@ services:
       KC_DB_URL_DATABASE: keycloak
       KC_DB_URL_HOST: postgresql
       KC_DB_USERNAME: keycloak
-      KC_HOSTNAME: 'https://regress-keycloak.my.example.test'
+      KC_HOSTNAME: 'https://regress-keycloak-0.my.example.test'
       KC_HTTP_ENABLED: 'true'
       KC_PROXY_HEADERS: xforwarded
     image: quay.io/keycloak/keycloak:26.7.2
@@ -21,9 +37,11 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 8080:8080
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: unless-stopped
+    volumes: []
   postgresql:
     environment:
       POSTGRES_DB: keycloak
@@ -46,9 +64,15 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: unless-stopped
     volumes:
-    - postgres_data:/var/lib/postgresql/data
+    - regress-keycloak_postgres_data:/var/lib/postgresql/data
 version: '3'
 volumes:
-  postgres_data: null
+  regress-keycloak_nginx_volume:
+    name: regress-keycloak_nginx_volume
+  regress-keycloak_postgres_data:
+    name: regress-keycloak_postgres_data

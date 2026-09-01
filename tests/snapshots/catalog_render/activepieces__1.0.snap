@@ -1,3 +1,5 @@
+networks:
+  greffon_internal_network: {}
 services:
   activepieces:
     depends_on:
@@ -7,7 +9,7 @@ services:
       AP_DB_TYPE: POSTGRES
       AP_ENCRYPTION_KEY: ''
       AP_EXECUTION_MODE: UNSANDBOXED
-      AP_FRONTEND_URL: 'https://regress-activepieces.my.example.test'
+      AP_FRONTEND_URL: 'https://regress-activepieces-0.my.example.test'
       AP_JWT_SECRET: ''
       AP_POSTGRES_DATABASE: activepieces
       AP_POSTGRES_HOST: activepieces_db
@@ -22,7 +24,7 @@ services:
       AP_SMTP_PASSWORD: 'pw'
       AP_SMTP_PORT: '587'
       AP_SMTP_SENDER_EMAIL: 'noreply@example.test'
-      AP_SMTP_USERNAME: ''
+      AP_SMTP_USERNAME: 'mailer@example.test'
       AP_TELEMETRY_ENABLED: 'false'
     image: ghcr.io/activepieces/activepieces:0.83.0
     logging:
@@ -30,9 +32,11 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 80:80
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
+    volumes: []
   activepieces_db:
     environment:
       POSTGRES_DB: activepieces
@@ -44,9 +48,12 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - activepieces_postgres:/var/lib/postgresql/data
+    - regress-activepieces_activepieces_postgres:/var/lib/postgresql/data
   activepieces_redis:
     image: redis:7.0.7
     logging:
@@ -54,10 +61,31 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - activepieces_redis:/data
+    - regress-activepieces_activepieces_redis:/data
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:80'
+    restart: unless-stopped
+    volumes:
+    - regress-activepieces_nginx_volume:/etc/nginx/
 version: '3'
 volumes:
-  activepieces_postgres: null
-  activepieces_redis: null
+  regress-activepieces_activepieces_postgres:
+    name: regress-activepieces_activepieces_postgres
+  regress-activepieces_activepieces_redis:
+    name: regress-activepieces_activepieces_redis
+  regress-activepieces_nginx_volume:
+    name: regress-activepieces_nginx_volume

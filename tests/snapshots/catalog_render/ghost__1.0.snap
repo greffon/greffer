@@ -1,3 +1,5 @@
+networks:
+  greffon_internal_network: {}
 services:
   db:
     environment:
@@ -22,9 +24,12 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: unless-stopped
     volumes:
-    - db_data:/var/lib/mysql
+    - regress-ghost_db_data:/var/lib/mysql
   ghost:
     depends_on:
       db:
@@ -38,23 +43,42 @@ services:
       database__connection__user: root
       mail__from: 'noreply@example.test'
       mail__options__auth__pass: 'pw'
-      mail__options__auth__user: ''
+      mail__options__auth__user: 'mailer@example.test'
       mail__options__host: 'smtp.example.test'
       mail__options__port: '587'
       mail__transport: SMTP
-      url: 'https://regress-ghost.my.example.test'
+      url: 'https://regress-ghost-0.my.example.test'
     image: ghost:5
     logging:
       driver: json-file
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 2368:2368
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: unless-stopped
     volumes:
-    - ghost_content:/var/lib/ghost/content
+    - regress-ghost_ghost_content:/var/lib/ghost/content
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:2368'
+    restart: unless-stopped
+    volumes:
+    - regress-ghost_nginx_volume:/etc/nginx/
 version: '3'
 volumes:
-  db_data: null
-  ghost_content: null
+  regress-ghost_db_data:
+    name: regress-ghost_db_data
+  regress-ghost_ghost_content:
+    name: regress-ghost_ghost_content
+  regress-ghost_nginx_volume:
+    name: regress-ghost_nginx_volume

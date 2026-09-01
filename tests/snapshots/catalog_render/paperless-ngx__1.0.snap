@@ -1,4 +1,20 @@
+networks:
+  greffon_internal_network: {}
 services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8000'
+    restart: unless-stopped
+    volumes:
+    - regress-paperless-ngx_nginx_volume:/etc/nginx/
   paperless:
     depends_on:
     - paperless_broker
@@ -9,27 +25,28 @@ services:
       PAPERLESS_EMAIL_FROM: 'noreply@example.test'
       PAPERLESS_EMAIL_HOST: 'smtp.example.test'
       PAPERLESS_EMAIL_HOST_PASSWORD: 'pw'
-      PAPERLESS_EMAIL_HOST_USER: ''
+      PAPERLESS_EMAIL_HOST_USER: 'mailer@example.test'
       PAPERLESS_EMAIL_PORT: '587'
       PAPERLESS_EMAIL_USE_SSL: 'false'
       PAPERLESS_EMAIL_USE_TLS: 'true'
       PAPERLESS_OCR_LANGUAGE: eng
       PAPERLESS_REDIS: redis://paperless_broker:6379
       PAPERLESS_SECRET_KEY: ''
-      PAPERLESS_URL: 'https://regress-paperless-ngx.my.example.test'
+      PAPERLESS_URL: 'https://regress-paperless-ngx-0.my.example.test'
     image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
     logging:
       driver: json-file
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 8000:8000
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - paperless_data:/usr/src/paperless/data
-    - paperless_media:/usr/src/paperless/media
-    - paperless_consume:/usr/src/paperless/consume
+    - regress-paperless-ngx_paperless_data:/usr/src/paperless/data
+    - regress-paperless-ngx_paperless_media:/usr/src/paperless/media
+    - regress-paperless-ngx_paperless_consume:/usr/src/paperless/consume
   paperless_broker:
     image: redis:8
     logging:
@@ -37,12 +54,21 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - paperless_redis:/data
+    - regress-paperless-ngx_paperless_redis:/data
 version: '3'
 volumes:
-  paperless_consume: null
-  paperless_data: null
-  paperless_media: null
-  paperless_redis: null
+  regress-paperless-ngx_nginx_volume:
+    name: regress-paperless-ngx_nginx_volume
+  regress-paperless-ngx_paperless_consume:
+    name: regress-paperless-ngx_paperless_consume
+  regress-paperless-ngx_paperless_data:
+    name: regress-paperless-ngx_paperless_data
+  regress-paperless-ngx_paperless_media:
+    name: regress-paperless-ngx_paperless_media
+  regress-paperless-ngx_paperless_redis:
+    name: regress-paperless-ngx_paperless_redis

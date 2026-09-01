@@ -1,4 +1,20 @@
+networks:
+  greffon_internal_network: {}
 services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-metabase_nginx_volume:/etc/nginx/
   metabase:
     depends_on:
     - metabase_db
@@ -14,18 +30,20 @@ services:
       MB_EMAIL_SMTP_PASSWORD: 'pw'
       MB_EMAIL_SMTP_PORT: '587'
       MB_EMAIL_SMTP_SECURITY: 'starttls'
-      MB_EMAIL_SMTP_USERNAME: ''
+      MB_EMAIL_SMTP_USERNAME: 'mailer@example.test'
       MB_ENCRYPTION_SECRET_KEY: ''
-      MB_SITE_URL: 'https://regress-metabase.my.example.test'
+      MB_SITE_URL: 'https://regress-metabase-0.my.example.test'
     image: metabase/metabase:v0.61.2
     logging:
       driver: json-file
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 3000:3000
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
+    volumes: []
   metabase_db:
     environment:
       POSTGRES_DB: metabase
@@ -48,9 +66,15 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - metabase_db_data:/var/lib/postgresql/data
+    - regress-metabase_metabase_db_data:/var/lib/postgresql/data
 version: '3'
 volumes:
-  metabase_db_data: null
+  regress-metabase_metabase_db_data:
+    name: regress-metabase_metabase_db_data
+  regress-metabase_nginx_volume:
+    name: regress-metabase_nginx_volume

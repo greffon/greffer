@@ -1,4 +1,21 @@
+networks:
+  greffon_internal_network: {}
 services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:51821'
+    - '20000:51820'
+    restart: unless-stopped
+    volumes:
+    - regress-wireguard_nginx_volume:/etc/nginx/
   wg-easy:
     cap_add:
     - NET_ADMIN
@@ -22,15 +39,18 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 51821:51821
-    - 51820:51820/udp
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: unless-stopped
     sysctls:
     - net.ipv4.ip_forward=1
     - net.ipv4.conf.all.src_valid_mark=1
     volumes:
-    - wg_easy_config:/etc/wireguard
+    - regress-wireguard_wg_easy_config:/etc/wireguard
 version: '3'
 volumes:
-  wg_easy_config: null
+  regress-wireguard_nginx_volume:
+    name: regress-wireguard_nginx_volume
+  regress-wireguard_wg_easy_config:
+    name: regress-wireguard_wg_easy_config

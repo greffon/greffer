@@ -1,4 +1,20 @@
+networks:
+  greffon_internal_network: {}
 services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:2283'
+    restart: unless-stopped
+    volumes:
+    - regress-immich_nginx_volume:/etc/nginx/
   immich:
     depends_on:
     - immich_redis
@@ -15,11 +31,12 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 2283:2283
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - immich_upload:/data
+    - regress-immich_immich_upload:/data
   immich-machine-learning:
     image: ghcr.io/immich-app/immich-machine-learning:v2.7.5
     logging:
@@ -27,9 +44,12 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - immich_model_cache:/cache
+    - regress-immich_immich_model_cache:/cache
   immich_database:
     environment:
       POSTGRES_DB: immich
@@ -42,10 +62,13 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     shm_size: 128mb
     volumes:
-    - immich_db_data:/var/lib/postgresql/data
+    - regress-immich_immich_db_data:/var/lib/postgresql/data
   immich_redis:
     image: redis:6.2-bookworm
     logging:
@@ -53,12 +76,21 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
     volumes:
-    - immich_redis_data:/data
+    - regress-immich_immich_redis_data:/data
 version: '3'
 volumes:
-  immich_db_data: null
-  immich_model_cache: null
-  immich_redis_data: null
-  immich_upload: null
+  regress-immich_immich_db_data:
+    name: regress-immich_immich_db_data
+  regress-immich_immich_model_cache:
+    name: regress-immich_immich_model_cache
+  regress-immich_immich_redis_data:
+    name: regress-immich_immich_redis_data
+  regress-immich_immich_upload:
+    name: regress-immich_immich_upload
+  regress-immich_nginx_volume:
+    name: regress-immich_nginx_volume

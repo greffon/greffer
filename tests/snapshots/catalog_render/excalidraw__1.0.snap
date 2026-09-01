@@ -1,3 +1,5 @@
+networks:
+  greffon_internal_network: {}
 services:
   excalidraw:
     image: excalidraw/excalidraw:latest
@@ -6,7 +8,26 @@ services:
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 80:80
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: on-failure
+    volumes: []
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:80'
+    restart: unless-stopped
+    volumes:
+    - regress-excalidraw_nginx_volume:/etc/nginx/
 version: '3'
+volumes:
+  regress-excalidraw_nginx_volume:
+    name: regress-excalidraw_nginx_volume

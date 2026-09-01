@@ -1,3 +1,5 @@
+networks:
+  greffon_internal_network: {}
 services:
   glitchtip:
     depends_on:
@@ -8,17 +10,27 @@ services:
       redis:
         condition: service_started
     environment:
+      CSRF_TRUSTED_ORIGINS: 'https://regress-glitchtip-0.my.example.test'
       DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
-      EMAIL_URL: smtp+tls://:pw@smtp.example.test:587
+      DEFAULT_FROM_EMAIL: ''
+      EMAIL_URL: smtp+tls://mailer%40example.test:pw@smtp.example.test:587
+      GLITCHTIP_DOMAIN: 'https://regress-glitchtip-0.my.example.test'
+      GLITCHTIP_EVENT_HOT_DAYS: '30'
+      GLITCHTIP_FILE_RETENTION_DAYS: '90'
+      GLITCHTIP_RETENTION_DAYS: '90'
+      GLITCHTIP_URL: 'https://regress-glitchtip-0.my.example.test'
       REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ''
     image: glitchtip/glitchtip:latest
     logging:
       driver: json-file
       options:
         max-file: '3'
         max-size: 10m
-    ports:
-    - 8000:8000
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes: []
   glitchtip_db:
     environment:
       POSTGRES_DB: glitchtip
@@ -37,8 +49,11 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     volumes:
-    - db_data:/var/lib/postgresql/data
+    - regress-glitchtip_db_data:/var/lib/postgresql/data
   glitchtip_migrate:
     command: ./manage.py migrate --noinput
     depends_on:
@@ -54,6 +69,10 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes: []
   glitchtip_seed:
     command: sh -c "./manage.py createsuperuser --noinput || true; exit 0"
     depends_on:
@@ -63,6 +82,8 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
+      DJANGO_SUPERUSER_EMAIL: admin@greffon.io
+      DJANGO_SUPERUSER_PASSWORD: ''
     image: glitchtip/glitchtip:latest
     labels:
       com.greffon.status: ignore
@@ -71,7 +92,11 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
     restart: 'no'
+    volumes: []
   glitchtip_worker:
     command: ./bin/run-celery-with-beat.sh
     depends_on:
@@ -83,7 +108,10 @@ services:
         condition: service_started
     environment:
       DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
-      EMAIL_URL: smtp+tls://:pw@smtp.example.test:587
+      EMAIL_URL: smtp+tls://mailer%40example.test:pw@smtp.example.test:587
+      GLITCHTIP_EVENT_HOT_DAYS: '30'
+      GLITCHTIP_FILE_RETENTION_DAYS: '90'
+      GLITCHTIP_RETENTION_DAYS: '90'
       REDIS_URL: redis://redis:6379/0
     image: glitchtip/glitchtip:latest
     logging:
@@ -91,6 +119,24 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes: []
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8000'
+    restart: unless-stopped
+    volumes:
+    - regress-glitchtip_nginx_volume:/etc/nginx/
   redis:
     image: redis:latest
     logging:
@@ -98,6 +144,13 @@ services:
       options:
         max-file: '3'
         max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes: []
 version: '3'
 volumes:
-  db_data: null
+  regress-glitchtip_db_data:
+    name: regress-glitchtip_db_data
+  regress-glitchtip_nginx_volume:
+    name: regress-glitchtip_nginx_volume
