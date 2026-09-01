@@ -757,6 +757,54 @@ class RescuePassRobustnessTests(TestCase):
         self.assertIn('J', compose['services']['a']['environment'])
 
 
+class RescueCostTests(TestCase):
+    """The rescue must not make `create_compose` slow.
+
+    It runs inside the start handler, under the per-instance lock and the
+    manager's request timeout, so its cost is not academic. Both bounds
+    below are asserted in DUMPS rather than seconds, which is the thing
+    that actually scales and does not turn the suite flaky on a loaded
+    machine.
+    """
+
+    CULPRIT = '\t' + 'x' * 45 + '{% if oidc %}a{% endif %}' + 'y' * 45
+    INNOCENT = '{% if oidc %}on{% else %}off{% endif %}'
+
+    def _dumps_for(self, env):
+        compose = {'services': {'a': {'environment': env}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        calls = []
+        real = yaml.dump
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        with patch('apps.utils.docker.compose.yaml.dump', side_effect=counting):
+            _delete_unset_integration_env_keys(compose, info)
+        return len(calls), compose['services']['a']['environment']
+
+    def test_no_candidates_costs_no_dump_at_all(self):
+        # The probe dumps and compiles the whole document, and the vast
+        # majority of instances have nothing to rescue. Paying it on
+        # every start to discover that is the wrong order.
+        dumps, _ = self._dumps_for({'PLAIN': 'literal', 'OTHER': '{{ instance_id }}'})
+        self.assertEqual(dumps, 0)
+
+    def test_the_restore_is_bisected_not_linear(self):
+        # Restoring one candidate at a time dumps and compiles the whole
+        # document per candidate -- quadratic in compose size, measured
+        # at 30s for 400 candidates. Halving is O(log n) for the single
+        # culprit that actually happens.
+        env = {'BAD': self.CULPRIT}
+        env.update({f'K{i:03d}': self.INNOCENT for i in range(200)})
+        dumps, kept = self._dumps_for(env)
+        self.assertLess(dumps, 40, f'{dumps} dumps for 201 candidates looks linear')
+        # And it still gets the right answer.
+        self.assertNotIn('BAD', kept)
+        self.assertEqual(len(kept), 200)
+
+
 class BindingIsWiredIntoTheRenderTests(TestCase):
     """That the binding is actually REACHED by `create_compose`.
 

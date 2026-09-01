@@ -748,11 +748,15 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
                         and any(t in value for t in KNOWN_INTEGRATION_TYPES)):
                     yield name, env, key
 
-    if _parses(yaml.dump(compose)):
-        return compose
-
+    # Candidates BEFORE the parse probe. The probe dumps and compiles the
+    # whole document, roughly doubling the cost of `create_compose`, and
+    # the overwhelming majority of instances have nothing to rescue --
+    # paying it on every start to learn that is the wrong order.
     candidates = list(_candidates())
     if not candidates:
+        return compose
+
+    if _parses(yaml.dump(compose)):
         return compose
 
     # Remove every candidate, then put back the ones that turn out to be
@@ -792,16 +796,39 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
             env[key] = removed[(id(env), key)]
         return compose
 
-    for name, env, key in candidates:
-        env[key] = removed[(id(env), key)]
+    # Restore by halves, not one at a time. The linear version dumped and
+    # compiled the entire document once per candidate, which is quadratic
+    # in compose size when candidates scale with it -- measured at 30s
+    # inside the start handler for 400 candidates, held under the
+    # per-instance lock and the manager's request timeout. Halving costs
+    # O(log n) dumps when there is a single culprit, which is the case
+    # that actually happens.
+    #
+    # Each probe runs against the document as it stands, so a half is
+    # kept only if everything restored so far still parses together. The
+    # final state therefore parses by construction, even when two values
+    # are individually innocent and jointly fatal -- yaml wraps on total
+    # line width, so that combination is real rather than theoretical.
+    def _restore_innocent(group):
+        for name, env, key in group:
+            env[key] = removed[(id(env), key)]
         if _parses(yaml.dump(compose)):
-            continue
-        env.pop(key, None)
-        logger.warning(
-            'integrations: dropping env %s from service %s -- yaml.dump '
-            'mangles its template, which would fail the whole compose '
-            'render', key, name,
-        )
+            return
+        for name, env, key in group:
+            env.pop(key, None)
+        if len(group) == 1:
+            name, _env, key = group[0]
+            logger.warning(
+                'integrations: dropping env %s from service %s -- yaml.dump '
+                'mangles its template, which would fail the whole compose '
+                'render', key, name,
+            )
+            return
+        mid = len(group) // 2
+        _restore_innocent(group[:mid])
+        _restore_innocent(group[mid:])
+
+    _restore_innocent(candidates)
     return compose
 
 
