@@ -424,54 +424,73 @@ class GuardedFallbackTests(TestCase):
 class UnsetBindingCannotFailTests(TestCase):
     """The safety net under the strip pass.
 
-    The pass reads template text, and seven rounds established it cannot
-    be complete: aliasing moves the dereference to another name, and
-    `map(attribute='a.b')` hides the path inside a string literal the
-    scanner blanks. So the deploy must not DEPEND on it being complete.
-    Every shape below renders empty instead of raising, whether or not
-    the strip pass saw it.
+    The pass reads template text, and eight rounds established it cannot
+    be complete: a macro argument moves the dereference onto another
+    name, and `map(attribute='a.b')` hides the path inside a string
+    literal the scanner has to blank. So the deploy must not DEPEND on it
+    being complete.
+
+    Two properties matter, and the second is why this is a `dict` and not
+    a `ChainableUndefined`:
+      1. nothing raises, whether or not the strip pass saw it;
+      2. everything that worked when unset types were a plain `{}` STILL
+         works. A ChainableUndefined chained correctly and stopped being
+         a dict, which broke `|tojson` outright (an uncaught 500), turned
+         `|int` into an UndefinedError, and wrote the literal text
+         `Undefined` into the compose file -- all regressions against the
+         `{}` it replaced.
     """
 
     def _render(self, value):
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         return Template(value).render(**_compose_render_context(info))
 
-    def test_attribute_chain_does_not_raise(self):
-        self.assertEqual(self._render('{{ oidc.issuer.host }}'), '')
+    def _renders_without_raising(self, value):
+        try:
+            self._render(value)
+        except Exception as exc:  # pragma: no cover - the failure we prevent
+            self.fail(f'{value!r} must render, not raise: {exc!r}')
 
-    def test_method_calls_do_not_raise(self):
-        # ChainableUndefined alone still raises on a CALL, and
-        # `{{ smtp.from_address.split('@')[0] }}` is a shape the catalog
-        # already ships -- so calls have to be absorbed too.
-        self.assertEqual(self._render('{{ oidc.get("issuer", "d") }}'), '')
-        self.assertEqual(self._render('{{ smtp.from_address.split("@")[0] }}'), '')
+    def test_dereference_shapes_do_not_raise(self):
+        # Each of these raises UndefinedError when the type is a plain
+        # `{}`, and each is a shape the strip pass may or may not see.
+        for value in (
+            '{{ oidc.issuer.host }}',
+            '{{ oidc.a.split("/")[0] }}',
+            '{{ smtp.from_address.split("@")[0] }}',
+            '{% with x = oidc %}{{ x.issuer.host }}{% endwith %}',
+            '{% macro m(x) %}{{ x.issuer.host }}{% endmacro %}{{ m(oidc) }}',
+            '{{ [oidc]|map(attribute="issuer.host")|list }}',
+        ):
+            with self.subTest(value=value):
+                self._renders_without_raising(value)
 
     def test_iteration_does_not_raise(self):
-        self.assertEqual(
-            self._render('{% for k, v in oidc.items() %}{{ k }}{% endfor %}'), '',
+        self._renders_without_raising(
+            '{% for k, v in oidc.items() %}{{ k }}{% endfor %}',
         )
 
-    def test_aliased_and_macro_forms_do_not_raise(self):
-        # The two the strip pass structurally cannot follow.
-        self.assertEqual(
-            self._render('{% with x = oidc %}{{ x.issuer.split("@")[0] }}{% endwith %}'), '',
-        )
-        self.assertEqual(
-            self._render('{% macro m(x) %}{{ x.issuer.host }}{% endmacro %}{{ m(oidc) }}'), '',
-        )
+    def test_it_is_still_an_empty_dict(self):
+        # The regression guard. Each of these worked with `{}` and MUST
+        # keep working; the ChainableUndefined version broke all four.
+        self.assertEqual(self._render('{{ oidc|tojson }}'), '{}')
+        self.assertEqual(self._render('{{ oidc|int }}'), '0')
+        self.assertEqual(self._render('{{ oidc|pprint }}'), '{}')
+        self.assertEqual(self._render('{{ oidc|length }}'), '0')
 
-    def test_the_binding_is_still_falsy_so_guards_work(self):
-        # It must not become truthy, or every `{% if smtp %}` would take
-        # the wrong branch.
+    def test_real_dict_methods_keep_their_behaviour(self):
+        # `.get` must be dict.get, not the chaining fallback, or the
+        # author's default is silently discarded.
+        self.assertEqual(self._render('{{ oidc.get("issuer", "d") }}'), 'd')
+
+    def test_it_is_falsy_so_guards_work(self):
         self.assertEqual(self._render('{% if oidc %}on{% else %}off{% endif %}'), 'off')
-        self.assertEqual(self._render('{{ oidc|default("none") }}'), 'none')
 
     def test_a_set_integration_is_untouched(self):
         info = _compute_integrations_context(
             {'id': 'i1', 'integrations': {'oidc': {'issuer': _ISSUER}}},
         )
-        ctx = _compose_render_context(info)
-        self.assertEqual(ctx['oidc'], {'issuer': _ISSUER})
+        self.assertEqual(_compose_render_context(info)['oidc'], {'issuer': _ISSUER})
 
     def test_baked_files_still_refuse_loudly(self):
         # Scoped to the compose render on purpose. A baked file is
@@ -479,11 +498,9 @@ class UnsetBindingCannotFailTests(TestCase):
         # and it has no strip pass to remove the key properly.
         #
         # Built through `build_render_context`, the SHARED builder the
-        # baked-file path actually uses, not by calling
-        # `_compute_integrations_context` directly. Constructing the
-        # context by hand made this pass even with the permissive binding
-        # leaked into the shared builder, which is precisely the mistake
-        # it is meant to catch.
+        # baked-file path actually uses. Constructing the context by hand
+        # made this pass even with the binding leaked into that builder,
+        # which is precisely the mistake it is meant to catch.
         info = build_render_context({
             'id': 'i1', 'integrations': {}, 'configurations': [], 'ports': [],
         })

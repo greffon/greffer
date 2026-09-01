@@ -185,47 +185,52 @@ def get_greffon_path(greffon_info):
 KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
-class _UnsetIntegration(ChainableUndefined):
+class _UnsetIntegration(dict):
     """How an integration type the user did not configure is bound at
     COMPOSE render time.
 
-    The env-key strip pass below removes the keys a catalog entry declares
-    for an unset type, but it works by reading template TEXT, and seven
-    adversarial rounds established that it cannot be made complete:
-    aliasing (`{% set x = oidc %}`, `{% with %}`, a macro argument) moves
-    the dereference onto a different name, and `map(attribute='a.b')`
-    hides the path inside a string literal the scanner deliberately
-    blanks. Each round closed one hole and the next found another, which
-    is the signature of an undecidable question rather than a bug.
+    The env-key strip pass below removes the keys a catalog entry
+    declares for an unset type, but it works by reading template TEXT,
+    and eight adversarial rounds established it cannot be made complete:
+    a macro argument moves the dereference onto another name, and
+    `map(attribute='a.b')` hides the path inside a string literal the
+    scanner has to blank for other reasons. Each round closed one hole
+    and the next found another, which is the signature of an undecidable
+    question rather than a bug.
 
-    So the strip pass stops being the thing that keeps the deploy alive.
-    Binding the type to a value that CANNOT fail makes the whole class
-    impossible instead of unlikely: a missed reference now renders empty
-    rather than raising `UndefinedError` out of `Template.render` and
-    failing the entire start.
+    So the deploy must not DEPEND on the scan being complete. This is a
+    real `dict`, so everything that worked when unset types were bound to
+    a plain `{}` still works -- `|tojson` gives `{}`, `|int` gives `0`,
+    `|pprint` gives `{}`, `.get('k', 'd')` gives `'d'`, `{% if oidc %}`
+    is falsy -- and attribute access chains instead of raising, so a
+    reference the scan missed renders rather than failing the start.
 
-    `ChainableUndefined` alone is not enough -- it survives attribute
-    chains but still raises when CALLED, and `{{ smtp.from_address.split('@')[0] }}`
-    is a shape the catalog already ships. Absorbing calls and iteration
-    covers `.get()`, `.items()`, `.split()` and `{% for k, v in oidc.items() %}`.
+    That combination is the point, and it is why this is NOT a
+    `ChainableUndefined` subclass. That version chained correctly but
+    stopped being a dict, which BROKE `{{ oidc|tojson }}` (a natural way
+    to pass a whole blob, and an uncaught 500 in `create_compose`),
+    turned `|int` into an UndefinedError, and rendered the literal text
+    `Undefined` into the compose file for `|pprint`. Every one of those
+    was a regression against the `{}` it replaced -- the fix was worse
+    than the failure it prevented for any template that did not chain.
 
     Scoped deliberately to the compose render. `greffon_info` still holds
-    `{}` for an unset type, so `_render_baked_file` keeps raising
-    ConfigRenderError (422) on `{{ oidc.issuer }}` rather than writing a
-    silently empty config file -- a baked file is content, where quiet
-    truncation is worse than a loud refusal, while a compose env var has
-    the strip pass to remove it properly.
+    a plain `{}`, so `_render_baked_file` keeps raising ConfigRenderError
+    (422) on `{{ oidc.issuer }}` rather than writing a silently empty
+    config file: a baked file is content, where quiet truncation is worse
+    than a loud refusal, and it has no strip pass to remove the key.
     """
 
-    __slots__ = ()
-
-    def __call__(self, *args, **kwargs):
+    def __missing__(self, key):
+        # This alone is what makes attribute access chain, which is not
+        # obvious: Jinja's `Environment.getattr` tries `getattr()` and
+        # falls back to `getitem()`, so `{{ oidc.issuer }}` arrives here
+        # as a missing KEY. An explicit `__getattr__` returning `self`
+        # was therefore dead code -- mutation-checked, no template in the
+        # matrix rendered differently without it -- so it is not here.
         return self
 
-    def __iter__(self):
-        return iter(())
-
-    def __getitem__(self, key):
+    def __call__(self, *args, **kwargs):
         return self
 
 
@@ -665,7 +670,11 @@ def _compose_render_context(greffon_info):
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
         if not _is_integration_set(integrations.get(t)) and context.get(t) == {}:
-            context[t] = _UnsetIntegration(name=t)
+            # No constructor args: this is a dict, so a kwarg would
+            # become real CONTENT -- making it truthy (every
+            # `{% if oidc %}` guard would take the wrong branch) and
+            # serialising as {"name": "oidc"} under |tojson.
+            context[t] = _UnsetIntegration()
     return context
 
 
