@@ -613,23 +613,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # so judging each in isolation sees only the bare access and
             # pops the key the guard exists to preserve.
             aliased = any(_aliases(e, bare) for e in expressions)
-            # A single quote inside a construct means the value cannot
-            # render AT ALL: `yaml.dump` re-serialises the compose in
-            # single-quoted style and doubles inner quotes, so Jinja is
-            # handed `default(''localhost'')` and raises
-            # TemplateSyntaxError for the whole file. That is a
-            # pre-existing hazard of rendering the DUMPED text -- it hits
-            # `{{ instance_id|default('x') }}` on main just the same, and
-            # fixing it means rendering before dumping, which is not this
-            # change's to make. What IS this change's business is not
-            # WIDENING it: excusing such a value as guarded would keep a
-            # key `main` popped, turning one missing env var into an
-            # instance that cannot deploy. So the guard does not apply
-            # there, and the key is popped as before.
-            renderable = not any("'" in b for b in raw_bodies)
-            guarded = renderable and any(
-                _guards(e, bare, member, attr) for e in expressions
-            )
+            # Whether a KEPT value can actually be rendered is decided
+            # after the fact, against the real dumped document, by
+            # `_pop_keys_the_dump_mangles` below. It cannot be decided
+            # here: the mangling depends on the whole document, not the
+            # value.
+            guarded = any(_guards(e, bare, member, attr) for e in expressions)
             deref = any(member.search(e) or attr.search(e) for e in expressions)
             # Aliasing wins over the guard: `{% set x = oidc %}` reads as
             # a bare mention, but the dereference is real and simply
@@ -677,6 +666,112 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     continue
                 kept.append(e)
             service['environment'] = kept
+
+    # Second pass, against the REAL dumped document.
+    #
+    # A value only reaches Jinja through `yaml.dump`, and the dump can
+    # mangle an expression beyond recognition. Single-quoted style
+    # doubles inner `'`, so `default('x')` arrives as `default(''x'')`.
+    # Double-quoted style -- chosen for non-ASCII or a tab -- escapes
+    # inner `"` as `\"`, and LINE-WRAPS long scalars with a
+    # backslash-continuation that can land inside a construct, splitting
+    # `{% endif %}` into `{% endif\` + `\ %}`. Any of those raises
+    # TemplateSyntaxError for the WHOLE FILE: an uncaught 500 out of
+    # `create_compose`, instance never starts.
+    #
+    # This cannot be decided per value, which two earlier attempts got
+    # wrong: whether yaml wraps depends on the value's INDENTATION and
+    # position in the finished document, so a value dumped alone answers
+    # a different question. Hence dumping what we actually have.
+    #
+    # The hazard is pre-existing and not integration-specific --
+    # `{{ instance_id|default('x') }}` hits it on main identically -- and
+    # fixing it properly means rendering before dumping, a core-path
+    # change that is not this one's to make. So this deliberately only
+    # rescues keys that reference an unset integration type: exactly the
+    # ones the guard above chose to KEEP and `main` would have popped.
+    # Widening the pop to every mangled value would change behaviour well
+    # beyond integrations.
+    _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
+                               evaluated_bodies)
+    return compose
+
+
+def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
+                               evaluated_bodies):
+    """Drop kept integration values whose constructs the dump breaks.
+
+    Asks the only question that matters -- does Jinja PARSE the finished
+    document -- rather than predicting how yaml will format a value. Two
+    earlier attempts predicted, and both were wrong: one tested for `'`
+    and missed the double-quoted style entirely, and one searched the
+    dumped text for each construct, which passed whenever an identical
+    construct appeared under some OTHER key.
+
+    Candidates are only values that name an unset integration type, i.e.
+    the ones the guard chose to keep and `main` would have popped.
+    Everything else is main's pre-existing hazard and is left exactly as
+    it was.
+    """
+
+    def _parses(text):
+        try:
+            Template(text)
+            return True
+        except TemplateError:
+            return False
+
+    def _candidates():
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            env = service.get('environment')
+            # List form is left alone: no catalog entry pairs it with
+            # integrations, so rescuing it would be untested code.
+            if not isinstance(env, dict):
+                continue
+            for key, value in list(env.items()):
+                if (isinstance(value, str)
+                        and evaluated_bodies(value)
+                        and any(t in value for t in KNOWN_INTEGRATION_TYPES)):
+                    yield name, env, key
+
+    if _parses(yaml.dump(compose)):
+        return compose
+
+    candidates = list(_candidates())
+    if not candidates:
+        return compose
+
+    # Remove every candidate, then put back the ones that turn out to be
+    # innocent. Removing them one at a time and testing does NOT work
+    # when more than one value is mangled: neither removal alone fixes
+    # the document, so each looks innocent and both are kept -- which is
+    # exactly how the first version of this failed.
+    removed = {}
+    for name, env, key in candidates:
+        removed[(name, key)] = env.pop(key)
+
+    if not _parses(yaml.dump(compose)):
+        # The breakage is in a value that names no integration type, so
+        # it is main's pre-existing hazard rather than something this
+        # change introduced. Put everything back and leave the document
+        # exactly as it was: deleting someone else's key to work around
+        # it would be a far bigger change than this one is entitled to.
+        for name, env, key in candidates:
+            env[key] = removed[(name, key)]
+        return compose
+
+    for name, env, key in candidates:
+        env[key] = removed[(name, key)]
+        if _parses(yaml.dump(compose)):
+            continue
+        env.pop(key, None)
+        logger.warning(
+            'integrations: dropping env %s from service %s -- yaml.dump '
+            'mangles its template, which would fail the whole compose '
+            'render', key, name,
+        )
     return compose
 
 

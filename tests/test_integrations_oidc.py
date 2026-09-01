@@ -400,16 +400,20 @@ class GuardedFallbackTests(TestCase):
         self.assertTrue(self._survives('{% if smtp %}on{% else %}off{% endif %}'))
 
     def test_default_filter_survives(self):
-        self.assertTrue(self._survives("{{ oidc|default('none') }}"))
-        self.assertTrue(self._survives("{{ smtp|default('none') }}"))
+        # Double quotes: a single quote inside a construct is doubled by
+        # `yaml.dump` and cannot render at all, so such a value is popped
+        # by the post-dump pass regardless of the guard. That is asserted
+        # separately in DumpMangledValuesTests.
+        self.assertTrue(self._survives('{{ oidc|default("none") }}'))
+        self.assertTrue(self._survives('{{ smtp|default("none") }}'))
 
     def test_is_defined_survives(self):
-        self.assertTrue(self._survives("{{ 'y' if smtp is defined else 'n' }}"))
+        self.assertTrue(self._survives('{{ "y" if smtp is defined else "n" }}'))
 
     def test_a_shadowing_binding_is_not_a_reference(self):
         # The name is being BOUND here, not read from the context.
-        self.assertTrue(self._survives("{% set oidc = 'x' %}{{ oidc }}"))
-        self.assertTrue(self._survives("{% for oidc in ['a'] %}{{ oidc }}{% endfor %}"))
+        self.assertTrue(self._survives('{% set oidc = "x" %}{{ oidc }}'))
+        self.assertTrue(self._survives('{% for oidc in ["a"] %}{{ oidc }}{% endfor %}'))
 
     def test_a_field_of_that_name_on_another_object_is_not_a_reference(self):
         # `oidc` here belongs to `keycloak`, not to the context.
@@ -551,7 +555,7 @@ class GuardSpansTheWholeValueTests(TestCase):
     def test_ternary_guard_with_double_quotes_protects_it(self):
         self.assertTrue(self._survives('{{ oidc.issuer if oidc else "none" }}'))
 
-    def test_a_single_quote_in_a_construct_is_never_excused_as_guarded(self):
+    def test_a_single_quote_in_a_construct_is_popped(self):
         # `yaml.dump` re-serialises the compose in single-quoted style and
         # DOUBLES inner quotes, so Jinja is handed `default(''x'')` and
         # raises TemplateSyntaxError for the WHOLE FILE. Keeping such a
@@ -562,7 +566,19 @@ class GuardSpansTheWholeValueTests(TestCase):
         # -- `{{ instance_id|default('x') }}` hits it on main just the
         # same -- so the rule here is only "do not widen it".
         self.assertFalse(self._survives("{{ oidc.issuer if oidc else 'none' }}"))
-        self.assertFalse(self._survives("{% if smtp %}{{ smtp.host|join(',') }}{% endif %}"))
+        self.assertFalse(self._survives("{% if smtp %}{{ smtp.host|default('x') }}{% endif %}"))
+
+    def test_a_doubled_quote_that_still_parses_is_a_known_residual(self):
+        # Not every mangling breaks the parse. `join(',')` dumps to
+        # `join('','')`, which Jinja reads as two empty strings: valid
+        # syntax, wrong separator. The rescue keys on whether the
+        # document PARSES, so this survives and renders with the wrong
+        # value rather than killing the deploy.
+        #
+        # Asserted so the limit is recorded rather than discovered. The
+        # complete fix is to render before dumping instead of templating
+        # the dumped text, which is tracked separately.
+        self.assertTrue(self._survives("{% if smtp %}{{ smtp.host|join(',') }}{% endif %}"))
 
     def test_a_quote_in_literal_TEXT_is_harmless_and_still_guarded(self):
         # Only a quote INSIDE a construct is doubled into the expression.
@@ -580,6 +596,89 @@ class GuardSpansTheWholeValueTests(TestCase):
 
     def test_an_unguarded_dereference_still_pops(self):
         self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
+
+
+class DumpMangledValuesTests(TestCase):
+    """Values a KEPT key cannot survive `yaml.dump` intact.
+
+    A value only reaches Jinja through the dump, and the dump can mangle
+    an expression past parsing: single-quoted style doubles inner `'`,
+    and double-quoted style (chosen for non-ASCII or a tab) escapes inner
+    `"` and LINE-WRAPS with a backslash continuation that can split a
+    construct in half. Any of those fails the whole compose render.
+    """
+
+    def _survives(self, value, extra_env=None):
+        env = {'K': value}
+        env.update(extra_env or {})
+        compose = {'services': {'a': {'environment': env}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_single_quote_doubling_is_caught(self):
+        self.assertFalse(self._survives("{{ smtp|default('localhost') }}"))
+
+    def test_double_quoted_style_escaping_is_caught(self):
+        # Non-ASCII forces double-quoted style, which escapes inner `"`.
+        self.assertFalse(
+            self._survives('é {% if smtp %}{{ smtp.host }}{% else %}{{ "n" }}{% endif %}'),
+        )
+
+    def test_line_wrapping_that_splits_a_construct_is_caught(self):
+        # The long double-quoted scalar wraps with a backslash
+        # continuation that lands inside `{% endif %}` and splits it.
+        #
+        # The KEY NAME is load-bearing here, which is the whole point:
+        # this exact value does NOT wrap under a short key and DOES under
+        # a longer one, because yaml wraps on total line width. That is
+        # why renderability cannot be decided per value, and why two
+        # earlier attempts that dumped a value in isolation were
+        # answering a different question.
+        value = "\u00e9 {% if smtp %}{{ smtp.host }}{% else %}{{ 'none' }}{% endif %}"
+        compose = {'services': {'a': {'environment': {
+            'A_QUITE_LONG_ENV_VARIABLE_NAME': value,
+        }}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['a']['environment'], {})
+        # The same value under a short key is left alone, because there
+        # it does not wrap and renders perfectly well.
+        self.assertTrue(self._survives(value))
+
+
+    def test_more_than_one_mangled_value_is_handled(self):
+        # Removing them one at a time and re-testing does not work:
+        # neither removal alone fixes the document, so each looks
+        # innocent and both are kept. That is how the first version of
+        # this failed.
+        self.assertFalse(self._survives(
+            'é {% if smtp %}{{ smtp.host }}{% else %}{{ "n" }}{% endif %}',
+            {'OTHER': '\t{% if oidc %}{{ oidc.issuer }}{% else %}{{ "n" }}{% endif %}'},
+        ))
+
+    def test_an_innocent_value_is_not_dropped_with_the_guilty(self):
+        # Minimal removal: a value that renders fine must survive even
+        # when a sibling is mangled.
+        compose = {'services': {'a': {'environment': {
+            'BAD': "{{ smtp|default('localhost') }}",
+            'GOOD': '{% if smtp %}on{% else %}off{% endif %}',
+        }}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(list(compose['services']['a']['environment']), ['GOOD'])
+
+    def test_a_non_integration_value_is_left_to_main(self):
+        # `{{ instance_id|default('x') }}` hits the same hazard and is
+        # not this change's to fix -- deleting someone else's key to work
+        # around a pre-existing bug would be a far bigger change than
+        # this is entitled to. It stays, exactly as on main.
+        compose = {'services': {'a': {'environment': {
+            'X': "{{ instance_id|default('x') }}",
+        }}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('X', compose['services']['a']['environment'])
 
 
 class PopLoggingTests(TestCase):
