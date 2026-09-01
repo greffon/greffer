@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined, Template
+from jinja2 import ChainableUndefined, StrictUndefined, Template
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -183,6 +183,50 @@ def get_greffon_path(greffon_info):
 # the render; it holds no provider credential and makes no call to the
 # provider.
 KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
+
+
+class _UnsetIntegration(ChainableUndefined):
+    """How an integration type the user did not configure is bound at
+    COMPOSE render time.
+
+    The env-key strip pass below removes the keys a catalog entry declares
+    for an unset type, but it works by reading template TEXT, and seven
+    adversarial rounds established that it cannot be made complete:
+    aliasing (`{% set x = oidc %}`, `{% with %}`, a macro argument) moves
+    the dereference onto a different name, and `map(attribute='a.b')`
+    hides the path inside a string literal the scanner deliberately
+    blanks. Each round closed one hole and the next found another, which
+    is the signature of an undecidable question rather than a bug.
+
+    So the strip pass stops being the thing that keeps the deploy alive.
+    Binding the type to a value that CANNOT fail makes the whole class
+    impossible instead of unlikely: a missed reference now renders empty
+    rather than raising `UndefinedError` out of `Template.render` and
+    failing the entire start.
+
+    `ChainableUndefined` alone is not enough -- it survives attribute
+    chains but still raises when CALLED, and `{{ smtp.from_address.split('@')[0] }}`
+    is a shape the catalog already ships. Absorbing calls and iteration
+    covers `.get()`, `.items()`, `.split()` and `{% for k, v in oidc.items() %}`.
+
+    Scoped deliberately to the compose render. `greffon_info` still holds
+    `{}` for an unset type, so `_render_baked_file` keeps raising
+    ConfigRenderError (422) on `{{ oidc.issuer }}` rather than writing a
+    silently empty config file -- a baked file is content, where quiet
+    truncation is worse than a loud refusal, while a compose env var has
+    the strip pass to remove it properly.
+    """
+
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+    def __getitem__(self, key):
+        return self
 
 
 def _is_integration_set(value):
@@ -504,16 +548,45 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         return bodies
 
     def _aliases(expression, bare):
-        """True if a `{% set %}` binds ANOTHER name to the type.
+        """True if `{% set %}` or `{% with %}` binds ANOTHER name to the type.
 
         Only the right-hand side counts: `{% set oidc = 'x' %}` binds the
         type's own name to something else, which is shadowing rather than
         aliasing, and its RHS holds no reference.
+
+        `with` is the same construct with a different keyword, and an
+        entry author is as likely to reach for it.
         """
         head = expression.strip()
-        if not head.startswith('set ') or '=' not in head:
+        if '=' not in head:
+            return False
+        if not (head.startswith('set ') or head.startswith('with ')):
             return False
         return bool(bare.search(head.split('=', 1)[1]))
+
+    def _guards(expression, bare, member, attr):
+        """True if this body TESTS the type rather than dereferencing it.
+
+        A bare use -- `{% if smtp %}`, `{{ x if smtp else y }}` -- is the
+        author handling the unset case, and the branch they wrote for it
+        is the intended output. Popping the key throws that away and was
+        a real regression against `smtp`, which has shipped since Feature
+        #4. `|default(...)` is the same intent spelled as a filter, and
+        there it attaches to the dereference itself, so it is checked on
+        the whole body rather than on a bare token.
+        """
+        if 'default(' in expression.replace(' ', ''):
+            return True
+        # A bare mention that is NOT the head of a dereference. Testing
+        # the tail for `.`/`[` by hand got `{{ (oidc).issuer }}` and
+        # `{{ oidc|attr(..) }}` wrong, so it re-uses the very patterns
+        # that define a dereference, anchored at the token.
+        for m in bare.finditer(expression):
+            rest = expression[m.start():]
+            if member.match(rest) or attr.match(rest):
+                continue
+            return True
+        return False
 
     def matching_unset_types(value):
         """Which unset types `value` actually references, in tuple order."""
@@ -521,16 +594,22 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         if '{{' not in value and '{%' not in value:
             return ()
+        expressions = [string_re.sub('', b) for b in evaluated_bodies(value)]
         matched = []
-        for body in evaluated_bodies(value):
-            expression = string_re.sub('', body)
-            for t, (member, attr, bare) in type_patterns.items():
-                if t in matched:
-                    continue
-                if (member.search(expression)
-                        or attr.search(expression)
-                        or _aliases(expression, bare)):
-                    matched.append(t)
+        for t, (member, attr, bare) in type_patterns.items():
+            # Evaluated over the WHOLE value, not body by body. The guard
+            # and the dereference it protects live in DIFFERENT bodies --
+            # `{% if smtp %}` and `{{ smtp.host }}` are two constructs --
+            # so judging each in isolation sees only the bare access and
+            # pops the key the guard exists to preserve.
+            aliased = any(_aliases(e, bare) for e in expressions)
+            guarded = any(_guards(e, bare, member, attr) for e in expressions)
+            deref = any(member.search(e) or attr.search(e) for e in expressions)
+            # Aliasing wins over the guard: `{% set x = oidc %}` reads as
+            # a bare mention, but the dereference is real and simply
+            # happens on another name.
+            if aliased or (deref and not guarded):
+                matched.append(t)
         return tuple(matched)
 
     # Log every pass-2 pop. This pass infers intent from the template
@@ -573,6 +652,21 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 kept.append(e)
             service['environment'] = kept
     return compose
+
+
+def _compose_render_context(greffon_info):
+    """`greffon_info` with unset integration types bound so nothing raises.
+
+    Only the values `_compute_integrations_context` itself defaulted to
+    `{}` are replaced, so a caller that deliberately populated the key
+    keeps winning -- the same non-clobbering rule that function follows.
+    """
+    integrations = greffon_info.get('integrations') or {}
+    context = dict(greffon_info)
+    for t in KNOWN_INTEGRATION_TYPES:
+        if not _is_integration_set(integrations.get(t)) and context.get(t) == {}:
+            context[t] = _UnsetIntegration(name=t)
+    return context
 
 
 def _compute_instance_context(greffon_info):
@@ -769,7 +863,7 @@ def create_compose(compose, greffon_info):
     _delete_unset_integration_env_keys(compose, greffon_info)
     _inject_instance_log_rotation(compose)
     t = Template(yaml.dump(compose))
-    compose_file = t.render(**greffon_info)
+    compose_file = t.render(**_compose_render_context(greffon_info))
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 

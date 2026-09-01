@@ -15,10 +15,14 @@ import logging
 from unittest import TestCase
 from unittest.mock import mock_open, patch
 
-from jinja2 import UndefinedError
+from jinja2 import Template, UndefinedError
 
 from apps.utils.docker.compose import (
     KNOWN_INTEGRATION_TYPES,
+    ConfigRenderError,
+    _compose_render_context,
+    _render_baked_file,
+    build_render_context,
     _compute_integrations_context,
     _delete_unset_integration_env_keys,
     create_compose,
@@ -415,6 +419,116 @@ class GuardedFallbackTests(TestCase):
         # The other side: these RAISE, so they must go.
         self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
         self.assertFalse(self._survives('{{ smtp.from_address.split("@")[0] }}'))
+
+
+class UnsetBindingCannotFailTests(TestCase):
+    """The safety net under the strip pass.
+
+    The pass reads template text, and seven rounds established it cannot
+    be complete: aliasing moves the dereference to another name, and
+    `map(attribute='a.b')` hides the path inside a string literal the
+    scanner blanks. So the deploy must not DEPEND on it being complete.
+    Every shape below renders empty instead of raising, whether or not
+    the strip pass saw it.
+    """
+
+    def _render(self, value):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        return Template(value).render(**_compose_render_context(info))
+
+    def test_attribute_chain_does_not_raise(self):
+        self.assertEqual(self._render('{{ oidc.issuer.host }}'), '')
+
+    def test_method_calls_do_not_raise(self):
+        # ChainableUndefined alone still raises on a CALL, and
+        # `{{ smtp.from_address.split('@')[0] }}` is a shape the catalog
+        # already ships -- so calls have to be absorbed too.
+        self.assertEqual(self._render('{{ oidc.get("issuer", "d") }}'), '')
+        self.assertEqual(self._render('{{ smtp.from_address.split("@")[0] }}'), '')
+
+    def test_iteration_does_not_raise(self):
+        self.assertEqual(
+            self._render('{% for k, v in oidc.items() %}{{ k }}{% endfor %}'), '',
+        )
+
+    def test_aliased_and_macro_forms_do_not_raise(self):
+        # The two the strip pass structurally cannot follow.
+        self.assertEqual(
+            self._render('{% with x = oidc %}{{ x.issuer.split("@")[0] }}{% endwith %}'), '',
+        )
+        self.assertEqual(
+            self._render('{% macro m(x) %}{{ x.issuer.host }}{% endmacro %}{{ m(oidc) }}'), '',
+        )
+
+    def test_the_binding_is_still_falsy_so_guards_work(self):
+        # It must not become truthy, or every `{% if smtp %}` would take
+        # the wrong branch.
+        self.assertEqual(self._render('{% if oidc %}on{% else %}off{% endif %}'), 'off')
+        self.assertEqual(self._render('{{ oidc|default("none") }}'), 'none')
+
+    def test_a_set_integration_is_untouched(self):
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {'oidc': {'issuer': _ISSUER}}},
+        )
+        ctx = _compose_render_context(info)
+        self.assertEqual(ctx['oidc'], {'issuer': _ISSUER})
+
+    def test_baked_files_still_refuse_loudly(self):
+        # Scoped to the compose render on purpose. A baked file is
+        # CONTENT, where a silently empty value is worse than a refusal,
+        # and it has no strip pass to remove the key properly.
+        #
+        # Built through `build_render_context`, the SHARED builder the
+        # baked-file path actually uses, not by calling
+        # `_compute_integrations_context` directly. Constructing the
+        # context by hand made this pass even with the permissive binding
+        # leaked into the shared builder, which is precisely the mistake
+        # it is meant to catch.
+        info = build_render_context({
+            'id': 'i1', 'integrations': {}, 'configurations': [], 'ports': [],
+        })
+        with self.assertRaises(ConfigRenderError):
+            _render_baked_file('{{ oidc.issuer }}', info, 'realm.json')
+
+
+class WithAliasingTests(TestCase):
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_with_binds_an_alias_like_set(self):
+        self.assertFalse(
+            self._survives('{% with x = oidc %}{{ x.issuer.host }}{% endwith %}'),
+        )
+
+
+class GuardSpansTheWholeValueTests(TestCase):
+    """The guard and the access it protects live in different bodies."""
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_guard_in_one_body_protects_access_in_another(self):
+        # `{% if smtp %}` and `{{ smtp.host }}` are two constructs.
+        # Judging each alone sees only the bare access and pops the key
+        # the guard exists to preserve.
+        self.assertTrue(
+            self._survives('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}'),
+        )
+
+    def test_default_filter_on_a_dereference_protects_it(self):
+        self.assertTrue(self._survives('{{ oidc.issuer|default("http://d") }}'))
+
+    def test_ternary_guard_protects_it(self):
+        self.assertTrue(self._survives('{{ oidc.issuer if oidc else "none" }}'))
+
+    def test_an_unguarded_dereference_still_pops(self):
+        self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
 
 
 class PopLoggingTests(TestCase):
