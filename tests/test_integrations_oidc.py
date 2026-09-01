@@ -538,11 +538,45 @@ class GuardSpansTheWholeValueTests(TestCase):
             self._survives('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}'),
         )
 
-    def test_default_filter_on_a_dereference_protects_it(self):
-        self.assertTrue(self._survives('{{ oidc.issuer|default("http://d") }}'))
+    def test_default_filter_is_not_a_guard(self):
+        # It reads like one, but the binding makes an unset type a real
+        # dict, so `oidc.issuer` IS defined and `default` is a no-op.
+        # Keeping the key on account of a default would guarantee the
+        # default cannot apply and render the literal `{}` instead.
+        self.assertFalse(self._survives('{{ oidc.issuer|default("http://d") }}'))
+        # Same for Jinja's documented `|d` alias -- the two spellings
+        # must not diverge.
+        self.assertFalse(self._survives('{{ oidc.issuer|d("http://d") }}'))
 
-    def test_ternary_guard_protects_it(self):
+    def test_ternary_guard_with_double_quotes_protects_it(self):
         self.assertTrue(self._survives('{{ oidc.issuer if oidc else "none" }}'))
+
+    def test_a_single_quote_in_a_construct_is_never_excused_as_guarded(self):
+        # `yaml.dump` re-serialises the compose in single-quoted style and
+        # DOUBLES inner quotes, so Jinja is handed `default(''x'')` and
+        # raises TemplateSyntaxError for the WHOLE FILE. Keeping such a
+        # key would turn one missing env var into an instance that cannot
+        # deploy, so the guard must not excuse it.
+        #
+        # The hazard itself is pre-existing and not integration-specific
+        # -- `{{ instance_id|default('x') }}` hits it on main just the
+        # same -- so the rule here is only "do not widen it".
+        self.assertFalse(self._survives("{{ oidc.issuer if oidc else 'none' }}"))
+        self.assertFalse(self._survives("{% if smtp %}{{ smtp.host|join(',') }}{% endif %}"))
+
+    def test_a_quote_in_literal_TEXT_is_harmless_and_still_guarded(self):
+        # Only a quote INSIDE a construct is doubled into the expression.
+        # One in the surrounding output text is just text, so the guard
+        # still applies -- being stricter than the hazard requires would
+        # pop keys that render perfectly well.
+        self.assertTrue(
+            self._survives("{% if smtp %}{{ smtp.host }}{% else %}'x'{% endif %}"),
+        )
+
+    def test_an_unrelated_default_does_not_excuse_a_real_dereference(self):
+        # `default(` appearing anywhere in the value used to disarm the
+        # pop, so the `{}` silently became the SMTP host.
+        self.assertFalse(self._survives('{{ smtp.host }} {{ other|default(1) }}'))
 
     def test_an_unguarded_dereference_still_pops(self):
         self.assertFalse(self._survives('{{ oidc.issuer.host }}'))

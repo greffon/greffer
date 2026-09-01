@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import ChainableUndefined, StrictUndefined, Template
+from jinja2 import StrictUndefined, Template
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -576,12 +576,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         author handling the unset case, and the branch they wrote for it
         is the intended output. Popping the key throws that away and was
         a real regression against `smtp`, which has shipped since Feature
-        #4. `|default(...)` is the same intent spelled as a filter, and
-        there it attaches to the dereference itself, so it is checked on
-        the whole body rather than on a bare token.
+        #4.
+
+        `|default(...)` is deliberately NOT treated as a guard, though it
+        reads like the same intent. The binding makes an unset type a
+        real dict, so `oidc.issuer` IS defined and `default` is a no-op:
+        keeping the key on account of a default guarantees the default
+        cannot apply, and the value renders the literal `{}` instead. The
+        pass and the binding would be disagreeing, with the pass keeping
+        a key precisely because of a fallback the binding then disables.
         """
-        if 'default(' in expression.replace(' ', ''):
-            return True
         # A bare mention that is NOT the head of a dereference. Testing
         # the tail for `.`/`[` by hand got `{{ (oidc).issuer }}` and
         # `{{ oidc|attr(..) }}` wrong, so it re-uses the very patterns
@@ -599,7 +603,8 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         if '{{' not in value and '{%' not in value:
             return ()
-        expressions = [string_re.sub('', b) for b in evaluated_bodies(value)]
+        raw_bodies = evaluated_bodies(value)
+        expressions = [string_re.sub('', b) for b in raw_bodies]
         matched = []
         for t, (member, attr, bare) in type_patterns.items():
             # Evaluated over the WHOLE value, not body by body. The guard
@@ -608,7 +613,23 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # so judging each in isolation sees only the bare access and
             # pops the key the guard exists to preserve.
             aliased = any(_aliases(e, bare) for e in expressions)
-            guarded = any(_guards(e, bare, member, attr) for e in expressions)
+            # A single quote inside a construct means the value cannot
+            # render AT ALL: `yaml.dump` re-serialises the compose in
+            # single-quoted style and doubles inner quotes, so Jinja is
+            # handed `default(''localhost'')` and raises
+            # TemplateSyntaxError for the whole file. That is a
+            # pre-existing hazard of rendering the DUMPED text -- it hits
+            # `{{ instance_id|default('x') }}` on main just the same, and
+            # fixing it means rendering before dumping, which is not this
+            # change's to make. What IS this change's business is not
+            # WIDENING it: excusing such a value as guarded would keep a
+            # key `main` popped, turning one missing env var into an
+            # instance that cannot deploy. So the guard does not apply
+            # there, and the key is popped as before.
+            renderable = not any("'" in b for b in raw_bodies)
+            guarded = renderable and any(
+                _guards(e, bare, member, attr) for e in expressions
+            )
             deref = any(member.search(e) or attr.search(e) for e in expressions)
             # Aliasing wins over the guard: `{% set x = oidc %}` reads as
             # a bare mention, but the dereference is real and simply
