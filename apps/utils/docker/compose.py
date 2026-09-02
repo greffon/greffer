@@ -558,26 +558,22 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # `a . b` means `a.b` to Jinja; make them look the same here too.
     spaced_dot_re = re.compile(r'\s*\.\s*')
 
-    def _shadows(t):
-        # `{% for oidc in ... %}`, `{% set oidc = ... %}`,
-        # `{% macro m(oidc) %}` all BIND the name, so the member access
-        # that follows resolves against the local value and renders
-        # fine. Popping those deleted working configuration -- the same
-        # failure mode as a mis-scoped qualifier, one scope deeper.
-        #
-        # Deliberately whole-value and not scope-accurate: a real
-        # analysis needs Jinja's parser, and the safe direction here is
-        # to KEEP, because the binding already makes an over-keep render
-        # empty while an over-pop loses config silently.
-        name = re.escape(t)
-        return re.compile(
-            r'\bfor\s+' + name + r'\b'
-            r'|\bset\s+' + name + r'\s*='
-            r'|\bmacro\s+\w+\s*\([^)]*\b' + name + r'\b'
-            r'|\bwith\s+' + name + r'\s*=',
-        )
-
-    type_patterns = {t: (_member_access(t), _shadows(t)) for t in unset_types}
+    # NO shadow rule. `{% for oidc in ... %}` and friends bind the name
+    # locally, so the access after them renders and popping the key is a
+    # false positive -- but `main` pops those too, and the whole-value
+    # rule that fixed it introduced something worse than the problem:
+    #
+    #   {% macro m(smtp) %}{{ smtp.host }}{% endmacro %}{{ smtp.port|int }}
+    #
+    # binds the name in ONE scope and reads the real global in another,
+    # so suppressing on any binding kept a genuine reference, `|int`
+    # raised, and `create_compose` 500'd where `main` had simply popped
+    # the key. Correct scoping needs Jinja's parser, not a regex over the
+    # whole value.
+    #
+    # So this over-pops shadowed names, exactly as `main` does. That
+    # direction costs one env var; the other costs the deploy.
+    type_patterns = {t: _member_access(t) for t in unset_types}
 
     # Escapes consumed so an escaped quote does not close the literal.
     string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
@@ -607,6 +603,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             closer = openers[opener]
             j = start_at + 2
             quote = None
+            depth = 0
             while j < n:
                 ch = value[j]
                 # A comment has no expression syntax, so quotes inside one
@@ -624,7 +621,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                         quote = ch
                         j += 1
                         continue
-                if value.startswith(closer, j):
+                # Depth, so a nested mapping's braces are not the
+                # terminator: `{{ {"a": {}} and smtp.port|int }}` ended
+                # the construct at the mapping's `}}`, left the real
+                # reference unscanned, and the key survived to raise at
+                # render -- where `main` popped it and deployed.
+                if opener == '{{' and ch == '{':
+                    depth += 1
+                elif opener == '{{' and ch == '}' and depth:
+                    depth -= 1
+                elif not depth and value.startswith(closer, j):
                     break
                 j += 1
             if j >= n:
@@ -662,9 +668,8 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             for b in evaluated_bodies(value)
         ]
         return tuple(
-            t for t, (member, shadows) in type_patterns.items()
+            t for t, member in type_patterns.items()
             if any(member.search(e) for e in expressions)
-            and not any(shadows.search(e) for e in expressions)
         )
 
     # Log every pass-2 pop. This pass infers intent from the template
