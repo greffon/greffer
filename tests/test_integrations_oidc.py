@@ -480,6 +480,19 @@ class UnsetBindingCannotFailTests(TestCase):
             '{% for k, v in oidc.items() %}{{ k }}{% endfor %}',
         )
 
+    def test_a_failure_that_still_raises_names_the_field(self):
+        # A few operations are not absorbed -- `|int`, comparisons,
+        # arithmetic -- and they raise out of `create_compose` as a 500.
+        # A shared no-name field made that message `None is undefined`,
+        # naming neither the type nor the field, where the plain `{}`
+        # binding named the field. The residual is accepted; an
+        # unreadable message for it is not.
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        ctx = _compose_render_context(info)
+        with self.assertRaises(UndefinedError) as caught:
+            Template('{{ oidc.issuer|int }}').render(**ctx)
+        self.assertIn('issuer', str(caught.exception))
+
     def test_a_dereference_matches_the_plain_dict_binding(self):
         # THE regression this leaf exists for. Returning `self` from
         # `__missing__` made a one-level access render the literal `{}`,

@@ -209,8 +209,6 @@ class _UnsetField(ChainableUndefined):
         return iter(())
 
 
-_UNSET_FIELD = _UnsetField()
-
 
 class _UnsetIntegration(dict):
     """How an integration type the user did not configure is bound at
@@ -268,7 +266,15 @@ class _UnsetIntegration(dict):
         # is not obvious: Jinja's `Environment.getattr` tries `getattr()`
         # and falls back to `getitem()`, so `{{ oidc.issuer }}` is a
         # missing KEY.
-        return _UNSET_FIELD
+        # Named, not a shared no-name singleton. A few operations still
+        # raise through `_UnsetField` -- `|int`, comparisons, arithmetic
+        # -- and with no name the message was `None is undefined`, so a
+        # 500 out of `create_compose` identified neither the type nor the
+        # field. `main` named the field, so that was a diagnosability
+        # regression on precisely the residual class this design accepts.
+        # The allocation happens only on the rare path the strip pass
+        # missed.
+        return _UnsetField(name=key, obj=self)
 
     def __call__(self, *args, **kwargs):
         return self
