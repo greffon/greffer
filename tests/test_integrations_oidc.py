@@ -480,6 +480,24 @@ class UnsetBindingCannotFailTests(TestCase):
             '{% for k, v in oidc.items() %}{{ k }}{% endfor %}',
         )
 
+    def test_a_dereference_matches_the_plain_dict_binding(self):
+        # THE regression this leaf exists for. Returning `self` from
+        # `__missing__` made a one-level access render the literal `{}`,
+        # where a plain `{}` binding rendered `''` -- swapping a benign
+        # empty value for a garbage one the container then tries to use
+        # as a hostname, at the depth that is by far the most common.
+        self.assertEqual(self._render('{{ oidc.issuer }}'), '')
+        self.assertEqual(self._render('{{ smtp.host }}'), '')
+
+    def test_a_default_on_a_dereference_still_fires(self):
+        # A field must be UNDEFINED, not an empty mapping, or `|default`
+        # silently stops working.
+        self.assertEqual(self._render('{{ smtp.host|default(25) }}'), '25')
+
+    def test_the_type_itself_is_still_an_empty_mapping(self):
+        # Only the FIELDS are undefined; the type keeps `{}`'s rendering.
+        self.assertEqual(self._render('{{ oidc }}'), '{}')
+
     def test_it_is_still_an_empty_dict(self):
         # The regression guard. Each of these worked with `{}` and MUST
         # keep working; the ChainableUndefined version broke all four.

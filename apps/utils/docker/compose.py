@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined, Template
+from jinja2 import ChainableUndefined, StrictUndefined, Template
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -185,6 +185,33 @@ def get_greffon_path(greffon_info):
 KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
+class _UnsetField(ChainableUndefined):
+    """A field of an integration the user did not configure.
+
+    Undefined, exactly as it was when unset types were a plain `{}`, so
+    `{{ smtp.host }}` renders `''` and `{{ smtp.host|default(25) }}`
+    renders `25` -- both matching that binding byte for byte.
+
+    What it adds is that going DEEPER cannot fail: `ChainableUndefined`
+    survives an attribute chain but still raises when called, and
+    `{{ smtp.from_address.split('@')[0] }}` is a shape the catalog ships,
+    so calls and iteration are absorbed too. The result is strictly
+    better than the old binding rather than different from it: identical
+    wherever `{}` rendered, and rendering where `{}` raised.
+    """
+
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+
+_UNSET_FIELD = _UnsetField()
+
+
 class _UnsetIntegration(dict):
     """How an integration type the user did not configure is bound at
     COMPOSE render time.
@@ -202,8 +229,15 @@ class _UnsetIntegration(dict):
     real `dict`, so everything that worked when unset types were bound to
     a plain `{}` still works -- `|tojson` gives `{}`, `|int` gives `0`,
     `|pprint` gives `{}`, `.get('k', 'd')` gives `'d'`, `{% if oidc %}`
-    is falsy -- and attribute access chains instead of raising, so a
-    reference the scan missed renders rather than failing the start.
+    is falsy -- and its FIELDS are `_UnsetField`, which keeps `{}`'s
+    behaviour one level down (`{{ oidc.issuer }}` renders `''`,
+    `|default` fires) while chaining deeper instead of raising.
+
+    Checked shape by shape against a plain `{}`: identical wherever `{}`
+    rendered, and rendering where `{}` raised. An earlier version had
+    `__missing__` return `self`, which made a one-level dereference
+    render the literal `{}` -- strictly worse than what it replaced, for
+    the depth that is by far the most common.
 
     That combination is the point, and it is why this is NOT a
     `ChainableUndefined` subclass. That version chained correctly but
@@ -222,13 +256,19 @@ class _UnsetIntegration(dict):
     """
 
     def __missing__(self, key):
-        # This alone is what makes attribute access chain, which is not
-        # obvious: Jinja's `Environment.getattr` tries `getattr()` and
-        # falls back to `getitem()`, so `{{ oidc.issuer }}` arrives here
-        # as a missing KEY. An explicit `__getattr__` returning `self`
-        # was therefore dead code -- mutation-checked, no template in the
-        # matrix rendered differently without it -- so it is not here.
-        return self
+        # A FIELD is undefined, not another empty mapping. Returning
+        # `self` here made `{{ smtp.host }}` render the literal `{}`
+        # where a plain `{}` binding rendered `''` -- a garbage value the
+        # container then tries to use as a hostname, in place of the
+        # benign empty one it used to get. That is a regression against
+        # the type already shipping, and the docstring above claimed the
+        # opposite of it.
+        #
+        # This is what makes attribute access arrive here at all, which
+        # is not obvious: Jinja's `Environment.getattr` tries `getattr()`
+        # and falls back to `getitem()`, so `{{ oidc.issuer }}` is a
+        # missing KEY.
+        return _UNSET_FIELD
 
     def __call__(self, *args, **kwargs):
         return self
@@ -680,9 +720,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # `create_compose`, instance never starts.
     #
     # This cannot be decided per value, which two earlier attempts got
-    # wrong: whether yaml wraps depends on the value's INDENTATION and
-    # position in the finished document, so a value dumped alone answers
-    # a different question. Hence dumping what we actually have.
+    # wrong: whether yaml wraps depends on the total line width, which is
+    # the KEY NAME plus the nesting indent plus the value -- so the same
+    # value wraps under a long key and not under a short one, and a value
+    # dumped alone under a placeholder key answers a different question.
+    # Hence dumping what we actually have.
     #
     # The hazard is pre-existing and not integration-specific --
     # `{{ instance_id|default('x') }}` hits it on main identically -- and
@@ -807,8 +849,18 @@ def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
     # Each probe runs against the document as it stands, so a half is
     # kept only if everything restored so far still parses together. The
     # final state therefore parses by construction, even when two values
-    # are individually innocent and jointly fatal -- yaml wraps on total
-    # line width, so that combination is real rather than theoretical.
+    # are individually innocent and jointly fatal -- which is real: a
+    # `{% if %}` in one env value with its `{% endif %}` in another is
+    # balanced only together. (Not, as an earlier version of this comment
+    # claimed, because yaml wraps on total line width -- PyYAML wraps
+    # each scalar independently of its siblings.)
+    #
+    # The surviving set is not guaranteed MINIMAL, and it depends on the
+    # order `_candidates()` walks, which is env insertion order while the
+    # dump sorts keys -- so two composes that dump identically can lose
+    # different keys. Fuzzing found this only with Jinja blocks split
+    # across env values. Recorded because the alternative is a later
+    # reader assuming determinism that is not there.
     def _restore_innocent(group):
         for name, env, key in group:
             env[key] = removed[(id(env), key)]
