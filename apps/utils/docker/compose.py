@@ -558,11 +558,31 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # `a . b` means `a.b` to Jinja; make them look the same here too.
     spaced_dot_re = re.compile(r'\s*\.\s*')
 
-    type_patterns = {t: _member_access(t) for t in unset_types}
+    def _shadows(t):
+        # `{% for oidc in ... %}`, `{% set oidc = ... %}`,
+        # `{% macro m(oidc) %}` all BIND the name, so the member access
+        # that follows resolves against the local value and renders
+        # fine. Popping those deleted working configuration -- the same
+        # failure mode as a mis-scoped qualifier, one scope deeper.
+        #
+        # Deliberately whole-value and not scope-accurate: a real
+        # analysis needs Jinja's parser, and the safe direction here is
+        # to KEEP, because the binding already makes an over-keep render
+        # empty while an over-pop loses config silently.
+        name = re.escape(t)
+        return re.compile(
+            r'\bfor\s+' + name + r'\b'
+            r'|\bset\s+' + name + r'\s*='
+            r'|\bmacro\s+\w+\s*\([^)]*\b' + name + r'\b'
+            r'|\bwith\s+' + name + r'\s*=',
+        )
+
+    type_patterns = {t: (_member_access(t), _shadows(t)) for t in unset_types}
 
     # Escapes consumed so an escaped quote does not close the literal.
     string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
     openers = {'{{': '}}', '{%': '%}', '{#': '#}'}
+    opener_re = re.compile(r'\{\{|\{%|\{#')
     # Jinja accepts `+` as well as `-` for whitespace control, in either
     # position. Accepting only `-` meant `{%+ endraw %}` was not found,
     # and the `else n` fallback then swallowed the whole rest of the
@@ -575,11 +595,15 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         bodies = []
         i, n = 0, len(value)
         while i < n:
-            found = [(value.find(o, i), o) for o in openers]
-            found = [(pos, o) for pos, o in found if pos != -1]
-            if not found:
+            # ONE search, not one per opener kind. Three `find` calls
+            # each scanned the whole remaining suffix, so a value with
+            # many constructs was quadratic -- measured 0.07s at 2500
+            # blocks, 1.18s at 10000, on the instance-start path where a
+            # catalog-controlled value can hold the handler.
+            match = opener_re.search(value, i)
+            if not match:
                 break
-            start_at, opener = min(found)
+            start_at, opener = match.start(), match.group()
             closer = openers[opener]
             j = start_at + 2
             quote = None
@@ -638,8 +662,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             for b in evaluated_bodies(value)
         ]
         return tuple(
-            t for t, member in type_patterns.items()
+            t for t, (member, shadows) in type_patterns.items()
             if any(member.search(e) for e in expressions)
+            and not any(shadows.search(e) for e in expressions)
         )
 
     # Log every pass-2 pop. This pass infers intent from the template
