@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import ChainableUndefined, StrictUndefined, Template
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -463,208 +463,70 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                         e for e in env if not (isinstance(e, str) and e.startswith(prefix))
                     ]
 
-    # Pass 2 — template-driven pop. We want to pop any env value that
-    # would expand to a reference of an unset integration type, e.g.
-    # ``{{ smtp.host }}``, ``{{ smtp.from_address.split('@')[0] }}``,
-    # the dict-index form
-    # ``{{ {"tls": "ssl", "starttls": "tls", "none": ""}[smtp.tls_mode] }}``,
-    # AND the bracket-key form ``{{ smtp['from_address'] }}`` (valid
-    # Jinja, semantically identical to ``smtp.from_address`` for our
-    # purposes — Codex P2 on PR #35).
+    # Pass 2 -- template-driven pop, for values the catalog templates
+    # rather than declares. `{{ smtp.host }}`,
+    # `{{ smtp.from_address.split('@')[0] }}`, the dict-index form
+    # `{{ {"tls": "ssl"}[smtp.tls_mode] }}` and the bracket form
+    # `{{ smtp['from_address'] }}` are all references for this purpose.
     #
-    # A key is popped when an UNSET type is referenced somewhere Jinja
-    # will actually evaluate. Getting that right needs a scanner rather
-    # than a regex, and the reason is worth stating, because two earlier
-    # regex spellings each shipped a different bug:
+    # ASKS JINJA'S OWN LEXER rather than approximating it.
     #
-    #   whole-string match       popped a value whose `{{ }}` was unrelated
-    #                            to a literal `oidc.<host>` beside it
-    #   `{{ }}` bodies only      missed statement blocks, which render too,
-    #                            so `{% if oidc.issuer.startswith(..) %}`
-    #                            survived and raised UndefinedError -- the
-    #                            exact failure this tuple entry prevents
-    #   non-greedy body match    stopped at the first `}}`, INCLUDING one
-    #                            inside a string literal, so everything
-    #                            after it was scanned by nothing:
-    #                            `{{ "}}" ~ oidc.issuer }}` survived and raised
+    # Five hand-rolled versions preceded this, and each one shipped a
+    # different way of being wrong about Jinja syntax: a whole-string
+    # match popped a literal `oidc.<host>` beside an unrelated `{{ }}`;
+    # scanning only `{{ }}` missed statement blocks; a non-greedy body
+    # match stopped at a `}}` inside a string literal; then, in turn,
+    # spaced dots (`{{ config . oidc . url }}`), nested mapping braces
+    # (`{{ {"a": {}} and smtp.port|int }}`), a call's closing paren
+    # (`{{ dict(oidc).get(..) }}`), the same with a space before the
+    # paren, and finally a `\s*\.\s*` normalisation that backtracked
+    # quadratically on a whitespace run -- a denial of service on input
+    # the catalog controls, reached through `/start/`.
     #
-    # The last one is why this walks the string tracking quote state: a
-    # delimiter inside a literal does not end a construct, and a literal
-    # is data rather than a reference. Comments and `{% raw %}` bodies are
-    # skipped because Jinja never evaluates them -- `{% raw %}` in
-    # particular is the documented way to ship a literal
-    # `{{ oidc.issuer }}` through to a downstream config file.
-    import re
-    # Pop when an evaluated Jinja construct DEREFERENCES the type.
+    # Every one of those is a place a regex approximates a parser and
+    # leaks. The lexer does not approximate: string literals, comments,
+    # `{% raw %}`, whitespace and nesting are its job, and it is a linear
+    # scan, so the backtracking class cannot recur either.
     #
-    # That is deliberately the whole rule. It does not try to decide
-    # whether the reference would actually fail -- it cannot, and earlier
-    # revisions that tried grew a guard for author-supplied fallbacks, an
-    # alias tracker for `{% set %}`/`{% with %}`, and then a whole
-    # post-dump rescue to undo the damage the guard caused, for a
-    # combined ~300 lines defending shapes no catalog entry uses.
-    #
-    # What makes that unnecessary is the binding: an unset type renders
-    # instead of raising, so a reference this rule MISSES costs an env
-    # var that renders empty, not a failed deploy. The rule is therefore
-    # allowed to be incomplete, and is kept simple on purpose.
-    #
-    # ACCEPTED RESIDUAL, stated because it is strictly worse than main
-    # in one narrow case. Keeping a value main popped exposes it to a
-    # pre-existing hazard: `yaml.dump` re-serialises the compose in
-    # single-quoted style and DOUBLES an inner `'`, so
-    #
-    #     {{ instance_host|default('smtp.acme.com') }}
-    #
-    # reaches Jinja as `default(''smtp.acme.com'')` and raises
-    # TemplateSyntaxError for the WHOLE document -- an uncaught 500 out
-    # of `create_compose`, no service starts. `main` pops that key and
-    # deploys without it.
-    #
-    # Accepted rather than defended against, deliberately:
-    #   - no catalog entry ships the shape; all five smtp templates
-    #     dereference directly and are popped by both implementations;
-    #   - main's protection is ACCIDENTAL -- it pops because its regex
-    #     false-positives on the token inside a string literal, not
-    #     because it knows about the hazard. The identical value without
-    #     `smtp.` in it (`default('example.com')`) breaks main too;
-    #   - the real fix is rendering BEFORE dumping instead of templating
-    #     the dumped text, which is a core-path change and not this
-    #     one's to make;
-    #   - a post-dump rescue for it was written, reviewed, and cut as
-    #     disproportionate (~180 lines to defend a shape nothing uses).
-    #
-    # The one thing this must get right is not popping a value that
-    # merely LOOKS like a reference, since that silently deletes working
-    # configuration. `oidc.<host>` is a conventional provider hostname,
-    # so `https://oidc.acme.com/{{ instance_id }}` is the normal shape
-    # for an OIDC entry and must survive -- hence scanning construct
-    # bodies rather than the whole string, and blanking string literals
-    # inside them.
-    def _member_access(t):
-        # `oidc.x`, `oidc ['x']`, `(oidc).x`. The lookbehind keeps
-        # `keycloak.oidc.issuer` out -- there the token is a field on
-        # something else, not our variable.
-        #
-        # It only inspects the character immediately before the token,
-        # which is why the caller collapses whitespace around `.` first:
-        # Jinja accepts `{{ config . oidc . url }}`, and there the
-        # preceding character is a SPACE, so the token read as
-        # top-level and the key was silently deleted. Python's `re` has
-        # no variable-length lookbehind, so normalising the expression is
-        # the way to see the qualifier.
-        name = re.escape(t)
-        # Two forms, and the parenthesised one requires the OPEN paren to
-        # be adjacent. `\)*` alone crossed a CALL's closing paren, so
-        # `{{ dict(oidc).get("issuer", "fallback") }}` matched `oidc).get`
-        # and lost the key -- while it renders `fallback` perfectly well.
-        # The lookbehind on `(` is what tells `(oidc).x` from `f(oidc).x`.
-        return re.compile(
-            r'(?<![.\w])' + name + r'\s*(?:\.|\[)'
-            r'|(?<![\w)\]])\(\s*' + name + r'\s*\)\s*(?:\.|\[)',
-        )
+    # A reference is a NAME token for the type that (a) is not itself an
+    # attribute of something else, and (b) is followed by `.` or `[`.
+    # Grouping parens are seen through; a CALL's parens are not, which is
+    # what separates `(oidc).issuer` from `dict(oidc).get(..)`.
+    lexer_env = Environment()
 
-    # `a . b` means `a.b` to Jinja; make them look the same here too.
-    spaced_dot_re = re.compile(r'\s*\.\s*')
-
-    # NO shadow rule. `{% for oidc in ... %}` and friends bind the name
-    # locally, so the access after them renders and popping the key is a
-    # false positive -- but `main` pops those too, and the whole-value
-    # rule that fixed it introduced something worse than the problem:
-    #
-    #   {% macro m(smtp) %}{{ smtp.host }}{% endmacro %}{{ smtp.port|int }}
-    #
-    # binds the name in ONE scope and reads the real global in another,
-    # so suppressing on any binding kept a genuine reference, `|int`
-    # raised, and `create_compose` 500'd where `main` had simply popped
-    # the key. Correct scoping needs Jinja's parser, not a regex over the
-    # whole value.
-    #
-    # So this over-pops shadowed names, exactly as `main` does. That
-    # direction costs one env var; the other costs the deploy.
-    type_patterns = {t: _member_access(t) for t in unset_types}
-
-    # Escapes consumed so an escaped quote does not close the literal.
-    string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
-    openers = {'{{': '}}', '{%': '%}', '{#': '#}'}
-    opener_re = re.compile(r'\{\{|\{%|\{#')
-    # Jinja accepts `+` as well as `-` for whitespace control, in either
-    # position. Accepting only `-` meant `{%+ endraw %}` was not found,
-    # and the `else n` fallback then swallowed the whole rest of the
-    # value unscanned. `{% raw +%}` is not legal Jinja, so only the
-    # closing tag needs `+` on the opening side.
-    endraw_re = re.compile(r'\{%[-+]?\s*endraw\s*[-+]?%\}')
-
-    def evaluated_bodies(value):
-        """Source of each construct in `value` that Jinja evaluates."""
-        bodies = []
-        i, n = 0, len(value)
-        while i < n:
-            # ONE search, not one per opener kind. Three `find` calls
-            # each scanned the whole remaining suffix, so a value with
-            # many constructs was quadratic -- measured 0.07s at 2500
-            # blocks, 1.18s at 10000, on the instance-start path where a
-            # catalog-controlled value can hold the handler.
-            match = opener_re.search(value, i)
-            if not match:
-                break
-            start_at, opener = match.start(), match.group()
-            closer = openers[opener]
-            j = start_at + 2
-            quote = None
-            depth = 0
-            while j < n:
-                ch = value[j]
-                # A comment has no expression syntax, so quotes inside one
-                # are just text and must not swallow the terminator.
-                if opener != '{#':
-                    if quote is not None:
-                        if ch == '\\':
-                            j += 2
-                            continue
-                        if ch == quote:
-                            quote = None
-                        j += 1
-                        continue
-                    if ch in '\'"':
-                        quote = ch
-                        j += 1
-                        continue
-                # Depth, so a nested mapping's braces are not the
-                # terminator: `{{ {"a": {}} and smtp.port|int }}` ended
-                # the construct at the mapping's `}}`, left the real
-                # reference unscanned, and the key survived to raise at
-                # render -- where `main` popped it and deployed.
-                if opener == '{{' and ch == '{':
-                    depth += 1
-                elif opener == '{{' and ch == '}' and depth:
-                    depth -= 1
-                elif not depth and value.startswith(closer, j):
-                    break
-                j += 1
-            if j >= n:
-                # Unterminated. The value is a TemplateSyntaxError
-                # whatever we decide, so this only picks which text a
-                # doomed value is scanned for; the narrower slice is the
-                # honest one.
-                bodies.append(value[start_at + 2:])
-                break
-            body = value[start_at + 2:j]
-            i = j + 2
-            if opener == '{#':
+    def _dereferences(value, name):
+        """Does `value` read the top-level `name` and dereference it?"""
+        try:
+            tokens = [t for t in lexer_env.lex(value) if t[1] != 'whitespace']
+        except TemplateError:
+            # Unparseable: it cannot render either way, so pop the key
+            # rather than leave it to fail the whole document.
+            return True
+        for i, (_line, kind, text) in enumerate(tokens):
+            if kind != 'name' or text != name:
                 continue
-            if opener == '{%' and body.strip().strip('-+').strip() == 'raw':
-                # Skip to the matching endraw TAG. Searching for the bare
-                # word closed the region early on raw content that merely
-                # contained it, e.g.
-                # `{% raw %}literal endraw %} {{ oidc.issuer }}{% endraw %}`,
-                # which renders perfectly well as literal text and was
-                # having its key dropped.
-                end = endraw_re.search(value, i)
-                i = end.end() if end else n
+            prev = tokens[i - 1] if i else None
+            # `config.oidc` -- a field of something else, not our variable.
+            if prev and prev[1] == 'operator' and prev[2] == '.':
                 continue
-            bodies.append(body)
-        return bodies
+            j = i + 1
+            if prev and prev[1] == 'operator' and prev[2] == '(':
+                before = tokens[i - 2] if i >= 2 else None
+                # `dict(oidc)` is a call; `(oidc)` is grouping. The token
+                # before the paren is the only thing that tells them
+                # apart, and with the lexer it is exact.
+                if before and (
+                    before[1] in ('name', 'integer', 'float', 'string')
+                    or (before[1] == 'operator' and before[2] in (')', ']'))
+                ):
+                    continue
+                while (j < len(tokens)
+                       and tokens[j][1] == 'operator' and tokens[j][2] == ')'):
+                    j += 1
+            nxt = tokens[j] if j < len(tokens) else None
+            if nxt and nxt[1] == 'operator' and nxt[2] in ('.', '['):
+                return True
+        return False
 
     def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
@@ -672,20 +534,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         if '{{' not in value and '{%' not in value:
             return ()
-        expressions = [
-            spaced_dot_re.sub('.', string_re.sub('', b))
-            for b in evaluated_bodies(value)
-        ]
-        return tuple(
-            t for t, member in type_patterns.items()
-            if any(member.search(e) for e in expressions)
-        )
+        return tuple(t for t in unset_types if _dereferences(value, t))
 
-    # Log every pass-2 pop. This pass infers intent from the template
-    # text rather than reading a declared destination, so when it gets it
-    # wrong the greffon simply boots without the variable and fails at
-    # runtime with nothing on the greffer connecting the two. Naming the
-    # service and key is what makes that diagnosable.
+
     def _log_pop(key, name, matched):
         # The types that MATCHED, not every unset type: on a fresh
         # instance both smtp and oidc are unset, so naming the whole set
