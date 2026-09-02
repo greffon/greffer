@@ -431,6 +431,32 @@ class DelimiterInsideStringLiteralTests(TestCase):
         self.assertTrue(self._survives('{%- raw -%}{{ oidc.issuer }}{%- endraw -%}'))
 
 
+class NotOurVariableTests(TestCase):
+    """A token that is a FIELD of something else, not our variable.
+
+    The `.` in `_member_access`'s lookbehind is the only thing keeping
+    these, and nothing pinned it -- a final mutation sweep found it as
+    the one surviving mutant. The failure mode is the expensive one:
+    the key is silently deleted, so working configuration disappears
+    with no error anywhere.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_field_on_another_object_is_not_a_reference(self):
+        self.assertTrue(self._survives('{{ keycloak.oidc.issuer }}'))
+
+    def test_the_config_namespace_is_real_and_must_survive(self):
+        # `config` is an actual namespace in this render context, so
+        # `{{ config.oidc.url }}` is a shape a catalog entry can write.
+        self.assertTrue(self._survives('{{ config.oidc.url }}'))
+        self.assertTrue(self._survives('{{ config.smtp.host }}'))
+
+
 class ReferenceFormTests(TestCase):
     """Every way of reaching an unset type that RAISES at render.
 
