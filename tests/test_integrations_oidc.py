@@ -470,14 +470,20 @@ class NotOurVariableTests(TestCase):
         self.assertFalse(self._survives('{{ oidc . issuer }}'))
 
 
-class LocallyBoundNameTests(TestCase):
-    """A name Jinja BINDS is not our variable.
+class ShadowedNameIsOverPoppedTests(TestCase):
+    """A locally bound name is popped, exactly as `main` pops it.
 
-    `{% for oidc in ... %}`, `{% set oidc = ... %}` and a macro parameter
-    named `oidc` all shadow the integration, so the member access after
-    them resolves against the local value and renders. Popping the key
-    deleted working configuration silently -- the expensive failure
-    direction.
+    `{% for oidc in ... %}` binds the name, so the access after it
+    renders and popping the key is a false positive. It is accepted --
+    `main` has the same one -- because the rule that removed it made
+    something worse: suppressing on ANY binding in the value kept a
+    genuine reference when one scope bound the name and another read the
+    real global, and `create_compose` then 500'd where `main` had simply
+    popped the key.
+
+    Scope-accurate detection needs Jinja's parser. Between two
+    imprecisions, this is the one that costs an env var rather than the
+    deploy.
     """
 
     def _survives(self, value):
@@ -486,23 +492,44 @@ class LocallyBoundNameTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def test_a_loop_variable_shadows_the_type(self):
-        value = '{% for oidc in [{"issuer": "local"}] %}{{ oidc.issuer }}{% endfor %}'
-        self.assertEqual(Template(value).render(), 'local')
-        self.assertTrue(self._survives(value))
+    def test_a_shadowed_name_is_popped_like_main_does(self):
+        for value in (
+            '{% for oidc in [{"issuer": "local"}] %}{{ oidc.issuer }}{% endfor %}',
+            '{% set oidc = {"issuer": "x"} %}{{ oidc.issuer }}',
+            '{% macro m(oidc) %}{{ oidc.issuer }}{% endmacro %}{{ m({"issuer":"y"}) }}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
 
-    def test_a_set_binding_shadows_the_type(self):
-        value = '{% set oidc = {"issuer": "x"} %}{{ oidc.issuer }}'
-        self.assertEqual(Template(value).render(), 'x')
-        self.assertTrue(self._survives(value))
+    def test_a_binding_in_one_scope_does_not_excuse_a_global_read_in_another(self):
+        # The regression the shadow rule introduced: this binds `smtp` in
+        # the macro and reads the REAL one outside it. Keeping the key
+        # left `|int` to raise and abort the start.
+        value = '{% macro m(smtp) %}{{ smtp.host }}{% endmacro %}{{ smtp.port|int }}'
+        self.assertFalse(self._survives(value))
 
-    def test_a_macro_parameter_shadows_the_type(self):
-        value = '{% macro m(oidc) %}{{ oidc.issuer }}{% endmacro %}{{ m({"issuer":"y"}) }}'
-        self.assertEqual(Template(value).render(), 'y')
-        self.assertTrue(self._survives(value))
 
-    def test_an_unshadowed_reference_still_pops(self):
-        self.assertFalse(self._survives('{{ oidc.issuer }}'))
+class NestedBracesTests(TestCase):
+    """A mapping's braces are not the construct's terminator."""
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_nested_mapping_does_not_end_the_expression_early(self):
+        # `{{ {"a": {}} and smtp.port|int }}` ended at the mapping's
+        # `}}`, so the real reference after it was never scanned, the key
+        # survived, and `|int` raised at render -- where `main` popped it
+        # and deployed.
+        self.assertFalse(self._survives('{{ {"a": {}} and smtp.port|int }}'))
+
+    def test_the_dict_index_form_the_catalog_uses_still_pops(self):
+        self.assertFalse(
+            self._survives('{{ {"tls": "ssl", "none": ""}[smtp.tls_mode] }}'),
+        )
+
 
 
 class OpenerScanCostTests(TestCase):
