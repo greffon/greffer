@@ -545,7 +545,18 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         # `oidc.x`, `oidc ['x']`, `(oidc).x`. The lookbehind keeps
         # `keycloak.oidc.issuer` out -- there the token is a field on
         # something else, not our variable.
+        #
+        # It only inspects the character immediately before the token,
+        # which is why the caller collapses whitespace around `.` first:
+        # Jinja accepts `{{ config . oidc . url }}`, and there the
+        # preceding character is a SPACE, so the token read as
+        # top-level and the key was silently deleted. Python's `re` has
+        # no variable-length lookbehind, so normalising the expression is
+        # the way to see the qualifier.
         return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\)*\s*(?:\.|\[)')
+
+    # `a . b` means `a.b` to Jinja; make them look the same here too.
+    spaced_dot_re = re.compile(r'\s*\.\s*')
 
     type_patterns = {t: _member_access(t) for t in unset_types}
 
@@ -622,7 +633,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         if '{{' not in value and '{%' not in value:
             return ()
-        expressions = [string_re.sub('', b) for b in evaluated_bodies(value)]
+        expressions = [
+            spaced_dot_re.sub('.', string_re.sub('', b))
+            for b in evaluated_bodies(value)
+        ]
         return tuple(
             t for t, member in type_patterns.items()
             if any(member.search(e) for e in expressions)
