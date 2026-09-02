@@ -470,6 +470,69 @@ class NotOurVariableTests(TestCase):
         self.assertFalse(self._survives('{{ oidc . issuer }}'))
 
 
+class LocallyBoundNameTests(TestCase):
+    """A name Jinja BINDS is not our variable.
+
+    `{% for oidc in ... %}`, `{% set oidc = ... %}` and a macro parameter
+    named `oidc` all shadow the integration, so the member access after
+    them resolves against the local value and renders. Popping the key
+    deleted working configuration silently -- the expensive failure
+    direction.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_loop_variable_shadows_the_type(self):
+        value = '{% for oidc in [{"issuer": "local"}] %}{{ oidc.issuer }}{% endfor %}'
+        self.assertEqual(Template(value).render(), 'local')
+        self.assertTrue(self._survives(value))
+
+    def test_a_set_binding_shadows_the_type(self):
+        value = '{% set oidc = {"issuer": "x"} %}{{ oidc.issuer }}'
+        self.assertEqual(Template(value).render(), 'x')
+        self.assertTrue(self._survives(value))
+
+    def test_a_macro_parameter_shadows_the_type(self):
+        value = '{% macro m(oidc) %}{{ oidc.issuer }}{% endmacro %}{{ m({"issuer":"y"}) }}'
+        self.assertEqual(Template(value).render(), 'y')
+        self.assertTrue(self._survives(value))
+
+    def test_an_unshadowed_reference_still_pops(self):
+        self.assertFalse(self._survives('{{ oidc.issuer }}'))
+
+
+class OpenerScanCostTests(TestCase):
+    """The construct scan must be linear in the value's length.
+
+    Searching for each opener kind separately re-scanned the whole
+    remaining suffix per construct, so a value with many `{{ }}` blocks
+    was quadratic -- and this runs on the instance-start path, where the
+    value comes from the catalog.
+    """
+
+    def _time(self, blocks):
+        import time
+        value = '{{ x }}' * blocks
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        start = time.perf_counter()
+        _delete_unset_integration_env_keys(compose, info)
+        return time.perf_counter() - start
+
+    def test_doubling_the_input_does_not_quadruple_the_work(self):
+        # Timing-based, so the bound is deliberately loose: quadratic
+        # showed a ~4x ratio, linear shows ~2x. A 3x ceiling separates
+        # them without going flaky on a loaded machine.
+        self._time(2000)  # warm up the regex cache
+        small = self._time(4000)
+        large = self._time(8000)
+        self.assertLess(large, small * 3, f'{small:.4f}s -> {large:.4f}s looks quadratic')
+
+
 class ReferenceFormTests(TestCase):
     """Every way of reaching an unset type that RAISES at render.
 
