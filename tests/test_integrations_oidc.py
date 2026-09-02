@@ -456,6 +456,19 @@ class NotOurVariableTests(TestCase):
         self.assertTrue(self._survives('{{ config.oidc.url }}'))
         self.assertTrue(self._survives('{{ config.smtp.host }}'))
 
+    def test_a_SPACED_qualifier_is_still_a_qualifier(self):
+        # `a . b` is `a.b` to Jinja. The lookbehind only sees the
+        # character immediately before the token, so with spaces that
+        # character is a SPACE and the token read as top-level -- the key
+        # was silently deleted while accessing `config.oidc`, not the
+        # integration. Python's `re` has no variable-length lookbehind,
+        # so the expression is normalised before matching.
+        self.assertTrue(self._survives('{{ config . oidc . url }}'))
+        self.assertTrue(self._survives('{{ config.  oidc.url }}'))
+        self.assertTrue(self._survives('{{ keycloak . oidc . issuer }}'))
+        # And the spacing must not hide a REAL reference either.
+        self.assertFalse(self._survives('{{ oidc . issuer }}'))
+
 
 class ReferenceFormTests(TestCase):
     """Every way of reaching an unset type that RAISES at render.
