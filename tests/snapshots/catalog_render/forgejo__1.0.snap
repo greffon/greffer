@@ -1,0 +1,51 @@
+networks:
+  greffon_internal_network: {}
+services:
+  forgejo:
+    environment:
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__mailer__ENABLED: 'true'
+      FORGEJO__mailer__FROM: 'noreply@example.test'
+      FORGEJO__mailer__PASSWD: 'pw'
+      FORGEJO__mailer__PROTOCOL: 'smtp+starttls'
+      FORGEJO__mailer__SMTP_ADDR: 'smtp.example.test'
+      FORGEJO__mailer__SMTP_PORT: '587'
+      FORGEJO__mailer__USER: 'mailer@example.test'
+      FORGEJO__security__INSTALL_LOCK: 'true'
+      FORGEJO__server__DISABLE_SSH: 'true'
+      FORGEJO__server__DOMAIN: 'regress-forgejo-0.my.example.test'
+      FORGEJO__server__ROOT_URL: 'https://regress-forgejo-0.my.example.test'
+      USER_GID: '1000'
+      USER_UID: '1000'
+    image: codeberg.org/forgejo/forgejo:15
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-forgejo_forgejo_data:/data
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-forgejo_nginx_volume:/etc/nginx/
+version: '3'
+volumes:
+  regress-forgejo_forgejo_data:
+    name: regress-forgejo_forgejo_data
+  regress-forgejo_nginx_volume:
+    name: regress-forgejo_nginx_volume

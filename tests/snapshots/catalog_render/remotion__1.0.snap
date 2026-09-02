@@ -1,0 +1,37 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-remotion_nginx_volume:/etc/nginx/
+  studio:
+    image: ghcr.io/greffon/remotion-studio:1.0
+    labels:
+      com.greffon.proxy.streaming: 'true'
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes:
+    - regress-remotion_project_data:/home/remotion/app
+version: '3'
+volumes:
+  regress-remotion_nginx_volume:
+    name: regress-remotion_nginx_volume
+  regress-remotion_project_data:
+    name: regress-remotion_project_data

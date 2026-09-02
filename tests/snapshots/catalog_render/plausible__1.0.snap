@@ -1,0 +1,88 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8000'
+    restart: unless-stopped
+    volumes:
+    - regress-plausible_nginx_volume:/etc/nginx/
+  plausible:
+    command: 'sh -c "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh
+      run"
+
+      '
+    depends_on:
+    - plausible_db
+    - plausible_events_db
+    environment:
+      BASE_URL: 'https://regress-plausible-0.my.example.test'
+      CLICKHOUSE_DATABASE_URL: http://plausible_events_db:8123/plausible_events_db
+      DATABASE_URL: postgres://postgres:postgres@plausible_db:5432/plausible
+      DISABLE_REGISTRATION: 'false'
+      MAILER_EMAIL: 'noreply@example.test'
+      SECRET_KEY_BASE: ''
+      SMTP_HOST_ADDR: 'smtp.example.test'
+      SMTP_HOST_PORT: '587'
+      SMTP_HOST_SSL_ENABLED: 'false'
+      SMTP_USER_NAME: 'mailer@example.test'
+      SMTP_USER_PWD: 'pw'
+    image: plausible/analytics:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes: []
+  plausible_db:
+    environment:
+      POSTGRES_DB: plausible
+      POSTGRES_PASSWORD: postgres
+    image: postgres:14-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes:
+    - regress-plausible_db_data:/var/lib/postgresql/data
+  plausible_events_db:
+    environment:
+      CLICKHOUSE_DB: plausible_events_db
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: ''
+      CLICKHOUSE_USER: default
+    image: clickhouse/clickhouse-server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes:
+    - regress-plausible_event_data:/var/lib/clickhouse
+version: '3'
+volumes:
+  regress-plausible_db_data:
+    name: regress-plausible_db_data
+  regress-plausible_event_data:
+    name: regress-plausible_event_data
+  regress-plausible_nginx_volume:
+    name: regress-plausible_nginx_volume

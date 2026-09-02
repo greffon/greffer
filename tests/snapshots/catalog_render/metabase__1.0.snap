@@ -1,0 +1,80 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-metabase_nginx_volume:/etc/nginx/
+  metabase:
+    depends_on:
+    - metabase_db
+    environment:
+      MB_DB_DBNAME: metabase
+      MB_DB_HOST: metabase_db
+      MB_DB_PASS: 'regress-metabase'
+      MB_DB_PORT: '5432'
+      MB_DB_TYPE: postgres
+      MB_DB_USER: metabase
+      MB_EMAIL_FROM_ADDRESS: 'noreply@example.test'
+      MB_EMAIL_SMTP_HOST: 'smtp.example.test'
+      MB_EMAIL_SMTP_PASSWORD: 'pw'
+      MB_EMAIL_SMTP_PORT: '587'
+      MB_EMAIL_SMTP_SECURITY: 'starttls'
+      MB_EMAIL_SMTP_USERNAME: 'mailer@example.test'
+      MB_ENCRYPTION_SECRET_KEY: ''
+      MB_SITE_URL: 'https://regress-metabase-0.my.example.test'
+    image: metabase/metabase:v0.61.2
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes: []
+  metabase_db:
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_PASSWORD: 'regress-metabase'
+      POSTGRES_USER: metabase
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -U metabase -d metabase
+      timeout: 5s
+    image: postgres:16
+    labels:
+      com.greffon.backup.dump: pg_dump -U metabase -d metabase -Fc
+      com.greffon.backup.restore: pg_restore -U metabase -d metabase --clean --if-exists
+        --no-owner --single-transaction
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-metabase_metabase_db_data:/var/lib/postgresql/data
+version: '3'
+volumes:
+  regress-metabase_metabase_db_data:
+    name: regress-metabase_metabase_db_data
+  regress-metabase_nginx_volume:
+    name: regress-metabase_nginx_volume

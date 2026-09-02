@@ -1,0 +1,47 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8080'
+    restart: unless-stopped
+    volumes:
+    - regress-stirling-pdf_nginx_volume:/etc/nginx/
+  stirling-pdf:
+    environment:
+      SECURITY_ENABLELOGIN: 'false'
+    image: stirlingtools/stirling-pdf:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-stirling-pdf_stirling_configs:/configs
+    - regress-stirling-pdf_stirling_logs:/logs
+    - regress-stirling-pdf_stirling_pipeline:/pipeline
+    - regress-stirling-pdf_stirling_custom_files:/customFiles
+version: '3'
+volumes:
+  regress-stirling-pdf_nginx_volume:
+    name: regress-stirling-pdf_nginx_volume
+  regress-stirling-pdf_stirling_configs:
+    name: regress-stirling-pdf_stirling_configs
+  regress-stirling-pdf_stirling_custom_files:
+    name: regress-stirling-pdf_stirling_custom_files
+  regress-stirling-pdf_stirling_logs:
+    name: regress-stirling-pdf_stirling_logs
+  regress-stirling-pdf_stirling_pipeline:
+    name: regress-stirling-pdf_stirling_pipeline

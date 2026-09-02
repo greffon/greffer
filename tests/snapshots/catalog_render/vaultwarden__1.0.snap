@@ -1,0 +1,46 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:80'
+    restart: unless-stopped
+    volumes:
+    - regress-vaultwarden_nginx_volume:/etc/nginx/
+  vaultwarden:
+    environment:
+      ADMIN_TOKEN: ''
+      DOMAIN: 'https://regress-vaultwarden-0.my.example.test'
+      SIGNUPS_ALLOWED: 'true'
+      SMTP_FROM: 'noreply@example.test'
+      SMTP_HOST: 'smtp.example.test'
+      SMTP_PASSWORD: 'pw'
+      SMTP_PORT: '587'
+      SMTP_SECURITY: 'starttls'
+      SMTP_USERNAME: 'mailer@example.test'
+    image: vaultwarden/server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-vaultwarden_vw_data:/data
+version: '3'
+volumes:
+  regress-vaultwarden_nginx_volume:
+    name: regress-vaultwarden_nginx_volume
+  regress-vaultwarden_vw_data:
+    name: regress-vaultwarden_vw_data

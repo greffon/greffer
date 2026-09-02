@@ -1,0 +1,84 @@
+networks:
+  greffon_internal_network: {}
+services:
+  db:
+    environment:
+      MYSQL_DATABASE: ghost
+      MYSQL_ROOT_PASSWORD: ''
+    healthcheck:
+      interval: 5s
+      retries: 30
+      start_period: 30s
+      test:
+      - CMD
+      - mysqladmin
+      - ping
+      - -h
+      - 127.0.0.1
+      - -uroot
+      - -p$$MYSQL_ROOT_PASSWORD
+      timeout: 5s
+    image: mysql:8
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: unless-stopped
+    volumes:
+    - regress-ghost_db_data:/var/lib/mysql
+  ghost:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      database__client: mysql
+      database__connection__database: ghost
+      database__connection__host: db
+      database__connection__password: ''
+      database__connection__user: root
+      mail__from: 'noreply@example.test'
+      mail__options__auth__pass: 'pw'
+      mail__options__auth__user: 'mailer@example.test'
+      mail__options__host: 'smtp.example.test'
+      mail__options__port: '587'
+      mail__transport: SMTP
+      url: 'https://regress-ghost-0.my.example.test'
+    image: ghost:5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: unless-stopped
+    volumes:
+    - regress-ghost_ghost_content:/var/lib/ghost/content
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:2368'
+    restart: unless-stopped
+    volumes:
+    - regress-ghost_nginx_volume:/etc/nginx/
+version: '3'
+volumes:
+  regress-ghost_db_data:
+    name: regress-ghost_db_data
+  regress-ghost_ghost_content:
+    name: regress-ghost_ghost_content
+  regress-ghost_nginx_volume:
+    name: regress-ghost_nginx_volume

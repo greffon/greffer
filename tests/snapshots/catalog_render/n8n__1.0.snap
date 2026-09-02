@@ -1,0 +1,52 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:5678'
+    restart: unless-stopped
+    volumes:
+    - regress-n8n_nginx_volume:/etc/nginx/
+  n8n:
+    environment:
+      N8N_EDITOR_BASE_URL: 'https://regress-n8n-0.my.example.test'
+      N8N_EMAIL_MODE: 'smtp'
+      N8N_ENCRYPTION_KEY: ''
+      N8N_HOST: 'regress-n8n-0.my.example.test'
+      N8N_PORT: '5678'
+      N8N_PROTOCOL: https
+      N8N_PROXY_HOPS: '1'
+      N8N_SMTP_HOST: 'smtp.example.test'
+      N8N_SMTP_PASS: 'pw'
+      N8N_SMTP_PORT: '587'
+      N8N_SMTP_SENDER: 'noreply@example.test'
+      N8N_SMTP_SSL: 'false'
+      N8N_SMTP_STARTTLS: 'true'
+      N8N_SMTP_USER: 'mailer@example.test'
+      WEBHOOK_URL: 'https://regress-n8n-0.my.example.test'
+    image: docker.n8n.io/n8nio/n8n:2.22.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-n8n_n8n_data:/home/node/.n8n
+version: '3'
+volumes:
+  regress-n8n_n8n_data:
+    name: regress-n8n_n8n_data
+  regress-n8n_nginx_volume:
+    name: regress-n8n_nginx_volume
