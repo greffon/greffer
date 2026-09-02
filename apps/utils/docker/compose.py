@@ -170,11 +170,17 @@ def get_greffon_path(greffon_info):
 # the limit, because it is the half Feature #3 will need: a baked config
 # file (`_render_baked_file`) renders under `StrictUndefined`, where
 # `oidc = {}` still raises on `{{ oidc.issuer }}` -- verified, it gives
-# `'dict object' has no attribute 'issuer'` and a 422. Only the bare
-# `{{ oidc }}` goes from raising to rendering `{}`. So a Keycloak-style
-# realm file referencing `{{ oidc.* }}` is NOT made deployable by this
-# change, and whoever writes the client-injection half needs a real
-# value there rather than an empty default.
+# `'dict object' has no attribute 'issuer'` and a 422. The shapes that
+# TOLERATE an empty mapping do now render, though, which is less than
+# "raises either way" would suggest: `{{ oidc }}` and `|tojson` give
+# `{}`, `|default(..)` and `.get(k, d)` give the default, and
+# `{% if oidc %}` takes the else branch. Same semantics `smtp` has
+# shipped with. So the loud-refusal guarantee covers a DEREFERENCE, not
+# every reference -- a realm file written with `|default` renders empty
+# rather than refusing. A Keycloak-style realm file referencing
+# `{{ oidc.* }}` is still NOT made deployable by this change, and
+# whoever writes the client-injection half needs a real value there
+# rather than an empty default.
 #
 # Note this greffer half is independent of how the manager REGISTERS an
 # OIDC client (platform-identity Feature #3, manager side). All the
