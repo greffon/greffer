@@ -515,12 +515,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 # `dict(oidc)` is a call; `(oidc)` is grouping. The token
                 # before the paren is the only thing that tells them
                 # apart, and with the lexer it is exact.
-                if before and (
+                #
+                # A call only means the closing paren is not ours to see
+                # through -- it does NOT mean the name is uninteresting.
+                # `{{ range(smtp.port)|list }}` dereferences it right
+                # there, as the first argument, and skipping the whole
+                # name let that reach the render and raise.
+                grouping = not (before and (
                     before[1] in ('name', 'integer', 'float', 'string')
                     or (before[1] == 'operator' and before[2] in (')', ']'))
-                ):
-                    continue
-                while (j < len(tokens)
+                ))
+                while (grouping and j < len(tokens)
                        and tokens[j][1] == 'operator' and tokens[j][2] == ')'):
                     j += 1
             nxt = tokens[j] if j < len(tokens) else None
