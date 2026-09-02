@@ -509,6 +509,29 @@ class ShadowedNameIsOverPoppedTests(TestCase):
         self.assertFalse(self._survives(value))
 
 
+class CallParenthesisTests(TestCase):
+    """A call's closing paren is not the integration's."""
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_call_result_is_not_the_integration(self):
+        # `\)*` in the pattern crossed the call's paren, so this matched
+        # `oidc).get` and the key was deleted -- while it renders
+        # `fallback` perfectly well.
+        value = '{{ dict(oidc).get("issuer", "fallback") }}'
+        self.assertEqual(Template(value).render(oidc={}), 'fallback')
+        self.assertTrue(self._survives(value))
+
+    def test_a_parenthesised_reference_still_pops(self):
+        # The form the parens were there for in the first place.
+        self.assertFalse(self._survives('{{ (oidc).issuer }}'))
+        self.assertFalse(self._survives('{{ ( oidc ) .issuer }}'))
+
+
 class NestedBracesTests(TestCase):
     """A mapping's braces are not the construct's terminator."""
 
@@ -541,23 +564,38 @@ class OpenerScanCostTests(TestCase):
     value comes from the catalog.
     """
 
-    def _time(self, blocks):
+    def _cost(self, blocks):
+        # `process_time`, not wall clock: it excludes time the scheduler
+        # spent elsewhere, which is the whole source of noise on a loaded
+        # machine. Median of three so one descheduled sample cannot
+        # decide the result.
+        import statistics
         import time
         value = '{{ x }}' * blocks
-        compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        start = time.perf_counter()
-        _delete_unset_integration_env_keys(compose, info)
-        return time.perf_counter() - start
+        samples = []
+        for _ in range(3):
+            compose = {'services': {'a': {'environment': {'K': value}}}}
+            start = time.process_time()
+            _delete_unset_integration_env_keys(compose, info)
+            samples.append(time.process_time() - start)
+        return statistics.median(samples)
 
-    def test_doubling_the_input_does_not_quadruple_the_work(self):
-        # Timing-based, so the bound is deliberately loose: quadratic
-        # showed a ~4x ratio, linear shows ~2x. A 3x ceiling separates
-        # them without going flaky on a loaded machine.
-        self._time(2000)  # warm up the regex cache
-        small = self._time(4000)
-        large = self._time(8000)
-        self.assertLess(large, small * 3, f'{small:.4f}s -> {large:.4f}s looks quadratic')
+    def test_the_scan_is_linear_not_quadratic(self):
+        # An 8x input step, so the two hypotheses are ~8x (linear) and
+        # ~64x (quadratic) -- far enough apart that scheduler noise
+        # cannot move one into the other. A single 2x step with a 3x
+        # ceiling, which this used to be, is exactly the shape that goes
+        # intermittently red on a busy CI worker.
+        self._cost(1000)  # warm the regex cache
+        small = self._cost(1000)
+        large = self._cost(8000)
+        self.assertLess(
+            large, small * 20,
+            f'{small:.4f}s at 1000 blocks -> {large:.4f}s at 8000 '
+            f'({large / small:.1f}x for an 8x input) looks quadratic',
+        )
+
 
 
 class ReferenceFormTests(TestCase):
