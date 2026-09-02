@@ -276,8 +276,6 @@ class _UnsetIntegration(dict):
         # missed.
         return _UnsetField(name=key, obj=self)
 
-    def __call__(self, *args, **kwargs):
-        return self
 
 
 def _is_integration_set(value):
@@ -489,46 +487,34 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # particular is the documented way to ship a literal
     # `{{ oidc.issuer }}` through to a downstream config file.
     import re
-    # What counts as a reference worth popping. With the type bound to
-    # `{}`, a SINGLE level of access renders empty and is harmless; it is
-    # CHAINED access that raises, and chaining is exactly the shape the
-    # catalog already ships (`smtp.from_address.split('@')[0]`).
+    # Pop when an evaluated Jinja construct DEREFERENCES the type.
     #
-    # A bare mention of the token is NOT enough. An earlier version used
-    # one and regressed the type that was already shipping: all of these
-    # render their intended fallback and must survive --
+    # That is deliberately the whole rule. It does not try to decide
+    # whether the reference would actually fail -- it cannot, and earlier
+    # revisions that tried grew a guard for author-supplied fallbacks, an
+    # alias tracker for `{% set %}`/`{% with %}`, and then a whole
+    # post-dump rescue to undo the damage the guard caused, for a
+    # combined ~300 lines defending shapes no catalog entry uses.
     #
-    #     {% if smtp %}on{% else %}off{% endif %}    -> 'off'
-    #     {{ smtp|default('none') }}
-    #     {{ 'y' if smtp is defined else 'n' }}
+    # What makes that unnecessary is the binding: an unset type renders
+    # instead of raising, so a reference this rule MISSES costs an env
+    # var that renders empty, not a failed deploy. The rule is therefore
+    # allowed to be incomplete, and is kept simple on purpose.
     #
-    # Their author HANDLED the unset case; the intended output is the
-    # fallback, not an absent env var. Equally, a name that merely
-    # SHADOWS the type is not a reference to it --
-    #
-    #     {% set oidc = 'x' %}{{ oidc }}
-    #     {% for oidc in xs %}{{ oidc }}{% endfor %}
-    #
-    # So pop on member access, on the `attr` filter (which raises the
-    # same way a chain does), and on aliasing through `{% set %}`. That
-    # last one is why no pure adjacency rule can work: the access then
-    # happens on an entirely different name.
+    # The one thing it must get right is not popping a value that merely
+    # LOOKS like a reference, since that silently deletes working
+    # configuration. `oidc.<host>` is a conventional provider hostname,
+    # so `https://oidc.acme.com/{{ instance_id }}` is the normal shape
+    # for an OIDC entry and must survive -- hence scanning construct
+    # bodies rather than the whole string, and blanking string literals
+    # inside them.
     def _member_access(t):
         # `oidc.x`, `oidc ['x']`, `(oidc).x`. The lookbehind keeps
         # `keycloak.oidc.issuer` out -- there the token is a field on
         # something else, not our variable.
         return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\)*\s*(?:\.|\[)')
 
-    def _attr_filter(t):
-        return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\|\s*attr\b')
-
-    def _bare(t):
-        return re.compile(r'(?<![.\w])' + re.escape(t) + r'(?![\w])')
-
-    type_patterns = {
-        t: (_member_access(t), _attr_filter(t), _bare(t))
-        for t in unset_types
-    }
+    type_patterns = {t: _member_access(t) for t in unset_types}
 
     # Escapes consumed so an escaped quote does not close the literal.
     string_re = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.S)
@@ -574,11 +560,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     break
                 j += 1
             if j >= n:
-                # Unterminated. Which slice is scanned no longer decides
-                # anything: the value is a TemplateSyntaxError either
-                # way, so `_pop_keys_the_dump_mangles` pops the key
-                # whatever this returns. Kept as the narrower of the two
-                # equivalent choices.
+                # Unterminated. The value is a TemplateSyntaxError
+                # whatever we decide, so this only picks which text a
+                # doomed value is scanned for; the narrower slice is the
+                # honest one.
                 bodies.append(value[start_at + 2:])
                 break
             body = value[start_at + 2:j]
@@ -598,80 +583,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             bodies.append(body)
         return bodies
 
-    def _aliases(expression, bare):
-        """True if `{% set %}` or `{% with %}` binds ANOTHER name to the type.
-
-        Only the right-hand side counts: `{% set oidc = 'x' %}` binds the
-        type's own name to something else, which is shadowing rather than
-        aliasing, and its RHS holds no reference.
-
-        `with` is the same construct with a different keyword, and an
-        entry author is as likely to reach for it.
-        """
-        head = expression.strip()
-        if '=' not in head:
-            return False
-        if not (head.startswith('set ') or head.startswith('with ')):
-            return False
-        return bool(bare.search(head.split('=', 1)[1]))
-
-    def _guards(expression, bare, member, attr):
-        """True if this body TESTS the type rather than dereferencing it.
-
-        A bare use -- `{% if smtp %}`, `{{ x if smtp else y }}` -- is the
-        author handling the unset case, and the branch they wrote for it
-        is the intended output. Popping the key throws that away and was
-        a real regression against `smtp`, which has shipped since Feature
-        #4.
-
-        `|default(...)` is deliberately NOT treated as a guard, though it
-        reads like the same intent. The binding makes an unset type a
-        real dict, so `oidc.issuer` IS defined and `default` is a no-op:
-        keeping the key on account of a default guarantees the default
-        cannot apply, and the value renders the literal `{}` instead. The
-        pass and the binding would be disagreeing, with the pass keeping
-        a key precisely because of a fallback the binding then disables.
-        """
-        # A bare mention that is NOT the head of a dereference. Testing
-        # the tail for `.`/`[` by hand got `{{ (oidc).issuer }}` and
-        # `{{ oidc|attr(..) }}` wrong, so it re-uses the very patterns
-        # that define a dereference, anchored at the token.
-        for m in bare.finditer(expression):
-            rest = expression[m.start():]
-            if member.match(rest) or attr.match(rest):
-                continue
-            return True
-        return False
-
     def matching_unset_types(value):
-        """Which unset types `value` actually references, in tuple order."""
+        """Which unset types `value` dereferences, in tuple order."""
         if not isinstance(value, str):
             return ()
         if '{{' not in value and '{%' not in value:
             return ()
-        raw_bodies = evaluated_bodies(value)
-        expressions = [string_re.sub('', b) for b in raw_bodies]
-        matched = []
-        for t, (member, attr, bare) in type_patterns.items():
-            # Evaluated over the WHOLE value, not body by body. The guard
-            # and the dereference it protects live in DIFFERENT bodies --
-            # `{% if smtp %}` and `{{ smtp.host }}` are two constructs --
-            # so judging each in isolation sees only the bare access and
-            # pops the key the guard exists to preserve.
-            aliased = any(_aliases(e, bare) for e in expressions)
-            # Whether a KEPT value can actually be rendered is decided
-            # after the fact, against the real dumped document, by
-            # `_pop_keys_the_dump_mangles` below. It cannot be decided
-            # here: the mangling depends on the whole document, not the
-            # value.
-            guarded = any(_guards(e, bare, member, attr) for e in expressions)
-            deref = any(member.search(e) or attr.search(e) for e in expressions)
-            # Aliasing wins over the guard: `{% set x = oidc %}` reads as
-            # a bare mention, but the dereference is real and simply
-            # happens on another name.
-            if aliased or (deref and not guarded):
-                matched.append(t)
-        return tuple(matched)
+        expressions = [string_re.sub('', b) for b in evaluated_bodies(value)]
+        return tuple(
+            t for t, member in type_patterns.items()
+            if any(member.search(e) for e in expressions)
+        )
 
     # Log every pass-2 pop. This pass infers intent from the template
     # text rather than reading a declared destination, so when it gets it
@@ -740,156 +662,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # ones the guard above chose to KEEP and `main` would have popped.
     # Widening the pop to every mangled value would change behaviour well
     # beyond integrations.
-    _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
-                               evaluated_bodies)
     return compose
-
-
-def _pop_keys_the_dump_mangles(compose, services, matching_unset_types,
-                               evaluated_bodies):
-    """Drop kept integration values whose constructs the dump breaks.
-
-    Asks the only question that matters -- does Jinja PARSE the finished
-    document -- rather than predicting how yaml will format a value. Two
-    earlier attempts predicted, and both were wrong: one tested for `'`
-    and missed the double-quoted style entirely, and one searched the
-    dumped text for each construct, which passed whenever an identical
-    construct appeared under some OTHER key.
-
-    Candidates are values naming ANY known integration type, set or
-    unset -- the membership test is a substring check over
-    `KNOWN_INTEGRATION_TYPES`, not a check against the unset ones.
-
-    That is deliberate but worth stating, because it has a consequence:
-    on an instance where smtp IS configured, a value the dump mangles is
-    now dropped where `main` raised TemplateSyntaxError and 500'd. `main`
-    is fully broken in that case, so this is not a regression, but a loud
-    failure has become a quiet missing env var. Reachable only because
-    `KNOWN_INTEGRATION_TYPES` now always has an unset member, so the
-    `if not unset_types: return` early exit no longer fires for
-    smtp-only instances.
-
-    A value naming no integration type at all is left exactly as it was:
-    that is main's pre-existing hazard, and deleting someone else's key
-    to work around it would be a much bigger change than this one.
-    """
-
-    def _parses(text):
-        try:
-            Template(text)
-            return True
-        except TemplateError:
-            return False
-
-    def _candidates():
-        for name, service in services.items():
-            if not isinstance(service, dict):
-                continue
-            env = service.get('environment')
-            # List form is left alone: no catalog entry pairs it with
-            # integrations, so rescuing it would be untested code.
-            if not isinstance(env, dict):
-                continue
-            for key, value in list(env.items()):
-                if (isinstance(value, str)
-                        and evaluated_bodies(value)
-                        and any(t in value for t in KNOWN_INTEGRATION_TYPES)):
-                    yield name, env, key
-
-    # Candidates BEFORE the parse probe. The probe dumps and compiles the
-    # whole document, roughly doubling the cost of `create_compose`, and
-    # the overwhelming majority of instances have nothing to rescue --
-    # paying it on every start to learn that is the wrong order.
-    candidates = list(_candidates())
-    if not candidates:
-        return compose
-
-    if _parses(yaml.dump(compose)):
-        return compose
-
-    # Remove every candidate, then put back the ones that turn out to be
-    # innocent. Removing them one at a time and testing does NOT work
-    # when more than one value is mangled: neither removal alone fixes
-    # the document, so each looks innocent and both are kept -- which is
-    # exactly how the first version of this failed.
-    # Keyed by the env dict's IDENTITY, not the service name. A compose
-    # may share one `environment:` block between services through a YAML
-    # anchor (`&env` / `*env`), which is an ordinary docker-compose
-    # idiom, and `yaml.safe_load` then hands back the SAME dict object
-    # for both. `_candidates` yields it once per service, so the second
-    # pop of the same slot found nothing -- a bare `env.pop(key)` raised
-    # KeyError straight out of `create_compose` as an uncaught 500, which
-    # is the exact failure class this function exists to prevent.
-    seen = set()
-    unique = []
-    for name, env, key in candidates:
-        slot = (id(env), key)
-        if slot in seen:
-            continue
-        seen.add(slot)
-        unique.append((name, env, key))
-    candidates = unique
-
-    removed = {}
-    for name, env, key in candidates:
-        removed[(id(env), key)] = env.pop(key, None)
-
-    if not _parses(yaml.dump(compose)):
-        # The breakage is in a value that names no integration type, so
-        # it is main's pre-existing hazard rather than something this
-        # change introduced. Put everything back and leave the document
-        # exactly as it was: deleting someone else's key to work around
-        # it would be a far bigger change than this one is entitled to.
-        for name, env, key in candidates:
-            env[key] = removed[(id(env), key)]
-        return compose
-
-    # Restore by halves, not one at a time. The linear version dumped and
-    # compiled the entire document once per candidate, which is quadratic
-    # in compose size when candidates scale with it -- measured at 30s
-    # inside the start handler for 400 candidates, held under the
-    # per-instance lock and the manager's request timeout. Halving costs
-    # O(log n) dumps when there is a single culprit, which is the case
-    # that actually happens.
-    #
-    # Each probe runs against the document as it stands, so a half is
-    # kept only if everything restored so far still parses together. The
-    # final state therefore parses by construction, even when two values
-    # are individually innocent and jointly fatal -- which is real: a
-    # `{% if %}` in one env value with its `{% endif %}` in another is
-    # balanced only together. (Not, as an earlier version of this comment
-    # claimed, because yaml wraps on total line width -- PyYAML wraps
-    # each scalar independently of its siblings.)
-    #
-    # The surviving set is not guaranteed MINIMAL, and it depends on the
-    # order `_candidates()` walks, which is env insertion order while the
-    # dump sorts keys -- so two composes that dump identically can lose
-    # different keys. Fuzzing found this only with Jinja blocks split
-    # across env values. Recorded because the alternative is a later
-    # reader assuming determinism that is not there.
-    def _restore_innocent(group):
-        for name, env, key in group:
-            env[key] = removed[(id(env), key)]
-        if _parses(yaml.dump(compose)):
-            return
-        for name, env, key in group:
-            env.pop(key, None)
-        if len(group) == 1:
-            name, _env, key = group[0]
-            logger.warning(
-                'integrations: dropping env %s from service %s -- yaml.dump '
-                'mangles its template, which would fail the whole compose '
-                'render', key, name,
-            )
-            return
-        mid = len(group) // 2
-        _restore_innocent(group[:mid])
-        _restore_innocent(group[mid:])
-
-    _restore_innocent(candidates)
-    return compose
-
-
 def _compose_render_context(greffon_info):
     """`greffon_info` with unset integration types bound so nothing raises.
 

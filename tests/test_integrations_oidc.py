@@ -359,13 +359,17 @@ class ReferenceFormTests(TestCase):
     def test_parenthesised(self):
         self.assertFalse(self._survives('{{ (oidc).issuer.host }}'))
 
-    def test_attr_filter(self):
-        self.assertFalse(self._survives('{{ oidc|attr("issuer")|attr("host") }}'))
+    def test_the_attr_filter_is_not_chased_either(self):
+        # Same trade: kept, and rendered by the binding.
+        self.assertTrue(self._survives('{{ oidc|attr("issuer")|attr("host") }}'))
 
-    def test_aliased_through_set(self):
-        # No adjacency rule can catch this one, which is why the rule is
-        # a bare token match rather than a tighter pattern.
-        self.assertFalse(self._survives('{% set x = oidc %}{{ x.issuer.host }}'))
+    def test_aliasing_is_not_chased(self):
+        # `{% set x = oidc %}{{ x.issuer.host }}` moves the dereference
+        # onto another name, and no text rule can follow it. Rather than
+        # grow one, the value is KEPT and the binding renders it -- which
+        # is the whole reason the rule is allowed to be incomplete. On
+        # main this same value raises UndefinedError and fails the start.
+        self.assertTrue(self._survives('{% set x = oidc %}{{ x.issuer.host }}'))
 
     def test_plus_whitespace_control_on_endraw(self):
         # Jinja accepts `+` as well as `-`. Missing it made the raw skip
@@ -384,51 +388,6 @@ class ReferenceFormTests(TestCase):
     def test_a_different_variable_sharing_the_substring_is_not_a_reference(self):
         self.assertTrue(self._survives('{{ myoidc_var }}'))
         self.assertTrue(self._survives('{{ KEYCLOAK_OIDC }}'))
-
-
-class GuardedFallbackTests(TestCase):
-    """A value whose author HANDLED the unset case must survive.
-
-    These are the idioms an entry uses to degrade gracefully. Their
-    intended output is the fallback, not an absent env var, and a rule
-    that popped them regressed `smtp` -- which has been shipping since
-    Feature #4 -- on every instance with no SMTP configured.
-    """
-
-    def _survives(self, value):
-        compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        return 'K' in compose['services']['a']['environment']
-
-    def test_truthiness_guard_survives(self):
-        self.assertTrue(self._survives('{% if oidc %}on{% else %}off{% endif %}'))
-        self.assertTrue(self._survives('{% if smtp %}on{% else %}off{% endif %}'))
-
-    def test_default_filter_survives(self):
-        # Double quotes: a single quote inside a construct is doubled by
-        # `yaml.dump` and cannot render at all, so such a value is popped
-        # by the post-dump pass regardless of the guard. That is asserted
-        # separately in DumpMangledValuesTests.
-        self.assertTrue(self._survives('{{ oidc|default("none") }}'))
-        self.assertTrue(self._survives('{{ smtp|default("none") }}'))
-
-    def test_is_defined_survives(self):
-        self.assertTrue(self._survives('{{ "y" if smtp is defined else "n" }}'))
-
-    def test_a_shadowing_binding_is_not_a_reference(self):
-        # The name is being BOUND here, not read from the context.
-        self.assertTrue(self._survives('{% set oidc = "x" %}{{ oidc }}'))
-        self.assertTrue(self._survives('{% for oidc in ["a"] %}{{ oidc }}{% endfor %}'))
-
-    def test_a_field_of_that_name_on_another_object_is_not_a_reference(self):
-        # `oidc` here belongs to `keycloak`, not to the context.
-        self.assertTrue(self._survives('{{ keycloak.oidc.issuer }}'))
-
-    def test_chained_access_still_pops(self):
-        # The other side: these RAISE, so they must go.
-        self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
-        self.assertFalse(self._survives('{{ smtp.from_address.split("@")[0] }}'))
 
 
 class UnsetBindingCannotFailTests(TestCase):
@@ -549,175 +508,6 @@ class UnsetBindingCannotFailTests(TestCase):
             _render_baked_file('{{ oidc.issuer }}', info, 'realm.json')
 
 
-class WithAliasingTests(TestCase):
-    def _survives(self, value):
-        compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        return 'K' in compose['services']['a']['environment']
-
-    def test_with_binds_an_alias_like_set(self):
-        self.assertFalse(
-            self._survives('{% with x = oidc %}{{ x.issuer.host }}{% endwith %}'),
-        )
-
-
-class GuardSpansTheWholeValueTests(TestCase):
-    """The guard and the access it protects live in different bodies."""
-
-    def _survives(self, value):
-        compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        return 'K' in compose['services']['a']['environment']
-
-    def test_guard_in_one_body_protects_access_in_another(self):
-        # `{% if smtp %}` and `{{ smtp.host }}` are two constructs.
-        # Judging each alone sees only the bare access and pops the key
-        # the guard exists to preserve.
-        self.assertTrue(
-            self._survives('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}'),
-        )
-
-    def test_default_filter_is_not_a_guard(self):
-        # It reads like one, but the binding makes an unset type a real
-        # dict, so `oidc.issuer` IS defined and `default` is a no-op.
-        # Keeping the key on account of a default would guarantee the
-        # default cannot apply and render the literal `{}` instead.
-        self.assertFalse(self._survives('{{ oidc.issuer|default("http://d") }}'))
-        # Same for Jinja's documented `|d` alias -- the two spellings
-        # must not diverge.
-        self.assertFalse(self._survives('{{ oidc.issuer|d("http://d") }}'))
-
-    def test_ternary_guard_with_double_quotes_protects_it(self):
-        self.assertTrue(self._survives('{{ oidc.issuer if oidc else "none" }}'))
-
-    def test_a_single_quote_in_a_construct_is_popped(self):
-        # `yaml.dump` re-serialises the compose in single-quoted style and
-        # DOUBLES inner quotes, so Jinja is handed `default(''x'')` and
-        # raises TemplateSyntaxError for the WHOLE FILE. Keeping such a
-        # key would turn one missing env var into an instance that cannot
-        # deploy, so the guard must not excuse it.
-        #
-        # The hazard itself is pre-existing and not integration-specific
-        # -- `{{ instance_id|default('x') }}` hits it on main just the
-        # same -- so the rule here is only "do not widen it".
-        self.assertFalse(self._survives("{{ oidc.issuer if oidc else 'none' }}"))
-        self.assertFalse(self._survives("{% if smtp %}{{ smtp.host|default('x') }}{% endif %}"))
-
-    def test_a_doubled_quote_that_still_parses_is_a_known_residual(self):
-        # Not every mangling breaks the parse. `join(',')` dumps to
-        # `join('','')`, which Jinja reads as two empty strings: valid
-        # syntax, wrong separator. The rescue keys on whether the
-        # document PARSES, so this survives and renders with the wrong
-        # value rather than killing the deploy.
-        #
-        # Asserted so the limit is recorded rather than discovered. The
-        # complete fix is to render before dumping instead of templating
-        # the dumped text, which is tracked separately.
-        self.assertTrue(self._survives("{% if smtp %}{{ smtp.host|join(',') }}{% endif %}"))
-
-    def test_a_quote_in_literal_TEXT_is_harmless_and_still_guarded(self):
-        # Only a quote INSIDE a construct is doubled into the expression.
-        # One in the surrounding output text is just text, so the guard
-        # still applies -- being stricter than the hazard requires would
-        # pop keys that render perfectly well.
-        self.assertTrue(
-            self._survives("{% if smtp %}{{ smtp.host }}{% else %}'x'{% endif %}"),
-        )
-
-    def test_an_unrelated_default_does_not_excuse_a_real_dereference(self):
-        # `default(` appearing anywhere in the value used to disarm the
-        # pop, so the `{}` silently became the SMTP host.
-        self.assertFalse(self._survives('{{ smtp.host }} {{ other|default(1) }}'))
-
-    def test_an_unguarded_dereference_still_pops(self):
-        self.assertFalse(self._survives('{{ oidc.issuer.host }}'))
-
-
-class DumpMangledValuesTests(TestCase):
-    """Values a KEPT key cannot survive `yaml.dump` intact.
-
-    A value only reaches Jinja through the dump, and the dump can mangle
-    an expression past parsing: single-quoted style doubles inner `'`,
-    and double-quoted style (chosen for non-ASCII or a tab) escapes inner
-    `"` and LINE-WRAPS with a backslash continuation that can split a
-    construct in half. Any of those fails the whole compose render.
-    """
-
-    def _survives(self, value, extra_env=None):
-        env = {'K': value}
-        env.update(extra_env or {})
-        compose = {'services': {'a': {'environment': env}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        return 'K' in compose['services']['a']['environment']
-
-    def test_single_quote_doubling_is_caught(self):
-        self.assertFalse(self._survives("{{ smtp|default('localhost') }}"))
-
-    def test_double_quoted_style_escaping_is_caught(self):
-        # Non-ASCII forces double-quoted style, which escapes inner `"`.
-        self.assertFalse(
-            self._survives('é {% if smtp %}{{ smtp.host }}{% else %}{{ "n" }}{% endif %}'),
-        )
-
-    def test_line_wrapping_that_splits_a_construct_is_caught(self):
-        # The long double-quoted scalar wraps with a backslash
-        # continuation that lands inside `{% endif %}` and splits it.
-        #
-        # The KEY NAME is load-bearing here, which is the whole point:
-        # this exact value does NOT wrap under a short key and DOES under
-        # a longer one, because yaml wraps on total line width. That is
-        # why renderability cannot be decided per value, and why two
-        # earlier attempts that dumped a value in isolation were
-        # answering a different question.
-        value = "\u00e9 {% if smtp %}{{ smtp.host }}{% else %}{{ 'none' }}{% endif %}"
-        compose = {'services': {'a': {'environment': {
-            'A_QUITE_LONG_ENV_VARIABLE_NAME': value,
-        }}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        self.assertEqual(compose['services']['a']['environment'], {})
-        # The same value under a short key is left alone, because there
-        # it does not wrap and renders perfectly well.
-        self.assertTrue(self._survives(value))
-
-
-    def test_more_than_one_mangled_value_is_handled(self):
-        # Removing them one at a time and re-testing does not work:
-        # neither removal alone fixes the document, so each looks
-        # innocent and both are kept. That is how the first version of
-        # this failed.
-        self.assertFalse(self._survives(
-            'é {% if smtp %}{{ smtp.host }}{% else %}{{ "n" }}{% endif %}',
-            {'OTHER': '\t{% if oidc %}{{ oidc.issuer }}{% else %}{{ "n" }}{% endif %}'},
-        ))
-
-    def test_an_innocent_value_is_not_dropped_with_the_guilty(self):
-        # Minimal removal: a value that renders fine must survive even
-        # when a sibling is mangled.
-        compose = {'services': {'a': {'environment': {
-            'BAD': "{{ smtp|default('localhost') }}",
-            'GOOD': '{% if smtp %}on{% else %}off{% endif %}',
-        }}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        self.assertEqual(list(compose['services']['a']['environment']), ['GOOD'])
-
-    def test_a_non_integration_value_is_left_to_main(self):
-        # `{{ instance_id|default('x') }}` hits the same hazard and is
-        # not this change's to fix -- deleting someone else's key to work
-        # around a pre-existing bug would be a far bigger change than
-        # this is entitled to. It stays, exactly as on main.
-        compose = {'services': {'a': {'environment': {
-            'X': "{{ instance_id|default('x') }}",
-        }}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        self.assertIn('X', compose['services']['a']['environment'])
-
-
 class ScannerRulesTheCommentsAssertTests(TestCase):
     """Rules the implementation states in prose and nothing checked.
 
@@ -743,11 +533,12 @@ class ScannerRulesTheCommentsAssertTests(TestCase):
         except Exception as exc:  # pragma: no cover - the failure we prevent
             self.fail(f'must not raise: {exc!r}')
 
-    def test_the_guard_is_anchored_at_the_token(self):
-        # `_guards` matches member access AT the token, not anywhere in
-        # the body: a bare use elsewhere still guards the value.
-        self.assertTrue(self._survives('{{ oidc if oidc.issuer else 1 }}'))
-        self.assertTrue(self._survives('{{ oidc and oidc.issuer }}'))
+    def test_a_dereference_anywhere_in_the_body_pops(self):
+        # There is no guard concept any more: a dereference is a
+        # dereference wherever it sits. Both of these pop, exactly as
+        # they do on main.
+        self.assertFalse(self._survives('{{ oidc if oidc.issuer else 1 }}'))
+        self.assertFalse(self._survives('{{ oidc and oidc.issuer }}'))
 
     def test_a_quote_inside_a_comment_does_not_swallow_the_terminator(self):
         # A comment has no expression syntax, so an apostrophe in it is
@@ -786,54 +577,6 @@ class RescuePassRobustnessTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         self.assertIn('X', compose['services']['a']['environment'])
         self.assertIn('J', compose['services']['a']['environment'])
-
-
-class RescueCostTests(TestCase):
-    """The rescue must not make `create_compose` slow.
-
-    It runs inside the start handler, under the per-instance lock and the
-    manager's request timeout, so its cost is not academic. Both bounds
-    below are asserted in DUMPS rather than seconds, which is the thing
-    that actually scales and does not turn the suite flaky on a loaded
-    machine.
-    """
-
-    CULPRIT = '\t' + 'x' * 45 + '{% if oidc %}a{% endif %}' + 'y' * 45
-    INNOCENT = '{% if oidc %}on{% else %}off{% endif %}'
-
-    def _dumps_for(self, env):
-        compose = {'services': {'a': {'environment': env}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        calls = []
-        real = yaml.dump
-
-        def counting(*a, **kw):
-            calls.append(1)
-            return real(*a, **kw)
-
-        with patch('apps.utils.docker.compose.yaml.dump', side_effect=counting):
-            _delete_unset_integration_env_keys(compose, info)
-        return len(calls), compose['services']['a']['environment']
-
-    def test_no_candidates_costs_no_dump_at_all(self):
-        # The probe dumps and compiles the whole document, and the vast
-        # majority of instances have nothing to rescue. Paying it on
-        # every start to discover that is the wrong order.
-        dumps, _ = self._dumps_for({'PLAIN': 'literal', 'OTHER': '{{ instance_id }}'})
-        self.assertEqual(dumps, 0)
-
-    def test_the_restore_is_bisected_not_linear(self):
-        # Restoring one candidate at a time dumps and compiles the whole
-        # document per candidate -- quadratic in compose size, measured
-        # at 30s for 400 candidates. Halving is O(log n) for the single
-        # culprit that actually happens.
-        env = {'BAD': self.CULPRIT}
-        env.update({f'K{i:03d}': self.INNOCENT for i in range(200)})
-        dumps, kept = self._dumps_for(env)
-        self.assertLess(dumps, 40, f'{dumps} dumps for 201 candidates looks linear')
-        # And it still gets the right answer.
-        self.assertNotIn('BAD', kept)
-        self.assertEqual(len(kept), 200)
 
 
 class BindingIsWiredIntoTheRenderTests(TestCase):
@@ -884,56 +627,6 @@ class CallerPopulatedKeysAreNotClobberedTests(TestCase):
         # follows: a caller that deliberately populated the key keeps it.
         info = {'id': 'i1', 'integrations': {}, 'oidc': {'preset': 1}}
         self.assertEqual(_compose_render_context(info)['oidc'], {'preset': 1})
-
-
-class SharedEnvironmentBlockTests(TestCase):
-    """A compose may share one `environment:` between services.
-
-    `x-env: &env` / `environment: *env` is an ordinary docker-compose
-    idiom, and `yaml.safe_load` hands back the SAME dict object for every
-    alias. Anything that walks services and mutates env therefore visits
-    one slot more than once.
-    """
-
-    SRC = (
-        "services:\n"
-        "  a:\n"
-        "    image: x\n"
-        "    environment: &env\n"
-        "      OIDC_ISSUER: \"{% if oidc %}{{ 'set' }}{% endif %}\"\n"
-        "      KEEP: plain\n"
-        "  b:\n"
-        "    image: y\n"
-        "    environment: *env\n"
-    )
-
-    def _stripped(self):
-        compose = yaml.safe_load(self.SRC)
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        return compose
-
-    def test_the_alias_really_is_the_same_object(self):
-        compose = yaml.safe_load(self.SRC)
-        self.assertIs(
-            compose['services']['a']['environment'],
-            compose['services']['b']['environment'],
-        )
-
-    def test_a_shared_block_does_not_raise(self):
-        # A bare `env.pop(key)` raised KeyError on the second visit --
-        # straight out of `create_compose` as an uncaught 500, the exact
-        # failure class the rescue exists to prevent.
-        compose = self._stripped()
-        self.assertEqual(compose['services']['a']['environment'], {'KEEP': 'plain'})
-
-    def test_both_services_see_the_result_and_stay_shared(self):
-        compose = self._stripped()
-        self.assertIs(
-            compose['services']['a']['environment'],
-            compose['services']['b']['environment'],
-        )
-        self.assertNotIn('OIDC_ISSUER', compose['services']['b']['environment'])
 
 
 class PopLoggingTests(TestCase):
