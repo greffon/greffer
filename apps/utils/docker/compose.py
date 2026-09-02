@@ -553,7 +553,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         # top-level and the key was silently deleted. Python's `re` has
         # no variable-length lookbehind, so normalising the expression is
         # the way to see the qualifier.
-        return re.compile(r'(?<![.\w])' + re.escape(t) + r'\s*\)*\s*(?:\.|\[)')
+        name = re.escape(t)
+        # Two forms, and the parenthesised one requires the OPEN paren to
+        # be adjacent. `\)*` alone crossed a CALL's closing paren, so
+        # `{{ dict(oidc).get("issuer", "fallback") }}` matched `oidc).get`
+        # and lost the key -- while it renders `fallback` perfectly well.
+        # The lookbehind on `(` is what tells `(oidc).x` from `f(oidc).x`.
+        return re.compile(
+            r'(?<![.\w])' + name + r'\s*(?:\.|\[)'
+            r'|(?<![\w)\]])\(\s*' + name + r'\s*\)\s*(?:\.|\[)',
+        )
 
     # `a . b` means `a.b` to Jinja; make them look the same here too.
     spaced_dot_re = re.compile(r'\s*\.\s*')
