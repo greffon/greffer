@@ -526,6 +526,20 @@ class CallParenthesisTests(TestCase):
         self.assertEqual(Template(value).render(oidc={}), 'fallback')
         self.assertTrue(self._survives(value))
 
+    def test_a_dereference_inside_a_call_argument_still_pops(self):
+        # `{{ range(smtp.port)|list }}` dereferences the type right
+        # there, as the first argument. Recognising the call's paren must
+        # only stop us seeing THROUGH it -- treating the name as
+        # uninteresting let this reach the render and raise, aborting the
+        # start, where the previous scanner popped the key.
+        self.assertFalse(self._survives('{{ range(smtp.port)|list }}'))
+        self.assertFalse(self._survives('{{ int(oidc.issuer) }}'))
+
+    def test_a_bare_name_as_a_call_argument_is_not_a_dereference(self):
+        # The other side: passed, not dereferenced. The binding renders
+        # it, so there is nothing to strip.
+        self.assertTrue(self._survives('{{ f(oidc) }}'))
+
     def test_a_call_result_is_not_the_integration_with_a_spaced_paren(self):
         # `dict (oidc)` -- Jinja allows whitespace before a call's paren,
         # and a lookbehind on the character before `(` saw the space and
