@@ -213,6 +213,57 @@ class DeleteUnsetOIDCEnvKeysTests(TestCase):
         self.assertEqual(compose['services']['grafana']['environment'], {})
 
 
+class PartiallyConfiguredIntegrationTests(TestCase):
+    """A blob with some fields but not others.
+
+    `smtp` is resolved by the manager from one fixed field set, so this
+    barely happens there. The per-instance OIDC client registration this
+    type exists for sends a blob whose key set varies by provider, so it
+    is the NORMAL state for `oidc` -- and it used to be the worst of the
+    three: "set" enough that neither pass strips its keys, but a plain
+    dict, so the binding never applied either. Both safety nets bypassed
+    at once.
+    """
+
+    PARTIAL = {'oidc': {'client_id': 'x'}}
+
+    def _render(self, template, integrations):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': integrations})
+        return Template(template).render(**_compose_render_context(info))
+
+    def test_a_present_field_is_untouched(self):
+        self.assertEqual(self._render('{{ oidc.client_id }}', self.PARTIAL), 'x')
+
+    def test_an_absent_field_renders_empty(self):
+        self.assertEqual(self._render('{{ oidc.issuer }}', self.PARTIAL), '')
+
+    def test_chaining_off_an_absent_field_does_not_raise(self):
+        # This was an UndefinedError out of `create_compose`, i.e. a 500
+        # with no service started.
+        try:
+            self.assertEqual(
+                self._render('{{ oidc.issuer.split("/")[0] }}', self.PARTIAL), '',
+            )
+        except Exception as exc:  # pragma: no cover - the failure we prevent
+            self.fail(f'a partial blob must not raise: {exc!r}')
+
+    def test_a_fully_configured_blob_is_unchanged(self):
+        full = {'oidc': {'issuer': 'https://id.example/x', 'client_id': 'x'}}
+        self.assertEqual(self._render('{{ oidc.issuer }}', full), 'https://id.example/x')
+        self.assertEqual(self._render('{{ oidc.issuer.split("/")[0] }}', full), 'https:')
+
+    def test_it_is_still_truthy_when_configured_and_falsy_when_not(self):
+        # Wrapping must not change what a `{% if oidc %}` guard decides.
+        guard = '{% if oidc %}on{% else %}off{% endif %}'
+        self.assertEqual(self._render(guard, self.PARTIAL), 'on')
+        self.assertEqual(self._render(guard, {}), 'off')
+
+    def test_a_configured_blob_still_serialises_as_itself(self):
+        self.assertEqual(
+            self._render('{{ oidc|tojson }}', self.PARTIAL), '{"client_id": "x"}',
+        )
+
+
 class AcceptedResidualTests(TestCase):
     """The one case where this is worse than `main`, asserted on purpose.
 

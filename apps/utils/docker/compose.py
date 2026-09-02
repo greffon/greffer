@@ -659,25 +659,36 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
     return compose
 def _compose_render_context(greffon_info):
-    """`greffon_info` with unset integration types bound so nothing raises.
+    """`greffon_info` with integration types bound so a missing FIELD renders.
 
-    Only the values `_compute_integrations_context` itself defaulted to
-    `{}` are replaced, so a caller that deliberately populated the key
-    keeps winning -- the same non-clobbering rule that function follows.
+    Every known type is wrapped, not just the unset ones. A PARTIALLY
+    populated blob is the case that forces this: it is "set", so neither
+    pass strips its keys, and if the binding only replaced `{}` it stayed
+    a plain dict too -- so `{{ oidc.issuer.split('/')[0] }}` against
+    `{'client_id': 'x'}` raised UndefinedError and 500'd the start, with
+    both safety nets bypassed at once.
+
+    That is not a hypothetical shape. `smtp` is resolved by the manager
+    from one fixed field set, so partial never really happens there. The
+    per-instance OIDC client registration that this type exists for sends
+    a blob whose key set varies by provider, so partial is its NORMAL
+    state.
+
+    Wrapping the real mapping keeps present keys winning -- `_UnsetField`
+    is reached only through `__missing__` -- so a configured value is
+    untouched and only an absent field renders empty.
+
+    A caller that deliberately populated the key still wins, which is the
+    same non-clobbering rule `_compute_integrations_context` follows.
     """
+    integrations = greffon_info.get('integrations') or {}
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
-        # `== {}` alone. `_compute_integrations_context` always runs
-        # first and writes the config when set and `{}` when unset, so
-        # an `_is_integration_set` term here would be a redundant
-        # conjunct dressed as a second safeguard -- no input
-        # distinguishes them.
-        if context.get(t) == {}:
-            # No constructor args: this is a dict, so a kwarg would
-            # become real CONTENT -- making it truthy (every
-            # `{% if oidc %}` guard would take the wrong branch) and
-            # serialising as {"name": "oidc"} under |tojson.
-            context[t] = _UnsetIntegration()
+        configured = integrations.get(t) if _is_integration_set(integrations.get(t)) else {}
+        # Only what `_compute_integrations_context` itself wrote. Anything
+        # else in that key was put there deliberately by a caller.
+        if context.get(t) == configured:
+            context[t] = _UnsetIntegration(configured)
     return context
 
 
