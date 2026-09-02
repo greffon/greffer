@@ -18,6 +18,7 @@ from unittest.mock import mock_open, patch
 import yaml
 
 from jinja2 import Template, UndefinedError
+from jinja2.exceptions import TemplateSyntaxError
 
 from apps.utils.docker.compose import (
     KNOWN_INTEGRATION_TYPES,
@@ -212,12 +213,54 @@ class DeleteUnsetOIDCEnvKeysTests(TestCase):
         self.assertEqual(compose['services']['grafana']['environment'], {})
 
 
+class AcceptedResidualTests(TestCase):
+    """The one case where this is worse than `main`, asserted on purpose.
+
+    Keeping a value main popped exposes it to the pre-existing
+    dump-then-template hazard: `yaml.dump` doubles an inner `'`, so the
+    expression reaches Jinja malformed and fails the WHOLE render.
+
+    Written down as a test rather than a comment so that if someone later
+    fixes the root cause -- rendering before dumping -- this fails and
+    tells them the residual is gone, instead of the knowledge living only
+    in a paragraph nobody re-reads.
+    """
+
+    def test_a_quoted_type_token_inside_a_literal_is_kept_and_then_fails(self):
+        value = "{{ instance_host|default('smtp.acme.com') }}"
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        # Kept: the token is inside a string literal, so it is not a
+        # reference, and not popping it is the false-positive fix working.
+        self.assertIn('K', compose['services']['a']['environment'])
+        # And then the dump mangles it. `main` pops this key by accident
+        # and deploys without it.
+        ctx = _compose_render_context(info)
+        ctx['instance_host'] = 'h'
+        with self.assertRaises(TemplateSyntaxError):
+            Template(yaml.dump(compose)).render(**ctx)
+
+    def test_the_same_shape_without_a_type_token_breaks_main_too(self):
+        # Shows the hazard is not ours: nothing here mentions an
+        # integration, so both implementations keep it and both fail.
+        value = "{{ instance_host|default('example.com') }}"
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('K', compose['services']['a']['environment'])
+        ctx = _compose_render_context(info)
+        ctx['instance_host'] = 'h'
+        with self.assertRaises(TemplateSyntaxError):
+            Template(yaml.dump(compose)).render(**ctx)
+
+
 class ConstructScanningTests(TestCase):
     """What counts as a reference to an unset type.
 
-    The rule the pop pass has to satisfy: after it runs, no surviving
-    value may raise when rendered with the type bound to `{}`, and no
-    value that would have rendered fine may be dropped. Each case below
+    The rule: a construct that DEREFERENCES the type pops the key; one
+    that merely mentions it does not. Survival is then made safe by the
+    binding rather than by the scan being complete. Each case below
     is a way of getting exactly one of those two halves wrong.
     """
 
@@ -360,8 +403,19 @@ class ReferenceFormTests(TestCase):
         self.assertFalse(self._survives('{{ (oidc).issuer.host }}'))
 
     def test_the_attr_filter_is_not_chased_either(self):
-        # Same trade: kept, and rendered by the binding.
+        # Kept -- but NOT saved by the binding, which is worth stating
+        # because it is the one shape where the binding does not hold.
+        # `do_attr` uses plain getattr and returns the environment's own
+        # `Undefined`, not `_UnsetField`, so a second `attr` raises. Main
+        # keeps and raises on this too, so it is parity rather than a
+        # regression, and popping it would need the alias-chasing the cut
+        # removed on purpose.
         self.assertTrue(self._survives('{{ oidc|attr("issuer")|attr("host") }}'))
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        with self.assertRaises(UndefinedError):
+            Template('{{ oidc|attr("issuer")|attr("host") }}').render(
+                **_compose_render_context(info),
+            )
 
     def test_aliasing_is_not_chased(self):
         # `{% set x = oidc %}{{ x.issuer.host }}` moves the dereference
@@ -544,39 +598,6 @@ class ScannerRulesTheCommentsAssertTests(TestCase):
         # A comment has no expression syntax, so an apostrophe in it is
         # text. Tracking quotes there let it eat the `#}`.
         self.assertTrue(self._survives("{# don't {{ oidc.issuer }} #}x"))
-
-
-class RescuePassRobustnessTests(TestCase):
-    """Shapes that made `_pop_keys_the_dump_mangles` itself 500."""
-
-    def test_a_list_form_env_alongside_a_mangled_one_is_survivable(self):
-        # The rescue only walks dict-form env blocks. Without that filter
-        # it called `.items()` on a list and raised AttributeError
-        # straight out of `create_compose`.
-        compose = {'services': {
-            'a': {'environment': {'BAD': "{{ smtp|default('localhost') }}"}},
-            'b': {'environment': ['PLAIN=1', 'OTHER=2']},
-        }}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        try:
-            _delete_unset_integration_env_keys(compose, info)
-        except Exception as exc:  # pragma: no cover - the failure we prevent
-            self.fail(f'must not raise: {exc!r}')
-        self.assertEqual(compose['services']['b']['environment'], ['PLAIN=1', 'OTHER=2'])
-
-    def test_someone_elses_breakage_does_not_cost_us_our_keys(self):
-        # `{{ instance_id|default('x') }}` mangles too, and is not ours.
-        # When it is the reason the document will not parse, the
-        # integration key must still be left alone rather than sacrificed
-        # to a document we cannot fix anyway.
-        compose = {'services': {'a': {'environment': {
-            'X': "{{ instance_id|default('x') }}",
-            'J': "{{ smtp|default('h') }}",
-        }}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
-        self.assertIn('X', compose['services']['a']['environment'])
-        self.assertIn('J', compose['services']['a']['environment'])
 
 
 class BindingIsWiredIntoTheRenderTests(TestCase):
