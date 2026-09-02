@@ -192,9 +192,11 @@ class _UnsetField(ChainableUndefined):
     renders `25` -- both matching that binding byte for byte.
 
     What it adds is that going DEEPER cannot fail: `ChainableUndefined`
-    survives an attribute chain but still raises when called, and
+    survives an attribute chain but still raises when CALLED, and
     `{{ smtp.from_address.split('@')[0] }}` is a shape the catalog ships,
-    so calls and iteration are absorbed too. The result is strictly
+    so `__call__` is absorbed. Iteration needs no override: the base
+    `Undefined` already yields nothing, and only `StrictUndefined`
+    refuses -- an explicit `__iter__` here was dead code. The result is strictly
     better than the old binding rather than different from it: identical
     wherever `{}` rendered, and rendering where `{}` raised.
     """
@@ -203,9 +205,6 @@ class _UnsetField(ChainableUndefined):
 
     def __call__(self, *args, **kwargs):
         return self
-
-    def __iter__(self):
-        return iter(())
 
 
 class _UnsetIntegration(dict):
@@ -272,7 +271,13 @@ class _UnsetIntegration(dict):
         # regression on precisely the residual class this design accepts.
         # The allocation happens only on the rare path the strip pass
         # missed.
-        return _UnsetField(name=key, obj=self)
+        # `obj=dict(self)`, not `self`. Jinja renders the object's type
+        # into the message, so passing the wrapper leaked
+        # `apps.utils.docker.compose._UnsetIntegration object` into a 500
+        # an operator has to read. A plain dict restores main's wording,
+        # `'dict object' has no attribute 'issuer'`, which is what they
+        # would recognise.
+        return _UnsetField(name=key, obj=dict(self))
 
 
 def _is_integration_set(value):
@@ -658,6 +663,8 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             service['environment'] = kept
 
     return compose
+
+
 def _compose_render_context(greffon_info):
     """`greffon_info` with integration types bound so a missing FIELD renders.
 

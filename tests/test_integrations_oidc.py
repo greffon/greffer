@@ -539,10 +539,35 @@ class UnsetBindingCannotFailTests(TestCase):
             with self.subTest(value=value):
                 self._renders_without_raising(value)
 
-    def test_iteration_does_not_raise(self):
+    def test_iterating_a_FIELD_does_not_raise(self):
+        # `oidc.items()` is `dict.items()` on the wrapper and never
+        # reaches `_UnsetField` at all -- which is what made a dead
+        # `__iter__` override look covered. These iterate a FIELD, which
+        # is the case an OIDC blob actually produces (`redirect_uris`,
+        # `scopes`).
+        for value in (
+            '{% for u in oidc.redirect_uris %}{{ u }}{% endfor %}',
+            '{{ oidc.scopes|join(",") }}',
+            '{{ oidc.redirect_uris|list }}',
+        ):
+            with self.subTest(value=value):
+                self._renders_without_raising(value)
+
+    def test_iterating_the_type_itself_does_not_raise(self):
         self._renders_without_raising(
             '{% for k, v in oidc.items() %}{{ k }}{% endfor %}',
         )
+
+    def test_the_message_reads_as_a_dict_not_an_internal_class(self):
+        # Jinja renders the object's type into the message. Passing the
+        # wrapper leaked `apps.utils.docker.compose._UnsetIntegration
+        # object` into a 500 an operator has to read; a plain dict gives
+        # main's wording, which is what they would recognise.
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        with self.assertRaises(UndefinedError) as caught:
+            Template('{{ oidc.issuer|int }}').render(**_compose_render_context(info))
+        self.assertIn('dict object', str(caught.exception))
+        self.assertNotIn('_UnsetIntegration', str(caught.exception))
 
     def test_a_failure_that_still_raises_names_the_field(self):
         # A few operations are not absorbed -- `|int`, comparisons,
