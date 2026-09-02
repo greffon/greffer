@@ -526,6 +526,14 @@ class CallParenthesisTests(TestCase):
         self.assertEqual(Template(value).render(oidc={}), 'fallback')
         self.assertTrue(self._survives(value))
 
+    def test_a_call_result_is_not_the_integration_with_a_spaced_paren(self):
+        # `dict (oidc)` -- Jinja allows whitespace before a call's paren,
+        # and a lookbehind on the character before `(` saw the space and
+        # read it as grouping. The lexer sees the callee token itself.
+        value = '{{ dict (oidc).get("issuer", "fallback") }}'
+        self.assertEqual(Template(value).render(oidc={}), 'fallback')
+        self.assertTrue(self._survives(value))
+
     def test_a_parenthesised_reference_still_pops(self):
         # The form the parens were there for in the first place.
         self.assertFalse(self._survives('{{ (oidc).issuer }}'))
@@ -553,6 +561,35 @@ class NestedBracesTests(TestCase):
             self._survives('{{ {"tls": "ssl", "none": ""}[smtp.tls_mode] }}'),
         )
 
+
+
+class LexerCostTests(TestCase):
+    """No input-shaped blow-up, including the one a regex had."""
+
+    def _cost(self, value):
+        import statistics
+        import time
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        samples = []
+        for _ in range(3):
+            compose = {'services': {'a': {'environment': {'K': value}}}}
+            start = time.process_time()
+            _delete_unset_integration_env_keys(compose, info)
+            samples.append(time.process_time() - start)
+        return statistics.median(samples)
+
+    def test_a_long_whitespace_run_is_not_quadratic(self):
+        # `\s*\.\s*` backtracked over the run at every position -- 4x the
+        # work for 2x the whitespace, on input the catalog controls and
+        # reached synchronously through `/start/`. The lexer is a linear
+        # scan, so the class cannot recur.
+        self._cost('{{' + ' ' * 1000 + 'x }}')  # warm up
+        small = self._cost('{{' + ' ' * 2000 + 'x }}')
+        large = self._cost('{{' + ' ' * 16000 + 'x }}')
+        self.assertLess(
+            large, max(small, 1e-5) * 20,
+            f'{small:.5f}s -> {large:.5f}s for 8x the whitespace looks quadratic',
+        )
 
 
 class OpenerScanCostTests(TestCase):
