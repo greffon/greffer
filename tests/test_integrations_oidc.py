@@ -622,6 +622,22 @@ class UnsetBindingCannotFailTests(TestCase):
         )
         self.assertEqual(_compose_render_context(info)['oidc'], {'issuer': _ISSUER})
 
+    def test_baked_files_render_the_shapes_that_tolerate_an_empty_mapping(self):
+        # The scope of the loud-refusal guarantee, asserted because the
+        # comment claiming it was once wider than the truth. A
+        # DEREFERENCE refuses; a reference that tolerates an empty
+        # mapping renders, exactly as it does for smtp.
+        info = build_render_context({
+            'id': 'i1', 'integrations': {}, 'configurations': [], 'ports': [],
+        })
+        self.assertEqual(_render_baked_file('{{ oidc }}', info, 'r.json'), '{}')
+        self.assertEqual(
+            _render_baked_file('{{ oidc.issuer|default("D") }}', info, 'r.json'), 'D',
+        )
+        self.assertEqual(
+            _render_baked_file('{% if oidc %}y{% else %}n{% endif %}', info, 'r.json'), 'n',
+        )
+
     def test_baked_files_still_refuse_loudly(self):
         # Scoped to the compose render on purpose. A baked file is
         # CONTENT, where a silently empty value is worse than a refusal,
