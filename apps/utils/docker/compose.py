@@ -80,7 +80,6 @@ def get_nginx_service(greffon):
     }
 
 
-
 def create_compose_template_from_greffon(compose, greffon_info):
     for service_name, service in compose['services'].items():
         service['ports'] = []
@@ -209,7 +208,6 @@ class _UnsetField(ChainableUndefined):
         return iter(())
 
 
-
 class _UnsetIntegration(dict):
     """How an integration type the user did not configure is bound at
     COMPOSE render time.
@@ -275,7 +273,6 @@ class _UnsetIntegration(dict):
         # The allocation happens only on the rare path the strip pass
         # missed.
         return _UnsetField(name=key, obj=self)
-
 
 
 def _is_integration_set(value):
@@ -501,8 +498,33 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # var that renders empty, not a failed deploy. The rule is therefore
     # allowed to be incomplete, and is kept simple on purpose.
     #
-    # The one thing it must get right is not popping a value that merely
-    # LOOKS like a reference, since that silently deletes working
+    # ACCEPTED RESIDUAL, stated because it is strictly worse than main
+    # in one narrow case. Keeping a value main popped exposes it to a
+    # pre-existing hazard: `yaml.dump` re-serialises the compose in
+    # single-quoted style and DOUBLES an inner `'`, so
+    #
+    #     {{ instance_host|default('smtp.acme.com') }}
+    #
+    # reaches Jinja as `default(''smtp.acme.com'')` and raises
+    # TemplateSyntaxError for the WHOLE document -- an uncaught 500 out
+    # of `create_compose`, no service starts. `main` pops that key and
+    # deploys without it.
+    #
+    # Accepted rather than defended against, deliberately:
+    #   - no catalog entry ships the shape; all five smtp templates
+    #     dereference directly and are popped by both implementations;
+    #   - main's protection is ACCIDENTAL -- it pops because its regex
+    #     false-positives on the token inside a string literal, not
+    #     because it knows about the hazard. The identical value without
+    #     `smtp.` in it (`default('example.com')`) breaks main too;
+    #   - the real fix is rendering BEFORE dumping instead of templating
+    #     the dumped text, which is a core-path change and not this
+    #     one's to make;
+    #   - a post-dump rescue for it was written, reviewed, and cut as
+    #     disproportionate (~180 lines to defend a shape nothing uses).
+    #
+    # The one thing this must get right is not popping a value that
+    # merely LOOKS like a reference, since that silently deletes working
     # configuration. `oidc.<host>` is a conventional provider hostname,
     # so `https://oidc.acme.com/{{ instance_id }}` is the normal shape
     # for an OIDC entry and must survive -- hence scanning construct
@@ -635,33 +657,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 kept.append(e)
             service['environment'] = kept
 
-    # Second pass, against the REAL dumped document.
-    #
-    # A value only reaches Jinja through `yaml.dump`, and the dump can
-    # mangle an expression beyond recognition. Single-quoted style
-    # doubles inner `'`, so `default('x')` arrives as `default(''x'')`.
-    # Double-quoted style -- chosen for non-ASCII or a tab -- escapes
-    # inner `"` as `\"`, and LINE-WRAPS long scalars with a
-    # backslash-continuation that can land inside a construct, splitting
-    # `{% endif %}` into `{% endif\` + `\ %}`. Any of those raises
-    # TemplateSyntaxError for the WHOLE FILE: an uncaught 500 out of
-    # `create_compose`, instance never starts.
-    #
-    # This cannot be decided per value, which two earlier attempts got
-    # wrong: whether yaml wraps depends on the total line width, which is
-    # the KEY NAME plus the nesting indent plus the value -- so the same
-    # value wraps under a long key and not under a short one, and a value
-    # dumped alone under a placeholder key answers a different question.
-    # Hence dumping what we actually have.
-    #
-    # The hazard is pre-existing and not integration-specific --
-    # `{{ instance_id|default('x') }}` hits it on main identically -- and
-    # fixing it properly means rendering before dumping, a core-path
-    # change that is not this one's to make. So this deliberately only
-    # rescues keys that reference an unset integration type: exactly the
-    # ones the guard above chose to KEEP and `main` would have popped.
-    # Widening the pop to every mangled value would change behaviour well
-    # beyond integrations.
     return compose
 def _compose_render_context(greffon_info):
     """`greffon_info` with unset integration types bound so nothing raises.
@@ -670,7 +665,6 @@ def _compose_render_context(greffon_info):
     `{}` are replaced, so a caller that deliberately populated the key
     keeps winning -- the same non-clobbering rule that function follows.
     """
-    integrations = greffon_info.get('integrations') or {}
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
         # `== {}` alone. `_compute_integrations_context` always runs
