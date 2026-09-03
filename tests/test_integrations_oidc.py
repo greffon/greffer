@@ -34,6 +34,7 @@ from apps.utils.docker.compose import (
     _UNDO_TIME_BUDGET,
     _UNDO_CHUNK,
     _document_renders,
+    _items_removed,
     _render_baked_file,
     build_render_context,
     _compute_integrations_context,
@@ -1264,6 +1265,114 @@ class TheContextIsCopiedPerRenderTests(TestCase):
         self.assertEqual(_document_renders(compose, context), first)
 
 
+class DuplicateKeysReachingTheUndoTests(TestCase):
+    """Duplicate list-form entries AND the undo path, together.
+
+    Each half is covered on its own -- `DuplicateListFormKeysTests` for
+    the multiset diff, `TheUndoIsBoundedTests` for the replay -- but
+    nothing crossed them, and the multiset diff only matters on the undo
+    path. Diffing by name instead would report the pop as never having
+    happened, and restore the referencing entry.
+    """
+
+    def test_a_duplicate_name_survives_a_round_trip_through_the_undo(self):
+        compose = {'services': {'app': {'environment': [
+            'EMAIL_URL=static',
+            'EMAIL_URL=smtp://{{ smtp.host }}',
+            'A_OPEN={# note',                    # forces the undo
+            'Z_END={{ oidc.issuer }} #}',
+            'KEEP=1',
+        ]}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        env = compose['services']['app']['environment']
+        self.assertIn('EMAIL_URL=static', env)
+        self.assertNotIn('EMAIL_URL=smtp://{{ smtp.host }}', env)
+        self.assertIn('KEEP=1', env)
+        Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+
+class ItemsRemovedIsAMultisetDiffTests(TestCase):
+    """`_items_removed` counts occurrences, not membership.
+
+    Tested at the helper directly and deliberately. The strip cannot
+    currently produce the distinguishing state -- both passes remove
+    EVERY entry matching a key, so two identical entries always go
+    together -- which means no end-to-end input separates a multiset
+    diff from a plain `not in` comprehension today.
+
+    That is an argument for pinning the contract here rather than
+    pretending an integration-level test covers it: the undo replays
+    whatever this returns, so if a future pass ever removes one of two
+    identical entries, a membership test would report nothing removed
+    and silently restore it.
+    """
+
+    def test_one_of_two_identical_entries_removed_is_reported(self):
+        self.assertEqual(_items_removed(['a', 'a', 'b'], ['a', 'b']), ['a'])
+        self.assertEqual(_items_removed(['a', 'b', 'a'], ['a']), ['b', 'a'])
+
+    def test_both_removed_is_reported_twice(self):
+        self.assertEqual(_items_removed(['a', 'a'], []), ['a', 'a'])
+
+    def test_nothing_removed_is_empty(self):
+        self.assertEqual(_items_removed(['x', 'y'], ['x', 'y']), [])
+
+    def test_order_follows_the_document(self):
+        self.assertEqual(_items_removed(['a', 'b', 'c'], ['b']), ['a', 'c'])
+
+    def test_unhashable_items_are_handled(self):
+        # Env values can be lists or dicts, which a Counter would refuse.
+        before = [('K', ['x']), ('L', {'a': 1}), ('M', 'plain')]
+        self.assertEqual(
+            _items_removed(before, [('M', 'plain')]),
+            [('K', ['x']), ('L', {'a': 1})],
+        )
+
+
+class TheAcceptedOverPopTests(TestCase):
+    """Where the subtree search pops a value that would have worked.
+
+    Searching the whole Getattr target means a value that merely
+    MENTIONS the name inside that target is popped, even when the name
+    cannot be what the expression evaluates to:
+
+        {{ (alpha if smtp else alpha).name }}
+
+    reads `alpha` either way, so `main` renders it and this pops it.
+    That is the deliberate trade -- over-pop costs one env var on an
+    integration nobody configured, under-pop ships a malformed value --
+    but it is a real cost, so it is asserted here rather than left in
+    prose. Measured at ~250 extra pops per 3000 adversarial fragments
+    and ZERO on the 120 real catalog values.
+
+    If someone narrows the rule so these survive, this test should fail
+    and be re-examined, not deleted unread.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_the_name_in_a_target_it_cannot_be_is_still_popped(self):
+        for value in ('{{ (alpha if smtp else alpha).name }}',
+                      '{{ (alpha, smtp)[0].name }}',
+                      '{{ {"a": alpha, "b": smtp}["a"].name }}',
+                      '{{ ([alpha] + [smtp])[0].name }}'):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_value_that_never_mentions_the_name_is_untouched(self):
+        # The boundary: over-popping requires the name to appear. It is
+        # not a licence to pop anything with a Getattr in it.
+        for value in ('{{ alpha.name }}', '{{ (alpha or beta).name }}',
+                      '{{ instance_url }}', '{{ config.ANY }}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+
 class GetOnAnUnsetIntegrationTests(TestCase):
     """`.get()` must not hand Jinja a bare `None`.
 
@@ -1533,7 +1642,10 @@ class MalformedPayloadShapesDoNotCrashTests(TestCase):
     """
 
     def test_a_non_mapping_integrations_is_treated_as_none(self):
-        for bad in ('garbage', 7, [], ['smtp'], None, True):
+        # Truthy non-dicts matter as much as falsy ones: `or {}` instead
+        # of an isinstance check passes a list straight through, and the
+        # `.get(t)` on it raises out of `/start/`.
+        for bad in ('garbage', 7, [], ['smtp'], [1], {1, 2}, None, True):
             with self.subTest(bad=bad):
                 info = _compute_integrations_context({'id': 'i1', 'integrations': bad})
                 self.assertEqual(info['smtp'], {})
