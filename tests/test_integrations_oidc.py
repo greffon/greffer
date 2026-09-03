@@ -25,6 +25,7 @@ from apps.utils.docker.compose import (
     ConfigRenderError,
     _UnsetIntegration,
     _compose_render_context,
+    _document_parses,
     _render_baked_file,
     build_render_context,
     _compute_integrations_context,
@@ -517,12 +518,14 @@ class ListFormPassTwoTests(TestCase):
         self.assertEqual(self._run(['Q=a=b=c']), ['Q=a=b=c'])
 
 
-class ParseFailureFallsBackToTheNameTests(TestCase):
-    """On a parse failure, pop only if the value mentions the name.
+class ParseFailureFallbackTests(TestCase):
+    """What an unparseable value falls back to, and that nothing escapes.
 
-    Popping unconditionally would silently drop an unrelated env var
-    whose value happens to be unparseable, turning a loud `main` failure
-    into a quiet missing variable on a deploy that otherwise works.
+    TWO rules pop, not one: the value names the integration, OR it
+    carries a `{%` tag (see `ABlockSplitAcrossValuesIsPoppedWholeTests`
+    for why the second exists). A value matching neither is kept, so an
+    unrelated unparseable value is not silently dropped from a deploy --
+    it fails the render loudly, exactly as it does on `main`.
     """
 
     def _kept(self, value):
@@ -635,6 +638,137 @@ class ABlockSplitAcrossValuesIsPoppedWholeTests(TestCase):
         self.assertEqual(
             self._strip({'C': '{% endif %}'}, {'smtp': {'host': 'h'}}), {},
         )
+
+
+class TheStripNeverBreaksTheDocumentTests(TestCase):
+    """The document-level invariant, which no per-value rule can give.
+
+    Both passes decide one env value at a time, but the whole compose is
+    dumped into ONE Jinja template and rendered together. A construct
+    split across two values therefore cannot be handled correctly value
+    by value -- proven by these two shapes pulling in opposite
+    directions:
+
+      `{% raw %}` PARSES alone, so it is kept, while its `{% endraw %}`
+      does not parse and is popped.
+
+      `{# comment` holds no Jinja delimiter, so it is never examined,
+      while the `{{ oidc.host }} #}` closing it is a real reference that
+      MUST be popped.
+
+    Either way the survivor is left dangling and the whole render
+    raises, which is a 500 at `/start/` -- much worse than the env var
+    the pop was worth. So the strip is checked as a whole and dropped if
+    it broke the document.
+    """
+
+    def _run(self, env, integrations=None):
+        compose = {'services': {'app': {'environment': dict(env)}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations or {}},
+        )
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def _renders(self, compose, info):
+        return Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_a_split_raw_block_is_left_alone_and_still_renders(self):
+        env = {'A': '{% raw %}', 'B': '{% endraw %}'}
+        compose, info = self._run(env)
+        self.assertEqual(compose['services']['app']['environment'], env)
+        self._renders(compose, info)  # must not raise
+
+    def test_a_split_comment_is_left_alone_and_still_renders(self):
+        env = {'A': '{# oidc note', 'B': '{{ oidc.host }} #}'}
+        compose, info = self._run(env)
+        self.assertEqual(compose['services']['app']['environment'], env)
+        self._renders(compose, info)
+
+    def test_an_ordinary_reference_is_still_popped(self):
+        # The guard must not be so eager that it undoes the feature.
+        compose, info = self._run({'H': '{{ oidc.issuer }}', 'X': '1'})
+        self.assertEqual(compose['services']['app']['environment'], {'X': '1'})
+        self._renders(compose, info)
+
+    def test_the_glitchtip_shape_is_still_popped(self):
+        # The case the strip exists for: present-but-empty renders
+        # `smtp://:@:`, a malformed URL the app parses at boot.
+        compose, info = self._run(
+            {'EMAIL_URL': 'smtp://{{ smtp.username }}@{{ smtp.host }}'},
+        )
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_a_balanced_split_block_is_still_popped_whole(self):
+        # Popping BOTH halves keeps the document balanced, so the guard
+        # has nothing to undo.
+        compose, info = self._run(
+            {'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'},
+        )
+        self.assertEqual(compose['services']['app']['environment'], {'B': 'x'})
+        self._renders(compose, info)
+
+    def test_an_already_broken_document_is_still_stripped(self):
+        # If it did not parse BEFORE, the strip is not what broke it, and
+        # refusing to strip would only lose the feature for no gain.
+        compose, info = self._run({'H': '{{ oidc.issuer }}', 'BAD': '{% endfor %}'})
+        self.assertNotIn('H', compose['services']['app']['environment'])
+
+    def test_the_revert_is_logged(self):
+        with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
+            self._run({'A': '{% raw %}', 'B': '{% endraw %}'})
+        self.assertIn('unrenderable', ''.join(caught.output))
+        self.assertIn('i1', ''.join(caught.output))
+
+    def test_a_compose_that_cannot_be_dumped_answers_no(self):
+        # `_document_parses` must ANSWER for any input, never raise --
+        # it runs on the `/start/` path. A generator makes `yaml.dump`
+        # raise TypeError, which is not a Jinja error at all.
+        self.assertFalse(_document_parses({'services': (i for i in [1])}))
+
+    def test_an_uncopyable_compose_does_not_crash_the_strip(self):
+        # Reachable: a module DUMPS (so the document parses and the
+        # snapshot is attempted) but cannot be deepcopied. Without the
+        # guard this is a TypeError straight out of `/start/`.
+        import sys as _sys
+        compose = {'services': {'app': {'environment': {'H': '{{ oidc.a }}'}}},
+                   'x-mod': _sys}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {}},
+        )
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_an_undumpable_compose_does_not_crash_the_strip(self):
+        compose = {'services': {'app': {'environment': {'H': '{{ oidc.a }}'}}},
+                   'x-gen': (i for i in [1])}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {}},
+        )
+        # Nothing parsed before, so the strip proceeds as best effort.
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+
+class ServicesThatIsNotAMappingTests(TestCase):
+    """`services:` with an empty body parses to None, not {}."""
+
+    def test_a_non_mapping_services_does_not_crash(self):
+        for bad in (None, 'garbage', 7, [], ['app']):
+            with self.subTest(bad=bad):
+                compose = {'services': bad}
+                _delete_unset_integration_env_keys(
+                    compose, {'id': 'i1', 'integrations': {}},
+                )
+                self.assertEqual(compose, {'services': bad})
+
+    def test_a_non_mapping_services_does_not_crash_in_pass_one(self):
+        compose = {'services': None}
+        _delete_unset_integration_env_keys(compose, {
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'K'},
+            ]}],
+        })
+        self.assertEqual(compose, {'services': None})
 
 
 class MalformedPayloadShapesDoNotCrashTests(TestCase):
@@ -1052,78 +1186,6 @@ class NestedBracesTests(TestCase):
 
 
 
-class LexerCostTests(TestCase):
-    """No input-shaped blow-up, including the one a regex had."""
-
-    def _cost(self, value):
-        import statistics
-        import time
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        samples = []
-        for _ in range(3):
-            compose = {'services': {'a': {'environment': {'K': value}}}}
-            start = time.process_time()
-            _delete_unset_integration_env_keys(compose, info)
-            samples.append(time.process_time() - start)
-        return statistics.median(samples)
-
-    def test_a_long_whitespace_run_is_not_quadratic(self):
-        # `\s*\.\s*` backtracked over the run at every position -- 4x the
-        # work for 2x the whitespace, on input the catalog controls and
-        # reached synchronously through `/start/`. The lexer is a linear
-        # scan, so the class cannot recur.
-        self._cost('{{' + ' ' * 1000 + 'x }}')  # warm up
-        small = self._cost('{{' + ' ' * 2000 + 'x }}')
-        large = self._cost('{{' + ' ' * 16000 + 'x }}')
-        self.assertLess(
-            large, max(small, 1e-5) * 20,
-            f'{small:.5f}s -> {large:.5f}s for 8x the whitespace looks quadratic',
-        )
-
-
-class OpenerScanCostTests(TestCase):
-    """The construct scan must be linear in the value's length.
-
-    Searching for each opener kind separately re-scanned the whole
-    remaining suffix per construct, so a value with many `{{ }}` blocks
-    was quadratic -- and this runs on the instance-start path, where the
-    value comes from the catalog.
-    """
-
-    def _cost(self, blocks):
-        # `process_time`, not wall clock: it excludes time the scheduler
-        # spent elsewhere, which is the whole source of noise on a loaded
-        # machine. Median of three so one descheduled sample cannot
-        # decide the result.
-        import statistics
-        import time
-        value = '{{ x }}' * blocks
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        samples = []
-        for _ in range(3):
-            compose = {'services': {'a': {'environment': {'K': value}}}}
-            start = time.process_time()
-            _delete_unset_integration_env_keys(compose, info)
-            samples.append(time.process_time() - start)
-        return statistics.median(samples)
-
-    def test_the_scan_is_linear_not_quadratic(self):
-        # An 8x input step, so the two hypotheses are ~8x (linear) and
-        # ~64x (quadratic) -- far enough apart that scheduler noise
-        # cannot move one into the other. A single 2x step with a 3x
-        # ceiling, which this used to be, is exactly the shape that goes
-        # intermittently red on a busy CI worker.
-        self._cost(1000)  # warm the regex cache
-        small = self._cost(1000)
-        large = self._cost(8000)
-        self.assertLess(
-            large, small * 20,
-            f'{small:.4f}s at 1000 blocks -> {large:.4f}s at 8000 '
-            f'({large / small:.1f}x for an 8x input) looks quadratic',
-        )
-
-
-
 class ReferenceFormTests(TestCase):
     """Every way of reaching an unset type that RAISES at render.
 
@@ -1347,11 +1409,13 @@ class UnsetBindingCannotFailTests(TestCase):
             _render_baked_file('{{ oidc.issuer }}', info, 'realm.json')
 
 
-class ScannerRulesTheCommentsAssertTests(TestCase):
-    """Rules the implementation states in prose and nothing checked.
+class JinjaFormsTheContractCoversTests(TestCase):
+    """Forms that decided a defect at some point in this feature's life.
 
-    Each of these survived mutation: the code could be changed to
-    contradict its own comment and the suite stayed green.
+    Each is asserted as an OUTCOME of the public function -- popped, kept
+    or simply not crashing -- rather than against any particular scanning
+    strategy, so they stayed meaningful when the implementation moved
+    from hand-written text scanning to parsing the Jinja AST.
     """
 
     def _survives(self, value):

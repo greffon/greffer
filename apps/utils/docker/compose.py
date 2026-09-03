@@ -1,5 +1,6 @@
 import yaml
 import asyncio
+import copy
 import re
 import json
 import logging
@@ -305,10 +306,29 @@ def _compute_integrations_context(greffon_info):
 
     Unset types become empty dicts — Jinja's default Undefined resolves
     `{{ smtp.host }}` on `{}` to an empty string rather than blowing up
-    with AttributeError on None. The companion delete-on-unset pass
-    strips those keys from the compose entirely; the empty-dict default
-    is purely belt-and-braces in case a future delete-pass bug leaves
-    a stray `{{ smtp.* }}` in place.
+    with AttributeError on None.
+
+    That `{}` is NOT belt-and-braces, whatever this docstring used to
+    claim. `_compose_render_context` reads it as the signal to install
+    the forgiving binding, and that binding is load-bearing: the strip
+    pass cannot be made complete (aliasing and `|map(attribute=...)`
+    move a dereference off the name entirely), so something has to
+    survive what it misses. The two mechanisms divide as follows —
+    the strip pass produces NO KEY, the binding produces an EMPTY VALUE.
+    Only the strip pass can deliver the first, which is what glitchtip
+    needs: an `EMAIL_URL` present but empty renders `smtp://:@:`, a
+    malformed URL its app parses at boot.
+
+    NOTE for the per-instance OIDC blobs of platform-identity Feature #3:
+    `_is_integration_set` is `bool(dict)`, so a blob with ANY key reads
+    as configured and switches BOTH mechanisms off. A half-written row —
+    persisted before client registration finished, or a provider variant
+    with a different shape — therefore reaches the render as a
+    configured integration, and a field it lacks is a hard 500 at
+    `/start/` rather than an empty value. That is the deliberate policy
+    (see `_compose_render_context`), but it means catalog entries reading
+    anything outside a guaranteed core field set must use `|default`, and
+    nothing mechanical enforces that yet.
     """
     integrations = greffon_info.get('integrations')
     # Shape-defensive for the same reason `_compute_config_context` is:
@@ -406,6 +426,20 @@ def _render_json_value(value, greffon_info, dest_name):
     return value
 
 
+def _document_parses(compose):
+    """Does the compose still parse as ONE Jinja template once dumped?
+
+    Asks the exact question the render will ask, of the exact text it
+    will ask it of (`Template(yaml.dump(compose))`). Any failure is a
+    no, including a compose that will not dump.
+    """
+    try:
+        Environment().parse(yaml.dump(compose))
+    except Exception:
+        return False
+    return True
+
+
 def _delete_unset_integration_env_keys(compose, greffon_info):
     """For each known integration type whose config is unset, pop every
     env key in the compose that would expand to an unset-integration
@@ -447,7 +481,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     integrations = greffon_info.get('integrations')
     if not isinstance(integrations, dict):
         integrations = {}
-    services = compose.get('services', {}) if isinstance(compose, dict) else {}
+    services = compose.get('services') if isinstance(compose, dict) else None
+    if not isinstance(services, dict):
+        # `services:` with an empty body parses to None.
+        services = {}
 
     unset_types = [
         t for t in KNOWN_INTEGRATION_TYPES
@@ -455,6 +492,38 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     ]
     if not unset_types:
         return compose
+
+    # Whether the document renders is a property of the WHOLE document,
+    # but both passes decide one value at a time, and a Jinja construct
+    # can span two of them. Popping one half leaves the other dangling
+    # and fails the entire render -- a 500 at `/start/`, far worse than
+    # the env var the pop was worth.
+    #
+    # Two reviews found this twice, in shapes that argue against ever
+    # fixing it value-by-value: `{% raw %}` PARSES alone (so it is kept)
+    # while its `{% endraw %}` does not (so it is popped), and a
+    # `{# comment` opener holds no Jinja delimiter at all (so it is never
+    # examined) while the `{{ oidc.host }} #}` closing it is a genuine
+    # reference that must be popped. No per-value rule is right about
+    # both.
+    #
+    # So stop enumerating shapes and check the invariant instead: if the
+    # document parsed before the strip and does not after, the strip
+    # broke it and is dropped wholesale. Those keys then render empty
+    # through the binding instead of being absent -- the weaker of the
+    # two guarantees, but still a working deploy. Costs one extra parse
+    # of a document we are about to render anyway.
+    parsed_before = _document_parses(compose)
+    snapshot = None
+    if parsed_before:
+        try:
+            snapshot = copy.deepcopy(compose)
+        except Exception:
+            # No snapshot means no revert, so do not pretend otherwise.
+            # A compose holding something uncopyable is not the shape
+            # this guard defends, and raising here would be the very
+            # 500 the guard exists to avoid.
+            parsed_before = False
 
     # Pass 1 — metadata-driven pop (unchanged behavior).
     for t in unset_types:
@@ -633,6 +702,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 kept.append(e)
             service['environment'] = kept
 
+    # `snapshot is not None` already implies the document parsed before
+    # and could be copied; re-testing `parsed_before` here would be a
+    # second spelling of the same condition.
+    if snapshot is not None and not _document_parses(compose):
+        logger.warning(
+            'integration strip left instance %s unrenderable; keeping every '
+            'env key and letting the unset binding render them empty',
+            greffon_info.get('id'),
+        )
+        compose.clear()
+        compose.update(snapshot)
     return compose
 
 
