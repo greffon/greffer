@@ -437,27 +437,37 @@ def _render_json_value(value, greffon_info, dest_name):
     return value
 
 
-# Upper bound on the one-at-a-time undo below, which costs a full dump
-# and compile per step. 100 is far above any real catalog entry and far
-# below where the cost is noticeable.
-_MAX_UNDO_STEPS = 100
+# The undo below costs one dump+compile+render per attempt. It tries
+# keys in batches of _UNDO_CHUNK and only splits a batch that fails, so
+# a clean run needs ceil(n / _UNDO_CHUNK) attempts. _MAX_UNDO_RENDERS
+# caps the total either way -- 200 covers ~1600 popped keys cleanly,
+# where a real catalog entry pops 10-30.
+_UNDO_CHUNK = 8
+_MAX_UNDO_RENDERS = 200
 
 
-def _document_parses(compose):
-    """Is the compose still a usable Jinja template once dumped?
+def _document_renders(compose, render_context):
+    """Does the compose survive the WHOLE render once dumped?
 
-    `from_string`, not `parse`: the render is `Template(...)`, which
-    parses AND compiles, and a family of `TemplateAssertionError`s is
-    raised only by the compile step. Popping a `{% raw %}`/`{% endraw %}`
-    pair un-shields whatever sat between them, so the strip can ADD live
-    constructs, not only remove them -- `block 'b' defined twice` is
-    reachable that way and parses perfectly well. Asking the cheaper
-    question let exactly that through.
+    Dump, compile, render -- the three steps `create_compose` performs,
+    with the same context, so the answer is the one that matters rather
+    than an approximation of it.
+
+    Compiling alone was not enough, twice over. `Template()` compiles as
+    well as parses, and a family of `TemplateAssertionError`s comes only
+    from the compile step. And a symbol can be DEFINED in one env value
+    and USED in another: popping the definition (it dereferences an
+    unset type) while keeping the use (it dereferences nothing) leaves a
+    document that compiles perfectly and raises `'u' is undefined` at
+    render:
+
+        A: '{% macro u(p) %}{{ oidc.issuer }}{{ p }}{% endmacro %}'
+        B: '{{ u(1) }}'
 
     Any failure is a no, including a compose that will not dump.
     """
     try:
-        Environment().from_string(yaml.dump(compose))
+        Environment().from_string(yaml.dump(compose)).render(**render_context)
     except Exception:
         return False
     return True
@@ -599,9 +609,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # including that popping a `{% raw %}` pair UN-SHIELDS what sat
     # between it, so the strip can add constructs, not only remove
     # them.
-    parsed_before = _document_parses(compose)
+    # The exact context `create_compose` renders with, so the guard's
+    # question is the render's question and not a proxy for it.
+    render_context = _compose_render_context(greffon_info)
+    rendered_before = _document_renders(compose, render_context)
     snapshot = None
-    if parsed_before:
+    if rendered_before:
         try:
             snapshot = copy.deepcopy(compose)
         except Exception:
@@ -696,8 +709,15 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         Still incomplete in the same two places the lexer was, and for the
         same reason -- aliasing (`{% set a = oidc %}{{ a.issuer }}`, a macro
         argument) and `|map(attribute='a.b')` move the dereference off this
-        name entirely. Deciding those needs dataflow, not syntax. The
-        binding is what covers them: they render empty instead of raising.
+        name entirely. Deciding those needs dataflow, not syntax.
+
+        The binding covers the SIMPLE aliases -- `{{ base }}` where
+        `base` was set from `oidc.url` renders empty rather than
+        raising. It does NOT cover a name bound to a definition that
+        gets popped: the binding knows `oidc`, not the macro named after
+        it. `{% macro u() %}{{ oidc.x }}{% endmacro %}` in one env value
+        and `{{ u() }}` in another raises `'u' is undefined`. That is
+        what the document guard is for.
 
         Over-pops a locally shadowed name (`{% for oidc in xs %}`), exactly
         as the lexer and `main` both do. Over-pop costs an env var;
@@ -788,15 +808,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 kept.append(e)
             service['environment'] = kept
 
-    # `snapshot is not None` already implies the document parsed before
-    # and could be copied; re-testing `parsed_before` here would be a
-    # second spelling of the same condition.
-    if snapshot is not None and not _document_parses(compose):
-        _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info)
+    # `snapshot is not None` already implies the document rendered
+    # before and could be copied; re-testing `rendered_before` here
+    # would be a second spelling of the same condition.
+    if snapshot is not None and not _document_renders(compose, render_context):
+        _reapply_pops_that_keep_it_renderable(
+            compose, snapshot, greffon_info, render_context)
     return compose
 
 
-def _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info):
+def _reapply_pops_that_keep_it_renderable(
+        compose, snapshot, greffon_info, render_context):
     """Keep every pop that is safe on its own; undo only the ones that
     break the document.
 
@@ -824,34 +846,69 @@ def _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info):
         for item in _items_removed(items, after.get(service, ()))
     ]
 
-    # The loop below dumps and compiles the WHOLE document once per
-    # popped key, so it is quadratic in that count. Real catalog entries
-    # pop 10-30 keys (well under a second), but the custom-compose epic
-    # makes this input user-controlled, and 1500 keys measured at ~94s
-    # of CPU on a `/start/` request. Past the cap, undo everything: the
-    # safe-but-blunt answer, rather than letting a compose choose how
-    # much CPU to spend.
-    if len(popped) > _MAX_UNDO_STEPS:
-        logger.warning(
-            'integration strip left instance %s unrenderable with %d popped '
-            'keys, over the %d-key limit; undoing all of them',
-            greffon_info.get('id'), len(popped), _MAX_UNDO_STEPS,
-        )
-        compose.clear()
-        compose.update(snapshot)
-        return
-
+    # Deciding one pop at a time costs a full dump+compile+render per
+    # step, which is quadratic in the number of popped keys. Chunk it:
+    # try a whole batch, and only fall back to one-at-a-time for a batch
+    # that fails. A real catalog entry pops 10-30 keys and almost never
+    # reaches here at all; the custom-compose epic makes this input
+    # user-controlled, so the work is also capped.
+    #
+    # Running out of budget undoes only the pops not yet DECIDED, never
+    # the ones already kept. Restoring everything wholesale was the
+    # earlier behaviour and it re-introduced the bug this function
+    # exists to prevent: glitchtip's `EMAIL_URL` came back to render
+    # `smtp://:@`. Degrading has to preserve the decisions already made.
     last_good = copy.deepcopy(snapshot)
     kept, undone = [], []
-    for service, item in popped:
+    budget = _MAX_UNDO_RENDERS
+    index = 0
+
+    def label(service, item):
         name = item[0] if isinstance(item, tuple) else str(item).split('=', 1)[0]
+        return f'{service}.{name}'
+
+    def try_removing(batch):
+        """Apply `batch` to a copy of `last_good`; keep it if it renders."""
+        nonlocal last_good, budget
         trial = copy.deepcopy(last_good)
-        _remove_env_item(trial, service, item)
-        if _document_parses(trial):
+        for service, item in batch:
+            _remove_env_item(trial, service, item)
+        budget -= 1
+        if _document_renders(trial, render_context):
             last_good = trial
-            kept.append(f'{service}.{name}')
-        else:
-            undone.append(f'{service}.{name}')
+            return True
+        return False
+
+    while index < len(popped) and budget > 0:
+        chunk = popped[index:index + _UNDO_CHUNK]
+        if try_removing(chunk):
+            kept.extend(label(*one) for one in chunk)
+            index += len(chunk)
+            continue
+        if len(chunk) == 1:
+            undone.append(label(*chunk[0]))
+            index += 1
+            continue
+        # The batch failed, so decide its members individually. `index`
+        # only advances past ones actually decided, so running out of
+        # budget mid-chunk leaves the rest to the tail below.
+        for one in chunk:
+            if budget <= 0:
+                break
+            if try_removing([one]):
+                kept.append(label(*one))
+            else:
+                undone.append(label(*one))
+            index += 1
+
+    if index < len(popped):
+        undone.extend(label(*one) for one in popped[index:])
+        logger.warning(
+            'integration strip on instance %s exhausted the %d-render undo '
+            'budget with %d popped keys; the %d undecided ones stay un-popped',
+            greffon_info.get('id'), _MAX_UNDO_RENDERS, len(popped),
+            len(popped) - index,
+        )
 
     logger.warning(
         'integration strip left instance %s unrenderable; kept %s and undid '
