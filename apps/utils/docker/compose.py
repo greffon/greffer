@@ -1,5 +1,6 @@
 import yaml
 import asyncio
+import re
 import json
 import logging
 from datauri import DataURI
@@ -424,6 +425,14 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        the template pass catches it directly from the compose body
        before Jinja renders.
 
+    SCOPE: both passes look only at ``services[*].environment``. A
+    reference from ``command``, ``labels``, ``env_file`` or anywhere else
+    is NOT popped, and the binding does not save every such case either
+    (it absorbs attribute access, but ``{{ oidc.port|int }}`` still
+    raises). Those render exactly as they do on ``main`` -- this function
+    narrows the failure, it does not eliminate it. The guarantee is
+    "absent integration => no env var", not "no reference anywhere".
+
     Defensive on shape: catalog metadata is supposed to use mapping-
     form ``environment:`` per the Feature #2 validator, but compose
     YAML also permits list form (``KEY=value``); both passes handle
@@ -520,18 +529,34 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         """
         try:
             ast = parser_env.parse(value)
-        except (TemplateError, RecursionError):
-            # Unparseable, or nested past the parser's stack limit
-            # (~200 levels, on input the catalog controls and `/start/`
-            # reaches). Either way it cannot render, so pop the key
-            # rather than let it fail the whole document. RecursionError
-            # is NOT a TemplateError and would otherwise escape as a 500.
-            return True
+        except (TemplateError, RecursionError, ValueError):
+            # Nothing the parser raises may escape: this runs inside
+            # `/start/`, so an exception here is a 500 and the instance
+            # never starts. All three are reachable on catalog-controlled
+            # input. TemplateError: `yaml.dump` doubles an inner quote, so
+            # malformed expressions really do arrive. RecursionError: the
+            # parser recurses per nesting level and blows the stack around
+            # 200 deep. ValueError: CPython refuses to convert an integer
+            # literal over 4300 digits (3.11+). Only the first is a Jinja
+            # error at all, which is why the tuple is not just
+            # `TemplateError`.
+            #
+            # Fall back to the crudest form of the question -- does the
+            # name occur at all? A value that never mentions `oidc` cannot
+            # dereference it except by aliasing, which is the residual
+            # named above and is no worse here than anywhere else. So a
+            # broken value with no integration reference keeps `main`'s
+            # behaviour (it fails the render, loudly) instead of being
+            # silently dropped, while anything that does mention the name
+            # is popped, which is the safe direction.
+            return re.search(rf'\b{re.escape(name)}\b', value) is not None
         for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
             target = node.node
-            if (isinstance(target, nodes.Name)
-                    and target.name == name
-                    and target.ctx == 'load'):
+            # No `ctx` check: a store-context Getattr is unreachable from
+            # Jinja source (`{% set oidc.a = 1 %}` parses to no Getattr,
+            # `{% for oidc.a in xs %}` is a syntax error), so testing it
+            # would pin nothing.
+            if isinstance(target, nodes.Name) and target.name == name:
                 return True
         return False
 
@@ -619,7 +644,7 @@ def _compose_render_context(greffon_info):
         # populated, since that key is not `{}` either. Re-deriving
         # "unset" from `integrations` here would be a second, redundant
         # spelling of the same condition that could drift from it.
-        if context.get(t) == {}:
+        if not context.get(t):
             context[t] = _UnsetIntegration()
     return context
 
