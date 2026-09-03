@@ -1331,6 +1331,89 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
+    """The ordinary way to write an optional integration.
+
+        MAIL_HOST: {% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}
+        MAIL_PORT: {{ smtp.port if smtp else 25 }}
+
+    The read in the taken-true branch cannot happen when `smtp` is
+    unset, because the binding is a falsy empty mapping -- the value
+    renders `localhost` and `25`, exactly what its author intended. The
+    rule popped them anyway: it exempted the guard SLOT but not the
+    branch that slot protects, so the container came up with the
+    variable absent instead of carrying the fallback.
+
+    Being wrong here is an UNDER-pop, which is the severe direction, so
+    only two shapes count as dominating: the test asserts the type is
+    truthy (itself, a field of it, or either inside an `and` chain), or
+    it is `not` that, which dominates the other branch instead. `or`
+    dominates nothing -- `{% if other or smtp %}` runs its body with the
+    integration unset -- and a `{% for %}` filter dominates nothing
+    either, being per-item rather than a precondition.
+    """
+
+    CFG = {'smtp': {'host': 'mail.ex', 'port': 587}}
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def _render(self, value, integrations):
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations})
+        return Template(value).render(other=0, **_compose_render_context(info))
+
+    def test_the_fallback_survives_and_is_what_renders(self):
+        for value, unset, configured in (
+            ('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}',
+             'localhost', 'mail.ex'),
+            ('{{ smtp.port if smtp else 25 }}', '25', '587'),
+            ('{% if not smtp %}none{% else %}{{ smtp.host }}{% endif %}',
+             'none', 'mail.ex'),
+            ('{% if smtp.host %}{{ smtp.host }}{% else %}lo{% endif %}',
+             'lo', 'mail.ex'),
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+                self.assertEqual(self._render(value, {}), unset)
+                self.assertEqual(self._render(value, self.CFG), configured)
+
+    def test_an_and_chain_still_dominates(self):
+        self.assertTrue(
+            self._survives('{% if smtp and other %}{{ smtp.host }}{% endif %}'))
+
+    def test_or_dominates_nothing(self):
+        # The body can run with the integration unset, so the read is
+        # reachable and the key must go.
+        self.assertFalse(
+            self._survives('{% if other or smtp %}{{ smtp.host }}{% endif %}'))
+
+    def test_a_negated_test_dominates_the_OTHER_branch(self):
+        # `{% if not smtp %}` runs its BODY when unset, so a read there
+        # is reachable and pops -- the mirror of the case above.
+        self.assertFalse(
+            self._survives('{% if not smtp %}{{ smtp.host }}{% endif %}'))
+
+    def test_the_object_itself_escaping_a_dominated_branch_still_pops(self):
+        # The under-pop domination introduced. Here the dominated
+        # branch is the BARE name, so the mapping object escapes
+        # through the alias and is read unconditionally afterwards --
+        # rendering present-but-empty. A DEREFERENCE in the same
+        # position is safe, because it cannot happen when unset.
+        self.assertFalse(self._survives(
+            '{% set x = smtp if smtp else {} %}{{ x.host }}'))
+        self.assertTrue(self._survives(
+            '{% set x = smtp.host if smtp else "lo" %}{{ x }}'))
+
+    def test_a_loop_filter_dominates_nothing(self):
+        # It runs per item, so it is not a precondition on the body.
+        self.assertFalse(
+            self._survives('{% for x in [1] if smtp %}{{ smtp.host }}{% endfor %}'))
+
+
 class TheReadRuleIsCompleteByConstructionTests(TestCase):
     """The base question is Jinja's, not ours.
 
@@ -1461,11 +1544,8 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
         # these has one outside a guard slot.
         for value in (
             '{{ (smtp if smtp else smtp).host }}',
-            '{% if smtp is mapping and smtp.host %}{{ smtp.host }}{% endif %}',
             '{% set x = smtp if smtp else {} %}{{ x.host }}',
-            '{% if smtp %}{{ smtp.host }}{% endif %}',
             '{{ smtp.host if 1 else 2 }}',
-            '{% if [smtp.host] %}{{ smtp.host }}{% endif %}',
             '{{ (smtp if 1 else {}).host }}',
         ):
             with self.subTest(value=value):
@@ -1478,8 +1558,6 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
         # it, and it must not depend on which occurrence it happens to
         # visit first -- so the read is placed both before and after
         # the guard.
-        self.assertFalse(self._survives(
-            '{% if smtp %}{{ smtp.host }}{% endif %}'))
         self.assertFalse(self._survives(
             '{% if smtp %}on{% endif %}{{ smtp|urlencode }}'))
         self.assertFalse(self._survives(
@@ -2705,7 +2783,10 @@ class JinjaFormsTheContractCoversTests(TestCase):
         # There is no guard concept any more: a dereference is a
         # dereference wherever it sits. Both of these pop, exactly as
         # they do on main.
-        self.assertFalse(self._survives('{{ oidc if oidc.issuer else 1 }}'))
+        # `{{ oidc if oidc.issuer else 1 }}` is NOT here: its test
+        # asserts the integration is configured, so the branch reading
+        # it is unreachable when unset. See
+        # `AGuardedBranchIsUnreachableWhenUnsetTests`.
         self.assertFalse(self._survives('{{ oidc and oidc.issuer }}'))
 
     def test_a_quote_inside_a_comment_does_not_swallow_the_terminator(self):
