@@ -479,6 +479,47 @@ _UNDO_TIME_BUDGET = 5.0
 # Filters that read an attribute off their operand, so they dereference
 # without producing a `Getattr` node. `attr` names the attribute
 # positionally; the rest take an `attribute=` keyword.
+def _can_evaluate_to(target, name):
+    """Can this expression evaluate to the top-level `name` itself?
+
+    Requiring the target to be literally a `Name` node missed every
+    form that puts an operator between the name and the dot, and those
+    are ordinary defensive catalog idioms rather than adversarial
+    shapes:
+
+        {{ (smtp or {}).host }}          Or
+        {{ (smtp|default({})).host }}    Filter
+        {{ (smtp if smtp else s).host }} CondExpr
+        {{ [smtp][0].host }}             List behind a Getitem
+
+    Each survived the strip and rendered empty, so a catalog author
+    writing the careful "be safe when it is unset" form was exactly the
+    one who got `EMAIL_URL: smtp://:@` -- silently, with no log line,
+    because the strip believed there was nothing to pop.
+
+    A `Call` is the one barrier. Its RESULT is not its operand, so
+    `{{ dict(oidc).get('x') }}` reads a new object rather than `oidc`,
+    and treating it as a dereference over-pops. That is the same
+    call-versus-grouping distinction the parser already resolves for
+    us everywhere else.
+
+    Over-popping through the other node types is deliberate and safe:
+    the expression does mention the name, and losing one env var on an
+    integration nobody configured beats a malformed value that ships.
+    """
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, nodes.Name):
+            if node.name == name:
+                return True
+            continue
+        if isinstance(node, nodes.Call):
+            continue
+        stack.extend(node.iter_child_nodes())
+    return False
+
+
 _ATTRIBUTE_FILTERS = frozenset({
     'attr', 'map', 'selectattr', 'rejectattr', 'groupby', 'sort',
     'min', 'max', 'sum',
@@ -819,12 +860,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # thought of.
             return re.search(rf'\b{re.escape(name)}\b', value) is not None
         for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
-            target = node.node
             # No `ctx` check: a store-context Getattr is unreachable from
             # Jinja source (`{% set oidc.a = 1 %}` parses to no Getattr,
             # `{% for oidc.a in xs %}` is a syntax error), so testing it
             # would pin nothing.
-            if isinstance(target, nodes.Name) and target.name == name:
+            if _can_evaluate_to(node.node, name):
                 return True
 
         # Dereferences that are not `Getattr`/`Getitem` nodes at all.
@@ -1041,7 +1081,8 @@ def _reapply_pops_that_keep_it_renderable(
 
     logger.warning(
         'integration strip left instance %s unrenderable; kept %s and undid '
-        '%s, which will render empty through the unset binding instead',
+        '%s, which stay in the compose and render through the unset binding '
+        'instead of being absent',
         greffon_info.get('id'),
         ', '.join(kept) or 'nothing',
         ', '.join(undone) or 'nothing',
