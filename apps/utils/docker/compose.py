@@ -498,6 +498,71 @@ _GUARD_SLOTS = frozenset({
 })
 
 
+def _conjuncts(node):
+    """Flatten an `and` chain; anything else is a single conjunct.
+
+    `or` is deliberately NOT flattened: `{% if other or smtp %}` can run
+    its body with `smtp` unset, so it dominates nothing.
+    """
+    if isinstance(node, nodes.And):
+        return _conjuncts(node.left) + _conjuncts(node.right)
+    return [node]
+
+
+def _asserts_truthy(test, name):
+    """Does `test` being TRUE imply the integration is configured?
+
+    True for a conjunct that is the name itself or a dereference rooted
+    at it -- `{% if smtp %}`, `{% if smtp and x %}`, `{% if smtp.host %}`
+    -- because none of those can be truthy on the unset binding, which
+    is an empty mapping whose fields are all falsy.
+    """
+    for conjunct in _conjuncts(test):
+        node = conjunct
+        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
+            node = node.node
+        if isinstance(node, nodes.Name) and node.name == name:
+            return True
+    return False
+
+
+def _dominated_slots(node, name):
+    """Fields of `node` that only run when the integration IS configured.
+
+    A guard slot says the mapping decides something; this says WHICH
+    branch that decision protects. `{% if smtp %}{{ smtp.host }}{% else
+    %}localhost{% endif %}` is the ordinary way to write an optional
+    integration, and the read in the body is unreachable when `smtp` is
+    unset -- the value renders `localhost`, exactly as its author
+    intended, so popping it discarded a working setting.
+
+    Only the two direct shapes, because being wrong here is an
+    UNDER-pop, which is the severe direction. `{% if not smtp %}` is
+    handled as the mirror -- it dominates the ELSE branch -- and
+    `{% if other or smtp %}` dominates nothing, since the body can run
+    with the integration unset.
+
+    `For.test` is excluded on purpose: a loop filter runs per item, so
+    it does not dominate the body.
+    """
+    if isinstance(node, nodes.If):
+        positive, negative = ('body', 'elif_'), ('else_',)
+    elif isinstance(node, nodes.CondExpr):
+        positive, negative = ('expr1',), ('expr2',)
+    else:
+        # Notably `For`: its `test` is a per-item filter, so it is a
+        # guard slot but never a precondition on the body.
+        return ()
+    test = node.test
+    if test is None:
+        return ()
+    if _asserts_truthy(test, name):
+        return positive
+    if isinstance(test, nodes.Not) and _asserts_truthy(test.node, name):
+        return negative
+    return ()
+
+
 def _reads(ast, name):
     """Does this parsed template READ the top-level `name`?
 
@@ -547,18 +612,40 @@ def _reads(ast, name):
     # (`{% filter upper %}..{% endfilter %}`) has that slot EMPTY, so it
     # raised an uncaught AttributeError out of `/start/`. Pushing only
     # `Node` instances makes that unrepresentable rather than guarded.
-    stack = [(ast, False)]
+    # State per occurrence: FREE reads, SLOT is inside a guard test,
+    # DOMINATED is inside a branch that only runs when the integration
+    # is configured.
+    FREE, SLOT, DOMINATED = 0, 1, 2
+    stack = [(ast, FREE, False)]
     while stack:
-        node, guarded = stack.pop()
+        node, state, via_deref = stack.pop()
         if isinstance(node, nodes.Name) and node.name == name:
-            if not guarded:
-                return True
-            continue
+            if state == SLOT:
+                continue
+            # In a dominated branch a DEREFERENCE is unreachable when
+            # unset, so it is safe -- but a BARE name is not, because
+            # the mapping object itself escapes and can be read later:
+            # `{% set x = smtp if smtp else {} %}{{ x.host }}` renders
+            # present-but-empty, which is the failure this pass exists
+            # to stop.
+            if state == DOMINATED and via_deref:
+                continue
+            return True
+        dominated = _dominated_slots(node, name)
+        deref_slot = (isinstance(node, (nodes.Getattr, nodes.Getitem)))
         for field, value in node.iter_fields():
-            child_guarded = guarded or (type(node), field) in _GUARD_SLOTS
+            if state != FREE:
+                child_state = state
+            elif (type(node), field) in _GUARD_SLOTS:
+                child_state = SLOT
+            elif field in dominated:
+                child_state = DOMINATED
+            else:
+                child_state = FREE
+            child_deref = via_deref or (deref_slot and field == 'node')
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
-                    stack.append((item, child_guarded))
+                    stack.append((item, child_state, child_deref))
     return False
 
 
