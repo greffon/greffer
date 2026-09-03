@@ -601,35 +601,34 @@ def _unless_a_value_escapes(node, slots):
     return tuple(kept)
 
 
-def _guard_spans_the_whole_value(ast):
-    """Is the guarded construct the ENTIRE value, with no literal around it?
+# Descents through which "this node is the whole output" survives. Only
+# one branch of an `If`/`CondExpr` renders at a time, and a `Template`
+# or `Output` with a single child renders just that child.
+#
+# An allowlist, because the alternative failed: counting nodes per FIELD
+# let `{{ "https://" + (oidc.issuer if oidc else "") + "/auth" }}`
+# through, since an `Add` holds one node in `left` and one in `right`
+# and each looked solitary. Both operands render, so neither is the
+# whole value -- and that shape produced `https:///auth`. Anything not
+# listed here loses the property, which costs an over-pop.
+_SPAN_PRESERVING = frozenset({
+    (nodes.Template, 'body'),
+    (nodes.Output, 'nodes'),
+    (nodes.If, 'body'),
+    (nodes.If, 'else_'),
+    (nodes.CondExpr, 'expr1'),
+    (nodes.CondExpr, 'expr2'),
+})
 
-    Domination asks whether the READ can happen. It does not ask whether
-    the text around it still renders, and that gap ships the exact
-    malformed values this pass exists to stop:
 
-        smtp://{{ smtp.user if smtp else "" }}@{{ smtp.host if smtp else "" }}
-        https://{% if smtp %}{{ smtp.host }}{% endif %}/path
+def _sole_node(value):
+    """Is `value` a field holding exactly one AST node?
 
-    Both keep their literal scaffolding when the integration is unset --
-    `smtp://:@` and `https:///path` -- so the key is present and broken,
-    which is worse than absent and is what `main` avoids by popping
-    them. The read really is unreachable; the value is still wrong.
-
-    So a branch is only dominated when the whole value IS the guard: one
-    `{% if %}`, or one `{{ a if test else b }}`. Anything with literal
-    text beside it falls back to being a read, which pops -- the safe
-    direction, and what `main` already did.
+    Used to decide whether a construct accounts for ALL of the output
+    around it. A field with siblings means something else renders too.
     """
-    body = getattr(ast, 'body', None)
-    if not isinstance(body, list) or len(body) != 1:
-        return False
-    node = body[0]
-    if isinstance(node, nodes.If):
-        return True
-    return (isinstance(node, nodes.Output)
-            and len(node.nodes) == 1
-            and isinstance(node.nodes[0], nodes.CondExpr))
+    items = value if isinstance(value, list) else [value]
+    return sum(1 for item in items if isinstance(item, nodes.Node)) == 1
 
 
 def _reads(ast, name):
@@ -685,10 +684,19 @@ def _reads(ast, name):
     # DOMINATED is inside a branch that only runs when the integration
     # is configured.
     FREE, SLOT, DOMINATED = 0, 1, 2
-    whole_value_guard = _guard_spans_the_whole_value(ast)
-    stack = [(ast, FREE, False)]
+    # `spans` tracks whether this node accounts for ALL of the value's
+    # output. Domination says the READ cannot happen; it says nothing
+    # about the text AROUND the read, and that text still renders --
+    # `smtp://{% if smtp %}{{ smtp.user }}{% endif %}@h` gives
+    # `smtp://@h` unset, present and malformed.
+    #
+    # It has to be recomputed per node, not decided once for the value.
+    # Latching it from the root let any guard nested inside a
+    # non-dominating outer one inherit the licence, so wrapping that
+    # same string in `{% if true %}` flipped it from popped to kept.
+    stack = [(ast, FREE, False, True)]
     while stack:
-        node, state, via_deref = stack.pop()
+        node, state, via_deref, spans = stack.pop()
         if isinstance(node, nodes.Name) and node.name == name:
             if state == SLOT:
                 continue
@@ -701,7 +709,7 @@ def _reads(ast, name):
             if state == DOMINATED and via_deref:
                 continue
             return True
-        dominated = _dominated_slots(node, name) if whole_value_guard else ()
+        dominated = _dominated_slots(node, name) if spans else ()
         deref_slot = (isinstance(node, (nodes.Getattr, nodes.Getitem)))
         for field, value in node.iter_fields():
             if state != FREE:
@@ -713,9 +721,12 @@ def _reads(ast, name):
             else:
                 child_state = FREE
             child_deref = via_deref or (deref_slot and field == 'node')
+            child_spans = (spans
+                           and (type(node), field) in _SPAN_PRESERVING
+                           and _sole_node(value))
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
-                    stack.append((item, child_state, child_deref))
+                    stack.append((item, child_state, child_deref, child_spans))
     return False
 
 
