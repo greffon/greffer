@@ -1331,6 +1331,36 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class DefaultDependsOnWhatItIsAppliedToTests(TestCase):
+    """`|default` on the MAPPING is not the same as on a FIELD.
+
+    Two comments in the module contradicted each other on this, and the
+    wrong one was written as guidance for whoever builds the OIDC client
+    registration. Pinned so neither can drift again.
+    """
+
+    def _render(self, template):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        return Template(template).render(**_compose_render_context(info))
+
+    def test_default_on_the_mapping_does_not_fire(self):
+        # The binding is a defined-but-empty mapping, so there is
+        # nothing for `default` to replace.
+        self.assertEqual(self._render('{{ oidc|default("d") }}'), '{}')
+
+    def test_default_on_a_field_does_fire(self):
+        # A missing field IS undefined.
+        self.assertEqual(self._render('{{ oidc.issuer|default("d") }}'), 'd')
+
+    def test_get_with_a_default_fires(self):
+        self.assertEqual(self._render('{{ oidc.get("k", "d") }}'), 'd')
+
+    def test_the_baked_file_path_agrees(self):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        self.assertEqual(
+            _render_baked_file('{{ oidc|default("d") }}', info, 'f.json'), '{}')
+
+
 class AGuardCanLeakThroughACallArgumentTests(TestCase):
     """A guard test only DECIDES -- unless it hands the type to a call.
 
