@@ -12,6 +12,8 @@
 #   - Adding the type does not disturb SMTP.
 
 import logging
+import os
+import tempfile
 from unittest import TestCase
 from unittest.mock import mock_open, patch
 
@@ -20,13 +22,15 @@ import yaml
 from jinja2 import Environment, Template, UndefinedError
 from jinja2.exceptions import TemplateAssertionError, TemplateSyntaxError
 
+from apps.utils.docker import compose as compose_module
 from apps.utils.docker.compose import (
     KNOWN_INTEGRATION_TYPES,
     ConfigRenderError,
     _UnsetIntegration,
     _compose_render_context,
-    _MAX_UNDO_STEPS,
-    _document_parses,
+    _MAX_UNDO_RENDERS,
+    _UNDO_CHUNK,
+    _document_renders,
     _render_baked_file,
     build_render_context,
     _compute_integrations_context,
@@ -734,10 +738,12 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         self.assertIn('undid', joined)
 
     def test_a_compose_that_cannot_be_dumped_answers_no(self):
-        # `_document_parses` must ANSWER for any input, never raise --
+        # `_document_renders` must ANSWER for any input, never raise --
         # it runs on the `/start/` path. A generator makes `yaml.dump`
         # raise TypeError, which is not a Jinja error at all.
-        self.assertFalse(_document_parses({'services': (i for i in [1])}))
+        self.assertFalse(
+            _document_renders({'services': (i for i in [1])}, {}),
+        )
 
     def test_an_uncopyable_compose_does_not_crash_the_strip(self):
         # Reachable: a module DUMPS (so the document parses and the
@@ -785,7 +791,7 @@ class ServicesThatIsNotAMappingTests(TestCase):
 
 
 class TheGuardAsksTheRenderQuestionTests(TestCase):
-    """`_document_parses` must compile, not merely parse.
+    """`_document_renders` must compile, not merely parse.
 
     The render is `Template(...)`, which parses AND compiles, and a
     family of `TemplateAssertionError`s comes only from the compile
@@ -1054,17 +1060,87 @@ class OneLevelMissIsQuietTests(TestCase):
                 )
 
 
-class TheUndoIsBoundedTests(TestCase):
-    """Past a cap the undo is wholesale, so a compose cannot pick its cost.
+class ASymbolDefinedInOneValueAndUsedInAnotherTests(TestCase):
+    """The guard must RENDER, not merely compile.
 
-    The one-at-a-time loop dumps and compiles the whole document per
-    step, which is quadratic. Fine for a catalog entry (10-30 keys), but
-    the custom-compose epic makes this input user-controlled.
+    A macro or namespace can be defined in one env value and used in
+    another. The definition dereferences an unset type so it is popped;
+    the use dereferences nothing so it is kept. What remains compiles
+    perfectly and raises at render:
+
+        A: '{% macro u(p) %}{{ oidc.issuer }}{{ p }}{% endmacro %}'
+        B: '{{ u(1) }}'                 -> "'u' is undefined"
+
+    That is a 500 at `/start/` on a compose that renders on `main`, and
+    a compile-only guard cannot see it. It is also the counter-example
+    to the claim that the binding covers every aliasing residual: the
+    binding covers `oidc`, not the macro name bound to it.
     """
 
-    def _compose(self, n):
-        env = {f'K{i}': '{{ oidc.issuer }}' for i in range(n)}
-        env['A_OPEN'] = '{# note'
+    CASES = {
+        'macro': {'A_DEF': '{% macro u(p) %}{{ oidc.issuer }}{{ p }}{% endmacro %}',
+                  'B_USE': '{{ u(1) }}'},
+        'namespace': {'A_DEF': '{% set ns = namespace(v=smtp.host) %}',
+                      'B_USE': '{{ ns.v }}'},
+    }
+
+    def _run(self, env):
+        compose = {'services': {'app': {'environment': dict(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def test_the_definition_is_not_popped_out_from_under_its_use(self):
+        for name, env in self.CASES.items():
+            with self.subTest(case=name):
+                compose, info = self._run(env)
+                # Must not raise: this is the 500 the guard now catches.
+                Template(yaml.dump(compose)).render(
+                    **_compose_render_context(info))
+
+    def test_both_halves_survive(self):
+        for name, env in self.CASES.items():
+            with self.subTest(case=name):
+                compose, _ = self._run(env)
+                self.assertEqual(
+                    compose['services']['app']['environment'], env)
+
+    def test_compiling_alone_would_not_have_caught_it(self):
+        # Pins the premise. The stripped document COMPILES; only
+        # rendering it reveals the missing definition.
+        stripped = {'services': {'app': {'environment': {'B_USE': '{{ u(1) }}'}}}}
+        text = yaml.dump(stripped)
+        Environment().from_string(text)  # compiles happily
+        with self.assertRaises(UndefinedError):
+            Environment().from_string(text).render()
+
+    def test_a_clean_pop_beside_them_still_happens(self):
+        # The guard must not become so timid that the feature stops
+        # working: an unrelated clean pop in the same service survives.
+        compose, _ = self._run(dict(self.CASES['macro'],
+                                    H='{{ oidc.issuer }}'))
+        self.assertNotIn('H', compose['services']['app']['environment'])
+
+
+class TheUndoIsBoundedTests(TestCase):
+    """The undo is chunked and budgeted, and degrades without regressing.
+
+    Each attempt costs a full dump+compile+render, so deciding one key
+    at a time is quadratic. Keys are tried in batches and only a failing
+    batch is split.
+
+    Crucially, running out of budget undoes only the keys not yet
+    DECIDED. Restoring everything wholesale was the earlier behaviour
+    and it brought back the very bug this function exists to prevent:
+    glitchtip's `EMAIL_URL` rendering `smtp://:@`.
+    """
+
+    def _compose(self, n, with_email=True):
+        env = {}
+        if with_email:
+            env['A_EMAIL_URL'] = 'smtp://{{ smtp.username }}@{{ smtp.host }}'
+        env.update({f'K{i:04d}': '{{ oidc.issuer }}' for i in range(n)})
+        env['Y_OPEN'] = '{# note'
         env['Z_CLOSE'] = '{{ oidc.host }} #}'
         return {'services': {'app': {'environment': env}}}
 
@@ -1073,21 +1149,93 @@ class TheUndoIsBoundedTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return compose['services']['app']['environment'], info
 
-    def test_under_the_cap_the_undo_is_selective(self):
-        env, _ = self._run(self._compose(5))
-        self.assertNotIn('K0', env)     # clean pops survive
-        self.assertIn('A_OPEN', env)    # the straddling pair is undone
+    def test_a_small_case_is_decided_selectively(self):
+        env, info = self._run(self._compose(5))
+        self.assertNotIn('K0000', env)      # clean pops survive
+        self.assertNotIn('A_EMAIL_URL', env)
+        self.assertIn('Y_OPEN', env)        # the straddling pair is undone
+        Template(yaml.dump({'services': {'app': {'environment': env}}})).render(
+            **_compose_render_context(info))
 
-    def test_over_the_cap_everything_is_undone(self):
-        with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
-            env, _ = self._run(self._compose(_MAX_UNDO_STEPS + 5))
-        self.assertIn('K0', env)
-        self.assertIn('over the', ''.join(caught.output))
+    def test_a_batch_that_renders_is_kept_whole(self):
+        # More keys than one chunk, all clean: still fully popped.
+        env, _ = self._run(self._compose(_UNDO_CHUNK * 3))
+        self.assertNotIn('A_EMAIL_URL', env)
+        self.assertFalse([k for k in env if k.startswith('K')])
 
-    def test_over_the_cap_the_document_still_renders(self):
-        compose = self._compose(_MAX_UNDO_STEPS + 5)
-        _, info = self._run(compose)
+    def test_beyond_the_budget_the_earlier_decisions_still_hold(self):
+        # The regression guard: exhausting the budget must NOT resurrect
+        # the malformed URL. The budget is patched rather than reached
+        # with a huge compose -- the behaviour is what matters, and a
+        # 1600-key document costs seconds to render repeatedly.
+        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
+            env, _ = self._run(self._compose(_UNDO_CHUNK * 4))
+        self.assertNotIn('A_EMAIL_URL', env)
+
+    def test_beyond_the_budget_the_document_still_renders(self):
+        compose = self._compose(_UNDO_CHUNK * 4)
+        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
+            _, info = self._run(compose)
         Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_beyond_the_budget_the_undecided_keys_are_left_alone(self):
+        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
+            env, _ = self._run(self._compose(_UNDO_CHUNK * 4))
+        # Some clean pops were never decided, so they survive un-popped.
+        self.assertTrue([k for k in env if k.startswith('K')])
+
+    def test_exhausting_the_budget_is_logged(self):
+        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
+            with self.assertLogs(
+                'apps.utils.docker.compose', level='WARNING',
+            ) as caught:
+                self._run(self._compose(_UNDO_CHUNK * 4))
+        self.assertIn('undo budget', ''.join(caught.output))
+
+
+class LogRotationIsInjectedBeforeTheStripTests(TestCase):
+    """Ordering inside `create_compose`, which nothing pinned.
+
+    The guard approves the exact text that will be rendered. Injecting
+    the `logging:` block AFTERWARDS changed that text, and appending is
+    not neutral to Jinja: an unclosed `{% raw %}` is accepted at EOF and
+    rejected once anything follows it. So the guard could approve a
+    document that then failed to compile.
+    """
+
+    def test_appending_content_can_change_jinja_s_answer(self):
+        # The premise. Without this the ordering is arbitrary.
+        Environment().from_string('x{% raw %}')
+        with self.assertRaises(TemplateSyntaxError):
+            Environment().from_string('x{% raw %}\nmore: content\n')
+
+    def test_create_compose_injects_logging_before_stripping(self):
+        order = []
+        real_inject = compose_module._inject_instance_log_rotation
+        real_strip = compose_module._delete_unset_integration_env_keys
+
+        def inject(compose):
+            order.append('inject')
+            return real_inject(compose)
+
+        def strip(compose, greffon_info):
+            order.append('strip')
+            svc = (compose.get('services') or {}).get('app') or {}
+            order.append('logging' if 'logging' in svc else 'no-logging')
+            return real_strip(compose, greffon_info)
+
+        info = {'id': 'i1', 'integrations': {},
+                'volumes': {}, 'networks': {}, 'ports': [], 'configurations': []}
+        compose = {'services': {'app': {'image': 'nginx',
+                                        'environment': {'H': '{{ oidc.a }}'}}}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'GREFFON_PATH': tmp}), \
+                patch.object(compose_module, '_inject_instance_log_rotation', inject), \
+                patch.object(
+                    compose_module, '_delete_unset_integration_env_keys', strip):
+            compose_module.create_compose(compose, info)
+
+        self.assertEqual(order, ['inject', 'strip', 'logging'])
 
 
 class MalformedPayloadShapesDoNotCrashTests(TestCase):
