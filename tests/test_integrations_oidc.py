@@ -1330,6 +1330,77 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class IteratingTheTypeIsADereferenceTests(TestCase):
+    """`{% for k in smtp %}` reads the mapping, and produces no node the
+    other rules look at.
+
+    It is the shortest spelling of what `{% for k, v in smtp|items %}`
+    does -- that one was popped and this one was not, which is an
+    arbitrary line between two forms of one idiom. Like the filter case
+    it renders correctly when the integration is configured, so a
+    catalog author has every reason to ship it, and unset it left the
+    key present-but-empty with no log line.
+    """
+
+    CONFIGURED = {'smtp': {'host': 'mail.ex', 'user': 'u'}}
+
+    def _run(self, value, integrations=None):
+        compose = {'services': {'app': {'environment': {'E': value}}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations or {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def _rendered(self, compose, info):
+        out = Template(yaml.dump(compose)).render(**_compose_render_context(info))
+        return (yaml.safe_load(out)['services']['app']['environment'] or {})
+
+    def test_bare_iteration_is_popped_when_unset(self):
+        compose, _ = self._run('X{% for k in smtp %}{{ k }},{% endfor %}')
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_the_same_value_works_when_configured(self):
+        value = 'X{% for k in smtp %}{{ k }},{% endfor %}'
+        compose, info = self._run(value, self.CONFIGURED)
+        self.assertEqual(self._rendered(compose, info)['E'], 'Xhost,user,')
+
+    def test_iterating_an_expression_that_reaches_the_type_also_pops(self):
+        # Same reason the Getattr target is searched as a subtree: the
+        # defensive spelling is the one a careful author reaches for.
+        for value in ('{% for k in (smtp or {}) %}{{ k }}{% endfor %}',
+                      '{% for k in [smtp][0] %}{{ k }}{% endfor %}',
+                      '{% for k in (smtp|default({})) %}{{ k }}{% endfor %}'):
+            with self.subTest(value=value):
+                compose, _ = self._run(value)
+                self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_iterating_something_else_is_untouched(self):
+        for value in ('{% for k in other %}{{ k }}{% endfor %}',
+                      "{% for k in ['a'] %}{{ k }}{% endfor %}"):
+            with self.subTest(value=value):
+                compose, _ = self._run(value)
+                self.assertIn('E', compose['services']['app']['environment'])
+
+    def test_outputting_the_type_is_popped(self):
+        # `{{ smtp }}` renders the literal `{}` unset, and a Python dict
+        # repr that breaks the YAML when configured. Neither is usable.
+        compose, _ = self._run('X{{ smtp }}')
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_a_guard_is_not_a_read(self):
+        # These render the CORRECT unset branch because the binding is a
+        # falsy empty mapping, so popping them would throw away a
+        # working setting.
+        compose, info = self._run('{% if smtp %}on{% else %}off{% endif %}')
+        self.assertIn('E', compose['services']['app']['environment'])
+        self.assertEqual(self._rendered(compose, info)['E'], 'off')
+
+    def test_a_guard_still_reads_correctly_when_configured(self):
+        compose, info = self._run(
+            '{% if smtp %}on{% else %}off{% endif %}', self.CONFIGURED)
+        self.assertEqual(self._rendered(compose, info)['E'], 'on')
+
+
 class WholeMappingFiltersAreDereferencesTests(TestCase):
     """The sharpest case in this module, so it gets its own class.
 

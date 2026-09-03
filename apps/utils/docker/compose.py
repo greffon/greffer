@@ -853,6 +853,31 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             if _can_evaluate_to(node.node, name):
                 return True
 
+        # Iterating the type reads its contents, and produces no
+        # Getattr, Getitem or filter to notice. `{% for k in smtp %}`
+        # is the shortest form of the same thing `{% for k, v in
+        # smtp|items %}` does -- one is popped and the other was not,
+        # which is an arbitrary line to draw between two spellings of
+        # one idiom. It renders correctly when configured, so it ships.
+        for node in ast.find_all(nodes.For):
+            if _can_evaluate_to(node.iter, name):
+                return True
+
+        # Outputting the type renders the mapping itself: `{{ smtp }}`
+        # gives the literal `{}` unset, and a Python dict repr that
+        # breaks the YAML when configured. Neither is usable, so the key
+        # is better absent.
+        #
+        # A BARE name only. Anything richer is a guard rather than a
+        # read -- `{{ 'on' if smtp else 'off' }}` and `{% if smtp %}`
+        # both render the correct branch on an unset integration
+        # precisely because the binding is a falsy empty mapping, and
+        # popping them would throw away a working setting.
+        for node in ast.find_all(nodes.Output):
+            for child in node.nodes:
+                if isinstance(child, nodes.Name) and child.name == name:
+                    return True
+
         # A filter READS its operand, so a filter applied to the type
         # reads the type. Listing the filters that DO dereference was
         # wrong twice -- first the attribute-naming ones
