@@ -773,34 +773,22 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     ]
 
     # Pass 2 -- template-driven pop, for values the catalog templates
-    # rather than declares. `{{ smtp.host }}`,
-    # `{{ smtp.from_address.split('@')[0] }}`, the dict-index form
-    # `{{ {"tls": "ssl"}[smtp.tls_mode] }}` and the bracket form
-    # `{{ smtp['from_address'] }}` are all references for this purpose.
+    # rather than declares.
     #
-    # ASKS JINJA'S OWN LEXER rather than approximating it.
+    # ASKS JINJA'S OWN PARSER rather than approximating it. Five
+    # hand-rolled scanners preceded this and each leaked somewhere a
+    # regex approximates a grammar: string literals holding delimiters,
+    # statement blocks, spaced dots, nested mapping braces, call parens,
+    # and finally a normalisation that backtracked quadratically on a
+    # whitespace run -- a denial of service on catalog-controlled input
+    # reached through `/start/`. The parser does not approximate; string
+    # literals, comments, `{% raw %}`, whitespace and nesting are its
+    # job. See the commit history for which scanner failed how.
     #
-    # Five hand-rolled versions preceded this, and each one shipped a
-    # different way of being wrong about Jinja syntax: a whole-string
-    # match popped a literal `oidc.<host>` beside an unrelated `{{ }}`;
-    # scanning only `{{ }}` missed statement blocks; a non-greedy body
-    # match stopped at a `}}` inside a string literal; then, in turn,
-    # spaced dots (`{{ config . oidc . url }}`), nested mapping braces
-    # (`{{ {"a": {}} and smtp.port|int }}`), a call's closing paren
-    # (`{{ dict(oidc).get(..) }}`), the same with a space before the
-    # paren, and finally a `\s*\.\s*` normalisation that backtracked
-    # quadratically on a whitespace run -- a denial of service on input
-    # the catalog controls, reached through `/start/`.
-    #
-    # Every one of those is a place a regex approximates a parser and
-    # leaks. The lexer does not approximate: string literals, comments,
-    # `{% raw %}`, whitespace and nesting are its job, and it is a linear
-    # scan, so the backtracking class cannot recur either.
-    #
-    # A reference is a NAME token for the type that (a) is not itself an
-    # attribute of something else, and (b) is followed by `.` or `[`.
-    # Grouping parens are seen through; a CALL's parens are not, which is
-    # what separates `(oidc).issuer` from `dict(oidc).get(..)`.
+    # A reference is anything that READS the type: a `Getattr`/`Getitem`
+    # whose target can evaluate to it, or a filter applied to it. Both
+    # started narrower and had to be widened -- see `_can_evaluate_to`
+    # and `_FILTERS_THAT_HANDLE_UNSET` for the shapes that forced it.
     parser_env = Environment()
 
     def _dereferences(value, name):
@@ -815,10 +803,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         call-versus-grouping parens. The parser has already resolved
         all of that.
 
-        Still incomplete in the same two places the lexer was, and for the
-        same reason -- aliasing (`{% set a = oidc %}{{ a.issuer }}`, a macro
-        argument) and `|map(attribute='a.b')` move the dereference off this
-        name entirely. Deciding those needs dataflow, not syntax.
+        Still incomplete in one place, and it is a dataflow one rather
+        than a syntactic one: aliasing (`{% set a = oidc %}{{ a.issuer }}`,
+        a macro argument) moves the dereference onto another name
+        entirely, and no amount of looking at THIS expression can follow
+        it.
 
         The binding covers the SIMPLE aliases -- `{{ base }}` where
         `base` was set from `oidc.url` renders empty rather than
@@ -828,9 +817,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         and `{{ u() }}` in another raises `'u' is undefined`. That is
         what the document guard is for.
 
-        Over-pops a locally shadowed name (`{% for oidc in xs %}`), exactly
-        as the lexer and `main` both do. Over-pop costs an env var;
-        under-pop costs the deploy.
+        Over-pops a locally shadowed name (`{% for oidc in xs %}`), as
+        `main` also does. Over-pop costs an env var; under-pop costs the
+        deploy.
         """
         try:
             ast = parser_env.parse(value)
@@ -838,13 +827,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # Deliberately bare: the body is a single `parse()` on
             # catalog-controlled input, so there is no logic of ours for
             # a broad catch to hide, and anything escaping is a 500 at
-            # `/start/`. Naming the classes was tried and failed three
-            # times -- TemplateError, RecursionError, ValueError and
-            # finally SyntaxError (Jinja's number lexer accepts non-ASCII
-            # digits, then hands `0.１` to the CPython compiler), each
-            # found only after the previous fix shipped. `Exception`, not
-            # `BaseException`, so a KeyboardInterrupt still stops the
-            # process.
+            # `/start/`. Naming the classes was tried and failed four
+            # times -- the last, `SyntaxError` from CPython via Jinja's
+            # number lexer on `{{ 0.１ }}`, was found by fuzzing after
+            # the third fix shipped. `Exception`, not `BaseException`,
+            # so a KeyboardInterrupt still stops the process.
             #
             # Fall back to the crudest form of the question: does the
             # name occur at all? A value that never mentions `oidc`
@@ -854,14 +841,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # loudly, rather than being silently dropped from a deploy
             # that then comes up misconfigured.
             #
-            # This deliberately does NOT also pop on `{%`. That rule
-            # existed to stop a block being half-popped and left
-            # dangling, but it popped values referencing no integration
-            # at all (`{% if instance_url %}` split across two values
-            # lost both keys on every instance with an unset type, which
-            # today is every instance). The document guard below
-            # supersedes it and is not restricted to shapes anyone
-            # thought of.
+            # Deliberately does NOT also pop on a `{%` tag: that rule
+            # popped values referencing no integration at all, and the
+            # document guard below covers what it was for.
             return re.search(rf'\b{re.escape(name)}\b', value) is not None
         for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
             # No `ctx` check: a store-context Getattr is unreachable from
@@ -872,22 +854,20 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 return True
 
         # A filter READS its operand, so a filter applied to the type
-        # reads the type. This is an allowlist of the filters that do
-        # NOT count, because enumerating the ones that do was wrong
-        # twice: `{{ smtp|attr("host") }}` reads exactly what
-        # `{{ smtp.host }}` reads, and then `{{ smtp|urlencode }}` and
-        # `{% for k, v in smtp|items %}` did the same by reading the
-        # whole mapping without naming any attribute at all.
+        # reads the type. Listing the filters that DO dereference was
+        # wrong twice -- first the attribute-naming ones
+        # (`{{ smtp|attr("host") }}`), then the whole-mapping ones
+        # (`{{ smtp|urlencode }}`, `{% for k, v in smtp|items %}`) --
+        # so what is listed instead is the filters that do not.
         #
-        # Those two are the sharpest case in this module. With the
-        # integration CONFIGURED they render correctly --
-        # `smtp://host=mail.ex&user=u@mailhost:25` -- so a catalog
-        # author has every reason to ship them; unset, they rendered
-        # `smtp://@mailhost:25`, a malformed URL parsed at boot.
+        # Those two matter more than the earlier misses because they
+        # render CORRECTLY when the integration is configured, so a
+        # catalog author has every reason to ship one; unset, the same
+        # value rendered `smtp://@mailhost:25`.
         #
-        # `default` is the exception that matters: its whole purpose is
-        # to handle the unset case, so popping a value that uses one
-        # would discard the author's own handling of it.
+        # `default` is the exception: its purpose IS handling the unset
+        # case, so popping a value that uses one discards the author's
+        # own handling.
         for node in ast.find_all(nodes.Filter):
             if node.name in _FILTERS_THAT_HANDLE_UNSET:
                 continue
