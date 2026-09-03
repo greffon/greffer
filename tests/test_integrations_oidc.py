@@ -330,6 +330,259 @@ class ConfiguredIntegrationsAreNotBoundTests(TestCase):
         self.assertIsInstance(ctx['oidc'], _UnsetIntegration)
 
 
+class TheBindingDoesNotEscapeIntoGreffonInfoTests(TestCase):
+    """`_compose_render_context` copies; it must not mutate its argument.
+
+    This is the invariant the module argues hardest for and the one a
+    single character (`dict(greffon_info)` -> `greffon_info`) silently
+    voids. `_render_baked_file` renders with StrictUndefined so that a
+    baked config file referencing an unset integration REFUSES (422)
+    instead of being written out with the value blanked. It reads the
+    same `greffon_info`. If the forgiving binding leaked back into it,
+    that refusal would quietly become an empty secret in a config file
+    on disk, which is the exact failure mode the strictness exists to
+    prevent -- and no other test in this file would notice.
+    """
+
+    def _info(self):
+        return _compute_integrations_context({'id': 'i1', 'integrations': {}})
+
+    def test_the_argument_is_not_mutated(self):
+        info = self._info()
+        _compose_render_context(info)
+        self.assertNotIsInstance(info['oidc'], _UnsetIntegration)
+        self.assertEqual(info['oidc'], {})
+
+    def test_the_returned_context_is_a_different_object(self):
+        info = self._info()
+        self.assertIsNot(_compose_render_context(info), info)
+
+    def test_the_baked_file_path_still_refuses_an_unset_reference(self):
+        # The consequence, end to end: rendering a baked file after
+        # building a render context must still raise, not blank the value.
+        info = self._info()
+        _compose_render_context(info)
+        with self.assertRaises(ConfigRenderError):
+            _render_baked_file('{{ oidc.client_secret }}', info, 'realm.json')
+
+
+class PassOneStillPopsFromMetadataTests(TestCase):
+    """Pass 1 (manager-sent destinations) needs a NON-templated value.
+
+    Every other test in this file uses a `{{ ... }}` value, which pass 2
+    pops on its own -- so pass 1 could be deleted outright and they would
+    all still pass. These use a literal value that only pass 1 can see.
+    """
+
+    def _run(self, env, destinations, container='app'):
+        compose = {'services': {container: {'environment': env}}}
+        _delete_unset_integration_env_keys(compose, {
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'destinations': destinations}],
+        })
+        return compose['services'][container]['environment']
+
+    def _dest(self, **kw):
+        d = {'type': 'smtp', 'container': 'app', 'key': 'SMTP_HOST'}
+        d.update(kw)
+        return d
+
+    def test_a_literal_value_is_popped_by_its_destination(self):
+        self.assertEqual(self._run({'SMTP_HOST': 'mail.example'}, [self._dest()]), {})
+
+    def test_a_literal_value_is_popped_in_list_form_too(self):
+        self.assertEqual(self._run(['SMTP_HOST=mail.example'], [self._dest()]), [])
+
+    def test_only_the_exact_key_is_popped(self):
+        # `startswith` on the bare key would also eat SMTP_HOSTNAME.
+        env = {'SMTP_HOST': 'a', 'SMTP_HOSTNAME': 'b'}
+        self.assertEqual(self._run(env, [self._dest()]), {'SMTP_HOSTNAME': 'b'})
+
+    def test_only_the_exact_key_is_popped_in_list_form(self):
+        env = ['SMTP_HOST=a', 'SMTP_HOSTNAME=b']
+        self.assertEqual(self._run(env, [self._dest()]), ['SMTP_HOSTNAME=b'])
+
+    def test_a_destination_for_a_configured_type_is_left_alone(self):
+        compose = {'services': {'app': {'environment': {'SMTP_HOST': 'mail'}}}}
+        _delete_unset_integration_env_keys(compose, {
+            'id': 'i1', 'integrations': {'smtp': {'host': 'mail'}},
+            'configurations': [{'destinations': [self._dest()]}],
+        })
+        self.assertEqual(compose['services']['app']['environment'], {'SMTP_HOST': 'mail'})
+
+    def test_a_destination_naming_another_container_is_ignored(self):
+        env = {'SMTP_HOST': 'a'}
+        self.assertEqual(
+            self._run(env, [self._dest(container='other')]), {'SMTP_HOST': 'a'},
+        )
+
+    def test_a_destination_missing_its_key_or_container_is_skipped(self):
+        for bad in ({'type': 'smtp', 'container': 'app'},
+                    {'type': 'smtp', 'key': 'SMTP_HOST'},
+                    {'type': 'smtp', 'container': '', 'key': 'SMTP_HOST'}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._run({'SMTP_HOST': 'a'}, [bad]), {'SMTP_HOST': 'a'})
+
+    def test_a_non_dict_destination_does_not_crash(self):
+        self.assertEqual(self._run({'SMTP_HOST': 'a'}, ['nonsense', None]), {'SMTP_HOST': 'a'})
+
+
+class MalformedComposeShapesDoNotCrashTests(TestCase):
+    """`/start/` must not 500 on a compose shape the catalog can express.
+
+    Each of these raised an uncaught AttributeError/IndexError out of
+    `create_compose` when its guard was removed.
+    """
+
+    def _run(self, compose):
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {}},
+        )
+        return compose
+
+    def test_a_non_dict_service_is_skipped(self):
+        self.assertEqual(
+            self._run({'services': {'app': 'notadict'}}),
+            {'services': {'app': 'notadict'}},
+        )
+
+    def test_a_bare_passthrough_env_entry_is_kept(self):
+        # `environment: [SMTP_HOST]` is legal compose -- it passes the
+        # host's variable through, and has no `=`.
+        compose = self._run({'services': {'app': {'environment': ['SMTP_HOST']}}})
+        self.assertEqual(compose['services']['app']['environment'], ['SMTP_HOST'])
+
+    def test_a_non_string_env_value_is_kept(self):
+        # YAML gives `K: 1` an int, and `K: [a]` a list. Stringifying
+        # instead of skipping would scan their repr for Jinja.
+        compose = self._run({'services': {'app': {'environment': {
+            'N': 1, 'B': True, 'L': ['{{ smtp.host }}'], 'NONE': None,
+        }}}})
+        self.assertEqual(
+            compose['services']['app']['environment'],
+            {'N': 1, 'B': True, 'L': ['{{ smtp.host }}'], 'NONE': None},
+        )
+
+    def test_a_service_without_an_environment_block_is_skipped(self):
+        self.assertEqual(
+            self._run({'services': {'app': {'image': 'nginx'}}}),
+            {'services': {'app': {'image': 'nginx'}}},
+        )
+
+    def test_a_compose_without_services_is_skipped(self):
+        self.assertEqual(self._run({}), {})
+
+    def test_a_garbage_integration_blob_counts_as_unset(self):
+        # `integrations={'smtp': 'garbage'}` is not a usable mapping, so
+        # it must be treated as unset (popped + bound), not passed to
+        # Jinja where `{{ smtp.host }}` would raise on a str.
+        compose = {'services': {'app': {'environment': {'H': '{{ smtp.host }}'}}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {'smtp': 'garbage'}},
+        )
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_a_garbage_blob_is_normalised_out_of_the_context(self):
+        # Not just popped -- the context must not carry the garbage
+        # through to Jinja, where `{{ smtp.host }}` on a str raises.
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {'smtp': 'garbage'}},
+        )
+        self.assertEqual(info['smtp'], {})
+        self.assertEqual(
+            Template('{{ smtp.host }}').render(**_compose_render_context(info)), '',
+        )
+
+
+class ListFormPassTwoTests(TestCase):
+    """Pass 2 over list-form `environment:`, which nothing asserted."""
+
+    def _run(self, env):
+        compose = {'services': {'app': {'environment': env}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {'smtp': {'host': 'h'}}},
+        )
+        return compose['services']['app']['environment']
+
+    def test_a_referencing_entry_is_dropped_and_the_rest_kept(self):
+        self.assertEqual(
+            self._run(['ISS={{ oidc.issuer }}', 'X=1', 'Y={{ instance_url }}']),
+            ['X=1', 'Y={{ instance_url }}'],
+        )
+
+    def test_a_configured_type_is_not_dropped_from_list_form(self):
+        self.assertEqual(self._run(['H={{ smtp.host }}']), ['H={{ smtp.host }}'])
+
+    def test_a_value_containing_an_equals_sign_survives_intact(self):
+        self.assertEqual(self._run(['Q=a=b=c']), ['Q=a=b=c'])
+
+
+class ParseFailureFallsBackToTheNameTests(TestCase):
+    """On a parse failure, pop only if the value mentions the name.
+
+    Popping unconditionally would silently drop an unrelated env var
+    whose value happens to be unparseable, turning a loud `main` failure
+    into a quiet missing variable on a deploy that otherwise works.
+    """
+
+    def _kept(self, value):
+        compose = {'services': {'app': {'environment': {'K': value}}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {'smtp': {'host': 'h'}}},
+        )
+        return 'K' in compose['services']['app']['environment']
+
+    def test_an_unparseable_value_mentioning_the_name_is_popped(self):
+        self.assertFalse(self._kept("{{ oidc.issuer'' }}"))
+
+    def test_an_unparseable_value_not_mentioning_it_is_kept(self):
+        self.assertTrue(self._kept("{{ 1 +* 2 }}"))
+
+    def test_a_giant_integer_literal_does_not_escape_as_a_500(self):
+        # `parse()` raises a bare ValueError (CPython's 4300-digit limit),
+        # which is neither a TemplateError nor a RecursionError.
+        self.assertTrue(self._kept('{{ 1' + '0' * 5000 + ' }}'))
+
+    def test_the_giant_literal_really_does_raise_ValueError(self):
+        # Pins the premise of the test above.
+        from jinja2 import Environment
+        with self.assertRaises(ValueError):
+            Environment().parse('{{ 1' + '0' * 5000 + ' }}')
+
+    def test_a_substring_of_the_name_does_not_count(self):
+        self.assertTrue(self._kept("{{ notoidc.issuer'' }}"))
+        self.assertTrue(self._kept("{{ oidcx.issuer'' }}"))
+
+
+class AFalsyPresetIsBoundTests(TestCase):
+    """A falsy preset on a top-level integration key is treated as unset.
+
+    `_compute_integrations_context` uses `setdefault`, so a `greffon_info`
+    already carrying `oidc: None` is never normalised to `{}`. Binding it
+    is the safe direction: `None` would raise on `{{ oidc.a.b }}` and 500
+    the start, while a real configured blob is truthy and still wins.
+    """
+
+    def _ctx(self, preset):
+        info = dict(preset, id='i1', integrations={})
+        return _compose_render_context(_compute_integrations_context(info))
+
+    def test_a_falsy_preset_is_bound(self):
+        for preset in ({'oidc': None}, {'oidc': []}, {'oidc': ''}, {'oidc': {}}):
+            with self.subTest(preset=preset):
+                self.assertIsInstance(self._ctx(preset)['oidc'], _UnsetIntegration)
+
+    def test_a_falsy_preset_renders_instead_of_raising(self):
+        self.assertEqual(
+            Template('{{ oidc.a.b }}').render(**self._ctx({'oidc': None})), '',
+        )
+
+    def test_a_truthy_preset_still_wins(self):
+        ctx = self._ctx({'oidc': {'issuer': 'https://preset'}})
+        self.assertNotIsInstance(ctx['oidc'], _UnsetIntegration)
+        self.assertEqual(ctx['oidc'], {'issuer': 'https://preset'})
+
+
 class AcceptedResidualTests(TestCase):
     """The one case where this is worse than `main`, asserted on purpose.
 
