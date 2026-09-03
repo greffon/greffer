@@ -1331,6 +1331,83 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class AGuardCanLeakThroughACallArgumentTests(TestCase):
+    """A guard test only DECIDES -- unless it hands the type to a call.
+
+    The exemption assumes the mapping's contents cannot reach the output
+    through a test. Passing them INTO a call breaks that, because the
+    call can stash them somewhere the value prints afterwards. Every
+    guard slot was reachable this way, and in the glitchtip shape the
+    key shipped as `smtp://` -- present and malformed, with the document
+    guard silent because the document renders fine.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_an_argument_leak_pops_from_every_guard_slot(self):
+        for value in (
+            '{% set l=[] %}{% if l.append(smtp.host) %}{% endif %}{{ l[0] }}',
+            "{% set l=[] %}{{ 'a' if l.append(smtp.password) else '' }}"
+            '{{ l|join }}',
+            '{% set d={} %}{% for x in [1] if d.update(h=smtp.host) %}'
+            '{% endfor %}{{ d.h }}',
+            '{% set l=[] %}{% if l.append(smtp) %}{% endif %}{{ l[0].host }}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_the_glitchtip_shape_of_it_pops(self):
+        self.assertFalse(self._survives(
+            'smtp://{% set l=[] %}{% if l.append(smtp.host) %}{% endif %}'
+            '{{ l[0] }}'))
+
+    def test_the_type_as_RECEIVER_still_guards(self):
+        # A method called ON the integration decides the branch and
+        # nothing leaves the test. Treating every call as unsafe popped
+        # these, which are ordinary catalog conditionals.
+        for value in (
+            '{% if oidc.issuer.startswith("https") %}a{% endif %}',
+            '{% if smtp.host.upper() %}x{% else %}y{% endif %}',
+            '{{ "a" if smtp.host.strip() else "b" }}',
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+
+class ASelfReferentialEnvValueDoesNotCrashTests(TestCase):
+    """A YAML alias can make an env value contain itself.
+
+        A: &a
+          - '{{ smtp.host }}'
+          - *a
+
+    `safe_load` accepts it and the render handles it, but walking the
+    value for template strings never terminates. `main` deploys such a
+    compose, so raising here would turn a working deploy into a 500.
+    """
+
+    def test_a_recursive_alias_is_popped_rather_than_raising(self):
+        doc = yaml.safe_load(
+            "services:\n  app:\n    environment:\n      A: &a\n"
+            "        - '{{ smtp.host }}'\n        - *a\n")
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(doc, info)
+        self.assertEqual(doc['services']['app']['environment'], {})
+
+    def test_a_very_deep_value_is_popped_rather_than_raising(self):
+        deep = ['{{ smtp.host }}']
+        for _ in range(3000):
+            deep = [deep]
+        compose = {'services': {'app': {'environment': {'A': deep}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+
 class DominationWasTriedAndWithdrawnTests(TestCase):
     """A read inside a branch that only runs when configured still pops.
 

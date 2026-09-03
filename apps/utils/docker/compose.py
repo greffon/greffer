@@ -498,6 +498,46 @@ _GUARD_SLOTS = frozenset({
 })
 
 
+def _call_consumes(value, name):
+    """Does a call in this subtree take the integration as an ARGUMENT?
+
+    A guard is exempt because it only DECIDES -- the mapping's contents
+    cannot reach the output through a test. Passing them INTO a call
+    breaks that, because the call can stash them somewhere the value
+    prints afterwards:
+
+        {% set l=[] %}{% if l.append(smtp.host) %}{% endif %}{{ l[0] }}
+
+    read `smtp.host` inside an `If.test` and printed it outside, so the
+    guard exemption kept a value rendering `smtp://` in the glitchtip
+    shape -- present and malformed.
+
+    Arguments only, not the receiver. `{% if oidc.issuer.startswith("h") %}`
+    calls a method ON the integration and uses the result to decide;
+    nothing leaves the test. Treating every call as unsafe popped that,
+    which is an ordinary catalog idiom and a working conditional.
+    """
+    for item in (value if isinstance(value, list) else [value]):
+        if not isinstance(item, nodes.Node):
+            continue
+        calls = ([item] if isinstance(item, nodes.Call) else []) + list(
+            item.find_all(nodes.Call))
+        for call in calls:
+            passed = list(call.args or []) + [
+                kw.value for kw in (call.kwargs or [])]
+            for extra in (call.dyn_args, call.dyn_kwargs):
+                if extra is not None:
+                    passed.append(extra)
+            for arg in passed:
+                if not isinstance(arg, nodes.Node):
+                    continue
+                if isinstance(arg, nodes.Name) and arg.name == name:
+                    return True
+                if any(n.name == name for n in arg.find_all(nodes.Name)):
+                    return True
+    return False
+
+
 def _reads(ast, name):
     """Does this parsed template READ the top-level `name`?
 
@@ -558,7 +598,9 @@ def _reads(ast, name):
                 continue
             return True
         for field, value in node.iter_fields():
-            child_guarded = guarded or (type(node), field) in _GUARD_SLOTS
+            child_guarded = guarded or (
+                (type(node), field) in _GUARD_SLOTS
+                and not _call_consumes(value, name))
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
                     stack.append((item, child_guarded))
@@ -897,10 +939,19 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
     def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
-        texts = [
-            text for text in _strings_in(value)
-            if '{{' in text or '{%' in text
-        ]
+        try:
+            texts = [
+                text for text in _strings_in(value)
+                if '{{' in text or '{%' in text
+            ]
+        except RecursionError:
+            # A YAML alias can make an env value refer to itself
+            # (`A: &a [..., *a]`), and `safe_load` accepts it. Walking
+            # that never terminates. `main` renders such a compose, so
+            # raising here would turn a working deploy into a 500 --
+            # pop instead, which is the same answer this function gives
+            # for anything else it cannot read.
+            return tuple(unset_types)
         if not texts:
             return ()
         return tuple(
