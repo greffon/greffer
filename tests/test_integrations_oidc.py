@@ -1962,6 +1962,39 @@ class ReferenceFormTests(TestCase):
         self.assertFalse(self._survives('{{ [oidc]|map(attribute="issuer")|list }}'))
         self.assertFalse(self._survives('{{ [oidc]|rejectattr("issuer")|list }}'))
 
+    def test_an_operator_between_the_name_and_the_dot_still_pops(self):
+        # A `Getattr` target is not always a bare `Name`. Requiring one
+        # missed every defensive idiom a careful catalog author would
+        # reach for, so THEY were the ones who got `smtp://:@` -- with
+        # no log line, because the strip believed there was nothing to
+        # pop and the document rendered fine.
+        for value in ('{{ oidc.issuer }}',
+                      '{{ (oidc).issuer }}',
+                      '{{ (oidc or {}).issuer }}',
+                      '{{ (oidc and oidc).issuer }}',
+                      '{{ (oidc if oidc else oidc).issuer }}',
+                      '{{ (oidc|default({})).issuer }}',
+                      '{{ [oidc][0].issuer }}',
+                      '{{ (oidc,)[0].issuer }}'):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_the_glitchtip_shape_written_defensively_still_pops(self):
+        self.assertFalse(self._survives(
+            'smtp://{{ (smtp or {}).user }}:{{ (smtp or {}).password }}'
+            '@{{ (smtp or {}).host }}:{{ (smtp or {}).port }}'))
+
+    def test_a_call_is_still_a_barrier(self):
+        # A call's RESULT is not its operand, so descending through one
+        # would over-pop. This is the same call-versus-grouping line the
+        # parser draws everywhere else, and it is why the search stops.
+        self.assertTrue(self._survives('{{ dict(oidc).get("x") }}'))
+
+    def test_an_unrelated_name_is_not_swept_up(self):
+        self.assertTrue(self._survives('{{ other.host }}'))
+        self.assertTrue(self._survives('{{ (other or {}).host }}'))
+        self.assertTrue(self._survives('{{ instance_url }}'))
+
     def test_a_filter_that_names_no_attribute_is_not_a_dereference(self):
         # `map`'s positional argument is a FILTER name, not an
         # attribute. The operand mentions `oidc` here, so only the
