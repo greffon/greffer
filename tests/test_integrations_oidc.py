@@ -11,9 +11,11 @@
 #     fails if the tuple entry is removed.
 #   - Adding the type does not disturb SMTP.
 
+import itertools
 import logging
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import mock_open, patch
 
@@ -28,7 +30,7 @@ from apps.utils.docker.compose import (
     ConfigRenderError,
     _UnsetIntegration,
     _compose_render_context,
-    _MAX_UNDO_RENDERS,
+    _UNDO_TIME_BUDGET,
     _UNDO_CHUNK,
     _document_renders,
     _render_baked_file,
@@ -1122,74 +1124,171 @@ class ASymbolDefinedInOneValueAndUsedInAnotherTests(TestCase):
         self.assertNotIn('H', compose['services']['app']['environment'])
 
 
-class TheUndoIsBoundedTests(TestCase):
-    """The undo is chunked and budgeted, and degrades without regressing.
+class TheGuardRendersAgainstItsOwnCopyTests(TestCase):
+    """The guard must not let a catalog expression touch caller state.
 
-    Each attempt costs a full dump+compile+render, so deciding one key
-    at a time is quadratic. Keys are tried in batches and only a failing
-    batch is split.
+    `_compose_render_context` copies only the top level, and the guard
+    RENDERS. A side-effecting expression therefore ran against the
+    caller's own nested objects, and what it did was permanent:
 
-    Crucially, running out of budget undoes only the keys not yet
-    DECIDED. Restoring everything wholesale was the earlier behaviour
-    and it brought back the very bug this function exists to prevent:
-    glitchtip's `EMAIL_URL` rendering `smtp://:@`.
+        {{ volumes.popitem() and '' }}
+
+    emptied `greffon_info['volumes']`, which `create_volumes_then_copy_files`
+    consumes immediately after `create_compose` returns -- so the
+    instance came up with no volumes, or `create_compose` raised
+    outright on the second call. The undo can repeat that render many
+    times over.
+
+    This module treats the catalog as hostile everywhere else; the guard
+    renders against a deep copy so it is treated as hostile here too.
     """
 
-    def _compose(self, n, with_email=True):
-        env = {}
-        if with_email:
-            env['A_EMAIL_URL'] = 'smtp://{{ smtp.username }}@{{ smtp.host }}'
+    def _info(self):
+        return _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'volumes': {'v1': {'value': 'a'}, 'v2': {'value': 'b'}},
+            'networks': {'n1': {'value': 'n'}},
+        })
+
+    def test_a_mutating_expression_does_not_reach_the_caller(self):
+        info = self._info()
+        compose = {'services': {'app': {'environment': {
+            'A': "{{ volumes.popitem() and '' }}",
+        }}}}
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            info['volumes'], {'v1': {'value': 'a'}, 'v2': {'value': 'b'}})
+
+    def test_a_nested_mutation_does_not_reach_the_caller(self):
+        info = self._info()
+        compose = {'services': {'app': {'environment': {
+            'A': "{{ volumes.v1.clear() and '' }}",
+        }}}}
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(info['volumes']['v1'], {'value': 'a'})
+
+    def test_the_strip_still_works_beside_a_mutating_expression(self):
+        info = self._info()
+        compose = {'services': {'app': {'environment': {
+            'A': "{{ volumes.popitem() and '' }}",
+            'H': '{{ oidc.issuer }}',
+        }}}}
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertNotIn('H', compose['services']['app']['environment'])
+
+    def test_an_uncopyable_context_skips_the_guard_rather_than_risking_it(self):
+        info = self._info()
+        info['unclonable'] = (i for i in [1])
+        compose = {'services': {'app': {'environment': {'H': '{{ oidc.issuer }}'}}}}
+        # Must not raise; the strip proceeds without the guard.
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertNotIn('H', compose['services']['app']['environment'])
+
+
+class TheUndoIsBoundedTests(TestCase):
+    """The undo is chunked and bounded by WALL CLOCK, and degrades safely.
+
+    Each attempt costs a full dump+compile+render, and what a render
+    costs is catalog-controlled and unbounded (`{{ range(2e7)|sum }}`),
+    so capping the number of attempts capped the wrong thing. Keys are
+    tried in batches and only a failing batch is split.
+
+    On exhaustion the decisions already made are KEPT -- restoring
+    everything was the earlier behaviour and it brought back glitchtip's
+    `EMAIL_URL` rendering `smtp://:@`.
+
+    The clock is faked rather than slept on, so these assert behaviour
+    and cannot go red because the machine is busy.
+    """
+
+    def _compose(self, n):
+        # Order matters: the strip decides in document order, so
+        # EMAIL_URL is decided before the poisoned pair at the end.
+        env = {'A_EMAIL_URL': 'smtp://{{ smtp.username }}@{{ smtp.host }}'}
         env.update({f'K{i:04d}': '{{ oidc.issuer }}' for i in range(n)})
         env['Y_OPEN'] = '{# note'
         env['Z_CLOSE'] = '{{ oidc.host }} #}'
         return {'services': {'app': {'environment': env}}}
 
-    def _run(self, compose):
+    def _run(self, compose, clock_step=None):
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        _delete_unset_integration_env_keys(compose, info)
+        if clock_step is None:
+            _delete_unset_integration_env_keys(compose, info)
+        else:
+            ticks = itertools.count(0.0, clock_step)
+            fake = SimpleNamespace(monotonic=lambda: next(ticks))
+            with patch.object(compose_module, 'time', fake):
+                _delete_unset_integration_env_keys(compose, info)
         return compose['services']['app']['environment'], info
 
+    def _renders(self, compose, info):
+        return Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
     def test_a_small_case_is_decided_selectively(self):
-        env, info = self._run(self._compose(5))
-        self.assertNotIn('K0000', env)      # clean pops survive
-        self.assertNotIn('A_EMAIL_URL', env)
-        self.assertIn('Y_OPEN', env)        # the straddling pair is undone
-        Template(yaml.dump({'services': {'app': {'environment': env}}})).render(
-            **_compose_render_context(info))
+        compose = self._compose(5)
+        env, info = self._run(compose)
+        self.assertNotIn('A_EMAIL_URL', env)   # clean pops survive
+        self.assertNotIn('K0000', env)
+        self.assertIn('Y_OPEN', env)           # the straddling pair is undone
+        self._renders(compose, info)
 
     def test_a_batch_that_renders_is_kept_whole(self):
-        # More keys than one chunk, all clean: still fully popped.
-        env, _ = self._run(self._compose(_UNDO_CHUNK * 3))
+        compose = self._compose(_UNDO_CHUNK * 3)
+        env, _ = self._run(compose)
         self.assertNotIn('A_EMAIL_URL', env)
         self.assertFalse([k for k in env if k.startswith('K')])
 
-    def test_beyond_the_budget_the_earlier_decisions_still_hold(self):
-        # The regression guard: exhausting the budget must NOT resurrect
-        # the malformed URL. The budget is patched rather than reached
-        # with a huge compose -- the behaviour is what matters, and a
-        # 1600-key document costs seconds to render repeatedly.
-        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
-            env, _ = self._run(self._compose(_UNDO_CHUNK * 4))
+    def test_decisions_made_before_the_budget_ran_out_are_kept(self):
+        # The regression guard. A clock that runs out partway must not
+        # resurrect the malformed URL decided in the first batch.
+        compose = self._compose(_UNDO_CHUNK * 6)
+        env, _ = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 4)
         self.assertNotIn('A_EMAIL_URL', env)
 
-    def test_beyond_the_budget_the_document_still_renders(self):
-        compose = self._compose(_UNDO_CHUNK * 4)
-        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
-            _, info = self._run(compose)
-        Template(yaml.dump(compose)).render(**_compose_render_context(info))
+    def test_running_out_of_budget_still_leaves_a_renderable_document(self):
+        compose = self._compose(_UNDO_CHUNK * 6)
+        _, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 4)
+        self._renders(compose, info)
 
-    def test_beyond_the_budget_the_undecided_keys_are_left_alone(self):
-        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
-            env, _ = self._run(self._compose(_UNDO_CHUNK * 4))
-        # Some clean pops were never decided, so they survive un-popped.
-        self.assertTrue([k for k in env if k.startswith('K')])
+    def test_with_no_budget_at_all_the_document_still_renders(self):
+        # Nothing is decided, so nothing is popped -- safe, not correct.
+        # The invariant that must never break is that it renders.
+        compose = self._compose(_UNDO_CHUNK)
+        env, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET)
+        self.assertIn('Y_OPEN', env)
+        self._renders(compose, info)
+
+    def test_the_remainder_is_tried_once_more_as_a_whole(self):
+        # When the poison was already decided, everything still
+        # outstanding is fine together, so one last attempt recovers it
+        # rather than shipping empty values for the tail.
+        env = {'Y_OPEN': '{# note', 'Z_CLOSE': '{{ oidc.host }} #}'}
+        env.update({f'K{i:04d}': '{{ oidc.issuer }}' for i in range(40)})
+        compose = {'services': {'app': {'environment': env}}}
+        got, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 3)
+        self.assertFalse([k for k in got if k.startswith('K')],
+                         'the outstanding clean pops should be recovered')
+        self._renders(compose, info)
+
+    def test_the_clock_is_checked_inside_a_split_chunk_too(self):
+        # A failing chunk is split and decided item by item. Without a
+        # clock check INSIDE that loop, an expired budget still pays for
+        # a whole chunk of renders -- up to 7 more, each unbounded in
+        # cost. Poison the FIRST chunk so the split happens immediately,
+        # and expire the clock as the inner loop starts.
+        env = {'Y_OPEN': '{# note', 'Z_CLOSE': '{{ oidc.host }} #}'}
+        env.update({f'K{i:04d}': '{{ oidc.issuer }}' for i in range(6)})
+        expected = sorted(env)  # `env` itself is mutated in place below
+        compose = {'services': {'app': {'environment': env}}}
+        got, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 2)
+        # Nothing from that chunk may be decided individually.
+        self.assertEqual(sorted(got), expected)
+        self._renders(compose, info)
 
     def test_exhausting_the_budget_is_logged(self):
-        with patch.object(compose_module, '_MAX_UNDO_RENDERS', 2):
-            with self.assertLogs(
-                'apps.utils.docker.compose', level='WARNING',
-            ) as caught:
-                self._run(self._compose(_UNDO_CHUNK * 4))
+        compose = self._compose(_UNDO_CHUNK * 6)
+        with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
+            self._run(compose, clock_step=_UNDO_TIME_BUDGET / 4)
         self.assertIn('undo budget', ''.join(caught.output))
 
 
