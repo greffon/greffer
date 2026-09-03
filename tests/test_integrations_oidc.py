@@ -23,6 +23,7 @@ from jinja2.exceptions import TemplateSyntaxError
 from apps.utils.docker.compose import (
     KNOWN_INTEGRATION_TYPES,
     ConfigRenderError,
+    _UnsetIntegration,
     _compose_render_context,
     _render_baked_file,
     build_render_context,
@@ -219,10 +220,13 @@ class PartiallyConfiguredIntegrationTests(TestCase):
     `smtp` is resolved by the manager from one fixed field set, so this
     barely happens there. The per-instance OIDC client registration this
     type exists for sends a blob whose key set varies by provider, so it
-    is the NORMAL state for `oidc` -- and it used to be the worst of the
-    three: "set" enough that neither pass strips its keys, but a plain
-    dict, so the binding never applied either. Both safety nets bypassed
-    at once.
+    is the NORMAL state for `oidc`.
+
+    A partial blob is CONFIGURED, so the binding deliberately does not
+    apply to it and every case below matches `main` exactly. A catalog
+    entry that reads a field its provider may not send must say so with
+    `|default`; the platform does not guess. See the docstring on
+    `_compose_render_context` for why quiet truncation was rejected.
     """
 
     PARTIAL = {'oidc': {'client_id': 'x'}}
@@ -231,21 +235,49 @@ class PartiallyConfiguredIntegrationTests(TestCase):
         info = _compute_integrations_context({'id': 'i1', 'integrations': integrations})
         return Template(template).render(**_compose_render_context(info))
 
+    def _main(self, template, integrations):
+        """What `main` renders: the raw blob, no binding at all."""
+        return Template(template).render(**integrations)
+
+    def _assert_matches_main(self, template, integrations):
+        try:
+            expected, raised = self._main(template, integrations), None
+        except UndefinedError as exc:
+            expected, raised = None, str(exc)
+        if raised is None:
+            self.assertEqual(self._render(template, integrations), expected)
+        else:
+            with self.assertRaises(UndefinedError) as caught:
+                self._render(template, integrations)
+            self.assertEqual(str(caught.exception), raised)
+
     def test_a_present_field_is_untouched(self):
         self.assertEqual(self._render('{{ oidc.client_id }}', self.PARTIAL), 'x')
+        self._assert_matches_main('{{ oidc.client_id }}', self.PARTIAL)
 
     def test_an_absent_field_renders_empty(self):
+        # Jinja's own default for a one-level miss, on `main` too.
         self.assertEqual(self._render('{{ oidc.issuer }}', self.PARTIAL), '')
+        self._assert_matches_main('{{ oidc.issuer }}', self.PARTIAL)
 
-    def test_chaining_off_an_absent_field_does_not_raise(self):
-        # This was an UndefinedError out of `create_compose`, i.e. a 500
-        # with no service started.
-        try:
-            self.assertEqual(
-                self._render('{{ oidc.issuer.split("/")[0] }}', self.PARTIAL), '',
-            )
-        except Exception as exc:  # pragma: no cover - the failure we prevent
-            self.fail(f'a partial blob must not raise: {exc!r}')
+    def test_chaining_off_an_absent_field_raises_like_main(self):
+        # The chosen policy: a configured integration keeps main's LOUD
+        # failure. Wrapping this too would render '' for a mistyped field
+        # name on a working integration -- `nextcloud` ships
+        # `{{ smtp.from_address.split("@")[1] }}`, and a rename there
+        # would have shipped MAIL_DOMAIN="" to every instance instead of
+        # refusing to start.
+        with self.assertRaises(UndefinedError) as caught:
+            self._render('{{ oidc.issuer.split("/")[0] }}', self.PARTIAL)
+        self.assertIn('issuer', str(caught.exception))
+        self._assert_matches_main('{{ oidc.issuer.split("/")[0] }}', self.PARTIAL)
+
+    def test_default_is_the_supported_way_to_read_an_optional_field(self):
+        # What a catalog entry for a varying-shape provider blob must do.
+        self.assertEqual(
+            self._render('{{ oidc.issuer|default("https://d") }}', self.PARTIAL),
+            'https://d',
+        )
 
     def test_a_fully_configured_blob_is_unchanged(self):
         full = {'oidc': {'issuer': 'https://id.example/x', 'client_id': 'x'}}
@@ -262,6 +294,40 @@ class PartiallyConfiguredIntegrationTests(TestCase):
         self.assertEqual(
             self._render('{{ oidc|tojson }}', self.PARTIAL), '{"client_id": "x"}',
         )
+
+
+class ConfiguredIntegrationsAreNotBoundTests(TestCase):
+    """The binding is unset-only, asserted at the context level.
+
+    `PartiallyConfiguredIntegrationTests` pins the rendered consequence;
+    this pins the mechanism, so a future change that starts wrapping
+    configured types again fails here first and by name.
+    """
+
+    def _ctx(self, integrations):
+        return _compose_render_context(
+            _compute_integrations_context({'id': 'i1', 'integrations': integrations}),
+        )
+
+    def test_a_configured_type_stays_a_plain_dict(self):
+        ctx = self._ctx({'smtp': {'host': 'h'}})
+        self.assertNotIsInstance(ctx['smtp'], _UnsetIntegration)
+        self.assertEqual(ctx['smtp'], {'host': 'h'})
+
+    def test_a_partial_type_stays_a_plain_dict(self):
+        ctx = self._ctx({'oidc': {'client_id': 'x'}})
+        self.assertNotIsInstance(ctx['oidc'], _UnsetIntegration)
+
+    def test_an_unset_type_is_bound(self):
+        self.assertIsInstance(self._ctx({})['oidc'], _UnsetIntegration)
+
+    def test_an_empty_blob_counts_as_unset_and_is_bound(self):
+        self.assertIsInstance(self._ctx({'oidc': {}})['oidc'], _UnsetIntegration)
+
+    def test_one_type_configured_does_not_unbind_the_other(self):
+        ctx = self._ctx({'smtp': {'host': 'h'}})
+        self.assertNotIsInstance(ctx['smtp'], _UnsetIntegration)
+        self.assertIsInstance(ctx['oidc'], _UnsetIntegration)
 
 
 class AcceptedResidualTests(TestCase):
@@ -304,6 +370,44 @@ class AcceptedResidualTests(TestCase):
         ctx['instance_host'] = 'h'
         with self.assertRaises(TemplateSyntaxError):
             Template(yaml.dump(compose)).render(**ctx)
+
+
+class ParserFailureIsTreatedAsAReferenceTests(TestCase):
+    """Pass 2 parses; both ways parsing can fail must POP, not escape.
+
+    The direction matters. Over-popping loses one env var on an
+    integration that is not configured anyway. Under-popping lets the
+    reference reach the render, where it raises and `create_compose`
+    500s -- the instance does not start at all.
+    """
+
+    def _pop(self, value):
+        compose = {'services': {'s': {'environment': {'K': value}}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': {'smtp': {'host': 'h'}}},
+        )
+        return 'K' not in compose['services']['s']['environment']
+
+    def test_a_syntax_error_pops(self):
+        # `yaml.dump` doubles an inner quote, so malformed expressions do
+        # reach this function in practice.
+        self.assertTrue(self._pop("{{ oidc.issuer''x }}"))
+
+    def test_nesting_past_the_parser_stack_limit_pops(self):
+        # `parse()` recurses per nesting level and blows the Python stack
+        # well before Jinja reports anything. RecursionError is NOT a
+        # TemplateError, so without its own guard it escapes as a 500 on
+        # catalog-controlled input.
+        deep = '{{ ' + '(' * 5000 + 'oidc.issuer' + ')' * 5000 + ' }}'
+        self.assertTrue(self._pop(deep))
+
+    def test_the_deep_input_really_does_blow_the_stack(self):
+        # Pins the premise: if a future Jinja parses this iteratively the
+        # test above stops covering anything and this says so.
+        from jinja2 import Environment
+        deep = '{{ ' + '(' * 5000 + 'oidc.issuer' + ')' * 5000 + ' }}'
+        with self.assertRaises(RecursionError):
+            Environment().parse(deep)
 
 
 class ConstructScanningTests(TestCase):

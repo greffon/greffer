@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template, nodes
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -492,44 +492,46 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # attribute of something else, and (b) is followed by `.` or `[`.
     # Grouping parens are seen through; a CALL's parens are not, which is
     # what separates `(oidc).issuer` from `dict(oidc).get(..)`.
-    lexer_env = Environment()
+    parser_env = Environment()
 
     def _dereferences(value, name):
-        """Does `value` read the top-level `name` and dereference it?"""
+        """Does `value` read the top-level `name` and dereference it?
+
+        Asks Jinja's PARSER. A dereference is a `Getattr`/`Getitem` whose
+        target is a `Name` for the type -- which is what the question
+        literally is, so there is nothing left to approximate.
+
+        The lexer version this replaces had to decide call-versus-grouping
+        by peeking at tokens, and that one hand-written fragment of Jinja's
+        grammar produced three defects in two review passes:
+        `{{ dict(oidc).get(..) }}`, `{{ range(smtp.port) }}` and
+        `{% if (oidc).issuer %}`. The AST has no such ambiguity, because
+        the parser already resolved it.
+
+        Still incomplete in the same two places the lexer was, and for the
+        same reason -- aliasing (`{% set a = oidc %}{{ a.issuer }}`, a macro
+        argument) and `|map(attribute='a.b')` move the dereference off this
+        name entirely. Deciding those needs dataflow, not syntax. The
+        binding is what covers them: they render empty instead of raising.
+
+        Over-pops a locally shadowed name (`{% for oidc in xs %}`), exactly
+        as the lexer and `main` both do. Over-pop costs an env var;
+        under-pop costs the deploy.
+        """
         try:
-            tokens = [t for t in lexer_env.lex(value) if t[1] != 'whitespace']
-        except TemplateError:
-            # Unparseable: it cannot render either way, so pop the key
-            # rather than leave it to fail the whole document.
+            ast = parser_env.parse(value)
+        except (TemplateError, RecursionError):
+            # Unparseable, or nested past the parser's stack limit
+            # (~200 levels, on input the catalog controls and `/start/`
+            # reaches). Either way it cannot render, so pop the key
+            # rather than let it fail the whole document. RecursionError
+            # is NOT a TemplateError and would otherwise escape as a 500.
             return True
-        for i, (_line, kind, text) in enumerate(tokens):
-            if kind != 'name' or text != name:
-                continue
-            prev = tokens[i - 1] if i else None
-            # `config.oidc` -- a field of something else, not our variable.
-            if prev and prev[1] == 'operator' and prev[2] == '.':
-                continue
-            j = i + 1
-            if prev and prev[1] == 'operator' and prev[2] == '(':
-                before = tokens[i - 2] if i >= 2 else None
-                # `dict(oidc)` is a call; `(oidc)` is grouping. The token
-                # before the paren is the only thing that tells them
-                # apart, and with the lexer it is exact.
-                #
-                # A call only means the closing paren is not ours to see
-                # through -- it does NOT mean the name is uninteresting.
-                # `{{ range(smtp.port)|list }}` dereferences it right
-                # there, as the first argument, and skipping the whole
-                # name let that reach the render and raise.
-                grouping = not (before and (
-                    before[1] in ('name', 'integer', 'float', 'string')
-                    or (before[1] == 'operator' and before[2] in (')', ']'))
-                ))
-                while (grouping and j < len(tokens)
-                       and tokens[j][1] == 'operator' and tokens[j][2] == ')'):
-                    j += 1
-            nxt = tokens[j] if j < len(tokens) else None
-            if nxt and nxt[1] == 'operator' and nxt[2] in ('.', '['):
+        for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
+            target = node.node
+            if (isinstance(target, nodes.Name)
+                    and target.name == name
+                    and target.ctx == 'load'):
                 return True
         return False
 
@@ -581,36 +583,44 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
 
 def _compose_render_context(greffon_info):
-    """`greffon_info` with integration types bound so a missing FIELD renders.
+    """`greffon_info` with UNSET integration types bound so nothing raises.
 
-    Every known type is wrapped, not just the unset ones. A PARTIALLY
-    populated blob is the case that forces this: it is "set", so neither
-    pass strips its keys, and if the binding only replaced `{}` it stayed
-    a plain dict too -- so `{{ oidc.issuer.split('/')[0] }}` against
-    `{'client_id': 'x'}` raised UndefinedError and 500'd the start, with
-    both safety nets bypassed at once.
+    Unset only, deliberately. Wrapping configured types as well made a
+    missing FIELD on a configured integration render empty, where `main`
+    raises and names it:
 
-    That is not a hypothetical shape. `smtp` is resolved by the manager
-    from one fixed field set, so partial never really happens there. The
-    per-instance OIDC client registration that this type exists for sends
-    a blob whose key set varies by provider, so partial is its NORMAL
-    state.
+        {{ smtp.from_addres.split("@")[1] }}   # renamed or mistyped
+            main    UndefinedError: 'dict object' has no attribute ...
+            wrapped ''
 
-    Wrapping the real mapping keeps present keys winning -- `_UnsetField`
-    is reached only through `__missing__` -- so a configured value is
-    untouched and only an absent field renders empty.
+    `nextcloud` ships `{{ smtp.from_address.split("@")[1] }}` today, so
+    that turned a loud refusal into `MAIL_DOMAIN=""` on every instance
+    with SMTP configured. It also contradicted the rule this module
+    applies to baked files -- quiet truncation is worse than a loud
+    refusal -- by exempting the compose path from it.
+
+    The cost is that a PARTIALLY populated blob raises on a field it does
+    not carry. That is the intended answer: a catalog entry that reads an
+    optional field should say so with `|default`, which is explicit and
+    reviewable, rather than relying on the platform to paper over it. It
+    matters for platform-identity Feature #3, whose per-provider blobs
+    vary in shape -- those entries must use `|default` for anything not
+    guaranteed.
 
     A caller that deliberately populated the key still wins, which is the
     same non-clobbering rule `_compute_integrations_context` follows.
     """
-    integrations = greffon_info.get('integrations') or {}
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
-        configured = integrations.get(t) if _is_integration_set(integrations.get(t)) else {}
-        # Only what `_compute_integrations_context` itself wrote. Anything
-        # else in that key was put there deliberately by a caller.
-        if context.get(t) == configured:
-            context[t] = _UnsetIntegration(configured)
+        # `== {}` is the whole policy, and does two jobs at once.
+        # `_compute_integrations_context` writes `{}` for an unset type
+        # and the blob itself for a configured one, so this wraps unset
+        # types ONLY -- and it still declines to touch a key a caller
+        # populated, since that key is not `{}` either. Re-deriving
+        # "unset" from `integrations` here would be a second, redundant
+        # spelling of the same condition that could drift from it.
+        if context.get(t) == {}:
+            context[t] = _UnsetIntegration()
     return context
 
 
