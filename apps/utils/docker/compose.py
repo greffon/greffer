@@ -544,6 +544,104 @@ def _call_consumes(value, name):
     return False
 
 
+class _Anything:
+    """A stand-in that absorbs everything, for the probe below.
+
+    Every name EXCEPT the integration is bound to this while probing, so
+    the only thing that can make the probe fail is the integration's own
+    semantics. Without it, `{{ config.PORT|int }}` would look like a
+    failure and a working key would be popped.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, _):
+        return self
+
+    def __getitem__(self, _):
+        return self
+
+    def __call__(self, *a, **k):
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+    def __str__(self):
+        return ''
+
+    def __bool__(self):
+        return False
+
+    def __int__(self):
+        return 0
+
+    def __float__(self):
+        return 0.0
+
+    def __round__(self, *a):
+        return 0
+
+    def __abs__(self):
+        return 0
+
+    def __len__(self):
+        return 0
+
+    def __eq__(self, _):
+        return False
+
+    def __hash__(self):
+        return 0
+
+    def __lt__(self, _):
+        return False
+
+    __gt__ = __le__ = __ge__ = __lt__
+
+    def __add__(self, _):
+        return self
+
+    __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
+
+
+def _guard_only_value_still_renders(text, name):
+    """Would this value render with the integration unset?
+
+    `_reads` exempts a guard because "the mapping decides, its contents
+    never reach the output". True for what the guard RETURNS -- but the
+    test itself still has to evaluate, and `_UnsetField` absorbs
+    attribute access and calls, not arithmetic or serialisation:
+
+        {% if smtp.port|int > 0 %}true{% else %}false{% endif %}
+
+    raises `UndefinedError` unset, and `|abs`, `|round` and `|tojson`
+    raise bare `TypeError`. That is not recoverable later: the document
+    fails to render BEFORE the strip, so the guard takes no snapshot and
+    the undo never runs. Popping the key instead deploys cleanly.
+
+    So a value the scan calls guard-only is rendered once against the
+    unset binding. Everything except the integration is bound to
+    `_Anything`, so a failure here is attributable to the integration
+    rather than to context this probe does not have.
+    """
+    env = Environment()
+    try:
+        template = env.from_string(text)
+        used = meta.find_undeclared_variables(env.parse(text))
+    except Exception:
+        # Unparseable values are already handled by the caller's
+        # fallback; this probe has nothing to add.
+        return True
+    context = {n: _Anything() for n in used}
+    context[name] = _UnsetIntegration()
+    try:
+        template.render(**context)
+    except Exception:
+        return False
+    return True
+
+
 def _reads(ast, name):
     """Does this parsed template READ the top-level `name`?
 
@@ -959,7 +1057,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         return tuple(
             t for t in unset_types
-            if any(_dereferences(text, t) for text in texts)
+            if any(_dereferences(text, t)
+                   or not _guard_only_value_still_renders(text, t)
+                   for text in texts)
         )
 
 
