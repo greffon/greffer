@@ -803,10 +803,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # literals, comments, `{% raw %}`, whitespace and nesting are its
     # job. See the commit history for which scanner failed how.
     #
-    # A reference is anything that READS the type: a `Getattr`/`Getitem`
-    # whose target can evaluate to it, or a filter applied to it. Both
-    # started narrower and had to be widened -- see `_can_evaluate_to`
-    # and `_FILTERS_THAT_HANDLE_UNSET` for the shapes that forced it.
+    # A reference is any USE of the type that is not a guard. Which
+    # uses exist is Jinja's answer, not ours -- see `_reads`, and the
+    # eleven constructs that had to be added one at a time before the
+    # question was asked that way round.
     parser_env = Environment()
 
     def _dereferences(value, name):
