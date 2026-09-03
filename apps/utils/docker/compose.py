@@ -600,13 +600,20 @@ class _Anything:
         return 0
 
     def __eq__(self, _):
-        return False
+        # Follows the assignment like `__bool__` does. Returning a
+        # constant made every assignment take the same path through a
+        # comparison, so `{% if instance_port == '' and oidc.port|int %}`
+        # short-circuited in both and the unset field was never reached.
+        return self._truthy
+
+    def __ne__(self, _):
+        return not self._truthy
 
     def __hash__(self):
         return 0
 
     def __lt__(self, _):
-        return False
+        return self._truthy
 
     __gt__ = __le__ = __ge__ = __lt__
 
@@ -619,6 +626,34 @@ class _Anything:
 # 2^n renders, so a ceiling. Every guard in the catalog names nothing
 # but the integration (n = 0); 6 allows 64.
 _PROBE_NAME_LIMIT = 6
+
+
+class _ProbeValue(int):
+    """A field of `_PopulatedProbe`: numeric, and chainable.
+
+    An `int` so it serialises and survives `|int`/`|abs`/`|round`/`>`;
+    attribute access returns itself so a chain like `smtp.a.b` keeps
+    working, which a bare `1` did not.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, _):
+        return self
+
+    def __call__(self, *a, **k):
+        return self
+
+
+class _PopulatedProbe(dict):
+    """The integration as if it were configured, for attribution only.
+
+    Every field answers a value that actually works, so a probe failure
+    that persists against it is not the integration's fault.
+    """
+
+    def __missing__(self, _):
+        return _ProbeValue(1)
 
 
 def _guard_only_value_still_renders(text, name):
@@ -674,12 +709,31 @@ def _guard_only_value_still_renders(text, name):
     else:
         assignments = ((False,) * len(others), (True,) * len(others))
     for combo in assignments:
-        context = {n: _Anything(t) for n, t in zip(others, combo)}
-        context[name] = _UnsetIntegration()
+        stand_ins = {n: _Anything(t) for n, t in zip(others, combo)}
         try:
-            template.render(**context)
+            template.render(**dict(stand_ins, **{name: _UnsetIntegration()}))
         except Exception:
-            return False
+            pass
+        else:
+            continue
+        # It failed -- but a stand-in is not a real value, so the
+        # failure is only evidence about the INTEGRATION if the same
+        # render SUCCEEDS once the integration is populated. Judging by
+        # "raised at all" blamed the integration for
+        # `{% if config|tojson and oidc %}`, where it is `config|tojson`
+        # that cannot cope with a stand-in, and popped a key the real
+        # context renders as `off`.
+        #
+        # The populated side has to be a value that actually works --
+        # numbers serialise, compare and take `|int`/`|abs`. Using the
+        # absorb-everything stand-in here made `{{ smtp.host|tojson }}`
+        # look unattributable, because that stand-in is not JSON
+        # serialisable either.
+        try:
+            template.render(**dict(stand_ins, **{name: _PopulatedProbe()}))
+        except Exception:
+            continue
+        return False
     return True
 
 
