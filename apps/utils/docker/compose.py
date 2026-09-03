@@ -427,17 +427,63 @@ def _render_json_value(value, greffon_info, dest_name):
 
 
 def _document_parses(compose):
-    """Does the compose still parse as ONE Jinja template once dumped?
+    """Is the compose still a usable Jinja template once dumped?
 
-    Asks the exact question the render will ask, of the exact text it
-    will ask it of (`Template(yaml.dump(compose))`). Any failure is a
-    no, including a compose that will not dump.
+    `from_string`, not `parse`: the render is `Template(...)`, which
+    parses AND compiles, and a family of `TemplateAssertionError`s is
+    raised only by the compile step. Popping a `{% raw %}`/`{% endraw %}`
+    pair un-shields whatever sat between them, so the strip can ADD live
+    constructs, not only remove them -- `block 'b' defined twice` is
+    reachable that way and parses perfectly well. Asking the cheaper
+    question let exactly that through.
+
+    Any failure is a no, including a compose that will not dump.
     """
     try:
-        Environment().parse(yaml.dump(compose))
+        Environment().from_string(yaml.dump(compose))
     except Exception:
         return False
     return True
+
+
+def _env_keys_by_service(compose):
+    """`{service: [env key]}` for every mapping- or list-form env block.
+
+    Lists, not sets: the order these come out in decides which pops are
+    tried first, and a set of strings iterates in an order that varies
+    between processes. Keeping the document's own order makes the undo
+    below reproducible without having to sort anything.
+    """
+    services = compose.get('services') if isinstance(compose, dict) else None
+    if not isinstance(services, dict):
+        return {}
+    found = {}
+    for name, service in services.items():
+        if not isinstance(service, dict):
+            continue
+        env = service.get('environment')
+        if isinstance(env, dict):
+            found[name] = list(env)
+        elif isinstance(env, list):
+            found[name] = [
+                e.split('=', 1)[0] for e in env if isinstance(e, str) and '=' in e
+            ]
+    return found
+
+
+def _pop_env_key(compose, service_name, key):
+    """Remove one env key from one service, in whichever form it uses."""
+    service = compose.get('services', {}).get(service_name)
+    if not isinstance(service, dict):
+        return
+    env = service.get('environment')
+    if isinstance(env, dict):
+        env.pop(key, None)
+    elif isinstance(env, list):
+        service['environment'] = [
+            e for e in env
+            if not (isinstance(e, str) and '=' in e and e.split('=', 1)[0] == key)
+        ]
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
@@ -499,20 +545,20 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # and fails the entire render -- a 500 at `/start/`, far worse than
     # the env var the pop was worth.
     #
-    # Two reviews found this twice, in shapes that argue against ever
-    # fixing it value-by-value: `{% raw %}` PARSES alone (so it is kept)
-    # while its `{% endraw %}` does not (so it is popped), and a
-    # `{# comment` opener holds no Jinja delimiter at all (so it is never
-    # examined) while the `{{ oidc.host }} #}` closing it is a genuine
-    # reference that must be popped. No per-value rule is right about
-    # both.
+    # Reviews found this in shapes that argue against ever fixing it
+    # value-by-value: `{% raw %}` PARSES alone (so it is kept) while its
+    # `{% endraw %}` does not (so it is popped), and a `{# comment`
+    # opener holds no Jinja delimiter at all (so it is never examined)
+    # while the `{{ oidc.host }} #}` closing it is a genuine reference
+    # that must be popped. No per-value rule is right about both.
     #
     # So stop enumerating shapes and check the invariant instead: if the
-    # document parsed before the strip and does not after, the strip
-    # broke it and is dropped wholesale. Those keys then render empty
-    # through the binding instead of being absent -- the weaker of the
-    # two guarantees, but still a working deploy. Costs one extra parse
-    # of a document we are about to render anyway.
+    # document was usable before the strip and is not after, the pops
+    # that broke it are undone. Costs one extra parse of a document we
+    # are about to render anyway, and catches shapes nobody predicted --
+    # including that popping a `{% raw %}` pair UN-SHIELDS what sat
+    # between it, so the strip can add constructs, not only remove
+    # them.
     parsed_before = _document_parses(compose)
     snapshot = None
     if parsed_before:
@@ -543,6 +589,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     continue
                 container = destination.get('container')
                 key = destination.get('key')
+                # `isinstance(str)`, not just truthiness: catalog
+                # metadata is JSON, so either of these can arrive as a
+                # list, and an unhashable dict lookup raises TypeError
+                # straight out of `/start/`.
+                if not isinstance(container, str) or not isinstance(key, str):
+                    continue
                 if not container or not key:
                     continue
                 service = services.get(container)
@@ -634,20 +686,23 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # by fuzzing after the third was fixed, which is the argument
             # for not writing a fifth tuple.
             #
-            # Two things make a failed parse a reference. The name
-            # occurring at all: a value that never mentions `oidc` cannot
-            # dereference it except by aliasing, the residual named above.
-            # And any `{%` tag: an unparseable statement fragment is how a
-            # block gets split across two env values, and popping only the
-            # half that names the integration would leave the other half
-            # to unbalance the whole document.
+            # Fall back to the crudest form of the question: does the
+            # name occur at all? A value that never mentions `oidc`
+            # cannot dereference it except by aliasing, the residual
+            # named above. What is left -- broken and not mentioning the
+            # name -- keeps `main`'s behaviour and fails the render
+            # loudly, rather than being silently dropped from a deploy
+            # that then comes up misconfigured.
             #
-            # What is left -- broken, no name, no tag -- keeps `main`'s
-            # behaviour and fails the render loudly, rather than being
-            # silently dropped from a deploy that then comes up
-            # misconfigured.
-            return ('{%' in value
-                    or re.search(rf'\b{re.escape(name)}\b', value) is not None)
+            # This deliberately does NOT also pop on `{%`. That rule
+            # existed to stop a block being half-popped and left
+            # dangling, but it popped values referencing no integration
+            # at all (`{% if instance_url %}` split across two values
+            # lost both keys on every instance with an unset type, which
+            # today is every instance). The document guard below
+            # supersedes it and is not restricted to shapes anyone
+            # thought of.
+            return re.search(rf'\b{re.escape(name)}\b', value) is not None
         for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
             target = node.node
             # No `ctx` check: a store-context Getattr is unreachable from
@@ -706,14 +761,61 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # and could be copied; re-testing `parsed_before` here would be a
     # second spelling of the same condition.
     if snapshot is not None and not _document_parses(compose):
-        logger.warning(
-            'integration strip left instance %s unrenderable; keeping every '
-            'env key and letting the unset binding render them empty',
-            greffon_info.get('id'),
-        )
-        compose.clear()
-        compose.update(snapshot)
+        _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info)
     return compose
+
+
+def _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info):
+    """Keep every pop that is safe on its own; undo only the ones that
+    break the document.
+
+    Reverting the strip WHOLESALE was wrong, because the document is one
+    template but the damage is local: a malformed value in one service
+    un-popped every correctly-popped key in every OTHER service, and
+    glitchtip's `EMAIL_URL` came back to render `smtp://:@`, which is the
+    exact malformed URL the strip exists to prevent. "Weaker guarantee
+    but still a working deploy" was not true for that app.
+
+    So rebuild from the snapshot and re-apply the pops one at a time,
+    keeping each only while the document still compiles. The pops that
+    are fine survive; the one that straddles a construct is dropped.
+
+    Cost is paid only here, in the case that already went wrong -- the
+    common path is the two `_document_parses` calls above. Order is
+    deterministic so the outcome does not depend on dict iteration luck.
+    Applying the FULL set is never retried: it is what just failed.
+    """
+    before = _env_keys_by_service(snapshot)
+    after = _env_keys_by_service(compose)
+    # Ordered by the document, so the outcome does not depend on set
+    # iteration luck and is the same on every node for the same input.
+    popped = [
+        (service, key)
+        for service, keys in before.items()
+        for key in keys
+        if key not in after.get(service, ())
+    ]
+
+    last_good = copy.deepcopy(snapshot)
+    kept, undone = [], []
+    for service, key in popped:
+        trial = copy.deepcopy(last_good)
+        _pop_env_key(trial, service, key)
+        if _document_parses(trial):
+            last_good = trial
+            kept.append(f'{service}.{key}')
+        else:
+            undone.append(f'{service}.{key}')
+
+    logger.warning(
+        'integration strip left instance %s unrenderable; kept %s and undid '
+        '%s, which will render empty through the unset binding instead',
+        greffon_info.get('id'),
+        ', '.join(kept) or 'nothing',
+        ', '.join(undone) or 'nothing',
+    )
+    compose.clear()
+    compose.update(last_good)
 
 
 def _compose_render_context(greffon_info):
