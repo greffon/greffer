@@ -1330,6 +1330,82 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class TheReadRuleIsCompleteByConstructionTests(TestCase):
+    """The base question is Jinja's, not ours.
+
+    Enumerating the constructs that read a variable was wrong ELEVEN
+    times, each miss an under-pop that shipped a malformed value. The
+    base rule is now `meta.find_undeclared_variables`, which reports
+    every use in every construct, so no twelfth construct can slip past
+    it. What is enumerated instead is the GUARD positions, and that
+    inversion is what makes the failure direction safe: miss a guard
+    slot and one env var is over-popped on an integration nobody
+    configured.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_string_concatenation_is_a_read(self):
+        # The eleventh route. `{{ smtp ~ "" }}` renders `{}` exactly as
+        # the bare `{{ smtp }}` does, but it is a Concat node, so the
+        # rule that matched a bare Output name did not see it.
+        for value in ('{{ smtp ~ "" }}', '{{ "" ~ smtp }}',
+                      'X{{ smtp ~ "y" }}Z'):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_filter_BLOCK_does_not_crash_the_strip(self):
+        # `{% filter upper %}..{% endfilter %}` is a `Filter` node whose
+        # operand slot is EMPTY, because its operand is the block body.
+        # Walking that raised an uncaught AttributeError out of
+        # `/start/` -- a 500 caused by the analysis, not the input.
+        self.assertFalse(
+            self._survives('{% filter upper %}{{ smtp.host }}{% endfilter %}'))
+        self.assertTrue(
+            self._survives('{% filter upper %}plain{% endfilter %}'))
+
+    def test_a_locally_bound_name_is_not_our_integration(self):
+        # Scoping comes free with the base rule, and every hand-written
+        # version of this got it wrong: a loop variable, a `{% set %}`
+        # or a macro parameter named `oidc` has nothing to do with the
+        # integration, so the key must survive.
+        for value in (
+            '{% for oidc in [{"issuer": "l"}] %}{{ oidc.issuer }}{% endfor %}',
+            '{% set oidc = {"issuer": "x"} %}{{ oidc.issuer }}',
+            '{% macro m(oidc) %}{{ oidc.issuer }}{% endmacro %}{{ m({"issuer":"y"}) }}',
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+    def test_a_local_binding_elsewhere_does_not_excuse_a_global_read(self):
+        # The mirror, and the case that makes the scoping load-bearing
+        # rather than merely permissive.
+        self.assertFalse(self._survives(
+            '{% macro m(smtp) %}{{ smtp.host }}{% endmacro %}{{ smtp.port|int }}'))
+
+    def test_a_guard_slot_is_the_only_exemption(self):
+        # Guards render the CORRECT value unset, because the binding is
+        # a falsy empty mapping.
+        for value in ('{% if smtp %}on{% else %}off{% endif %}',
+                      '{{ "y" if smtp.host else "n" }}',
+                      '{% if smtp.tls_mode == "tls" %}a{% endif %}',
+                      '{{ smtp is defined }}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+    def test_a_guard_does_not_launder_a_read_beside_it(self):
+        # Guardedness applies to the occurrence, not the value: a read
+        # elsewhere in the same value still pops.
+        self.assertFalse(self._survives(
+            '{% if smtp %}{{ smtp.host }}{% endif %}'))
+        self.assertFalse(self._survives(
+            '{% if smtp %}on{% endif %}{{ smtp|urlencode }}'))
+
+
 class IteratingTheTypeIsADereferenceTests(TestCase):
     """`{% for k in smtp %}` reads the mapping, and produces no node the
     other rules look at.
@@ -1488,12 +1564,22 @@ class TheAcceptedOverPopTests(TestCase):
         return 'K' in compose['services']['a']['environment']
 
     def test_the_name_in_a_target_it_cannot_be_is_still_popped(self):
-        for value in ('{{ (alpha if smtp else alpha).name }}',
-                      '{{ (alpha, smtp)[0].name }}',
+        # The name appears in the Getattr target but cannot be what the
+        # expression evaluates to, so `main` renders these and this
+        # drops them. Over-pop costs one env var on an integration
+        # nobody configured; under-pop ships a malformed value.
+        for value in ('{{ (alpha, smtp)[0].name }}',
                       '{{ {"a": alpha, "b": smtp}["a"].name }}',
                       '{{ ([alpha] + [smtp])[0].name }}'):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
+
+    def test_a_ternary_TEST_is_a_guard_and_is_kept(self):
+        # `{{ (alpha if smtp else alpha).name }}` used to be in the list
+        # above. It is a guard -- the mapping decides which branch, its
+        # contents never reach the output -- so keeping it renders the
+        # correct value in both worlds, and the over-pop is gone.
+        self.assertTrue(self._survives('{{ (alpha if smtp else alpha).name }}'))
 
     def test_a_value_that_never_mentions_the_name_is_untouched(self):
         # The boundary: over-popping requires the name to appear. It is
@@ -1934,16 +2020,23 @@ class ConstructScanningTests(TestCase):
         # prevent, reintroduced by the fix for the false positive.
         for value in (
             '{% set x = oidc.issuer %}{{ x }}',
-            '{% if oidc.issuer.startswith("https") %}a{% endif %}',
             '{% for s in oidc.scopes %}{{ s }}{% endfor %}',
         ):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
 
+    def test_a_statement_that_only_GUARDS_is_kept(self):
+        # `{% if %}` decides a branch; the mapping's contents never
+        # reach the output through its test. Unset renders '' and
+        # configured renders the branch, so both are correct and
+        # popping would discard a working conditional.
+        self.assertTrue(
+            self._survives('{% if oidc.issuer.startswith("https") %}a{% endif %}'))
+
     def test_statement_blocks_are_scanned_for_smtp_too(self):
         # Not an oidc-only rule; the same hole existed for the type that
         # was already shipping.
-        self.assertFalse(self._survives('{% if smtp.host %}x{% endif %}'))
+        self.assertTrue(self._survives('{% if smtp.host %}x{% endif %}'))
 
     def test_token_inside_a_string_literal_is_data_not_a_reference(self):
         # `oidc.acme.com` here is a quoted hostname being concatenated,
@@ -1988,7 +2081,7 @@ class DelimiterInsideStringLiteralTests(TestCase):
         self.assertFalse(self._survives('{{ "}}" ~ oidc.issuer.split("@")[0] }}'))
 
     def test_reference_after_a_quoted_block_delimiter_is_found(self):
-        self.assertFalse(
+        self.assertTrue(
             self._survives('{% if "%}" and oidc.issuer.startswith("h") %}y{% endif %}'),
         )
 
@@ -2032,7 +2125,7 @@ class DelimiterInsideStringLiteralTests(TestCase):
 
     def test_whitespace_control_markers_are_handled(self):
         self.assertFalse(self._survives('{{- oidc.issuer -}}'))
-        self.assertFalse(self._survives('{%- if oidc.issuer -%}a{%- endif -%}'))
+        self.assertTrue(self._survives('{%- if oidc.issuer -%}a{%- endif -%}'))
         self.assertTrue(self._survives('{%- raw -%}{{ oidc.issuer }}{%- endraw -%}'))
 
 
@@ -2097,14 +2190,19 @@ class ShadowedNameIsOverPoppedTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def test_a_shadowed_name_is_popped_like_main_does(self):
+    def test_a_shadowed_name_is_NOT_popped(self):
+        # These bind `oidc` LOCALLY -- a loop variable, a `{% set %}`, a
+        # macro parameter -- so the value never touches our integration
+        # and the key must survive. `main` and every hand-written rule
+        # here over-popped all three; asking Jinja which variables are
+        # UNDECLARED gets the scoping right for free.
         for value in (
             '{% for oidc in [{"issuer": "local"}] %}{{ oidc.issuer }}{% endfor %}',
             '{% set oidc = {"issuer": "x"} %}{{ oidc.issuer }}',
             '{% macro m(oidc) %}{{ oidc.issuer }}{% endmacro %}{{ m({"issuer":"y"}) }}',
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(value))
+                self.assertTrue(self._survives(value))
 
     def test_a_binding_in_one_scope_does_not_excuse_a_global_read_in_another(self):
         # The regression the shadow rule introduced: this binds `smtp` in
@@ -2147,7 +2245,9 @@ class CallParenthesisTests(TestCase):
     def test_a_bare_name_as_a_call_argument_is_not_a_dereference(self):
         # The other side: passed, not dereferenced. The binding renders
         # it, so there is nothing to strip.
-        self.assertTrue(self._survives('{{ f(oidc) }}'))
+        # Passing the type INTO a call is a read: the callee may do
+        # anything with it, and popping is the safe direction.
+        self.assertFalse(self._survives('{{ f(oidc) }}'))
 
     def test_a_spaced_call_paren_is_still_a_call(self):
         # `dict (oidc)` -- Jinja allows whitespace before a call's
@@ -2273,11 +2373,14 @@ class ReferenceFormTests(TestCase):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
 
-    def test_default_is_the_exception(self):
-        # `default` exists to handle the unset case, so popping a value
-        # that uses one would discard the author's own handling.
-        self.assertTrue(self._survives('{{ oidc|default("D") }}'))
-        self.assertTrue(self._survives('{{ oidc|d("D") }}'))
+    def test_default_is_NOT_an_exception(self):
+        # This code claimed for two rounds that `default` handles the
+        # unset case and so must be preserved. It does not: the binding
+        # is a DEFINED empty mapping, so `{{ oidc|default("D") }}`
+        # renders `{}`, not `D`. There is no author handling to keep,
+        # only garbage to remove.
+        self.assertFalse(self._survives('{{ oidc|default("D") }}'))
+        self.assertFalse(self._survives('{{ oidc|d("D") }}'))
 
     def test_a_filter_on_an_unrelated_name_is_untouched(self):
         self.assertTrue(self._survives("{{ ['a']|map('upper')|list }}"))
@@ -2290,7 +2393,12 @@ class ReferenceFormTests(TestCase):
         # grow one, the value is KEPT and the binding renders it -- which
         # is the whole reason the rule is allowed to be incomplete. On
         # main this same value raises UndefinedError and fails the start.
-        self.assertTrue(self._survives('{% set x = oidc %}{{ x.issuer.host }}'))
+        # Now POPPED: `find_undeclared_variables` reports `oidc` for
+        # this whole value, so the base rule catches it even though no
+        # rule follows the alias. What remains uncovered is a macro
+        # PARAMETER carrying it across two env values, which no
+        # single-value analysis can see.
+        self.assertFalse(self._survives('{% set x = oidc %}{{ x.issuer.host }}'))
 
     def test_plus_whitespace_control_on_endraw(self):
         # `{% raw %}` shields its body, and Jinja accepts `+` as well as
@@ -2300,11 +2408,19 @@ class ReferenceFormTests(TestCase):
         # parser handles it natively now, but the property still has to
         # hold, so the case is kept: what follows `{% endraw %}` is
         # scanned.
-        self.assertFalse(
+        # What follows `{% endraw %}` is examined -- and here what
+        # follows is a GUARD, so it is correctly kept (it renders `x`
+        # unset and `xy` configured). The property being pinned is that
+        # the text after the raw block is not skipped; a read there is
+        # still popped, which the next assertion covers.
+        self.assertTrue(
             self._survives('{% raw %}x{%+ endraw %}{% if oidc.issuer.startswith("h") %}y{% endif %}'),
         )
         self.assertFalse(
-            self._survives('{% raw %}x{% endraw +%}{% if oidc.issuer.startswith("h") %}y{% endif %}'),
+            self._survives('{% raw %}x{%+ endraw %}{{ oidc.issuer }}'),
+        )
+        self.assertFalse(
+            self._survives('{% raw %}x{% endraw +%}{{ oidc.issuer }}'),
         )
 
     def test_plus_whitespace_control_on_raw_opener(self):
@@ -2526,13 +2642,16 @@ class BindingIsWiredIntoTheRenderTests(TestCase):
     testing found that; nothing else would have.
 
     The value below is the one case that distinguishes wired from
-    unwired: the strip pass KEEPS it (the bare `oidc` reads as a guard,
-    and the dereference happens on a macro parameter it cannot follow),
-    so the binding is the only thing standing between it and
-    `UndefinedError` out of the render.
+    unwired: the strip pass KEEPS it, so the binding is the only thing
+    standing between it and `UndefinedError` out of the render.
     """
 
-    MACRO = '{% macro m(o) %}{{ o.issuer.host }}{% endmacro %}{{ m(oidc) }}'
+    # A GUARD: the strip keeps it (the mapping only decides a branch),
+    # and without the binding `oidc.a.b` raises `UndefinedError` on the
+    # plain `{}` -- so this is the shape that distinguishes wired from
+    # unwired. The macro form used before is popped now that the base
+    # rule reports every use of the name.
+    MACRO = '{% if oidc.a.b %}x{% endif %}'
 
     def test_the_strip_pass_keeps_it(self):
         # If this ever starts being popped the test below stops testing

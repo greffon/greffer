@@ -6,7 +6,7 @@ import re
 import json
 import logging
 from datauri import DataURI
-from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template, nodes
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template, meta, nodes
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -479,60 +479,78 @@ _UNDO_TIME_BUDGET = 5.0
 # Filters that read an attribute off their operand, so they dereference
 # without producing a `Getattr` node. `attr` names the attribute
 # positionally; the rest take an `attribute=` keyword.
-def _can_evaluate_to(target, name):
-    """Can this expression evaluate to the top-level `name` itself?
+# Slots whose occupant only DECIDES something: the mapping's contents
+# never reach the output through them. An occurrence of the type inside
+# one of these is a guard, not a read.
+_GUARD_SLOTS = frozenset({
+    (nodes.If, 'test'),
+    (nodes.CondExpr, 'test'),
+    (nodes.Test, 'node'),
+})
 
-    Requiring the target to be literally a `Name` node missed every
-    form that puts an operator between the name and the dot, and those
-    are ordinary defensive catalog idioms rather than adversarial
-    shapes:
 
-        {{ (smtp or {}).host }}          Or
-        {{ (smtp|default({})).host }}    Filter
-        {{ (smtp if smtp else s).host }} CondExpr
-        {{ [smtp][0].host }}             List behind a Getitem
+def _reads(ast, name):
+    """Does this parsed template READ the top-level `name`?
 
-    Each survived the strip and rendered empty, so a catalog author
-    writing the careful "be safe when it is unset" form was exactly the
-    one who got `EMAIL_URL: smtp://:@` -- silently, with no log line,
-    because the strip believed there was nothing to pop.
+    Asked in two halves, and the split is the point.
 
-    Calls are NOT a barrier, though they were briefly. The idea was
-    that a call's result is not its operand, so `dict(oidc).get('x')`
-    reads a new object. In practice a call is the easiest way to
-    launder the type back into something unprotected, and both
-    directions shipped:
+    The BASE is `meta.find_undeclared_variables`, which is Jinja's own
+    answer to "which variables does this template use". It is complete
+    by construction: every occurrence, in every construct, present and
+    future. Enumerating the constructs that read a variable was tried
+    instead and was wrong ELEVEN times -- bare-`Name` targets only,
+    `|attr()`, whole-mapping filters (`|urlencode`, `|items`),
+    `namespace(v=smtp).v`, `dict(smtp).get()`, `{% for k in smtp %}`,
+    `{{ smtp }}`, `{{ smtp ~ "" }}` -- each found by a different review,
+    each an under-pop that shipped a malformed value. A list reached
+    that way is evidence of nothing about the twelfth case.
 
-        {{ namespace(v=smtp).v.host }}   ->  smtp://:@   (empty)
-        {{ dict(smtp).get('user') }}     ->  None        (garbage)
+    What is enumerated instead is the GUARD positions, and that
+    inversion is what makes the failure direction safe. Miss a read
+    construct and the base rule still catches it. Miss a guard slot and
+    the cost is one env var over-popped on an integration nobody
+    configured -- the trade this module makes everywhere.
 
-    `namespace()` hands its keyword straight back, and `dict()` strips
-    the forgiving wrapper and restores the very `None` that
-    `_UnsetIntegration.get` exists to prevent. Both read the
-    integration, so both are dereferences, and the barrier was
-    protecting exactly one case -- `dict(...)` -- that turned out to be
-    the bug rather than a false positive.
+    A guard renders CORRECTLY on an unset integration, because the
+    binding is a falsy empty mapping: `{% if smtp %}on{% else %}off
+    {% endif %}` gives `off`, and `{{ 'y' if smtp.host else 'n' }}`
+    gives `n`. Popping those would discard a working setting.
 
-    Over-popping is deliberate and safe throughout: the expression does
-    mention the name, and losing one env var on an integration nobody
-    configured beats a malformed value that ships.
+    `|default` is NOT a guard, contrary to what this code claimed for
+    two rounds. The binding is DEFINED, so `{{ smtp|default('x') }}`
+    renders `{}` rather than `x` -- there is no author handling to
+    preserve, only garbage to remove. (`default(x, true)` does fire, and
+    is over-popped; that is the accepted direction.)
+
+    Left incomplete on purpose: aliasing and dataflow.
+    `{% set a = smtp %}{{ a.host }}` moves the read onto another name,
+    and `find_undeclared_variables` reports `smtp` for it, so it is
+    popped -- but a macro parameter carrying it across two env values is
+    not something any single-value analysis can follow. The binding and
+    the document guard cover that.
     """
-    stack = [target]
+    if name not in meta.find_undeclared_variables(ast):
+        return False
+
+    # Only real nodes are ever pushed, which is why there is no
+    # empty-slot check here. The previous implementation walked a
+    # `Filter`'s operand directly, and a filter BLOCK
+    # (`{% filter upper %}..{% endfilter %}`) has that slot EMPTY, so it
+    # raised an uncaught AttributeError out of `/start/`. Pushing only
+    # `Node` instances makes that unrepresentable rather than guarded.
+    stack = [(ast, False)]
     while stack:
-        node = stack.pop()
-        if isinstance(node, nodes.Name):
-            if node.name == name:
+        node, guarded = stack.pop()
+        if isinstance(node, nodes.Name) and node.name == name:
+            if not guarded:
                 return True
             continue
-        stack.extend(node.iter_child_nodes())
+        for field, value in node.iter_fields():
+            child_guarded = guarded or (type(node), field) in _GUARD_SLOTS
+            for item in (value if isinstance(value, list) else [value]):
+                if isinstance(item, nodes.Node):
+                    stack.append((item, child_guarded))
     return False
-
-
-# Filters whose result does not depend on reading the operand's
-# contents, so applying one to an unset integration is not a
-# dereference. `default` (and its alias `d`) exist precisely to handle
-# the unset case.
-_FILTERS_THAT_HANDLE_UNSET = frozenset({'default', 'd'})
 
 
 def _document_renders(compose, render_context):
@@ -822,7 +840,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         deploy.
         """
         try:
-            ast = parser_env.parse(value)
+            return _reads(parser_env.parse(value), name)
         except Exception:
             # Deliberately bare: the body is a single `parse()` on
             # catalog-controlled input, so there is no logic of ours for
@@ -845,60 +863,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # popped values referencing no integration at all, and the
             # document guard below covers what it was for.
             return re.search(rf'\b{re.escape(name)}\b', value) is not None
-        for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
-            # No `ctx` check: a store-context Getattr is unreachable from
-            # Jinja source (`{% set oidc.a = 1 %}` parses to no Getattr,
-            # `{% for oidc.a in xs %}` is a syntax error), so testing it
-            # would pin nothing.
-            if _can_evaluate_to(node.node, name):
-                return True
-
-        # Iterating the type reads its contents, and produces no
-        # Getattr, Getitem or filter to notice. `{% for k in smtp %}`
-        # is the shortest form of the same thing `{% for k, v in
-        # smtp|items %}` does -- one is popped and the other was not,
-        # which is an arbitrary line to draw between two spellings of
-        # one idiom. It renders correctly when configured, so it ships.
-        for node in ast.find_all(nodes.For):
-            if _can_evaluate_to(node.iter, name):
-                return True
-
-        # Outputting the type renders the mapping itself: `{{ smtp }}`
-        # gives the literal `{}` unset, and a Python dict repr that
-        # breaks the YAML when configured. Neither is usable, so the key
-        # is better absent.
-        #
-        # A BARE name only. Anything richer is a guard rather than a
-        # read -- `{{ 'on' if smtp else 'off' }}` and `{% if smtp %}`
-        # both render the correct branch on an unset integration
-        # precisely because the binding is a falsy empty mapping, and
-        # popping them would throw away a working setting.
-        for node in ast.find_all(nodes.Output):
-            for child in node.nodes:
-                if isinstance(child, nodes.Name) and child.name == name:
-                    return True
-
-        # A filter READS its operand, so a filter applied to the type
-        # reads the type. Listing the filters that DO dereference was
-        # wrong twice -- first the attribute-naming ones
-        # (`{{ smtp|attr("host") }}`), then the whole-mapping ones
-        # (`{{ smtp|urlencode }}`, `{% for k, v in smtp|items %}`) --
-        # so what is listed instead is the filters that do not.
-        #
-        # Those two matter more than the earlier misses because they
-        # render CORRECTLY when the integration is configured, so a
-        # catalog author has every reason to ship one; unset, the same
-        # value rendered `smtp://@mailhost:25`.
-        #
-        # `default` is the exception: its purpose IS handling the unset
-        # case, so popping a value that uses one discards the author's
-        # own handling.
-        for node in ast.find_all(nodes.Filter):
-            if node.name in _FILTERS_THAT_HANDLE_UNSET:
-                continue
-            if _can_evaluate_to(node.node, name):
-                return True
-        return False
 
     def _strings_in(value):
         """Every string inside `value`, however nested.
