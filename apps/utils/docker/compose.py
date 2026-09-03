@@ -176,11 +176,17 @@ def get_greffon_path(greffon_info):
 # `'dict object' has no attribute 'issuer'` and a 422. The shapes that
 # TOLERATE an empty mapping do now render, though, which is less than
 # "raises either way" would suggest: `{{ oidc }}` and `|tojson` give
-# `{}`, `|default(..)` and `.get(k, d)` give the default, and
-# `{% if oidc %}` takes the else branch. Same semantics `smtp` has
-# shipped with. So the loud-refusal guarantee covers a DEREFERENCE, not
-# every reference -- a realm file written with `|default` renders empty
-# rather than refusing. A Keycloak-style realm file referencing
+# `{}`, `.get(k, d)` gives `d`, and `{% if oidc %}` takes the else
+# branch. Same semantics `smtp` has shipped with.
+#
+# `|default` depends on WHAT it is applied to, and the difference is
+# easy to get backwards. The mapping is DEFINED -- an empty dict -- so
+# `{{ oidc|default('d') }}` renders `{}`, not `d`. A missing FIELD is
+# undefined, so `{{ oidc.issuer|default('d') }}` does render `d`.
+#
+# So the loud-refusal guarantee covers a DEREFERENCE, not every
+# reference -- a realm file written with `|default` on a field renders
+# that default rather than refusing. A Keycloak-style realm file referencing
 # `{{ oidc.* }}` is still NOT made deployable by this change, and
 # whoever writes the client-injection half needs a real value there
 # rather than an empty default.
