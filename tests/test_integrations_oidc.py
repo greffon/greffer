@@ -1330,6 +1330,66 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
+class WholeMappingFiltersAreDereferencesTests(TestCase):
+    """The sharpest case in this module, so it gets its own class.
+
+    `{{ smtp|urlencode }}` and `{% for k, v in smtp|items %}` read the
+    mapping's CONTENTS without naming any attribute, so neither a
+    `Getattr` nor an attribute-naming filter appears and the scan saw
+    nothing to pop.
+
+    What makes them worse than the earlier misses is that they WORK.
+    With SMTP configured they render correctly, so a catalog author has
+    every reason to ship one -- and unset, the same value renders
+    `smtp://@mailhost:25`, a malformed URL the app parses at boot. The
+    strip stayed silent throughout: nothing was popped, so the document
+    guard had nothing to undo and no log line was emitted.
+    """
+
+    CONFIGURED = {'smtp': {'host': 'mail.ex', 'user': 'u', 'password': 'p'}}
+
+    def _run(self, value, integrations=None):
+        compose = {'services': {'app': {'environment': {'E': value}}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations or {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def test_a_whole_mapping_filter_is_popped_when_unset(self):
+        for value in ('smtp://{{ smtp|urlencode }}@mailhost:25',
+                      '{% for k, v in smtp|items %}{{ k }}={{ v }};{% endfor %}',
+                      '{{ smtp|dictsort }}',
+                      '{{ smtp|xmlattr }}'):
+            with self.subTest(value=value):
+                compose, _ = self._run(value)
+                self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_the_same_value_still_works_when_configured(self):
+        # The reason it must be popped rather than left alone: this is a
+        # real, working idiom, not a broken one.
+        value = 'smtp://{{ smtp|urlencode }}@mailhost:25'
+        compose, info = self._run(value, self.CONFIGURED)
+        rendered = Template(yaml.dump(compose)).render(
+            **_compose_render_context(info))
+        got = yaml.safe_load(rendered)['services']['app']['environment']['E']
+        self.assertIn('host=mail.ex', got)
+        self.assertNotIn('smtp://@', got)
+
+    def test_the_malformed_url_is_gone_when_unset(self):
+        value = 'smtp://{{ smtp|urlencode }}@mailhost:25'
+        compose, info = self._run(value)
+        rendered = Template(yaml.dump(compose)).render(
+            **_compose_render_context(info))
+        self.assertNotIn('smtp://@', rendered)
+
+    def test_map_attr_does_not_smuggle_the_attribute_rule_through(self):
+        # `map`'s positional argument names a FILTER -- but that filter
+        # can be `attr`, which is the one indirection that turned the
+        # old attribute rule back off.
+        compose, _ = self._run("smtp://{{ [smtp]|map('attr','user')|join }}@h")
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+
 class TheAcceptedOverPopTests(TestCase):
     """Where the subtree search pops a value that would have worked.
 
@@ -2126,14 +2186,32 @@ class ReferenceFormTests(TestCase):
         self.assertTrue(self._survives('{{ (other or {}).host }}'))
         self.assertTrue(self._survives('{{ instance_url }}'))
 
-    def test_a_filter_that_names_no_attribute_is_not_a_dereference(self):
-        # `map`'s positional argument is a FILTER name, not an
-        # attribute. The operand mentions `oidc` here, so only the
-        # attribute rule keeps this from being swept up.
-        self.assertTrue(self._survives("{{ [oidc]|map('upper')|list }}"))
+    def test_any_filter_reading_the_type_is_a_dereference(self):
+        # Enumerating the filters that DEREFERENCE was wrong twice: the
+        # attribute-naming ones were missed first, then the ones that
+        # read the whole mapping without naming an attribute. A filter
+        # reads its operand, so the rule is now the other way round.
+        for value in ("{{ oidc|urlencode }}",
+                      "{% for k, v in oidc|items %}{{ k }}{% endfor %}",
+                      "{{ oidc|dictsort }}",
+                      "{{ oidc|list }}",
+                      "{{ oidc|tojson }}",
+                      "{{ oidc|attr('issuer') }}",
+                      "{{ [oidc]|map('attr','issuer')|join }}",
+                      "{{ [oidc]|map('upper')|list }}"):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_default_is_the_exception(self):
+        # `default` exists to handle the unset case, so popping a value
+        # that uses one would discard the author's own handling.
+        self.assertTrue(self._survives('{{ oidc|default("D") }}'))
+        self.assertTrue(self._survives('{{ oidc|d("D") }}'))
+
+    def test_a_filter_on_an_unrelated_name_is_untouched(self):
         self.assertTrue(self._survives("{{ ['a']|map('upper')|list }}"))
         self.assertTrue(self._survives('{{ instance_url|upper }}'))
-        self.assertTrue(self._survives('{{ oidc|default("D") }}'))
+        self.assertTrue(self._survives('{{ other|urlencode }}'))
 
     def test_aliasing_is_not_chased(self):
         # `{% set x = oidc %}{{ x.issuer.host }}` moves the dereference

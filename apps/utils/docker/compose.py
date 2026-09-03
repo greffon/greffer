@@ -528,15 +528,11 @@ def _can_evaluate_to(target, name):
     return False
 
 
-_ATTRIBUTE_FILTERS = frozenset({
-    'attr', 'map', 'selectattr', 'rejectattr', 'groupby', 'sort',
-    'min', 'max', 'sum',
-})
-# Of those, the ones whose FIRST POSITIONAL argument is the attribute.
-# `map` is excluded on purpose: its positional argument names a filter.
-_POSITIONAL_ATTRIBUTE_FILTERS = frozenset({
-    'selectattr', 'rejectattr', 'groupby',
-})
+# Filters whose result does not depend on reading the operand's
+# contents, so applying one to an unset integration is not a
+# dereference. `default` (and its alias `d`) exist precisely to handle
+# the unset case.
+_FILTERS_THAT_HANDLE_UNSET = frozenset({'default', 'd'})
 
 
 def _document_renders(compose, render_context):
@@ -875,27 +871,27 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             if _can_evaluate_to(node.node, name):
                 return True
 
-        # Dereferences that are not `Getattr`/`Getitem` nodes at all.
-        # `{{ smtp|attr("host") }}` is a Filter with a constant argument
-        # and reads exactly what `{{ smtp.host }}` reads, but the walk
-        # above never asked about it, so it survived and rendered
-        # `smtp://@` -- a malformed URL, silently.
+        # A filter READS its operand, so a filter applied to the type
+        # reads the type. This is an allowlist of the filters that do
+        # NOT count, because enumerating the ones that do was wrong
+        # twice: `{{ smtp|attr("host") }}` reads exactly what
+        # `{{ smtp.host }}` reads, and then `{{ smtp|urlencode }}` and
+        # `{% for k, v in smtp|items %}` did the same by reading the
+        # whole mapping without naming any attribute at all.
+        #
+        # Those two are the sharpest case in this module. With the
+        # integration CONFIGURED they render correctly --
+        # `smtp://host=mail.ex&user=u@mailhost:25` -- so a catalog
+        # author has every reason to ship them; unset, they rendered
+        # `smtp://@mailhost:25`, a malformed URL parsed at boot.
+        #
+        # `default` is the exception that matters: its whole purpose is
+        # to handle the unset case, so popping a value that uses one
+        # would discard the author's own handling of it.
         for node in ast.find_all(nodes.Filter):
-            if node.name not in _ATTRIBUTE_FILTERS:
+            if node.name in _FILTERS_THAT_HANDLE_UNSET:
                 continue
-            if node.name != 'attr' and not (
-                any(kw.key == 'attribute' for kw in (node.kwargs or ()))
-                or (node.name in _POSITIONAL_ATTRIBUTE_FILTERS and node.args)
-            ):
-                # These only dereference when told WHICH attribute to
-                # read. `{{ xs|map('upper') }}` names a filter, not an
-                # attribute, so it does not -- but `selectattr('host')`
-                # takes the attribute positionally and does.
-                continue
-            if any(isinstance(n, nodes.Name) and n.name == name
-                   for n in node.node.find_all(nodes.Name)) or (
-                       isinstance(node.node, nodes.Name)
-                       and node.node.name == name):
+            if _can_evaluate_to(node.node, name):
                 return True
         return False
 
