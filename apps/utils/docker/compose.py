@@ -587,9 +587,6 @@ def _reads(ast, name):
     # (`{% filter upper %}..{% endfilter %}`) has that slot EMPTY, so it
     # raised an uncaught AttributeError out of `/start/`. Pushing only
     # `Node` instances makes that unrepresentable rather than guarded.
-    # State per occurrence: FREE reads, SLOT is inside a guard test,
-    # DOMINATED is inside a branch that only runs when the integration
-    # is configured.
     stack = [(ast, False)]
     while stack:
         node, guarded = stack.pop()
