@@ -2013,9 +2013,13 @@ class ReferenceFormTests(TestCase):
         self.assertTrue(self._survives('{% set x = oidc %}{{ x.issuer.host }}'))
 
     def test_plus_whitespace_control_on_endraw(self):
-        # Jinja accepts `+` as well as `-`. Missing it made the raw skip
-        # run to the end of the value, so everything after the raw block
-        # went unscanned.
+        # `{% raw %}` shields its body, and Jinja accepts `+` as well as
+        # `-` for whitespace control on either tag. A hand-written
+        # scanner got this wrong -- it ran the skip to the end of the
+        # value, so everything AFTER the raw block went unexamined. The
+        # parser handles it natively now, but the property still has to
+        # hold, so the case is kept: what follows `{% endraw %}` is
+        # scanned.
         self.assertFalse(
             self._survives('{% raw %}x{%+ endraw %}{% if oidc.issuer.startswith("h") %}y{% endif %}'),
         )
@@ -2024,6 +2028,8 @@ class ReferenceFormTests(TestCase):
         )
 
     def test_plus_whitespace_control_on_raw_opener(self):
+        # The mirror: what a raw block SHIELDS is literal text, not a
+        # reference, so it must not be popped.
         self.assertTrue(self._survives('{%+ raw %}{{ oidc.issuer }}{% endraw %}'))
 
     def test_a_different_variable_sharing_the_substring_is_not_a_reference(self):
