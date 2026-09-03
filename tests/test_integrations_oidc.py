@@ -553,6 +553,124 @@ class ParseFailureFallsBackToTheNameTests(TestCase):
         self.assertTrue(self._kept("{{ notoidc.issuer'' }}"))
         self.assertTrue(self._kept("{{ oidcx.issuer'' }}"))
 
+    def test_a_non_ascii_digit_does_not_escape_as_a_500(self):
+        # Jinja's number lexer matches non-ASCII digits with a unicode
+        # `\d`, then hands the literal to the CPython compiler, which
+        # raises SyntaxError -- not a TemplateError, not a ValueError.
+        for value in ('{{ 0.\uff11 }}', '{{ 0.\u0661 }}',
+                      '{{ 1.0e\u0661 }}', '{{ 1.\u0665e\u0663 }}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._kept(value))
+
+    def test_the_non_ascii_digit_really_does_raise_SyntaxError(self):
+        # Pins the premise: if Jinja stops accepting these, the test
+        # above quietly stops covering anything.
+        from jinja2 import Environment
+        with self.assertRaises(SyntaxError):
+            Environment().parse('{{ 0.\uff11 }}')
+
+    def test_no_parser_exception_escapes_whatever_its_class(self):
+        # The guard is deliberately bare, so pin the property rather than
+        # a list of classes: a parse that blows up in ANY way must be
+        # answered, not propagated.
+        class Boom(Exception):
+            pass
+
+        with patch('apps.utils.docker.compose.Environment') as env_cls:
+            env_cls.return_value.parse.side_effect = Boom('from the parser')
+            try:
+                kept = self._kept('{{ oidc.issuer }}')
+            except Boom:
+                self.fail('a parser exception escaped _dereferences')
+        self.assertFalse(kept)
+
+    def test_a_keyboard_interrupt_is_NOT_swallowed(self):
+        # `Exception`, not `BaseException`: the broad catch is about the
+        # parser failing, not about making the process unkillable.
+        with patch('apps.utils.docker.compose.Environment') as env_cls:
+            env_cls.return_value.parse.side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                self._kept('{{ oidc.issuer }}')
+
+
+class ABlockSplitAcrossValuesIsPoppedWholeTests(TestCase):
+    """A `{% %}` block can straddle two env values, and half-popping it
+    corrupts the document.
+
+    The values are dumped into ONE YAML document and rendered together,
+    so popping `{% if oidc %}` while keeping the matching `{% endif %}`
+    leaves a stray tag that fails the whole render -- turning a
+    would-be over-pop (cost: one env var) into a failed deploy, which
+    is the direction this module exists to avoid. So an unparseable
+    value carrying any `{%` tag is popped even when it never names an
+    integration.
+    """
+
+    def _strip(self, env, integrations=None):
+        compose = {'services': {'app': {'environment': env}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': integrations or {}},
+        )
+        return compose['services']['app']['environment']
+
+    def test_both_halves_of_a_split_block_are_popped(self):
+        self.assertEqual(
+            self._strip({'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'}),
+            {'B': 'x'},
+        )
+
+    def test_what_remains_still_renders(self):
+        env = {'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'}
+        compose = {'services': {'app': {'environment': env}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        # The whole point: the surviving document is renderable.
+        rendered = Template(yaml.dump(compose)).render(**_compose_render_context(info))
+        self.assertEqual(
+            yaml.safe_load(rendered)['services']['app']['environment'], {'B': 'x'},
+        )
+
+    def test_a_lone_end_tag_is_popped_even_with_smtp_configured(self):
+        # It names no integration at all, so only the `{%` rule reaches it.
+        self.assertEqual(
+            self._strip({'C': '{% endif %}'}, {'smtp': {'host': 'h'}}), {},
+        )
+
+
+class MalformedPayloadShapesDoNotCrashTests(TestCase):
+    """A malformed manager payload must not 500 a deploy that works.
+
+    `_compute_config_context` documents defending exactly this; these two
+    did not, and a non-mapping `integrations` or a non-list
+    `configurations` raised straight out of `/start/`.
+    """
+
+    def test_a_non_mapping_integrations_is_treated_as_none(self):
+        for bad in ('garbage', 7, [], ['smtp'], None, True):
+            with self.subTest(bad=bad):
+                info = _compute_integrations_context({'id': 'i1', 'integrations': bad})
+                self.assertEqual(info['smtp'], {})
+                self.assertEqual(info['oidc'], {})
+
+    def test_a_non_mapping_integrations_still_pops(self):
+        compose = {'services': {'app': {'environment': {'H': '{{ smtp.host }}'}}}}
+        _delete_unset_integration_env_keys(
+            compose, {'id': 'i1', 'integrations': 'garbage'},
+        )
+        self.assertEqual(compose['services']['app']['environment'], {})
+
+    def test_a_malformed_configurations_block_is_skipped(self):
+        for bad in ('garbage', 7, None, [None, 'x', 7],
+                    [{'destinations': 'nope'}], [{'destinations': None}]):
+            with self.subTest(bad=bad):
+                compose = {'services': {'app': {'environment': {'K': 'v'}}}}
+                _delete_unset_integration_env_keys(compose, {
+                    'id': 'i1', 'integrations': {}, 'configurations': bad,
+                })
+                self.assertEqual(
+                    compose['services']['app']['environment'], {'K': 'v'},
+                )
+
 
 class AFalsyPresetIsBoundTests(TestCase):
     """A falsy preset on a top-level integration key is treated as unset.
