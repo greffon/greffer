@@ -25,6 +25,7 @@ from apps.utils.docker.compose import (
     ConfigRenderError,
     _UnsetIntegration,
     _compose_render_context,
+    _MAX_UNDO_STEPS,
     _document_parses,
     _render_baked_file,
     build_render_context,
@@ -943,6 +944,150 @@ class UnhashableDestinationFieldsTests(TestCase):
                 self.assertEqual(
                     compose['services']['app']['environment'], {'K': 'v'},
                 )
+
+
+class ACallOnAnUnsetFieldRendersNothingTests(TestCase):
+    """`_UnsetField.__call__` returning SELF is load-bearing.
+
+    Returning `None` instead passes every other test in this file, and
+    writes the literal string `None` into the compose as an env value:
+
+        {{ oidc.host.upper() }}   self -> ''      None -> 'None'
+
+    That is precisely the garbage-value class `__missing__` exists to
+    prevent, so it needs a case whose result is rendered DIRECTLY. The
+    docstring's usual example, `{{ smtp.from_address.split('@')[0] }}`,
+    renders `''` either way and demonstrated nothing.
+    """
+
+    def _render(self, template):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        return Template(template).render(**_compose_render_context(info))
+
+    def test_a_called_field_renders_empty_not_none(self):
+        for template in ('{{ oidc.host.upper() }}',
+                         '{{ oidc.host.strip().lower() }}',
+                         '{{ oidc.a.b.c() }}'):
+            with self.subTest(template=template):
+                rendered = self._render(template)
+                self.assertEqual(rendered, '')
+                self.assertNotIn('None', rendered)
+
+    def test_a_called_field_inside_a_larger_value_stays_empty(self):
+        self.assertEqual(self._render('x={{ oidc.host.upper() }};'), 'x=;')
+
+
+class DuplicateListFormKeysTests(TestCase):
+    """A list-form `environment` may carry the same NAME twice.
+
+    The undo used to diff by key name, so popping one occurrence left
+    the name still present and the pop read as "nothing was popped". It
+    was then never replayed and the referencing entry came back -- a
+    silent under-pop rendering `EMAIL_URL=smtp://`, the malformed URL
+    the strip exists to prevent, while the guard reported success.
+    """
+
+    DUPES = ['EMAIL_URL=static', 'EMAIL_URL=smtp://{{ smtp.host }}',
+             'BROKE={% raw %}', 'B2={{ smtp.user }}{% endraw %}']
+
+    def _run(self, env):
+        compose = {'services': {'app': {'image': 'x', 'environment': list(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def test_only_the_referencing_occurrence_is_popped(self):
+        compose, _ = self._run(self.DUPES)
+        env = compose['services']['app']['environment']
+        self.assertIn('EMAIL_URL=static', env)
+        self.assertNotIn('EMAIL_URL=smtp://{{ smtp.host }}', env)
+
+    def test_the_malformed_url_is_not_rendered(self):
+        compose, info = self._run(self.DUPES)
+        rendered = yaml.safe_load(
+            Template(yaml.dump(compose)).render(**_compose_render_context(info)))
+        env = rendered['services']['app']['environment']
+        self.assertNotIn('EMAIL_URL=smtp://', env)
+        self.assertIn('EMAIL_URL=static', env)
+
+    def test_duplicate_names_that_both_reference_are_both_popped(self):
+        compose, _ = self._run(['E={{ smtp.host }}', 'E={{ smtp.port }}', 'KEEP=1'])
+        self.assertEqual(compose['services']['app']['environment'], ['KEEP=1'])
+
+
+class OneLevelMissIsQuietTests(TestCase):
+    """Pins the shape Feature #3 must NOT lean on.
+
+    The policy is "a configured integration fails loudly on a field it
+    does not carry". That holds only for a CHAINED dereference. Reading
+    the field directly renders `''`, exactly as a plain dict does, so a
+    half-registered OIDC client deploys an empty secret rather than
+    refusing. Asserted here so the docstrings cannot drift back into
+    claiming a refusal that does not exist.
+    """
+
+    PARTIAL = {'oidc': {'issuer': 'https://id.example'}}
+
+    def _render(self, template):
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': self.PARTIAL})
+        return Template(template).render(**_compose_render_context(info))
+
+    def test_a_direct_read_of_a_missing_field_is_quiet(self):
+        self.assertEqual(self._render('{{ oidc.client_secret }}'), '')
+
+    def test_a_chained_read_is_loud(self):
+        for template in ('{{ oidc.client_secret.x }}',
+                         '{{ oidc.client_secret|int }}'):
+            with self.subTest(template=template):
+                with self.assertRaises(UndefinedError):
+                    self._render(template)
+
+    def test_this_matches_a_plain_dict_exactly(self):
+        # Why the quiet case is tolerated: it is not a regression, it is
+        # Jinja's own behaviour on the raw blob.
+        for template in ('{{ oidc.client_secret }}', '{{ oidc.issuer }}'):
+            with self.subTest(template=template):
+                self.assertEqual(
+                    self._render(template),
+                    Template(template).render(**self.PARTIAL),
+                )
+
+
+class TheUndoIsBoundedTests(TestCase):
+    """Past a cap the undo is wholesale, so a compose cannot pick its cost.
+
+    The one-at-a-time loop dumps and compiles the whole document per
+    step, which is quadratic. Fine for a catalog entry (10-30 keys), but
+    the custom-compose epic makes this input user-controlled.
+    """
+
+    def _compose(self, n):
+        env = {f'K{i}': '{{ oidc.issuer }}' for i in range(n)}
+        env['A_OPEN'] = '{# note'
+        env['Z_CLOSE'] = '{{ oidc.host }} #}'
+        return {'services': {'app': {'environment': env}}}
+
+    def _run(self, compose):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['app']['environment'], info
+
+    def test_under_the_cap_the_undo_is_selective(self):
+        env, _ = self._run(self._compose(5))
+        self.assertNotIn('K0', env)     # clean pops survive
+        self.assertIn('A_OPEN', env)    # the straddling pair is undone
+
+    def test_over_the_cap_everything_is_undone(self):
+        with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
+            env, _ = self._run(self._compose(_MAX_UNDO_STEPS + 5))
+        self.assertIn('K0', env)
+        self.assertIn('over the', ''.join(caught.output))
+
+    def test_over_the_cap_the_document_still_renders(self):
+        compose = self._compose(_MAX_UNDO_STEPS + 5)
+        _, info = self._run(compose)
+        Template(yaml.dump(compose)).render(**_compose_render_context(info))
 
 
 class MalformedPayloadShapesDoNotCrashTests(TestCase):
