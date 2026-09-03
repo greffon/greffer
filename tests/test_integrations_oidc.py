@@ -1408,6 +1408,52 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
         self.assertTrue(self._survives(
             '{% set x = smtp.host if smtp else "lo" %}{{ x }}'))
 
+    def test_an_elif_body_is_not_dominated(self):
+        # An elif runs when THIS test is false, so the integration can
+        # be unset when its body runs. Marking `elif_` alongside `body`
+        # let `smtp://@x` ship.
+        self.assertFalse(self._survives(
+            '{% if smtp %}{% elif other %}smtp://{{ smtp.host }}@x{% endif %}'))
+
+    def test_a_branch_that_publishes_a_value_outside_itself_is_not_dominated(self):
+        # Jinja's `{% set %}` leaks to the enclosing scope, so a branch
+        # that only RUNS when configured can still leave something
+        # behind that is read unconditionally afterwards. This rendered
+        # `smtp://@x` -- present and malformed.
+        self.assertFalse(self._survives(
+            '{% if smtp %}{% set h = smtp.host %}{% endif %}smtp://{{ h }}@x'))
+        self.assertFalse(self._survives(
+            '{% if smtp %}{% macro m() %}{{ smtp.host }}{% endmacro %}'
+            '{% endif %}{{ m() }}'))
+        # The ELSE branch is dominated when the test is negated, so it
+        # needs the same check.
+        self.assertFalse(self._survives(
+            '{% if not smtp %}lo{% else %}{% set h = smtp.host %}{% endif %}'
+            'smtp://{{ h }}@x'))
+        # And the escape can sit deeper than a direct child of the
+        # branch, so the search has to descend.
+        self.assertFalse(self._survives(
+            '{% if smtp %}{% if 1 %}{% set h = smtp.host %}{% endif %}'
+            '{% endif %}smtp://{{ h }}@x'))
+
+    def test_every_arm_assigning_is_over_popped_on_purpose(self):
+        # The cost of the blunt escape rule, asserted rather than
+        # discovered later. This renders `smtp://lh/` correctly when
+        # unset, because both arms bind `h` -- but telling that apart
+        # from the one-armed form needs real dataflow, and being wrong
+        # there ships a malformed value. If someone adds that analysis,
+        # this test should fail and be deleted, not adjusted.
+        self.assertFalse(self._survives(
+            "{% if smtp %}{% set h = smtp.host %}"
+            "{% else %}{% set h = 'lh' %}{% endif %}smtp://{{ h }}/"))
+
+    def test_a_nested_branch_under_a_real_dominator_stays_kept(self):
+        # The outer `{% if smtp %}` genuinely dominates, so nothing
+        # inside it can run when unset -- including an inner elif.
+        self.assertTrue(self._survives(
+            '{% if smtp %}{% if False %}a{% elif True %}{{ smtp.host }}'
+            '{% endif %}{% endif %}'))
+
     def test_a_loop_filter_dominates_nothing(self):
         # It runs per item, so it is not a precondition on the body.
         self.assertFalse(
