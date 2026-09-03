@@ -324,11 +324,22 @@ def _compute_integrations_context(greffon_info):
     as configured and switches BOTH mechanisms off. A half-written row —
     persisted before client registration finished, or a provider variant
     with a different shape — therefore reaches the render as a
-    configured integration, and a field it lacks is a hard 500 at
-    `/start/` rather than an empty value. That is the deliberate policy
-    (see `_compose_render_context`), but it means catalog entries reading
-    anything outside a guaranteed core field set must use `|default`, and
-    nothing mechanical enforces that yet.
+    configured integration.
+
+    What happens then depends on the SHAPE of the reference, and the
+    quiet case is the likely one:
+
+        {{ oidc.client_secret }}     ''   — Jinja's own default for a
+                                            one-level miss. No error.
+        {{ oidc.client_secret.x }}   UndefinedError
+        {{ oidc.client_secret|int }} UndefinedError
+
+    So a half-registered client does NOT reliably fail loudly: the
+    commonest shape of all, reading a secret directly, deploys an empty
+    string. This is identical to `main` and to any plain dict, so it is
+    not a regression — but Feature #3 must not lean on a refusal that
+    only covers chained access. Enforce the shape in the catalog
+    validator, or have the manager refuse to send an incomplete blob.
     """
     integrations = greffon_info.get('integrations')
     # Shape-defensive for the same reason `_compute_config_context` is:
@@ -426,6 +437,12 @@ def _render_json_value(value, greffon_info, dest_name):
     return value
 
 
+# Upper bound on the one-at-a-time undo below, which costs a full dump
+# and compile per step. 100 is far above any real catalog entry and far
+# below where the cost is noticeable.
+_MAX_UNDO_STEPS = 100
+
+
 def _document_parses(compose):
     """Is the compose still a usable Jinja template once dumped?
 
@@ -446,13 +463,22 @@ def _document_parses(compose):
     return True
 
 
-def _env_keys_by_service(compose):
-    """`{service: [env key]}` for every mapping- or list-form env block.
+def _env_items_by_service(compose):
+    """`{service: [item]}` where an item is what the strip can remove.
+
+    Mapping form gives `(key, value)` pairs; list form gives the raw
+    `"KEY=value"` entries. ITEMS, not key names: a list-form
+    `environment` may legally carry the same name twice, and popping one
+    occurrence must not read as "nothing was popped" -- that made a
+    required pop invisible to the undo, which then silently restored
+    glitchtip's `EMAIL_URL` to render `smtp://:@`. Keying on the whole
+    item also stops the undo removing the OTHER occurrence, which
+    matching by name would.
 
     Lists, not sets: the order these come out in decides which pops are
-    tried first, and a set of strings iterates in an order that varies
-    between processes. Keeping the document's own order makes the undo
-    below reproducible without having to sort anything.
+    replayed first, and a set of strings iterates differently between
+    processes. Keeping the document's own order makes the undo
+    reproducible without sorting anything.
     """
     services = compose.get('services') if isinstance(compose, dict) else None
     if not isinstance(services, dict):
@@ -463,27 +489,41 @@ def _env_keys_by_service(compose):
             continue
         env = service.get('environment')
         if isinstance(env, dict):
-            found[name] = list(env)
+            found[name] = [(k, v) for k, v in env.items()]
         elif isinstance(env, list):
-            found[name] = [
-                e.split('=', 1)[0] for e in env if isinstance(e, str) and '=' in e
-            ]
+            found[name] = list(env)
     return found
 
 
-def _pop_env_key(compose, service_name, key):
-    """Remove one env key from one service, in whichever form it uses."""
+def _items_removed(before, after):
+    """Multiset difference, order-preserving.
+
+    `list.remove` compares with `==`, so this works for the unhashable
+    values YAML can produce (a list- or dict-valued env var), which a
+    `Counter` would refuse.
+    """
+    remaining = list(after)
+    removed = []
+    for item in before:
+        if item in remaining:
+            remaining.remove(item)
+        else:
+            removed.append(item)
+    return removed
+
+
+def _remove_env_item(compose, service_name, item):
+    """Remove ONE occurrence of `item` from one service's env block."""
     service = compose.get('services', {}).get(service_name)
     if not isinstance(service, dict):
         return
     env = service.get('environment')
     if isinstance(env, dict):
-        env.pop(key, None)
-    elif isinstance(env, list):
-        service['environment'] = [
-            e for e in env
-            if not (isinstance(e, str) and '=' in e and e.split('=', 1)[0] == key)
-        ]
+        key, value = item
+        if key in env and env[key] == value:
+            del env[key]
+    elif isinstance(env, list) and item in env:
+        env.remove(item)
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
@@ -565,11 +605,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         try:
             snapshot = copy.deepcopy(compose)
         except Exception:
-            # No snapshot means no revert, so do not pretend otherwise.
-            # A compose holding something uncopyable is not the shape
-            # this guard defends, and raising here would be the very
-            # 500 the guard exists to avoid.
-            parsed_before = False
+            # No snapshot means no undo; the guard below keys on
+            # `snapshot is not None`. A compose holding something
+            # uncopyable (a module dumps but does not deepcopy) is not
+            # the shape this defends, and raising here would be the very
+            # 500 it exists to avoid.
+            pass
 
     # Pass 1 — metadata-driven pop (unchanged behavior).
     for t in unset_types:
@@ -647,12 +688,10 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         target is a `Name` for the type -- which is what the question
         literally is, so there is nothing left to approximate.
 
-        The lexer version this replaces had to decide call-versus-grouping
-        by peeking at tokens, and that one hand-written fragment of Jinja's
-        grammar produced three defects in two review passes:
-        `{{ dict(oidc).get(..) }}`, `{{ range(smtp.port) }}` and
-        `{% if (oidc).issuer %}`. The AST has no such ambiguity, because
-        the parser already resolved it.
+        Hand-written scanners preceded it and were repeatedly wrong
+        about string literals holding delimiters, nesting, and
+        call-versus-grouping parens. The parser has already resolved
+        all of that.
 
         Still incomplete in the same two places the lexer was, and for the
         same reason -- aliasing (`{% set a = oidc %}{{ a.issuer }}`, a macro
@@ -667,24 +706,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         try:
             ast = parser_env.parse(value)
         except Exception:
-            # Deliberately bare. This runs inside `/start/`, so anything
-            # escaping is a 500 and the instance never starts, and the
-            # try body is a SINGLE `parse()` call -- there is no logic of
-            # ours in here for a broad catch to hide. Enumerating what
-            # the parser raises was tried and failed three times, each
-            # miss being a 500 on catalog-controlled input:
-            #   TemplateError  `yaml.dump` doubles an inner quote, so
-            #                  malformed expressions really do arrive
-            #   RecursionError the parser recurses per nesting level and
-            #                  blows the stack around 200 deep
-            #   ValueError     CPython refuses an integer literal over
-            #                  4300 digits (3.11+)
-            #   SyntaxError    Jinja's number lexer matches non-ASCII
-            #                  digits, then hands `0.１` to the CPython
-            #                  compiler
-            # Only the first is a Jinja error at all. The fourth was found
-            # by fuzzing after the third was fixed, which is the argument
-            # for not writing a fifth tuple.
+            # Deliberately bare: the body is a single `parse()` on
+            # catalog-controlled input, so there is no logic of ours for
+            # a broad catch to hide, and anything escaping is a 500 at
+            # `/start/`. Naming the classes was tried and failed three
+            # times -- TemplateError, RecursionError, ValueError and
+            # finally SyntaxError (Jinja's number lexer accepts non-ASCII
+            # digits, then hands `0.１` to the CPython compiler), each
+            # found only after the previous fix shipped. `Exception`, not
+            # `BaseException`, so a KeyboardInterrupt still stops the
+            # process.
             #
             # Fall back to the crudest form of the question: does the
             # name occur at all? A value that never mentions `oidc`
@@ -785,27 +816,42 @@ def _reapply_pops_that_keep_it_renderable(compose, snapshot, greffon_info):
     deterministic so the outcome does not depend on dict iteration luck.
     Applying the FULL set is never retried: it is what just failed.
     """
-    before = _env_keys_by_service(snapshot)
-    after = _env_keys_by_service(compose)
-    # Ordered by the document, so the outcome does not depend on set
-    # iteration luck and is the same on every node for the same input.
+    before = _env_items_by_service(snapshot)
+    after = _env_items_by_service(compose)
     popped = [
-        (service, key)
-        for service, keys in before.items()
-        for key in keys
-        if key not in after.get(service, ())
+        (service, item)
+        for service, items in before.items()
+        for item in _items_removed(items, after.get(service, ()))
     ]
+
+    # The loop below dumps and compiles the WHOLE document once per
+    # popped key, so it is quadratic in that count. Real catalog entries
+    # pop 10-30 keys (well under a second), but the custom-compose epic
+    # makes this input user-controlled, and 1500 keys measured at ~94s
+    # of CPU on a `/start/` request. Past the cap, undo everything: the
+    # safe-but-blunt answer, rather than letting a compose choose how
+    # much CPU to spend.
+    if len(popped) > _MAX_UNDO_STEPS:
+        logger.warning(
+            'integration strip left instance %s unrenderable with %d popped '
+            'keys, over the %d-key limit; undoing all of them',
+            greffon_info.get('id'), len(popped), _MAX_UNDO_STEPS,
+        )
+        compose.clear()
+        compose.update(snapshot)
+        return
 
     last_good = copy.deepcopy(snapshot)
     kept, undone = [], []
-    for service, key in popped:
+    for service, item in popped:
+        name = item[0] if isinstance(item, tuple) else str(item).split('=', 1)[0]
         trial = copy.deepcopy(last_good)
-        _pop_env_key(trial, service, key)
+        _remove_env_item(trial, service, item)
         if _document_parses(trial):
             last_good = trial
-            kept.append(f'{service}.{key}')
+            kept.append(f'{service}.{name}')
         else:
-            undone.append(f'{service}.{key}')
+            undone.append(f'{service}.{name}')
 
     logger.warning(
         'integration strip left instance %s unrenderable; kept %s and undid '
@@ -835,13 +881,14 @@ def _compose_render_context(greffon_info):
     applies to baked files -- quiet truncation is worse than a loud
     refusal -- by exempting the compose path from it.
 
-    The cost is that a PARTIALLY populated blob raises on a field it does
-    not carry. That is the intended answer: a catalog entry that reads an
-    optional field should say so with `|default`, which is explicit and
-    reviewable, rather than relying on the platform to paper over it. It
-    matters for platform-identity Feature #3, whose per-provider blobs
-    vary in shape -- those entries must use `|default` for anything not
-    guaranteed.
+    The cost is that a PARTIALLY populated blob raises on a CHAINED
+    dereference of a field it does not carry. Only chained: reading the
+    field directly still renders `''`, exactly as a plain dict does, so
+    this is not a general "loud refusal" and Feature #3 must not treat
+    it as one (see `_compute_integrations_context`). Where it does fire,
+    it is the intended answer: a catalog entry reading an optional field
+    should say so with `|default`, which is explicit and reviewable,
+    rather than relying on the platform to paper over it.
 
     A caller that deliberately populated the key still wins, which is the
     same non-clobbering rule `_compute_integrations_context` follows.
@@ -1058,8 +1105,15 @@ def create_compose(compose, greffon_info):
     # but BEFORE Jinja substitution; it pops the SMTP env keys whose
     # values would otherwise be templated `{{ smtp.host }}` strings.
     greffon_info = _compute_integrations_context(greffon_info)
-    _delete_unset_integration_env_keys(compose, greffon_info)
+    # Log rotation FIRST: the strip's document guard approves the exact
+    # text that will be rendered, and injecting afterwards changed that
+    # text. Appending content is not neutral to Jinja -- an unclosed
+    # `{% raw %}` is accepted at EOF and rejected once anything follows
+    # it -- so the guard could pass on a document that then failed to
+    # compile. Neither function reads what the other writes (one touches
+    # `environment`, the other `logging`), so the order is free.
     _inject_instance_log_rotation(compose)
+    _delete_unset_integration_env_keys(compose, greffon_info)
     t = Template(yaml.dump(compose))
     compose_file = t.render(**_compose_render_context(greffon_info))
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
