@@ -546,10 +546,11 @@ def _remove_env_item(compose, service_name, item):
 def _delete_unset_integration_env_keys(compose, greffon_info):
     """For each known integration type whose config is unset, pop every
     env key in the compose that would expand to an unset-integration
-    Jinja reference. This guarantees ``absent ⇒ no env var`` regardless
-    of how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
+    Jinja reference. This aims at ``absent ⇒ no env var`` regardless of
+    how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
     crucially, regardless of whether the catalog destination metadata
-    actually reached the greffer for this start.
+    actually reached the greffer for this start. See below for the one
+    case where it settles for less.
 
     Two passes:
 
@@ -567,6 +568,13 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        has nothing to send) so the metadata pass alone can't see it;
        the template pass catches it directly from the compose body
        before Jinja renders.
+
+    The guarantee is "absent integration => no env var", with one
+    documented exception: a pop the document guard has to undo (see
+    `_reapply_pops_that_keep_it_renderable`) leaves the key in place,
+    where it renders EMPTY through the binding rather than being absent.
+    That is the weaker outcome, taken only when the alternative is a
+    document that will not render at all.
 
     SCOPE: both passes look only at ``services[*].environment``. A
     reference from ``command``, ``labels``, ``env_file`` or anywhere else
@@ -854,11 +862,13 @@ def _reapply_pops_that_keep_it_renderable(
     but still a working deploy" was not true for that app.
 
     So rebuild from the snapshot and re-apply the pops one at a time,
-    keeping each only while the document still compiles. The pops that
+    keeping each only while the document still RENDERS -- compiling is
+    not enough, which is what `_document_renders` argues at length. The
+    pops that
     are fine survive; the one that straddles a construct is dropped.
 
     Cost is paid only here, in the case that already went wrong -- the
-    common path is the two `_document_parses` calls above. Order is
+    common path is the two `_document_renders` calls above. Order is
     deterministic so the outcome does not depend on dict iteration luck.
     Applying the FULL set is never retried: it is what just failed.
     """

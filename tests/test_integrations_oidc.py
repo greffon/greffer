@@ -528,11 +528,13 @@ class ListFormPassTwoTests(TestCase):
 class ParseFailureFallbackTests(TestCase):
     """What an unparseable value falls back to, and that nothing escapes.
 
-    TWO rules pop, not one: the value names the integration, OR it
-    carries a `{%` tag (see `ABlockSplitAcrossValuesIsPoppedWholeTests`
-    for why the second exists). A value matching neither is kept, so an
-    unrelated unparseable value is not silently dropped from a deploy --
-    it fails the render loudly, exactly as it does on `main`.
+    ONE rule: the value names the integration. A `{%`-carrying value
+    used to pop as well, to stop a block being half-popped, but the
+    document guard supersedes that and the rule was removed because it
+    also popped values referencing no integration at all (see
+    `ASplitBlockIsLeftAloneTests`). So an unrelated unparseable value is
+    not silently dropped from a deploy -- it fails the render loudly,
+    exactly as it does on `main`.
     """
 
     def _kept(self, value):
