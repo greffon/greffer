@@ -498,139 +498,6 @@ _GUARD_SLOTS = frozenset({
 })
 
 
-def _conjuncts(node):
-    """Flatten an `and` chain; anything else is a single conjunct.
-
-    `or` is deliberately NOT flattened: `{% if other or smtp %}` can run
-    its body with `smtp` unset, so it dominates nothing.
-    """
-    if isinstance(node, nodes.And):
-        return _conjuncts(node.left) + _conjuncts(node.right)
-    return [node]
-
-
-def _asserts_truthy(test, name):
-    """Does `test` being TRUE imply the integration is configured?
-
-    True for a conjunct that is the name itself or a dereference rooted
-    at it -- `{% if smtp %}`, `{% if smtp and x %}`, `{% if smtp.host %}`
-    -- because none of those can be truthy on the unset binding, which
-    is an empty mapping whose fields are all falsy.
-    """
-    for conjunct in _conjuncts(test):
-        node = conjunct
-        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
-            node = node.node
-        if isinstance(node, nodes.Name) and node.name == name:
-            return True
-    return False
-
-
-def _dominated_slots(node, name):
-    """Fields of `node` that only run when the integration IS configured.
-
-    A guard slot says the mapping decides something; this says WHICH
-    branch that decision protects. `{% if smtp %}{{ smtp.host }}{% else
-    %}localhost{% endif %}` is the ordinary way to write an optional
-    integration, and the read in the body is unreachable when `smtp` is
-    unset -- the value renders `localhost`, exactly as its author
-    intended, so popping it discarded a working setting.
-
-    Only the two direct shapes, because being wrong here is an
-    UNDER-pop, which is the severe direction. `{% if not smtp %}` is
-    handled as the mirror -- it dominates the ELSE branch -- and
-    `{% if other or smtp %}` dominates nothing, since the body can run
-    with the integration unset.
-
-    `For.test` is excluded on purpose: a loop filter runs per item, so
-    it does not dominate the body.
-    """
-    if isinstance(node, nodes.If):
-        # NOT `elif_`: an elif body runs when this test is FALSE, so
-        # `{% if smtp %}{% elif other %}{{ smtp.host }}{% endif %}` can
-        # reach the read with the integration unset.
-        positive, negative = ('body',), ('else_',)
-    elif isinstance(node, nodes.CondExpr):
-        positive, negative = ('expr1',), ('expr2',)
-    else:
-        # Notably `For`: its `test` is a per-item filter, so it is a
-        # guard slot but never a precondition on the body.
-        return ()
-    test = node.test
-    if test is None:
-        return ()
-    if _asserts_truthy(test, name):
-        return _unless_a_value_escapes(node, positive)
-    if isinstance(test, nodes.Not) and _asserts_truthy(test.node, name):
-        return _unless_a_value_escapes(node, negative)
-    return ()
-
-
-def _unless_a_value_escapes(node, slots):
-    """Drop a slot whose branch can publish a value outside itself.
-
-    Jinja's `{% set %}` leaks to the enclosing scope, so a branch that
-    only RUNS when the integration is configured can still leave
-    something behind that is read unconditionally afterwards:
-
-        {% if smtp %}{% set h = smtp.host %}{% endif %}smtp://{{ h }}@x
-
-    renders `smtp://@x` when unset -- present, malformed, and exactly
-    what the strip exists to stop. A macro defined in the branch and
-    called outside does the same. Rather than track which names escape,
-    a branch containing any of that is simply not dominated: the cost
-    is an over-pop, which is the safe direction.
-    """
-    # Deliberately blunt. A branch where EVERY arm assigns the name --
-    # `{% if smtp %}{% set h = smtp.host %}{% else %}{% set h = 'lh' %}
-    # {% endif %}` -- is actually safe, and is over-popped here. Telling
-    # that apart needs real dataflow, and being wrong in the other
-    # direction ships a malformed value, so the blunt rule stands and
-    # the cost is an env var on an unconfigured integration.
-    escapes = (nodes.Assign, nodes.AssignBlock, nodes.Macro)
-    kept = []
-    for slot in slots:
-        value = getattr(node, slot, None)
-        items = value if isinstance(value, list) else [value]
-        if any(isinstance(item, nodes.Node)
-               and (isinstance(item, escapes)
-                    or any(True for _ in item.find_all(escapes)))
-               for item in items):
-            continue
-        kept.append(slot)
-    return tuple(kept)
-
-
-# Descents through which "this node is the whole output" survives. Only
-# one branch of an `If`/`CondExpr` renders at a time, and a `Template`
-# or `Output` with a single child renders just that child.
-#
-# An allowlist, because the alternative failed: counting nodes per FIELD
-# let `{{ "https://" + (oidc.issuer if oidc else "") + "/auth" }}`
-# through, since an `Add` holds one node in `left` and one in `right`
-# and each looked solitary. Both operands render, so neither is the
-# whole value -- and that shape produced `https:///auth`. Anything not
-# listed here loses the property, which costs an over-pop.
-_SPAN_PRESERVING = frozenset({
-    (nodes.Template, 'body'),
-    (nodes.Output, 'nodes'),
-    (nodes.If, 'body'),
-    (nodes.If, 'else_'),
-    (nodes.CondExpr, 'expr1'),
-    (nodes.CondExpr, 'expr2'),
-})
-
-
-def _sole_node(value):
-    """Is `value` a field holding exactly one AST node?
-
-    Used to decide whether a construct accounts for ALL of the output
-    around it. A field with siblings means something else renders too.
-    """
-    items = value if isinstance(value, list) else [value]
-    return sum(1 for item in items if isinstance(item, nodes.Node)) == 1
-
-
 def _reads(ast, name):
     """Does this parsed template READ the top-level `name`?
 
@@ -683,50 +550,18 @@ def _reads(ast, name):
     # State per occurrence: FREE reads, SLOT is inside a guard test,
     # DOMINATED is inside a branch that only runs when the integration
     # is configured.
-    FREE, SLOT, DOMINATED = 0, 1, 2
-    # `spans` tracks whether this node accounts for ALL of the value's
-    # output. Domination says the READ cannot happen; it says nothing
-    # about the text AROUND the read, and that text still renders --
-    # `smtp://{% if smtp %}{{ smtp.user }}{% endif %}@h` gives
-    # `smtp://@h` unset, present and malformed.
-    #
-    # It has to be recomputed per node, not decided once for the value.
-    # Latching it from the root let any guard nested inside a
-    # non-dominating outer one inherit the licence, so wrapping that
-    # same string in `{% if true %}` flipped it from popped to kept.
-    stack = [(ast, FREE, False, True)]
+    stack = [(ast, False)]
     while stack:
-        node, state, via_deref, spans = stack.pop()
+        node, guarded = stack.pop()
         if isinstance(node, nodes.Name) and node.name == name:
-            if state == SLOT:
-                continue
-            # In a dominated branch a DEREFERENCE is unreachable when
-            # unset, so it is safe -- but a BARE name is not, because
-            # the mapping object itself escapes and can be read later:
-            # `{% set x = smtp if smtp else {} %}{{ x.host }}` renders
-            # present-but-empty, which is the failure this pass exists
-            # to stop.
-            if state == DOMINATED and via_deref:
+            if guarded:
                 continue
             return True
-        dominated = _dominated_slots(node, name) if spans else ()
-        deref_slot = (isinstance(node, (nodes.Getattr, nodes.Getitem)))
         for field, value in node.iter_fields():
-            if state != FREE:
-                child_state = state
-            elif (type(node), field) in _GUARD_SLOTS:
-                child_state = SLOT
-            elif field in dominated:
-                child_state = DOMINATED
-            else:
-                child_state = FREE
-            child_deref = via_deref or (deref_slot and field == 'node')
-            child_spans = (spans
-                           and (type(node), field) in _SPAN_PRESERVING
-                           and _sole_node(value))
+            child_guarded = guarded or (type(node), field) in _GUARD_SLOTS
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
-                    stack.append((item, child_state, child_deref, child_spans))
+                    stack.append((item, child_guarded))
     return False
 
 

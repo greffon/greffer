@@ -1331,29 +1331,29 @@ class ItemsRemovedIsAMultisetDiffTests(TestCase):
         )
 
 
-class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
-    """The ordinary way to write an optional integration.
+class DominationWasTriedAndWithdrawnTests(TestCase):
+    """A read inside a branch that only runs when configured still pops.
 
-        MAIL_HOST: {% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}
-        MAIL_PORT: {{ smtp.port if smtp else 25 }}
+        {% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}
 
-    The read in the taken-true branch cannot happen when `smtp` is
-    unset, because the binding is a falsy empty mapping -- the value
-    renders `localhost` and `25`, exactly what its author intended. The
-    rule popped them anyway: it exempted the guard SLOT but not the
-    branch that slot protects, so the container came up with the
-    variable absent instead of carrying the fallback.
+    cannot reach `smtp.host` when the integration is unset, so keeping
+    it would render the author's `localhost` instead of dropping the
+    key. That was implemented and then withdrawn, and this class exists
+    so the next person to propose it starts from the measurement rather
+    than the idea.
 
-    Being wrong here is an UNDER-pop, which is the severe direction, so
-    only two shapes count as dominating: the test asserts the type is
-    truthy (itself, a field of it, or either inside an `and` chain), or
-    it is `not` that, which dominates the other branch instead. `or`
-    dominates nothing -- `{% if other or smtp %}` runs its body with the
-    integration unset -- and a `{% for %}` filter dominates nothing
-    either, being per-item rather than a precondition.
+    It saved ZERO keys across the real catalog: every value the catalog
+    ships guards in the TEST position, which the slot rule already
+    covers. It was the only path in the rule that could UNDER-pop, and
+    it did in four consecutive review rounds -- an `elif` body (which
+    runs when the guard is false), a `{% set %}` escaping its branch, a
+    guard sharing the value with literal text
+    (`smtp://{% if smtp %}..{% endif %}@h` -> `smtp://@h`), and the
+    licence leaking into nested constructs. It cost ~165 lines.
+
+    Popping these is what `main` does, so this is parity, not a
+    regression.
     """
-
-    CFG = {'smtp': {'host': 'mail.ex', 'port': 587}}
 
     def _survives(self, value):
         compose = {'services': {'a': {'environment': {'K': value}}}}
@@ -1361,175 +1361,35 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def _render(self, value, integrations):
-        info = _compute_integrations_context(
-            {'id': 'i1', 'integrations': integrations})
-        return Template(value).render(other=0, **_compose_render_context(info))
-
-    def test_the_fallback_survives_and_is_what_renders(self):
-        for value, unset, configured in (
-            ('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}',
-             'localhost', 'mail.ex'),
-            ('{{ smtp.port if smtp else 25 }}', '25', '587'),
-            ('{% if not smtp %}none{% else %}{{ smtp.host }}{% endif %}',
-             'none', 'mail.ex'),
-            ('{% if smtp.host %}{{ smtp.host }}{% else %}lo{% endif %}',
-             'lo', 'mail.ex'),
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(self._survives(value))
-                self.assertEqual(self._render(value, {}), unset)
-                self.assertEqual(self._render(value, self.CFG), configured)
-
-    def test_an_and_chain_still_dominates(self):
-        self.assertTrue(
-            self._survives('{% if smtp and other %}{{ smtp.host }}{% endif %}'))
-
-    def test_or_dominates_nothing(self):
-        # The body can run with the integration unset, so the read is
-        # reachable and the key must go.
-        self.assertFalse(
-            self._survives('{% if other or smtp %}{{ smtp.host }}{% endif %}'))
-
-    def test_a_negated_test_dominates_the_OTHER_branch(self):
-        # `{% if not smtp %}` runs its BODY when unset, so a read there
-        # is reachable and pops -- the mirror of the case above.
-        self.assertFalse(
-            self._survives('{% if not smtp %}{{ smtp.host }}{% endif %}'))
-
-    def test_the_object_itself_escaping_a_dominated_branch_still_pops(self):
-        # The under-pop domination introduced. Here the dominated
-        # branch is the BARE name, so the mapping object escapes
-        # through the alias and is read unconditionally afterwards --
-        # rendering present-but-empty. A DEREFERENCE in the same
-        # position is safe, because it cannot happen when unset.
-        self.assertFalse(self._survives(
-            '{% set x = smtp if smtp else {} %}{{ x.host }}'))
-        # The dereference form is over-popped too, and deliberately:
-        # it renders `lo` correctly, but the guard does not span the
-        # whole value (a `{% set %}` plus a use is two statements), and
-        # that is the rule that stops `smtp://:@` shipping. Over-pop is
-        # the safe direction.
-        self.assertFalse(self._survives(
-            '{% set x = smtp.host if smtp else "lo" %}{{ x }}'))
-
-    def test_an_elif_body_is_not_dominated(self):
-        # An elif runs when THIS test is false, so the integration can
-        # be unset when its body runs. Marking `elif_` alongside `body`
-        # let `smtp://@x` ship.
-        self.assertFalse(self._survives(
-            '{% if smtp %}{% elif other %}smtp://{{ smtp.host }}@x{% endif %}'))
-
-    def test_a_branch_that_publishes_a_value_outside_itself_is_not_dominated(self):
-        # Jinja's `{% set %}` leaks to the enclosing scope, so a branch
-        # that only RUNS when configured can still leave something
-        # behind that is read unconditionally afterwards. This rendered
-        # `smtp://@x` -- present and malformed.
-        self.assertFalse(self._survives(
-            '{% if smtp %}{% set h = smtp.host %}{% endif %}smtp://{{ h }}@x'))
-        self.assertFalse(self._survives(
-            '{% if smtp %}{% macro m() %}{{ smtp.host }}{% endmacro %}'
-            '{% endif %}{{ m() }}'))
-        # The ELSE branch is dominated when the test is negated, so it
-        # needs the same check.
-        self.assertFalse(self._survives(
-            '{% if not smtp %}lo{% else %}{% set h = smtp.host %}{% endif %}'
-            'smtp://{{ h }}@x'))
-        # And the escape can sit deeper than a direct child of the
-        # branch, so the search has to descend.
-        self.assertFalse(self._survives(
-            '{% if smtp %}{% if 1 %}{% set h = smtp.host %}{% endif %}'
-            '{% endif %}smtp://{{ h }}@x'))
-
-    def test_every_arm_assigning_is_over_popped_on_purpose(self):
-        # The cost of the blunt escape rule, asserted rather than
-        # discovered later. This renders `smtp://lh/` correctly when
-        # unset, because both arms bind `h` -- but telling that apart
-        # from the one-armed form needs real dataflow, and being wrong
-        # there ships a malformed value. If someone adds that analysis,
-        # this test should fail and be deleted, not adjusted.
-        self.assertFalse(self._survives(
-            "{% if smtp %}{% set h = smtp.host %}"
-            "{% else %}{% set h = 'lh' %}{% endif %}smtp://{{ h }}/"))
-
-    def test_a_nested_branch_under_a_real_dominator_stays_kept(self):
-        # The outer `{% if smtp %}` genuinely dominates, so nothing
-        # inside it can run when unset -- including an inner elif.
-        self.assertTrue(self._survives(
-            '{% if smtp %}{% if False %}a{% elif True %}{{ smtp.host }}'
-            '{% endif %}{% endif %}'))
-
-    def test_a_guard_must_span_the_WHOLE_value(self):
-        # Domination asks whether the READ can happen, not whether the
-        # text around it still renders. Both of these keep their literal
-        # scaffolding when unset -- `smtp://:@` and `https:///path` --
-        # so the key ships present and broken, which is worse than
-        # absent and is what `main` avoids by popping them.
+    def test_a_read_in_a_guarded_branch_still_pops(self):
         for value in (
-            'smtp://{{ smtp.username if smtp else "" }}'
-            ':{{ smtp.password if smtp else "" }}@{{ smtp.host if smtp else "" }}',
-            'https://{% if smtp %}{{ smtp.host }}{% endif %}/path',
-            'prefix {% if smtp %}{{ smtp.host }}{% else %}lo{% endif %}',
-            '{% if smtp %}{{ smtp.host }}{% else %}lo{% endif %} suffix',
+            '{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}',
+            '{{ smtp.port if smtp else 25 }}',
+            '{% if not smtp %}none{% else %}{{ smtp.host }}{% endif %}',
+            '{% if smtp and other %}{{ smtp.host }}{% endif %}',
         ):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
 
-    def test_an_outer_construct_does_not_lend_the_licence_inward(self):
-        # "Spans the whole value" has to be recomputed per node. Latched
-        # once from the root, any guard nested inside a NON-dominating
-        # outer construct inherited it -- so wrapping a known-bad shape
-        # in `{% if true %}` flipped it from popped to kept.
+    def test_the_shapes_that_made_it_unsafe_pop_too(self):
+        # The four failure modes that killed it, kept as regression
+        # cover in case someone reinstates the idea.
         for value in (
-            '{% if true %}smtp://{% if smtp %}{{ smtp.user }}{% endif %}'
-            '@mailhost{% endif %}',
+            '{% if smtp %}A{% elif True %}smtp://{{ smtp.host }}{% endif %}',
+            '{% if smtp %}{% set h = smtp.host %}{% endif %}smtp://{{ h }}/',
+            'smtp://{% if smtp %}{{ smtp.user }}{% endif %}@mailhost',
             '{% if true %}https://{{ smtp.host if smtp else "" }}/path{% endif %}',
-            '{% if false %}x{% else %}host={% if smtp %}{{ smtp.host }}'
-            '{% endif %}{% endif %}',
+            '{{ "https://" + (oidc.issuer if oidc else "") + "/auth" }}',
         ):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
 
-    def test_concatenation_is_not_a_span_preserving_descent(self):
-        # Both operands of an `+` render, so neither is the whole value.
-        # Counting nodes per FIELD said otherwise -- an `Add` holds one
-        # node in `left` and one in `right`, and each looked solitary --
-        # which let `https:///auth` ship.
-        for value in (
-            '{{ ("smtp://" + (smtp.user if smtp else "") + "@h") if True else "" }}',
-            '{% if true %}{{ "https://" + (oidc.issuer if oidc else "") '
-            '+ "/auth" }}{% endif %}',
-            '{{ "smtp://" ~ (smtp.host if smtp else "") ~ "/x" }}',
-        ):
-            with self.subTest(value=value):
-                self.assertFalse(self._survives(value))
-
-    def test_a_branch_whose_sole_content_is_the_guard_keeps_the_licence(self):
-        # The mirror of the case above: an outer construct that adds no
-        # output of its own passes the property through, so the guard
-        # inside it still spans everything that renders. These give the
-        # author's fallback, so popping them would lose a setting.
+    def test_a_guard_in_the_TEST_position_is_still_exempt(self):
+        # What the catalog actually uses, and what the slot rule covers.
         for value, unset in (
-            ('{% if true %}{{ smtp.host if smtp else "lo" }}{% endif %}', 'lo'),
-            ('{% if true %}{% if smtp %}{{ smtp.host }}{% else %}lo'
-             '{% endif %}{% endif %}', 'lo'),
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(self._survives(value))
-                info = _compute_integrations_context(
-                    {'id': 'i1', 'integrations': {}})
-                self.assertEqual(
-                    Template(value).render(**_compose_render_context(info)),
-                    unset)
-
-    def test_a_whole_value_guard_is_still_kept(self):
-        # The catalog forms this exists for: one `{% if %}`, or one
-        # ternary, and nothing else in the value.
-        for value, unset in (
+            ('{% if smtp %}on{% else %}off{% endif %}', 'off'),
             ('{{ "true" if smtp else "false" }}', 'false'),
-            ('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}',
-             'localhost'),
-            ('{{ smtp.port if smtp else 25 }}', '25'),
+            ('{% if not smtp %}unset{% endif %}', 'unset'),
         ):
             with self.subTest(value=value):
                 self.assertTrue(self._survives(value))
@@ -1538,29 +1398,6 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
                 self.assertEqual(
                     Template(value).render(**_compose_render_context(info)),
                     unset)
-
-    def test_a_set_BLOCK_escapes_its_branch_too(self):
-        # `{% set h %}..{% endset %}` is an AssignBlock, not an Assign.
-        # The whole value has to BE the guard for this to be the rule
-        # doing the work -- with trailing text the value pops anyway.
-        self.assertFalse(self._survives(
-            '{% if smtp %}{% set h %}{{ smtp.host }}{% endset %}'
-            '{{ h }}{% endif %}'))
-
-    def test_a_trailing_output_beside_a_ternary_is_over_popped(self):
-        # `{{ smtp.host if smtp else "b" }}{{ "-suffix" }}` renders
-        # `b-suffix` correctly, but the guard does not span the whole
-        # value so it pops. Conservative on purpose: the same
-        # "something else renders too" shape is what produced
-        # `smtp://:@`, and telling the safe arrangement from the unsafe
-        # one is not worth an under-pop.
-        self.assertFalse(self._survives(
-            '{{ smtp.host if smtp else "b" }}{{ "-suffix" }}'))
-
-    def test_a_loop_filter_dominates_nothing(self):
-        # It runs per item, so it is not a precondition on the body.
-        self.assertFalse(
-            self._survives('{% for x in [1] if smtp %}{{ smtp.host }}{% endfor %}'))
 
 
 class TheReadRuleIsCompleteByConstructionTests(TestCase):
