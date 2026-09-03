@@ -22,7 +22,7 @@ from unittest.mock import mock_open, patch
 
 import yaml
 
-from jinja2 import Environment, Template, UndefinedError
+from jinja2 import Environment, Template, UndefinedError, nodes
 from jinja2.exceptions import TemplateAssertionError, TemplateSyntaxError
 
 from apps.utils.docker import compose as compose_module
@@ -33,6 +33,7 @@ from apps.utils.docker.compose import (
     _compose_render_context,
     _UNDO_TIME_BUDGET,
     _UNDO_CHUNK,
+    _GUARD_SLOTS,
     _document_renders,
     _items_removed,
     _render_baked_file,
@@ -1386,6 +1387,37 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
         # rather than merely permissive.
         self.assertFalse(self._survives(
             '{% macro m(smtp) %}{{ smtp.host }}{% endmacro %}{{ smtp.port|int }}'))
+
+    def test_the_guard_slots_are_every_one_jinja_has(self):
+        # Derived, not recalled. `For.test` -- the `{% for x in xs if
+        # cond %}` filter -- was missed, so the `{% for %}` spelling of
+        # a guard was popped while the `{% if %}` spelling was kept.
+        # If a Jinja upgrade adds another decide-only slot, this fails
+        # rather than the strip silently discarding a working setting.
+        expected = {(cls, 'test')
+                    for cls in vars(nodes).values()
+                    if isinstance(cls, type) and issubclass(cls, nodes.Node)
+                    and 'test' in getattr(cls, 'fields', ())}
+        expected.add((nodes.Test, 'node'))
+        self.assertEqual(set(_GUARD_SLOTS), expected)
+
+    def test_a_loop_filter_is_a_guard(self):
+        # Renders the author's fallback when unset and the other branch
+        # when configured, exactly like the `{% if %}` form beside it.
+        loop = ("{% for x in ['off'] if not smtp %}{{ x }}{% endfor %}"
+                "{% for x in ['on'] if smtp %}{{ x }}{% endfor %}")
+        self.assertTrue(self._survives(loop))
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        self.assertEqual(Template(loop).render(**_compose_render_context(info)), 'off')
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {'smtp': {'host': 'm'}}})
+        self.assertEqual(Template(loop).render(**_compose_render_context(info)), 'on')
+
+    def test_a_loop_filter_does_not_excuse_a_read_in_the_body(self):
+        # `For.test` is a guard; `For.body` is a sibling, not a child of
+        # it, so a read inside the loop still pops.
+        self.assertFalse(self._survives(
+            '{% for x in [1] if smtp %}{{ smtp.host }}{% endfor %}'))
 
     def test_a_guard_slot_is_the_only_exemption(self):
         # Guards render the CORRECT value unset, because the binding is

@@ -482,9 +482,18 @@ _UNDO_TIME_BUDGET = 5.0
 # Slots whose occupant only DECIDES something: the mapping's contents
 # never reach the output through them. An occurrence of the type inside
 # one of these is a guard, not a read.
+# These are every such slot Jinja has, not a sample: the classes with a
+# `test` field are `If`, `CondExpr` and `For` (the `{% for x in xs if
+# cond %}` filter), plus `Test.node`, the thing an `is` test examines.
+# `For.test` was missed at first, and the cost shows why the list is
+# derived rather than recalled -- `{% for x in ['off'] if not smtp %}`
+# is the same guard as `{% if not smtp %}`, renders the same `off` on
+# an unset integration, and was popped while the `{% if %}` spelling
+# was kept.
 _GUARD_SLOTS = frozenset({
     (nodes.If, 'test'),
     (nodes.CondExpr, 'test'),
+    (nodes.For, 'test'),
     (nodes.Test, 'node'),
 })
 
