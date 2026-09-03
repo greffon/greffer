@@ -199,6 +199,13 @@ def get_greffon_path(greffon_info):
 KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
+# Distinguishes `.get(k)` from `.get(k, none)`. Using `None` as the
+# sentinel treated an explicitly passed `none` as "no default", so
+# `{{ oidc.get('issuer', none) is none }}` took the opposite branch from
+# a plain empty dict -- the one behaviour this wrapper exists to keep.
+_OMITTED = object()
+
+
 class _UnsetField(ChainableUndefined):
     """A field of an integration the user did not configure.
 
@@ -265,7 +272,7 @@ class _UnsetIntegration(dict):
     than a loud refusal, and it has no strip pass to remove the key.
     """
 
-    def get(self, key, default=None):
+    def get(self, key, default=_OMITTED):
         """`dict.get`, except that a missing key with no default gives
         the forgiving Undefined rather than `None`.
 
@@ -277,7 +284,7 @@ class _UnsetIntegration(dict):
         """
         if key in self:
             return self[key]
-        return self[key] if default is None else default
+        return self[key] if default is _OMITTED else default
 
     def __missing__(self, key):
         # A FIELD is undefined, not another empty mapping. Returning
@@ -553,7 +560,7 @@ class _Anything:
     failure and a working key would be popped.
     """
 
-    __slots__ = ()
+    __slots__ = ('_truthy',)
 
     def __getattr__(self, _):
         return self
@@ -570,8 +577,11 @@ class _Anything:
     def __str__(self):
         return ''
 
+    def __init__(self, truthy=False):
+        object.__setattr__(self, '_truthy', truthy)
+
     def __bool__(self):
-        return False
+        return self._truthy
 
     def __int__(self):
         return 0
@@ -633,12 +643,20 @@ def _guard_only_value_still_renders(text, name):
         # Unparseable values are already handled by the caller's
         # fallback; this probe has nothing to add.
         return True
-    context = {n: _Anything() for n in used}
-    context[name] = _UnsetIntegration()
-    try:
-        template.render(**context)
-    except Exception:
-        return False
+    # BOTH truth values for the stand-ins. A compound guard
+    # short-circuits, so one arbitrary truthiness hides half the
+    # expression: with the stand-in falsy, `{% if config and
+    # oidc.port|int > 0 %}` never evaluates the right-hand side and the
+    # probe reports success -- while the real render, with a populated
+    # `config`, raises. Whichever way an unrelated operand happens to go
+    # in production, the reachable expression has to have been probed.
+    for truthy in (False, True):
+        context = {n: _Anything(truthy) for n in used}
+        context[name] = _UnsetIntegration()
+        try:
+            template.render(**context)
+        except Exception:
+            return False
     return True
 
 
