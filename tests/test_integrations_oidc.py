@@ -17,8 +17,8 @@ from unittest.mock import mock_open, patch
 
 import yaml
 
-from jinja2 import Template, UndefinedError
-from jinja2.exceptions import TemplateSyntaxError
+from jinja2 import Environment, Template, UndefinedError
+from jinja2.exceptions import TemplateAssertionError, TemplateSyntaxError
 
 from apps.utils.docker.compose import (
     KNOWN_INTEGRATION_TYPES,
@@ -596,48 +596,50 @@ class ParseFailureFallbackTests(TestCase):
                 self._kept('{{ oidc.issuer }}')
 
 
-class ABlockSplitAcrossValuesIsPoppedWholeTests(TestCase):
-    """A `{% %}` block can straddle two env values, and half-popping it
-    corrupts the document.
+class ASplitBlockIsLeftAloneTests(TestCase):
+    """A `{% %}` block straddling two env values is not touched.
 
-    The values are dumped into ONE YAML document and rendered together,
-    so popping `{% if oidc %}` while keeping the matching `{% endif %}`
-    leaves a stray tag that fails the whole render -- turning a
-    would-be over-pop (cost: one env var) into a failed deploy, which
-    is the direction this module exists to avoid. So an unparseable
-    value carrying any `{%` tag is popped even when it never names an
-    integration.
+    An earlier attempt popped any unparseable value carrying a `{%` tag,
+    so that a block could not be half-popped and left dangling. The
+    document-level guard (see `TheStripNeverBreaksTheDocumentTests`)
+    made that rule redundant and it was removed, because it also popped
+    values that reference no integration at all -- `{% if instance_url %}`
+    split across two values lost both keys on every instance with an
+    unset integration, which today is every instance.
+
+    So a half that names an integration is popped, the document is found
+    unrenderable, and the pop is undone. The keys survive and render
+    through the binding.
     """
 
     def _strip(self, env, integrations=None):
-        compose = {'services': {'app': {'environment': env}}}
-        _delete_unset_integration_env_keys(
-            compose, {'id': 'i1', 'integrations': integrations or {}},
+        compose = {'services': {'app': {'environment': dict(env)}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations or {}},
         )
-        return compose['services']['app']['environment']
-
-    def test_both_halves_of_a_split_block_are_popped(self):
-        self.assertEqual(
-            self._strip({'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'}),
-            {'B': 'x'},
-        )
-
-    def test_what_remains_still_renders(self):
-        env = {'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'}
-        compose = {'services': {'app': {'environment': env}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
-        # The whole point: the surviving document is renderable.
-        rendered = Template(yaml.dump(compose)).render(**_compose_render_context(info))
-        self.assertEqual(
-            yaml.safe_load(rendered)['services']['app']['environment'], {'B': 'x'},
-        )
+        return compose, info
 
-    def test_a_lone_end_tag_is_popped_even_with_smtp_configured(self):
-        # It names no integration at all, so only the `{%` rule reaches it.
-        self.assertEqual(
-            self._strip({'C': '{% endif %}'}, {'smtp': {'host': 'h'}}), {},
-        )
+    def _render(self, compose, info):
+        return Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_a_split_block_keeps_both_halves_and_renders(self):
+        env = {'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'}
+        compose, info = self._strip(env)
+        self.assertEqual(compose['services']['app']['environment'], env)
+        self._render(compose, info)  # must not raise
+
+    def test_a_block_naming_no_integration_is_not_touched(self):
+        # The over-pop the removed rule caused: neither half references
+        # an integration, so neither should be considered at all.
+        env = {'A': '{% if instance_url %}', 'B': 'yes{% endif %}', 'KEEP': 'plain'}
+        compose, info = self._strip(env, {'smtp': {'host': 'h'}})
+        self.assertEqual(compose['services']['app']['environment'], env)
+
+    def test_a_lone_end_tag_is_left_alone(self):
+        env = {'C': '{% endif %}'}
+        compose, _ = self._strip(env, {'smtp': {'host': 'h'}})
+        self.assertEqual(compose['services']['app']['environment'], env)
 
 
 class TheStripNeverBreaksTheDocumentTests(TestCase):
@@ -699,13 +701,16 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         )
         self.assertEqual(compose['services']['app']['environment'], {})
 
-    def test_a_balanced_split_block_is_still_popped_whole(self):
-        # Popping BOTH halves keeps the document balanced, so the guard
-        # has nothing to undo.
-        compose, info = self._run(
-            {'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}'},
-        )
-        self.assertEqual(compose['services']['app']['environment'], {'B': 'x'})
+    def test_a_split_block_is_undone_but_a_clean_pop_is_kept(self):
+        # The point of scoping the undo: `H` is a clean pop and survives,
+        # while the straddling half that broke the document is restored.
+        compose, info = self._run({
+            'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}',
+            'H': '{{ oidc.issuer }}',
+        })
+        env = compose['services']['app']['environment']
+        self.assertNotIn('H', env)
+        self.assertEqual(sorted(env), ['A', 'B', 'C'])
         self._renders(compose, info)
 
     def test_an_already_broken_document_is_still_stripped(self):
@@ -715,10 +720,17 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         self.assertNotIn('H', compose['services']['app']['environment'])
 
     def test_the_revert_is_logged(self):
+        # A shape that actually triggers the undo: the closing half is a
+        # real reference and IS popped, which orphans the opener.
         with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
-            self._run({'A': '{% raw %}', 'B': '{% endraw %}'})
-        self.assertIn('unrenderable', ''.join(caught.output))
-        self.assertIn('i1', ''.join(caught.output))
+            self._run({'A': '{# oidc note', 'B': '{{ oidc.host }} #}'})
+        joined = ''.join(caught.output)
+        self.assertIn('unrenderable', joined)
+        self.assertIn('i1', joined)
+        # The message must say what was kept and what was undone, or an
+        # operator cannot tell a harmless undo from a lost env var.
+        self.assertIn('kept', joined)
+        self.assertIn('undid', joined)
 
     def test_a_compose_that_cannot_be_dumped_answers_no(self):
         # `_document_parses` must ANSWER for any input, never raise --
@@ -769,6 +781,168 @@ class ServicesThatIsNotAMappingTests(TestCase):
             ]}],
         })
         self.assertEqual(compose, {'services': None})
+
+
+class TheGuardAsksTheRenderQuestionTests(TestCase):
+    """`_document_parses` must compile, not merely parse.
+
+    The render is `Template(...)`, which parses AND compiles, and a
+    family of `TemplateAssertionError`s comes only from the compile
+    step. Popping a `{% raw %}`/`{% endraw %}` pair un-shields whatever
+    sat between them, so the strip can ADD live constructs: a second
+    `{% block b %}` becomes real, and the document fails to compile
+    while parsing perfectly well. Asking the cheaper question let that
+    through as a 500.
+    """
+
+    UNSHIELDED = {
+        'A': '{% block b %}x{% endblock %}',
+        'B': '{{ oidc.x }}{% raw %}',
+        'C': '{% block b %}y{% endblock %}',
+        'D': '{{ oidc.y }}{% endraw %}',
+    }
+
+    def test_a_compile_only_error_is_caught(self):
+        compose = {'services': {'app': {'environment': dict(self.UNSHIELDED)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_parsing_alone_would_not_have_caught_it(self):
+        # Pins the premise: if these two ever agree, the test above
+        # quietly stops covering anything.
+        text = yaml.dump({'services': {'app': {'environment': {
+            'A': '{% block b %}x{% endblock %}',
+            'C': '{% block b %}y{% endblock %}',
+        }}}})
+        Environment().parse(text)  # parses happily
+        with self.assertRaises(TemplateAssertionError):
+            Environment().from_string(text)
+
+
+class TheUndoIsScopedToWhatBrokeItTests(TestCase):
+    """Undoing the WHOLE strip re-introduced the bug it exists to fix.
+
+    The document is one template, but the damage is local. A malformed
+    value in one service used to un-pop every correctly-popped key in
+    every OTHER service, so glitchtip's `EMAIL_URL` came back and
+    rendered `smtp://:@` -- the malformed URL its app parses at boot,
+    and the whole reason the strip was written. "Weaker guarantee but
+    still a working deploy" was not true for that app.
+    """
+
+    SPLIT_COMMENT = {'A_NOTE': '{# optional oidc wiring:',
+                     'Z_END': '{{ oidc.issuer }} #}'}
+
+    def _run(self, services, integrations=None):
+        compose = {'services': {
+            name: {'environment': dict(env)} for name, env in services.items()
+        }}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations or {}},
+        )
+        _delete_unset_integration_env_keys(compose, info)
+        return compose, info
+
+    def test_a_broken_service_does_not_un_pop_a_clean_one(self):
+        compose, _ = self._run({
+            'web': {'EMAIL_URL': 'smtp://{{ smtp.username }}@{{ smtp.host }}'},
+            'worker': self.SPLIT_COMMENT,
+        })
+        self.assertEqual(compose['services']['web']['environment'], {})
+        self.assertEqual(
+            sorted(compose['services']['worker']['environment']),
+            ['A_NOTE', 'Z_END'],
+        )
+
+    def test_the_malformed_url_does_not_come_back(self):
+        compose, info = self._run({
+            'web': {'EMAIL_URL': 'smtp://{{ smtp.username }}@{{ smtp.host }}'},
+            'worker': self.SPLIT_COMMENT,
+        })
+        rendered = yaml.safe_load(
+            Template(yaml.dump(compose)).render(**_compose_render_context(info)),
+        )
+        self.assertNotIn(
+            'EMAIL_URL', rendered['services']['web']['environment'] or {},
+        )
+
+    def test_the_undo_handles_list_form_environments(self):
+        # `environment:` may be a list of "KEY=value" strings, and the
+        # undo has to re-apply a pop in that form too.
+        compose = {'services': {'app': {'environment': [
+            'EMAIL_URL=smtp://{{ smtp.username }}@{{ smtp.host }}',
+            'A_NOTE={# optional oidc wiring:',
+            'Z_END={{ oidc.issuer }} #}',
+            'PLAIN=keepme',
+            # Value MENTIONS a popped key's name. Matching on
+            # containment rather than the key would take this too.
+            'NOTE=see EMAIL_URL for details',
+        ]}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        env = compose['services']['app']['environment']
+        self.assertNotIn(
+            'EMAIL_URL=smtp://{{ smtp.username }}@{{ smtp.host }}', env,
+        )
+        self.assertIn('A_NOTE={# optional oidc wiring:', env)
+        self.assertIn('Z_END={{ oidc.issuer }} #}', env)
+        self.assertIn('PLAIN=keepme', env)
+        self.assertIn('NOTE=see EMAIL_URL for details', env)
+        Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_the_undo_is_deterministic(self):
+        # Same input, same answer -- the undo walks the document's own
+        # key order rather than a set's.
+        def once():
+            compose = {'services': {
+                'web': {'environment': {
+                    'E': 'smtp://{{ smtp.username }}@{{ smtp.host }}',
+                    'F': '{{ smtp.port }}', 'G': '{{ oidc.issuer }}',
+                }},
+                'worker': {'environment': dict(self.SPLIT_COMMENT)},
+            }}
+            _delete_unset_integration_env_keys(
+                compose, _compute_integrations_context(
+                    {'id': 'i1', 'integrations': {}}),
+            )
+            return {k: sorted(v['environment'])
+                    for k, v in compose['services'].items()}
+        first = once()
+        for _ in range(5):
+            self.assertEqual(once(), first)
+
+    def test_a_clean_pop_in_the_SAME_service_still_survives(self):
+        compose, _ = self._run({'app': dict(
+            self.SPLIT_COMMENT, H='{{ oidc.issuer }}',
+        )})
+        env = compose['services']['app']['environment']
+        self.assertNotIn('H', env)
+        self.assertEqual(sorted(env), ['A_NOTE', 'Z_END'])
+
+
+class UnhashableDestinationFieldsTests(TestCase):
+    """Catalog metadata is JSON, so `container`/`key` can arrive as a list.
+
+    Pass 1 used them as dict keys directly, and an unhashable value
+    raised TypeError out of `/start/` -- inconsistent with every other
+    shape guard in this module.
+    """
+
+    def test_an_unhashable_container_or_key_is_skipped(self):
+        for dest in ({'type': 'oidc', 'container': ['a'], 'key': 'K'},
+                     {'type': 'oidc', 'container': 'app', 'key': ['K']},
+                     {'type': 'oidc', 'container': {'a': 1}, 'key': 'K'},
+                     {'type': 'oidc', 'container': 'app', 'key': 7}):
+            with self.subTest(dest=dest):
+                compose = {'services': {'app': {'environment': {'K': 'v'}}}}
+                _delete_unset_integration_env_keys(compose, {
+                    'id': 'i1', 'integrations': {},
+                    'configurations': [{'destinations': [dest]}],
+                })
+                self.assertEqual(
+                    compose['services']['app']['environment'], {'K': 'v'},
+                )
 
 
 class MalformedPayloadShapesDoNotCrashTests(TestCase):
