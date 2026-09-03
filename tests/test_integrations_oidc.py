@@ -1405,7 +1405,12 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
         # position is safe, because it cannot happen when unset.
         self.assertFalse(self._survives(
             '{% set x = smtp if smtp else {} %}{{ x.host }}'))
-        self.assertTrue(self._survives(
+        # The dereference form is over-popped too, and deliberately:
+        # it renders `lo` correctly, but the guard does not span the
+        # whole value (a `{% set %}` plus a use is two statements), and
+        # that is the rule that stops `smtp://:@` shipping. Over-pop is
+        # the safe direction.
+        self.assertFalse(self._survives(
             '{% set x = smtp.host if smtp else "lo" %}{{ x }}'))
 
     def test_an_elif_body_is_not_dominated(self):
@@ -1453,6 +1458,57 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
         self.assertTrue(self._survives(
             '{% if smtp %}{% if False %}a{% elif True %}{{ smtp.host }}'
             '{% endif %}{% endif %}'))
+
+    def test_a_guard_must_span_the_WHOLE_value(self):
+        # Domination asks whether the READ can happen, not whether the
+        # text around it still renders. Both of these keep their literal
+        # scaffolding when unset -- `smtp://:@` and `https:///path` --
+        # so the key ships present and broken, which is worse than
+        # absent and is what `main` avoids by popping them.
+        for value in (
+            'smtp://{{ smtp.username if smtp else "" }}'
+            ':{{ smtp.password if smtp else "" }}@{{ smtp.host if smtp else "" }}',
+            'https://{% if smtp %}{{ smtp.host }}{% endif %}/path',
+            'prefix {% if smtp %}{{ smtp.host }}{% else %}lo{% endif %}',
+            '{% if smtp %}{{ smtp.host }}{% else %}lo{% endif %} suffix',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_whole_value_guard_is_still_kept(self):
+        # The catalog forms this exists for: one `{% if %}`, or one
+        # ternary, and nothing else in the value.
+        for value, unset in (
+            ('{{ "true" if smtp else "false" }}', 'false'),
+            ('{% if smtp %}{{ smtp.host }}{% else %}localhost{% endif %}',
+             'localhost'),
+            ('{{ smtp.port if smtp else 25 }}', '25'),
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+                info = _compute_integrations_context(
+                    {'id': 'i1', 'integrations': {}})
+                self.assertEqual(
+                    Template(value).render(**_compose_render_context(info)),
+                    unset)
+
+    def test_a_set_BLOCK_escapes_its_branch_too(self):
+        # `{% set h %}..{% endset %}` is an AssignBlock, not an Assign.
+        # The whole value has to BE the guard for this to be the rule
+        # doing the work -- with trailing text the value pops anyway.
+        self.assertFalse(self._survives(
+            '{% if smtp %}{% set h %}{{ smtp.host }}{% endset %}'
+            '{{ h }}{% endif %}'))
+
+    def test_a_trailing_output_beside_a_ternary_is_over_popped(self):
+        # `{{ smtp.host if smtp else "b" }}{{ "-suffix" }}` renders
+        # `b-suffix` correctly, but the guard does not span the whole
+        # value so it pops. Conservative on purpose: the same
+        # "something else renders too" shape is what produced
+        # `smtp://:@`, and telling the safe arrangement from the unsafe
+        # one is not worth an under-pop.
+        self.assertFalse(self._survives(
+            '{{ smtp.host if smtp else "b" }}{{ "-suffix" }}'))
 
     def test_a_loop_filter_dominates_nothing(self):
         # It runs per item, so it is not a precondition on the body.

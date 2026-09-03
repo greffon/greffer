@@ -601,6 +601,37 @@ def _unless_a_value_escapes(node, slots):
     return tuple(kept)
 
 
+def _guard_spans_the_whole_value(ast):
+    """Is the guarded construct the ENTIRE value, with no literal around it?
+
+    Domination asks whether the READ can happen. It does not ask whether
+    the text around it still renders, and that gap ships the exact
+    malformed values this pass exists to stop:
+
+        smtp://{{ smtp.user if smtp else "" }}@{{ smtp.host if smtp else "" }}
+        https://{% if smtp %}{{ smtp.host }}{% endif %}/path
+
+    Both keep their literal scaffolding when the integration is unset --
+    `smtp://:@` and `https:///path` -- so the key is present and broken,
+    which is worse than absent and is what `main` avoids by popping
+    them. The read really is unreachable; the value is still wrong.
+
+    So a branch is only dominated when the whole value IS the guard: one
+    `{% if %}`, or one `{{ a if test else b }}`. Anything with literal
+    text beside it falls back to being a read, which pops -- the safe
+    direction, and what `main` already did.
+    """
+    body = getattr(ast, 'body', None)
+    if not isinstance(body, list) or len(body) != 1:
+        return False
+    node = body[0]
+    if isinstance(node, nodes.If):
+        return True
+    return (isinstance(node, nodes.Output)
+            and len(node.nodes) == 1
+            and isinstance(node.nodes[0], nodes.CondExpr))
+
+
 def _reads(ast, name):
     """Does this parsed template READ the top-level `name`?
 
@@ -654,6 +685,7 @@ def _reads(ast, name):
     # DOMINATED is inside a branch that only runs when the integration
     # is configured.
     FREE, SLOT, DOMINATED = 0, 1, 2
+    whole_value_guard = _guard_spans_the_whole_value(ast)
     stack = [(ast, FREE, False)]
     while stack:
         node, state, via_deref = stack.pop()
@@ -669,7 +701,7 @@ def _reads(ast, name):
             if state == DOMINATED and via_deref:
                 continue
             return True
-        dominated = _dominated_slots(node, name)
+        dominated = _dominated_slots(node, name) if whole_value_guard else ()
         deref_slot = (isinstance(node, (nodes.Getattr, nodes.Getitem)))
         for field, value in node.iter_fields():
             if state != FREE:
