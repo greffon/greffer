@@ -1431,6 +1431,67 @@ class AGuardWhoseTestCannotEvaluateStillPopsTests(TestCase):
             '{% if smtp %}on{% else %}{{ config.PORT|int }}{% endif %}'))
 
 
+class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
+    """The probe must not pop a value that never mentions the type.
+
+    It binds every OTHER name to a stand-in, and the stand-in cannot do
+    everything a real value can. `{{ config|tojson }}` fails only
+    because the stand-in will not serialise -- the key was removed while
+    the real render produced `{"X": "1"}`. A value the integration does
+    not appear in cannot fail *because of* the integration.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_value_without_the_type_is_never_popped_by_the_probe(self):
+        for value in ('{{ config|tojson }}', '{{ config|list }}',
+                      '{{ config.X }}', '{{ instance_url|urlencode }}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+
+class TheProbeTriesEveryTruthAssignmentTests(TestCase):
+    """One truth assignment hides half a compound guard.
+
+    A guard short-circuits, so probing with the stand-ins all-false --
+    or even all-false and all-true -- leaves part of the expression
+    unevaluated:
+
+        {% if config and not feature and oidc.port|int > 0 %}
+
+    all-false stops at `config`, all-true stops at `not feature`, and
+    the real context (populated `config`, false `feature`) reaches the
+    unset field and raises. Every assignment is tried, which is one
+    render for every guard the catalog actually ships.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_guard_needing_mixed_truth_values_is_popped(self):
+        for value in (
+            '{% if config and not feature and oidc.port|int > 0 %}a'
+            '{% else %}b{% endif %}',
+            '{% if not config and feature and smtp.port|int %}a{% endif %}',
+            '{% if config and oidc.port|int > 0 %}a{% else %}b{% endif %}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_guard_that_renders_under_every_assignment_is_kept(self):
+        for value in ('{% if config and smtp %}a{% else %}b{% endif %}',
+                      '{% if config and smtp.host %}a{% else %}b{% endif %}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+
 class AGuardCanLeakThroughACallArgumentTests(TestCase):
     """A guard test only DECIDES -- unless it hands the type to a call.
 

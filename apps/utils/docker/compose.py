@@ -1,5 +1,6 @@
 import yaml
 import asyncio
+import itertools
 import time
 import copy
 import re
@@ -615,6 +616,11 @@ class _Anything:
     __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
 
 
+# 2^n renders, so a ceiling. Every guard in the catalog names nothing
+# but the integration (n = 0); 6 allows 64.
+_PROBE_NAME_LIMIT = 6
+
+
 def _guard_only_value_still_renders(text, name):
     """Would this value render with the integration unset?
 
@@ -643,15 +649,32 @@ def _guard_only_value_still_renders(text, name):
         # Unparseable values are already handled by the caller's
         # fallback; this probe has nothing to add.
         return True
-    # BOTH truth values for the stand-ins. A compound guard
-    # short-circuits, so one arbitrary truthiness hides half the
-    # expression: with the stand-in falsy, `{% if config and
-    # oidc.port|int > 0 %}` never evaluates the right-hand side and the
-    # probe reports success -- while the real render, with a populated
-    # `config`, raises. Whichever way an unrelated operand happens to go
-    # in production, the reachable expression has to have been probed.
-    for truthy in (False, True):
-        context = {n: _Anything(truthy) for n in used}
+    if name not in used:
+        # The value never mentions this integration, so a failure here
+        # cannot be about it. Probing anyway popped working keys:
+        # `{{ config|tojson }}` fails only because the probe binds
+        # `config` to a stand-in that will not serialise, and the key
+        # was removed while the real render produced `{"X": "1"}`.
+        return True
+    # EVERY truth assignment of the stand-ins, not one pair. A compound
+    # guard short-circuits, so a single assignment hides part of the
+    # expression: with all-false `{% if config and not feature and
+    # oidc.port|int > 0 %}` stops at `config`, with all-true it stops at
+    # `not feature`, and the real context -- populated `config`, false
+    # `feature` -- reaches the unset field and raises.
+    #
+    # The count is 2^(other names), which is 1 for every guard in the
+    # catalog today: they mention nothing but the integration. Past
+    # `_PROBE_NAME_LIMIT` only the two extremes are tried, leaving a
+    # residual rather than spending exponential time on a shape nothing
+    # writes.
+    others = sorted(used - {name})
+    if len(others) <= _PROBE_NAME_LIMIT:
+        assignments = itertools.product((False, True), repeat=len(others))
+    else:
+        assignments = ((False,) * len(others), (True,) * len(others))
+    for combo in assignments:
+        context = {n: _Anything(t) for n, t in zip(others, combo)}
         context[name] = _UnsetIntegration()
         try:
             template.render(**context)
