@@ -1475,6 +1475,53 @@ class AGuardedBranchIsUnreachableWhenUnsetTests(TestCase):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
 
+    def test_an_outer_construct_does_not_lend_the_licence_inward(self):
+        # "Spans the whole value" has to be recomputed per node. Latched
+        # once from the root, any guard nested inside a NON-dominating
+        # outer construct inherited it -- so wrapping a known-bad shape
+        # in `{% if true %}` flipped it from popped to kept.
+        for value in (
+            '{% if true %}smtp://{% if smtp %}{{ smtp.user }}{% endif %}'
+            '@mailhost{% endif %}',
+            '{% if true %}https://{{ smtp.host if smtp else "" }}/path{% endif %}',
+            '{% if false %}x{% else %}host={% if smtp %}{{ smtp.host }}'
+            '{% endif %}{% endif %}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_concatenation_is_not_a_span_preserving_descent(self):
+        # Both operands of an `+` render, so neither is the whole value.
+        # Counting nodes per FIELD said otherwise -- an `Add` holds one
+        # node in `left` and one in `right`, and each looked solitary --
+        # which let `https:///auth` ship.
+        for value in (
+            '{{ ("smtp://" + (smtp.user if smtp else "") + "@h") if True else "" }}',
+            '{% if true %}{{ "https://" + (oidc.issuer if oidc else "") '
+            '+ "/auth" }}{% endif %}',
+            '{{ "smtp://" ~ (smtp.host if smtp else "") ~ "/x" }}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_branch_whose_sole_content_is_the_guard_keeps_the_licence(self):
+        # The mirror of the case above: an outer construct that adds no
+        # output of its own passes the property through, so the guard
+        # inside it still spans everything that renders. These give the
+        # author's fallback, so popping them would lose a setting.
+        for value, unset in (
+            ('{% if true %}{{ smtp.host if smtp else "lo" }}{% endif %}', 'lo'),
+            ('{% if true %}{% if smtp %}{{ smtp.host }}{% else %}lo'
+             '{% endif %}{% endif %}', 'lo'),
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+                info = _compute_integrations_context(
+                    {'id': 'i1', 'integrations': {}})
+                self.assertEqual(
+                    Template(value).render(**_compose_render_context(info)),
+                    unset)
+
     def test_a_whole_value_guard_is_still_kept(self):
         # The catalog forms this exists for: one `{% if %}`, or one
         # ternary, and nothing else in the value.
