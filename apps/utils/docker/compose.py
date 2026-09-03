@@ -546,7 +546,10 @@ def _dominated_slots(node, name):
     it does not dominate the body.
     """
     if isinstance(node, nodes.If):
-        positive, negative = ('body', 'elif_'), ('else_',)
+        # NOT `elif_`: an elif body runs when this test is FALSE, so
+        # `{% if smtp %}{% elif other %}{{ smtp.host }}{% endif %}` can
+        # reach the read with the integration unset.
+        positive, negative = ('body',), ('else_',)
     elif isinstance(node, nodes.CondExpr):
         positive, negative = ('expr1',), ('expr2',)
     else:
@@ -557,10 +560,45 @@ def _dominated_slots(node, name):
     if test is None:
         return ()
     if _asserts_truthy(test, name):
-        return positive
+        return _unless_a_value_escapes(node, positive)
     if isinstance(test, nodes.Not) and _asserts_truthy(test.node, name):
-        return negative
+        return _unless_a_value_escapes(node, negative)
     return ()
+
+
+def _unless_a_value_escapes(node, slots):
+    """Drop a slot whose branch can publish a value outside itself.
+
+    Jinja's `{% set %}` leaks to the enclosing scope, so a branch that
+    only RUNS when the integration is configured can still leave
+    something behind that is read unconditionally afterwards:
+
+        {% if smtp %}{% set h = smtp.host %}{% endif %}smtp://{{ h }}@x
+
+    renders `smtp://@x` when unset -- present, malformed, and exactly
+    what the strip exists to stop. A macro defined in the branch and
+    called outside does the same. Rather than track which names escape,
+    a branch containing any of that is simply not dominated: the cost
+    is an over-pop, which is the safe direction.
+    """
+    # Deliberately blunt. A branch where EVERY arm assigns the name --
+    # `{% if smtp %}{% set h = smtp.host %}{% else %}{% set h = 'lh' %}
+    # {% endif %}` -- is actually safe, and is over-popped here. Telling
+    # that apart needs real dataflow, and being wrong in the other
+    # direction ships a malformed value, so the blunt rule stands and
+    # the cost is an env var on an unconfigured integration.
+    escapes = (nodes.Assign, nodes.AssignBlock, nodes.Macro)
+    kept = []
+    for slot in slots:
+        value = getattr(node, slot, None)
+        items = value if isinstance(value, list) else [value]
+        if any(isinstance(item, nodes.Node)
+               and (isinstance(item, escapes)
+                    or any(True for _ in item.find_all(escapes)))
+               for item in items):
+            continue
+        kept.append(slot)
+    return tuple(kept)
 
 
 def _reads(ast, name):
