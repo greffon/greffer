@@ -442,13 +442,22 @@ def _render_json_value(value, greffon_info, dest_name):
 # keys in batches of _UNDO_CHUNK and only splits a batch that fails, so
 # a clean run needs ceil(n / _UNDO_CHUNK) attempts.
 #
-# The bound is WALL CLOCK, not a render count. What a render costs is
-# catalog-controlled and unbounded -- `{{ range(20000000)|sum }}` or a
-# large string multiply take seconds each -- so capping the count
-# capped the wrong thing: 200 renders of a slow document is still
-# minutes of CPU on `/start/`. A time budget bounds the actual damage
-# whatever a single render costs. Real catalog entries never reach here
-# at all; when they do, the whole undo is milliseconds.
+# The bound is WALL CLOCK, not a render count, because what a render
+# costs is catalog-controlled and unbounded -- `{{ range(20000000)|sum }}`
+# or a large string multiply take seconds each -- so capping the count
+# capped the wrong thing.
+#
+# It bounds the LOOP, not the request. A render already in flight when
+# the deadline passes still runs to completion, and the two guard
+# renders plus the final all-at-once retry sit outside the loop
+# entirely, so the true worst case is roughly `budget + 4R` for a
+# single-render cost R. With R unbounded this is a mitigation, not a
+# guarantee: a compose that renders slowly can still occupy `/start/`
+# for a long time -- as it can on `main`, which renders it once. Real
+# catalog entries never reach the loop at all; when they do the whole
+# undo is milliseconds. Bounding R itself needs a sandbox or a
+# watchdog, which is the custom-compose epic's problem, not this
+# function's.
 _UNDO_CHUNK = 8
 _UNDO_TIME_BUDGET = 5.0
 
@@ -458,23 +467,33 @@ def _document_renders(compose, render_context):
 
     Dump, compile, render -- the three steps `create_compose` performs,
     with the same context, so the answer is the one that matters rather
-    than an approximation of it.
+    than an approximation of it. Compiling alone was not enough twice
+    over: a family of `TemplateAssertionError`s comes only from the
+    compile step, and a symbol can be DEFINED in one env value and USED
+    in another, so popping the definition leaves a document that
+    compiles and then raises `'u' is undefined`.
 
-    Compiling alone was not enough, twice over. `Template()` compiles as
-    well as parses, and a family of `TemplateAssertionError`s comes only
-    from the compile step. And a symbol can be DEFINED in one env value
-    and USED in another: popping the definition (it dereferences an
-    unset type) while keeping the use (it dereferences nothing) leaves a
-    document that compiles perfectly and raises `'u' is undefined` at
-    render:
+    The context is deep-copied PER CALL, and that is load-bearing.
+    Copying it once at the call site and reusing it was not enough: a
+    catalog expression that mutates the context corrupts the copy, and
+    every later verdict then answers a different question than
+    `create_compose` will ask with its own fresh context. Both
+    directions shipped real bugs -- a mutation that removes made the
+    guard undo every pop, so glitchtip's `EMAIL_URL` went out as
+    `smtp://:@`; a mutation that adds made the guard approve a document
+    that then raised at `/start/`.
 
-        A: '{% macro u(p) %}{{ oidc.issuer }}{{ p }}{% endmacro %}'
-        B: '{{ u(1) }}'
+    A context that will not copy means the question cannot be asked
+    safely, so the answer is no.
 
     Any failure is a no, including a compose that will not dump.
     """
     try:
-        Environment().from_string(yaml.dump(compose)).render(**render_context)
+        context = copy.deepcopy(render_context)
+    except Exception:
+        return False
+    try:
+        Environment().from_string(yaml.dump(compose)).render(**context)
     except Exception:
         return False
     return True
@@ -625,26 +644,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # between it, so the strip can add constructs, not only remove
     # them.
     # The exact context `create_compose` renders with, so the guard's
-    # question is the render's question and not a proxy for it -- but a
-    # DEEP COPY of it. `_compose_render_context` copies only the top
-    # level, and the guard now RENDERS, so a side-effecting expression
-    # would run against the caller's own objects and be observed by
-    # everything downstream: `{{ volumes.popitem() and '' }}` emptied
-    # `greffon_info['volumes']`, which `create_volumes_then_copy_files`
-    # consumes two lines after `create_compose` returns. The catalog is
-    # treated as hostile elsewhere in this module, so it is treated as
-    # hostile here.
-    #
-    # A context that will not deep-copy means the guard cannot be run
-    # safely, so it is skipped rather than run dangerously.
-    try:
-        render_context = copy.deepcopy(_compose_render_context(greffon_info))
-    except Exception:
-        render_context = None
-    rendered_before = (
-        render_context is not None
-        and _document_renders(compose, render_context)
-    )
+    # question is the render's question and not a proxy for it.
+    # `_document_renders` copies it per call -- see there for why once
+    # at this call site was not enough.
+    render_context = _compose_render_context(greffon_info)
+    rendered_before = _document_renders(compose, render_context)
     snapshot = None
     if rendered_before:
         try:
