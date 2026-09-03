@@ -1447,6 +1447,33 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
+    def test_an_unrelated_operand_that_trips_the_stand_in_is_not_blamed(self):
+        # A stand-in is not a real value. `{% if config|tojson and oidc %}`
+        # fails the probe because the STAND-IN for `config` will not
+        # serialise, not because of `oidc` -- and it renders `off`
+        # against a real dict. A failure counts only if the same render
+        # succeeds once the integration is populated.
+        for value in ('{% if config|tojson and oidc %}on{% else %}off{% endif %}',
+                      '{% if config|tojson and smtp.host %}a{% else %}b{% endif %}'):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+    def test_a_comparison_does_not_hide_the_unset_field(self):
+        # The stand-in's comparisons follow the assignment too. Returning
+        # a constant made every assignment take the same path, so
+        # `{% if instance_port == '' and oidc.port|int > 0 %}` short
+        # circuited in all of them and the unset field was never reached
+        # -- while the real render raises.
+        self.assertFalse(self._survives(
+            "{% if instance_port == '' and oidc.port|int > 0 %}a{% else %}b{% endif %}"))
+
+    def test_a_chained_field_is_still_attributed(self):
+        # The populated side has to survive a CHAIN as well as a filter;
+        # a plain number broke on `smtp.a.b` and made a real failure
+        # look unattributable.
+        self.assertFalse(self._survives('{% if smtp.a.b|int %}a{% endif %}'))
+        self.assertFalse(self._survives('{% if smtp.host|tojson %}a{% endif %}'))
+
     def test_a_value_without_the_type_is_never_popped_by_the_probe(self):
         for value in ('{{ config|tojson }}', '{{ config|list }}',
                       '{{ config.X }}', '{{ instance_url|urlencode }}'):
