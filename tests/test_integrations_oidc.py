@@ -1361,6 +1361,76 @@ class DefaultDependsOnWhatItIsAppliedToTests(TestCase):
             _render_baked_file('{{ oidc|default("d") }}', info, 'f.json'), '{}')
 
 
+class AGuardWhoseTestCannotEvaluateStillPopsTests(TestCase):
+    """The exemption assumes a guard RENDERS when the type is unset.
+
+    It assumes too much. `_UnsetField` absorbs attribute access and
+    calls, not arithmetic or serialisation, so the test itself can
+    raise:
+
+        {% if smtp.port|int > 0 %}true{% else %}false{% endif %}
+
+    That is unrecoverable, not merely wrong: the document fails to
+    render BEFORE the strip, so the document guard takes no snapshot and
+    the undo never runs -- a 500 at `/start/` with no fallback. Popping
+    the key deploys cleanly.
+
+    Not a regression against `main`, which raises identically. It is a
+    hole in the exemption this feature added.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_test_that_raises_when_unset_is_popped(self):
+        for value in (
+            '{% if smtp.port|int > 0 %}true{% else %}false{% endif %}',
+            '{% if smtp.port > 25 %}a{% endif %}',
+            '{{ "a" if smtp.host|abs else "b" }}',
+            '{% if smtp.host|tojson %}a{% endif %}',
+            '{% if smtp.a.b|int %}a{% endif %}',
+            '{% for x in [1] if smtp.port|int %}{{ x }}{% endfor %}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_the_whole_document_still_deploys(self):
+        # The consequence: the neighbouring key survives instead of the
+        # instance failing to start.
+        compose = {'services': {'app': {'environment': {
+            'SMTP_ENABLED': '{% if smtp.port|int > 0 %}true{% else %}false{% endif %}',
+            'OTHER': 'ok',
+        }}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'], {'OTHER': 'ok'})
+        Template(yaml.dump(compose)).render(**_compose_render_context(info))
+
+    def test_a_guard_that_DOES_render_is_still_kept(self):
+        # The probe must not become "pop every guard". `|default`
+        # rescues the same expression, and that must still be kept.
+        for value in (
+            '{% if smtp.port|default(25)|int > 0 %}a{% else %}b{% endif %}',
+            '{% if smtp %}on{% else %}off{% endif %}',
+            '{% if smtp.host %}x{% else %}y{% endif %}',
+            '{% if oidc.issuer.startswith("h") %}a{% endif %}',
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+    def test_the_probe_does_not_blame_the_type_for_other_context(self):
+        # Everything but the integration is bound to a total stand-in,
+        # so a value that needs real context is not popped for failing
+        # in a probe that cannot supply it.
+        self.assertTrue(self._survives(
+            '{% if smtp %}{{ config.PORT|int }}{% else %}0{% endif %}'
+            if False else
+            '{% if smtp %}on{% else %}{{ config.PORT|int }}{% endif %}'))
+
+
 class AGuardCanLeakThroughACallArgumentTests(TestCase):
     """A guard test only DECIDES -- unless it hands the type to a call.
 
