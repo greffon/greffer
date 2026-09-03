@@ -14,6 +14,7 @@
 import itertools
 import logging
 import os
+import pathlib
 import tempfile
 from types import SimpleNamespace
 from unittest import TestCase
@@ -1187,6 +1188,65 @@ class TheGuardRendersAgainstItsOwnCopyTests(TestCase):
         self.assertNotIn('H', compose['services']['app']['environment'])
 
 
+class TheContextIsCopiedPerRenderTests(TestCase):
+    """Copying the guard's context ONCE was not enough.
+
+    The guard renders several times: before the strip, after it, and
+    once per undo trial. Sharing one copy across them means a catalog
+    expression that mutates the context corrupts every later verdict,
+    so the guard answers a different question than `create_compose`
+    will ask with its own fresh context. Both directions shipped bugs.
+    """
+
+    def _create(self, gid, env):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'GREFFON_PATH': tmp}):
+                info = {'id': gid, 'integrations': {}, 'name': 'n',
+                        'volumes': {'v': {'value': 'vol1'}},
+                        'networks': {}, 'ports': [], 'configurations': []}
+                compose = {'services': {'app': {'environment': dict(env)}}}
+                compose_module.create_compose(compose, info)
+                written = pathlib.Path(tmp, gid, 'docker-compose.yml').read_text()
+        return yaml.safe_load(written)['services']['app']['environment'] or {}
+
+    def test_a_mutation_that_REMOVES_does_not_un_pop_everything(self):
+        # `popitem()` empties the shared copy on the first render, so
+        # every later render died on it and the guard undid every pop --
+        # shipping glitchtip's `EMAIL_URL` as `smtp://:@`.
+        env = self._create('i1', {
+            'EMAIL_URL': 'smtp://{{ smtp.user }}@{{ smtp.host }}',
+            'SELF': "{{ volumes.popitem() and '' }}",
+        })
+        self.assertNotIn('EMAIL_URL', env)
+
+    def test_a_mutation_that_ADDS_does_not_get_the_guard_to_approve(self):
+        # The mirror: the first render created `v2` in the shared copy,
+        # so the guard approved a document whose real render raised.
+        env = self._create('i2', {
+            'AAA': '{{ volumes.setdefault("v2", volumes["v"]) and oidc.issuer }}',
+            'ZZZ': '{{ volumes.v2.value }}',
+        })
+        self.assertEqual(env.get('ZZZ'), 'vol1')
+
+    def test_an_ordinary_pop_is_unaffected(self):
+        env = self._create('i3', {'H': '{{ oidc.issuer }}', 'X': '1'})
+        self.assertEqual(env, {'X': '1'})
+
+    def test_the_helper_does_not_mutate_the_context_it_is_given(self):
+        context = {'volumes': {'v1': {'value': 'a'}, 'v2': {'value': 'b'}}}
+        compose = {'services': {'app': {'environment': {
+            'A': "{{ volumes.popitem() and '' }}"}}}}
+        self.assertTrue(_document_renders(compose, context))
+        self.assertEqual(len(context['volumes']), 2)
+
+    def test_two_calls_with_the_same_context_agree(self):
+        context = {'volumes': {'v1': {'value': 'a'}, 'v2': {'value': 'b'}}}
+        compose = {'services': {'app': {'environment': {
+            'A': "{{ volumes.popitem() and '' }}"}}}}
+        first = _document_renders(compose, context)
+        self.assertEqual(_document_renders(compose, context), first)
+
+
 class TheUndoIsBoundedTests(TestCase):
     """The undo is chunked and bounded by WALL CLOCK, and degrades safely.
 
@@ -1286,6 +1346,31 @@ class TheUndoIsBoundedTests(TestCase):
         # Nothing from that chunk may be decided individually.
         self.assertEqual(sorted(got), expected)
         self._renders(compose, info)
+
+    def test_the_log_says_which_keys_were_kept_and_which_undone(self):
+        # The undo's log is the operator's only record of which env vars
+        # were dropped, so the labels have to be the right way round.
+        env = {'A_POISON': '{# note', 'Z_CLOSE': '{{ oidc.host }} #}'}
+        env.update({f'K{i}': '{{ oidc.issuer }}' for i in range(3)})
+        compose = {'services': {'app': {'environment': env}}}
+        with self.assertLogs('apps.utils.docker.compose', level='WARNING') as caught:
+            self._run(compose)
+        line = ''.join(caught.output)
+        kept = line.split('kept ', 1)[1].split(' and undid ')[0]
+        undone = line.split(' and undid ', 1)[1]
+        for i in range(3):
+            self.assertIn(f'app.K{i}', kept)
+            self.assertNotIn(f'app.K{i}', undone)
+        self.assertIn('app.Z_CLOSE', undone)
+        self.assertNotIn('app.Z_CLOSE', kept)
+
+    def test_the_shipped_budget_is_sane(self):
+        # The tests patch this constant, so nothing otherwise pins the
+        # value that actually ships. It has to be finite and small
+        # enough that a stuck undo cannot hold `/start/` for minutes.
+        self.assertGreater(_UNDO_TIME_BUDGET, 0)
+        self.assertLessEqual(_UNDO_TIME_BUDGET, 30)
+        self.assertGreaterEqual(_UNDO_CHUNK, 2)
 
     def test_exhausting_the_budget_is_logged(self):
         compose = self._compose(_UNDO_CHUNK * 6)
