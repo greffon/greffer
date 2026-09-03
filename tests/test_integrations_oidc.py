@@ -2491,20 +2491,21 @@ class NotOurVariableTests(TestCase):
         self.assertFalse(self._survives('{{ oidc . issuer }}'))
 
 
-class ShadowedNameIsOverPoppedTests(TestCase):
-    """A locally bound name is popped, exactly as `main` pops it.
+class ShadowedNameIsNotPoppedTests(TestCase):
+    """A locally bound name is NOT popped -- and `main` pops it.
 
-    `{% for oidc in ... %}` binds the name, so the access after it
-    renders and popping the key is a false positive. It is accepted --
-    `main` has the same one -- because the rule that removed it made
-    something worse: suppressing on ANY binding in the value kept a
-    genuine reference when one scope bound the name and another read the
-    real global, and `create_compose` then 500'd where `main` had simply
-    popped the key.
+    `{% for smtp in xs %}{{ smtp.a }}{% endfor %}` binds the name
+    locally, so the value never touches the integration and the key must
+    survive. Every hand-written rule this module went through got that
+    wrong, and so does `main`; asking Jinja which variables a template
+    leaves undeclared gets the scoping right for free.
 
-    Scope-accurate detection needs Jinja's parser. Between two
-    imprecisions, this is the one that costs an env var rather than the
-    deploy.
+    The class was called `...IsOverPoppedTests` and its docstring
+    described the false positive as accepted, which stopped being true
+    when the scan moved to the parser. The test inside it was always
+    asserting the correct behaviour -- only the framing was stale, which
+    is the more dangerous half: someone grepping for what this module
+    accepts would have read the opposite of the truth.
     """
 
     def _survives(self, value):
@@ -2512,6 +2513,15 @@ class ShadowedNameIsOverPoppedTests(TestCase):
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
+
+    def test_main_pops_it_and_we_do_not(self):
+        # Pins the comparison the docstring makes, so the claim cannot
+        # rot again: this is a difference FROM `main`, not parity.
+        value = '{% for smtp in [{"a": 1}] %}{{ smtp.a }}{% endfor %}'
+        self.assertTrue(self._survives(value))
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        self.assertEqual(
+            Template(value).render(**_compose_render_context(info)), '1')
 
     def test_a_shadowed_name_is_NOT_popped(self):
         # These bind `oidc` LOCALLY -- a loop variable, a `{% set %}`, a
