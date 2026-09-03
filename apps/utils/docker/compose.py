@@ -259,6 +259,20 @@ class _UnsetIntegration(dict):
     than a loud refusal, and it has no strip pass to remove the key.
     """
 
+    def get(self, key, default=None):
+        """`dict.get`, except that a missing key with no default gives
+        the forgiving Undefined rather than `None`.
+
+        `{{ smtp.get('host') }}` otherwise rendered the literal string
+        `None` into a container's environment -- a value that is neither
+        empty nor correct, which is the whole class this object exists
+        to prevent. A caller who passes an explicit default still gets
+        it, so `.get(k, 'x')` is unchanged.
+        """
+        if key in self:
+            return self[key]
+        return self[key] if default is None else default
+
     def __missing__(self, key):
         # A FIELD is undefined, not another empty mapping. Returning
         # `self` here made `{{ smtp.host }}` render the literal `{}`
@@ -460,6 +474,20 @@ def _render_json_value(value, greffon_info, dest_name):
 # function's.
 _UNDO_CHUNK = 8
 _UNDO_TIME_BUDGET = 5.0
+
+
+# Filters that read an attribute off their operand, so they dereference
+# without producing a `Getattr` node. `attr` names the attribute
+# positionally; the rest take an `attribute=` keyword.
+_ATTRIBUTE_FILTERS = frozenset({
+    'attr', 'map', 'selectattr', 'rejectattr', 'groupby', 'sort',
+    'min', 'max', 'sum',
+})
+# Of those, the ones whose FIRST POSITIONAL argument is the attribute.
+# `map` is excluded on purpose: its positional argument names a filter.
+_POSITIONAL_ATTRIBUTE_FILTERS = frozenset({
+    'selectattr', 'rejectattr', 'groupby',
+})
 
 
 def _document_renders(compose, render_context):
@@ -798,6 +826,29 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # would pin nothing.
             if isinstance(target, nodes.Name) and target.name == name:
                 return True
+
+        # Dereferences that are not `Getattr`/`Getitem` nodes at all.
+        # `{{ smtp|attr("host") }}` is a Filter with a constant argument
+        # and reads exactly what `{{ smtp.host }}` reads, but the walk
+        # above never asked about it, so it survived and rendered
+        # `smtp://@` -- a malformed URL, silently.
+        for node in ast.find_all(nodes.Filter):
+            if node.name not in _ATTRIBUTE_FILTERS:
+                continue
+            if node.name != 'attr' and not (
+                any(kw.key == 'attribute' for kw in (node.kwargs or ()))
+                or (node.name in _POSITIONAL_ATTRIBUTE_FILTERS and node.args)
+            ):
+                # These only dereference when told WHICH attribute to
+                # read. `{{ xs|map('upper') }}` names a filter, not an
+                # attribute, so it does not -- but `selectattr('host')`
+                # takes the attribute positionally and does.
+                continue
+            if any(isinstance(n, nodes.Name) and n.name == name
+                   for n in node.node.find_all(nodes.Name)) or (
+                       isinstance(node.node, nodes.Name)
+                       and node.node.name == name):
+                return True
         return False
 
     def matching_unset_types(value):
@@ -874,7 +925,6 @@ def _reapply_pops_that_keep_it_renderable(
     Cost is paid only here, in the case that already went wrong -- the
     common path is the two `_document_renders` calls above. Order is
     deterministic so the outcome does not depend on dict iteration luck.
-    Applying the FULL set is never retried: it is what just failed.
     """
     before = _env_items_by_service(snapshot)
     after = _env_items_by_service(compose)
@@ -899,14 +949,13 @@ def _reapply_pops_that_keep_it_renderable(
     last_good = copy.deepcopy(snapshot)
     kept, undone = [], []
     deadline = time.monotonic() + _UNDO_TIME_BUDGET
-    index = 0
+
+    def out_of_time():
+        return time.monotonic() >= deadline
 
     def label(service, item):
         name = item[0] if isinstance(item, tuple) else str(item).split('=', 1)[0]
         return f'{service}.{name}'
-
-    def out_of_time():
-        return time.monotonic() >= deadline
 
     def try_removing(batch):
         """Apply `batch` to a copy of `last_good`; keep it if it renders."""
@@ -919,48 +968,75 @@ def _reapply_pops_that_keep_it_renderable(
             return True
         return False
 
-    while index < len(popped) and not out_of_time():
-        chunk = popped[index:index + _UNDO_CHUNK]
-        if try_removing(chunk):
-            kept.extend(label(*one) for one in chunk)
-            index += len(chunk)
-            continue
-        if len(chunk) == 1:
-            undone.append(label(*chunk[0]))
-            index += 1
-            continue
-        # The batch failed, so decide its members individually. `index`
-        # only advances past ones actually decided, so running out of
-        # budget mid-chunk leaves the rest to the tail below.
-        for one in chunk:
-            if out_of_time():
-                break
-            if try_removing([one]):
-                kept.append(label(*one))
-            else:
-                undone.append(label(*one))
-            index += 1
+    def decide(items):
+        """Decide as many of `items` as the deadline allows.
 
-    if index < len(popped):
-        # Out of time with keys still undecided. Leaving them un-popped
-        # is safe for the RENDER but drops the strip's actual guarantee
-        # for the tail, and the tail is chosen by nothing but document
-        # order -- that is how glitchtip's `EMAIL_URL` came back to
-        # render `smtp://:@`. So spend one more render trying the whole
-        # remainder at once: the poison is usually a key already
-        # decided, in which case everything left is fine together.
-        rest = popped[index:]
+        Returns how many were decided. Tries a whole batch first and
+        splits only a batch that fails, so a clean run costs
+        ceil(n / _UNDO_CHUNK) renders instead of n.
+        """
+        index = 0
+        while index < len(items) and not out_of_time():
+            chunk = items[index:index + _UNDO_CHUNK]
+            if try_removing(chunk):
+                kept.extend(label(*one) for one in chunk)
+                index += len(chunk)
+                continue
+            if len(chunk) == 1:
+                undone.append(label(*chunk[0]))
+                index += 1
+                continue
+            # The batch failed, so decide its members individually.
+            # `index` only advances past ones actually decided, so
+            # running out of time mid-chunk leaves the rest outstanding.
+            for one in chunk:
+                if out_of_time():
+                    break
+                if try_removing([one]):
+                    kept.append(label(*one))
+                else:
+                    undone.append(label(*one))
+                index += 1
+        return index
+
+    decided = decide(popped)
+    if decided < len(popped):
+        rest = popped[decided:]
+        # One cheap attempt at the whole remainder. When the key that
+        # broke the document was already decided, everything left is
+        # fine together and this recovers it in a single render.
+        #
+        # When it was NOT -- `rest` then contains it -- this fails and
+        # every key in `rest` is restored, must-pop ones included. That
+        # is a REAL residual, not a safe degradation: it is how
+        # `EMAIL_URL: smtp://@` comes back, and it is triggered by wall
+        # clock, so a loaded node reaches it where an idle one does not.
+        #
+        # Reserving part of the budget for this phase was tried and
+        # MEASURED WORSE: the only input that distinguished the two kept
+        # the malformed key where spending the whole budget up front
+        # popped it. Splitting a fixed budget cannot buy work that is
+        # not there. Deciding `rest` needs budget the deadline has by
+        # definition already spent, so the honest answer is to make the
+        # residual loud rather than pretend to fix it -- see the log
+        # below, which names every key involved.
+        #
+        # This CAN re-apply the full set, when the deadline passed before
+        # anything was decided. That costs one render.
         if try_removing(rest):
             kept.extend(label(*one) for one in rest)
-            index = len(popped)
-        else:
-            undone.extend(label(*one) for one in rest)
-        logger.warning(
-            'integration strip on instance %s ran out of undo budget (%.1fs) '
-            'with %d popped keys; the remaining %d were %s',
-            greffon_info.get('id'), _UNDO_TIME_BUDGET, len(popped), len(rest),
-            'all applied together' if index == len(popped)
-            else 'left un-popped, so they render empty rather than absent',
+            decided = len(popped)
+
+    if decided < len(popped):
+        outstanding = popped[decided:]
+        undone.extend(label(*one) for one in outstanding)
+        logger.error(
+            'integration strip on instance %s ran out of its %.1fs undo '
+            'budget with %d of %d keys still undecided; they keep their '
+            'value and will render EMPTY rather than being absent, so this '
+            'instance may come up misconfigured: %s',
+            greffon_info.get('id'), _UNDO_TIME_BUDGET, len(outstanding),
+            len(popped), ', '.join(label(*one) for one in outstanding),
         )
 
     logger.warning(

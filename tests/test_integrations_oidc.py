@@ -1247,6 +1247,51 @@ class TheContextIsCopiedPerRenderTests(TestCase):
         self.assertEqual(_document_renders(compose, context), first)
 
 
+class GetOnAnUnsetIntegrationTests(TestCase):
+    """`.get()` must not hand Jinja a bare `None`.
+
+    `_UnsetIntegration` is a real `dict`, so `dict.get` returned `None`
+    for a missing key and Jinja rendered the literal string `None` into
+    a container's environment -- `smtp://None` -- which is neither empty
+    nor correct, and is the class of garbage this object exists to
+    prevent. A plain `{}` does the same, so this is an improvement on
+    `main` rather than a regression from it.
+
+    An explicit default still wins, because that is the caller saying
+    what they want.
+    """
+
+    def _render(self, template):
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        return Template(template).render(**_compose_render_context(info))
+
+    def test_a_missing_key_with_no_default_renders_empty(self):
+        # Via an alias, so the strip does not pop the value first.
+        self.assertEqual(
+            self._render('{% set s = smtp %}smtp://{{ s.get("host") }}'),
+            'smtp://',
+        )
+
+    def test_an_explicit_default_still_wins(self):
+        self.assertEqual(
+            self._render('{% set s = smtp %}{{ s.get("host", "fallback") }}'),
+            'fallback',
+        )
+
+    def test_a_present_key_is_returned(self):
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {'smtp': {'host': 'mail.x'}}})
+        ctx = _compose_render_context(info)
+        self.assertEqual(
+            Template('{% set s = smtp %}{{ s.get("host") }}').render(**ctx),
+            'mail.x',
+        )
+
+    def test_it_is_still_a_dict(self):
+        # The binding must stay dict-shaped for everything else.
+        self.assertEqual(self._render('{% set s = smtp %}{{ s|tojson }}'), '{}')
+
+
 class TheUndoIsBoundedTests(TestCase):
     """The undo is chunked and bounded by WALL CLOCK, and degrades safely.
 
@@ -1327,10 +1372,48 @@ class TheUndoIsBoundedTests(TestCase):
         env = {'Y_OPEN': '{# note', 'Z_CLOSE': '{{ oidc.host }} #}'}
         env.update({f'K{i:04d}': '{{ oidc.issuer }}' for i in range(40)})
         compose = {'services': {'app': {'environment': env}}}
-        got, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 3)
+        got, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 8)
         self.assertFalse([k for k in got if k.startswith('K')],
                          'the outstanding clean pops should be recovered')
         self._renders(compose, info)
+
+    # --- the accepted residual, asserted rather than left implicit ---
+
+    def _poison_in_the_tail(self):
+        env = {f'K{i:04d}': '{{ oidc.issuer }}' for i in range(30)}
+        env['Y_OPEN'] = '{# note'                       # poison, late
+        env['ZA_EMAIL'] = 'smtp://{{ smtp.username }}@{{ smtp.host }}'
+        env['ZZ_CLOSE'] = '{{ oidc.host }} #}'
+        return {'services': {'app': {'environment': env}}}
+
+    def test_the_budget_running_out_can_leave_a_must_pop_key_behind(self):
+        # THE RESIDUAL, pinned on purpose. When the key that breaks the
+        # document is itself in the undecided tail, the all-at-once
+        # retry fails and every key in the tail is restored -- must-pop
+        # ones included. So `ZA_EMAIL` survives and renders `smtp://@`.
+        #
+        # Reserving part of the budget for this phase was tried and
+        # measured WORSE (it kept the key in the one case that
+        # distinguished the two). Splitting a fixed budget cannot buy
+        # work that is not there, so this is documented and made loud
+        # rather than papered over.
+        #
+        # If someone later makes this pass, the residual is gone and
+        # this test should be deleted, not adjusted.
+        compose = self._poison_in_the_tail()
+        got, info = self._run(compose, clock_step=_UNDO_TIME_BUDGET / 8)
+        self.assertIn('ZA_EMAIL', got)
+        self._renders(compose, info)   # still renders: safety holds
+
+    def test_the_residual_is_reported_loudly_and_by_name(self):
+        # An operator's only signal that an instance may be
+        # misconfigured, so it has to be ERROR and it has to name keys.
+        compose = self._poison_in_the_tail()
+        with self.assertLogs('apps.utils.docker.compose', level='ERROR') as caught:
+            self._run(compose, clock_step=_UNDO_TIME_BUDGET / 8)
+        line = ''.join(caught.output)
+        self.assertIn('app.ZA_EMAIL', line)
+        self.assertIn('misconfigured', line)
 
     def test_the_clock_is_checked_inside_a_split_chunk_too(self):
         # A failing chunk is split and decided item by item. Without a
@@ -1861,20 +1944,32 @@ class ReferenceFormTests(TestCase):
     def test_parenthesised(self):
         self.assertFalse(self._survives('{{ (oidc).issuer.host }}'))
 
-    def test_the_attr_filter_is_not_chased_either(self):
-        # Kept -- but NOT saved by the binding, which is worth stating
-        # because it is the one shape where the binding does not hold.
-        # `do_attr` uses plain getattr and returns the environment's own
-        # `Undefined`, not `_UnsetField`, so a second `attr` raises. Main
-        # keeps and raises on this too, so it is parity rather than a
-        # regression, and popping it would need the alias-chasing the cut
-        # removed on purpose.
-        self.assertTrue(self._survives('{{ oidc|attr("issuer")|attr("host") }}'))
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
-        with self.assertRaises(UndefinedError):
-            Template('{{ oidc|attr("issuer")|attr("host") }}').render(
-                **_compose_render_context(info),
-            )
+    def test_the_attr_filter_is_a_dereference_too(self):
+        # `{{ smtp|attr("host") }}` reads exactly what `{{ smtp.host }}`
+        # reads, but it is a Filter node, not a Getattr, so the AST walk
+        # did not see it. It survived and rendered `smtp://@` -- a
+        # malformed URL shipped silently, which is the class this whole
+        # pass exists to stop.
+        self.assertFalse(self._survives('{{ oidc|attr("issuer") }}'))
+        self.assertFalse(self._survives(
+            '{{ oidc|attr("issuer")|attr("host") }}'))
+        self.assertFalse(self._survives(
+            'smtp://{{ smtp|attr("username") }}@{{ smtp|attr("host") }}'))
+
+    def test_attribute_taking_filters_are_dereferences(self):
+        # Whether the attribute is named positionally or by keyword.
+        self.assertFalse(self._survives('{{ [oidc]|selectattr("issuer")|list }}'))
+        self.assertFalse(self._survives('{{ [oidc]|map(attribute="issuer")|list }}'))
+        self.assertFalse(self._survives('{{ [oidc]|rejectattr("issuer")|list }}'))
+
+    def test_a_filter_that_names_no_attribute_is_not_a_dereference(self):
+        # `map`'s positional argument is a FILTER name, not an
+        # attribute. The operand mentions `oidc` here, so only the
+        # attribute rule keeps this from being swept up.
+        self.assertTrue(self._survives("{{ [oidc]|map('upper')|list }}"))
+        self.assertTrue(self._survives("{{ ['a']|map('upper')|list }}"))
+        self.assertTrue(self._survives('{{ instance_url|upper }}'))
+        self.assertTrue(self._survives('{{ oidc|default("D") }}'))
 
     def test_aliasing_is_not_chased(self):
         # `{% set x = oidc %}{{ x.issuer.host }}` moves the dereference
