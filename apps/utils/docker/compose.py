@@ -1,5 +1,6 @@
 import yaml
 import asyncio
+import time
 import copy
 import re
 import json
@@ -439,11 +440,17 @@ def _render_json_value(value, greffon_info, dest_name):
 
 # The undo below costs one dump+compile+render per attempt. It tries
 # keys in batches of _UNDO_CHUNK and only splits a batch that fails, so
-# a clean run needs ceil(n / _UNDO_CHUNK) attempts. _MAX_UNDO_RENDERS
-# caps the total either way -- 200 covers ~1600 popped keys cleanly,
-# where a real catalog entry pops 10-30.
+# a clean run needs ceil(n / _UNDO_CHUNK) attempts.
+#
+# The bound is WALL CLOCK, not a render count. What a render costs is
+# catalog-controlled and unbounded -- `{{ range(20000000)|sum }}` or a
+# large string multiply take seconds each -- so capping the count
+# capped the wrong thing: 200 renders of a slow document is still
+# minutes of CPU on `/start/`. A time budget bounds the actual damage
+# whatever a single render costs. Real catalog entries never reach here
+# at all; when they do, the whole undo is milliseconds.
 _UNDO_CHUNK = 8
-_MAX_UNDO_RENDERS = 200
+_UNDO_TIME_BUDGET = 5.0
 
 
 def _document_renders(compose, render_context):
@@ -610,9 +617,26 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # between it, so the strip can add constructs, not only remove
     # them.
     # The exact context `create_compose` renders with, so the guard's
-    # question is the render's question and not a proxy for it.
-    render_context = _compose_render_context(greffon_info)
-    rendered_before = _document_renders(compose, render_context)
+    # question is the render's question and not a proxy for it -- but a
+    # DEEP COPY of it. `_compose_render_context` copies only the top
+    # level, and the guard now RENDERS, so a side-effecting expression
+    # would run against the caller's own objects and be observed by
+    # everything downstream: `{{ volumes.popitem() and '' }}` emptied
+    # `greffon_info['volumes']`, which `create_volumes_then_copy_files`
+    # consumes two lines after `create_compose` returns. The catalog is
+    # treated as hostile elsewhere in this module, so it is treated as
+    # hostile here.
+    #
+    # A context that will not deep-copy means the guard cannot be run
+    # safely, so it is skipped rather than run dangerously.
+    try:
+        render_context = copy.deepcopy(_compose_render_context(greffon_info))
+    except Exception:
+        render_context = None
+    rendered_before = (
+        render_context is not None
+        and _document_renders(compose, render_context)
+    )
     snapshot = None
     if rendered_before:
         try:
@@ -860,26 +884,28 @@ def _reapply_pops_that_keep_it_renderable(
     # `smtp://:@`. Degrading has to preserve the decisions already made.
     last_good = copy.deepcopy(snapshot)
     kept, undone = [], []
-    budget = _MAX_UNDO_RENDERS
+    deadline = time.monotonic() + _UNDO_TIME_BUDGET
     index = 0
 
     def label(service, item):
         name = item[0] if isinstance(item, tuple) else str(item).split('=', 1)[0]
         return f'{service}.{name}'
 
+    def out_of_time():
+        return time.monotonic() >= deadline
+
     def try_removing(batch):
         """Apply `batch` to a copy of `last_good`; keep it if it renders."""
-        nonlocal last_good, budget
+        nonlocal last_good
         trial = copy.deepcopy(last_good)
         for service, item in batch:
             _remove_env_item(trial, service, item)
-        budget -= 1
         if _document_renders(trial, render_context):
             last_good = trial
             return True
         return False
 
-    while index < len(popped) and budget > 0:
+    while index < len(popped) and not out_of_time():
         chunk = popped[index:index + _UNDO_CHUNK]
         if try_removing(chunk):
             kept.extend(label(*one) for one in chunk)
@@ -893,7 +919,7 @@ def _reapply_pops_that_keep_it_renderable(
         # only advances past ones actually decided, so running out of
         # budget mid-chunk leaves the rest to the tail below.
         for one in chunk:
-            if budget <= 0:
+            if out_of_time():
                 break
             if try_removing([one]):
                 kept.append(label(*one))
@@ -902,12 +928,25 @@ def _reapply_pops_that_keep_it_renderable(
             index += 1
 
     if index < len(popped):
-        undone.extend(label(*one) for one in popped[index:])
+        # Out of time with keys still undecided. Leaving them un-popped
+        # is safe for the RENDER but drops the strip's actual guarantee
+        # for the tail, and the tail is chosen by nothing but document
+        # order -- that is how glitchtip's `EMAIL_URL` came back to
+        # render `smtp://:@`. So spend one more render trying the whole
+        # remainder at once: the poison is usually a key already
+        # decided, in which case everything left is fine together.
+        rest = popped[index:]
+        if try_removing(rest):
+            kept.extend(label(*one) for one in rest)
+            index = len(popped)
+        else:
+            undone.extend(label(*one) for one in rest)
         logger.warning(
-            'integration strip on instance %s exhausted the %d-render undo '
-            'budget with %d popped keys; the %d undecided ones stay un-popped',
-            greffon_info.get('id'), _MAX_UNDO_RENDERS, len(popped),
-            len(popped) - index,
+            'integration strip on instance %s ran out of undo budget (%.1fs) '
+            'with %d popped keys; the remaining %d were %s',
+            greffon_info.get('id'), _UNDO_TIME_BUDGET, len(popped), len(rest),
+            'all applied together' if index == len(popped)
+            else 'left un-popped, so they render empty rather than absent',
         )
 
     logger.warning(
