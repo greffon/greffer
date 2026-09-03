@@ -310,7 +310,13 @@ def _compute_integrations_context(greffon_info):
     is purely belt-and-braces in case a future delete-pass bug leaves
     a stray `{{ smtp.* }}` in place.
     """
-    integrations = greffon_info.get('integrations') or {}
+    integrations = greffon_info.get('integrations')
+    # Shape-defensive for the same reason `_compute_config_context` is:
+    # this runs eagerly for EVERY greffon at start, so a malformed
+    # manager payload must not 500 a deploy that works today. A non-
+    # mapping `integrations` is no integrations.
+    if not isinstance(integrations, dict):
+        integrations = {}
     for t in KNOWN_INTEGRATION_TYPES:
         value = integrations.get(t)
         # Always set the key so the Jinja context has a stable shape;
@@ -438,7 +444,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     YAML also permits list form (``KEY=value``); both passes handle
     each form.
     """
-    integrations = greffon_info.get('integrations') or {}
+    integrations = greffon_info.get('integrations')
+    if not isinstance(integrations, dict):
+        integrations = {}
     services = compose.get('services', {}) if isinstance(compose, dict) else {}
 
     unset_types = [
@@ -450,8 +458,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
 
     # Pass 1 — metadata-driven pop (unchanged behavior).
     for t in unset_types:
-        for configuration in greffon_info.get('configurations', []) or []:
-            for destination in configuration.get('destinations', []) or []:
+        configurations = greffon_info.get('configurations')
+        if not isinstance(configurations, list):
+            configurations = []
+        for configuration in configurations:
+            if not isinstance(configuration, dict):
+                continue
+            destinations = configuration.get('destinations')
+            if not isinstance(destinations, list):
+                continue
+            for destination in destinations:
                 if not isinstance(destination, dict):
                     continue
                 if destination.get('type') != t:
@@ -529,27 +545,40 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         """
         try:
             ast = parser_env.parse(value)
-        except (TemplateError, RecursionError, ValueError):
-            # Nothing the parser raises may escape: this runs inside
-            # `/start/`, so an exception here is a 500 and the instance
-            # never starts. All three are reachable on catalog-controlled
-            # input. TemplateError: `yaml.dump` doubles an inner quote, so
-            # malformed expressions really do arrive. RecursionError: the
-            # parser recurses per nesting level and blows the stack around
-            # 200 deep. ValueError: CPython refuses to convert an integer
-            # literal over 4300 digits (3.11+). Only the first is a Jinja
-            # error at all, which is why the tuple is not just
-            # `TemplateError`.
+        except Exception:
+            # Deliberately bare. This runs inside `/start/`, so anything
+            # escaping is a 500 and the instance never starts, and the
+            # try body is a SINGLE `parse()` call -- there is no logic of
+            # ours in here for a broad catch to hide. Enumerating what
+            # the parser raises was tried and failed three times, each
+            # miss being a 500 on catalog-controlled input:
+            #   TemplateError  `yaml.dump` doubles an inner quote, so
+            #                  malformed expressions really do arrive
+            #   RecursionError the parser recurses per nesting level and
+            #                  blows the stack around 200 deep
+            #   ValueError     CPython refuses an integer literal over
+            #                  4300 digits (3.11+)
+            #   SyntaxError    Jinja's number lexer matches non-ASCII
+            #                  digits, then hands `0.１` to the CPython
+            #                  compiler
+            # Only the first is a Jinja error at all. The fourth was found
+            # by fuzzing after the third was fixed, which is the argument
+            # for not writing a fifth tuple.
             #
-            # Fall back to the crudest form of the question -- does the
-            # name occur at all? A value that never mentions `oidc` cannot
-            # dereference it except by aliasing, which is the residual
-            # named above and is no worse here than anywhere else. So a
-            # broken value with no integration reference keeps `main`'s
-            # behaviour (it fails the render, loudly) instead of being
-            # silently dropped, while anything that does mention the name
-            # is popped, which is the safe direction.
-            return re.search(rf'\b{re.escape(name)}\b', value) is not None
+            # Two things make a failed parse a reference. The name
+            # occurring at all: a value that never mentions `oidc` cannot
+            # dereference it except by aliasing, the residual named above.
+            # And any `{%` tag: an unparseable statement fragment is how a
+            # block gets split across two env values, and popping only the
+            # half that names the integration would leave the other half
+            # to unbalance the whole document.
+            #
+            # What is left -- broken, no name, no tag -- keeps `main`'s
+            # behaviour and fails the render loudly, rather than being
+            # silently dropped from a deploy that then comes up
+            # misconfigured.
+            return ('{%' in value
+                    or re.search(rf'\b{re.escape(name)}\b', value) is not None)
         for node in ast.find_all((nodes.Getattr, nodes.Getitem)):
             target = node.node
             # No `ctx` check: a store-context Getattr is unreachable from
@@ -637,13 +666,20 @@ def _compose_render_context(greffon_info):
     """
     context = dict(greffon_info)
     for t in KNOWN_INTEGRATION_TYPES:
-        # `== {}` is the whole policy, and does two jobs at once.
+        # Falsiness is the whole policy, and does two jobs at once.
         # `_compute_integrations_context` writes `{}` for an unset type
         # and the blob itself for a configured one, so this wraps unset
-        # types ONLY -- and it still declines to touch a key a caller
-        # populated, since that key is not `{}` either. Re-deriving
-        # "unset" from `integrations` here would be a second, redundant
-        # spelling of the same condition that could drift from it.
+        # types ONLY -- a configured blob is a non-empty dict, hence
+        # truthy, hence untouched. Re-deriving "unset" from
+        # `integrations` here would be a second, redundant spelling of
+        # the same condition that could drift from it.
+        #
+        # Falsy rather than `== {}` so that a `greffon_info` which
+        # already carries a top-level `oidc: None` is bound too.
+        # `_compute_integrations_context` uses `setdefault`, so such a
+        # key is never normalised to `{}`, and leaving it would let
+        # `{{ oidc.a.b }}` raise. A caller with a REAL preset still
+        # wins, because a usable blob is truthy.
         if not context.get(t):
             context[t] = _UnsetIntegration()
     return context
