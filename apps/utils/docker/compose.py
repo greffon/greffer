@@ -990,9 +990,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         and `{{ u() }}` in another raises `'u' is undefined`. That is
         what the document guard is for.
 
-        Over-pops a locally shadowed name (`{% for oidc in xs %}`), as
-        `main` also does. Over-pop costs an env var; under-pop costs the
-        deploy.
+        Handles a locally shadowed name correctly, which is worth
+        stating because it used to be listed here as an accepted
+        over-pop. `{% for smtp in xs %}{{ smtp.a }}{% endfor %}` binds
+        the name locally and never touches the integration, so the key
+        survives -- `find_undeclared_variables` gets the scoping right
+        and does not report it. `main` pops it.
         """
         try:
             return _reads(parser_env.parse(value), name)
