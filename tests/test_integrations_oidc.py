@@ -1397,13 +1397,63 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
             with self.subTest(value=value):
                 self.assertTrue(self._survives(value))
 
+    def test_the_base_rule_sees_every_construct_i_could_invent(self):
+        # The completeness claim, exercised rather than asserted. Each
+        # of these uses the type somewhere a hand-written scanner would
+        # have to know about specifically; `find_undeclared_variables`
+        # reports it without being told any of them exist.
+        for value in (
+            '{% set x %}{{ smtp.host }}{% endset %}{{ x }}',
+            '{% block b %}{{ smtp.host }}{% endblock %}',
+            '{% call f() %}{{ smtp.host }}{% endcall %}',
+            '{% filter upper %}{{ smtp.host }}{% endfilter %}',
+            '{% for i in [1] %}{% else %}{{ smtp.host }}{% endfor %}',
+            '{% macro m() %}{{ smtp.host }}{% endmacro %}{{ m() }}',
+            '{% if 1 %}{% set smtp = {} %}{% endif %}{{ smtp.host }}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_a_test_ARGUMENT_is_not_a_guard(self):
+        # `Test.node` is the operand -- the thing being tested. An
+        # argument is not that, so the type appearing there is a read.
+        for value in ('{{ x is eq(smtp.host) }}', '{{ x is in(smtp) }}',
+                      '{{ x is sameas(smtp) }}'):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_guardedness_does_not_leak_to_a_read_inside_the_branch(self):
+        # The risk the inversion creates: guardedness is inherited by
+        # child nodes, so a read whose ancestor is a guard could be
+        # excused. It is not -- the flag is per OCCURRENCE, and each of
+        # these has one outside a guard slot.
+        for value in (
+            '{{ (smtp if smtp else smtp).host }}',
+            '{% if smtp is mapping and smtp.host %}{{ smtp.host }}{% endif %}',
+            '{% set x = smtp if smtp else {} %}{{ x.host }}',
+            '{% if smtp %}{{ smtp.host }}{% endif %}',
+            '{{ smtp.host if 1 else 2 }}',
+            '{% if [smtp.host] %}{{ smtp.host }}{% endif %}',
+            '{{ (smtp if 1 else {}).host }}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
     def test_a_guard_does_not_launder_a_read_beside_it(self):
-        # Guardedness applies to the occurrence, not the value: a read
-        # elsewhere in the same value still pops.
+        # Guardedness applies to the OCCURRENCE, not the value: a read
+        # elsewhere in the same value still pops. The scan must keep
+        # going after a guarded occurrence rather than concluding from
+        # it, and it must not depend on which occurrence it happens to
+        # visit first -- so the read is placed both before and after
+        # the guard.
         self.assertFalse(self._survives(
             '{% if smtp %}{{ smtp.host }}{% endif %}'))
         self.assertFalse(self._survives(
             '{% if smtp %}on{% endif %}{{ smtp|urlencode }}'))
+        self.assertFalse(self._survives(
+            '{{ smtp.host }}{% if smtp %}x{% endif %}'))
+        self.assertFalse(self._survives(
+            '{{ smtp|urlencode }}{{ "a" if smtp else "b" }}'))
 
 
 class IteratingTheTypeIsADereferenceTests(TestCase):
