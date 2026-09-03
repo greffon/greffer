@@ -497,15 +497,25 @@ def _can_evaluate_to(target, name):
     one who got `EMAIL_URL: smtp://:@` -- silently, with no log line,
     because the strip believed there was nothing to pop.
 
-    A `Call` is the one barrier. Its RESULT is not its operand, so
-    `{{ dict(oidc).get('x') }}` reads a new object rather than `oidc`,
-    and treating it as a dereference over-pops. That is the same
-    call-versus-grouping distinction the parser already resolves for
-    us everywhere else.
+    Calls are NOT a barrier, though they were briefly. The idea was
+    that a call's result is not its operand, so `dict(oidc).get('x')`
+    reads a new object. In practice a call is the easiest way to
+    launder the type back into something unprotected, and both
+    directions shipped:
 
-    Over-popping through the other node types is deliberate and safe:
-    the expression does mention the name, and losing one env var on an
-    integration nobody configured beats a malformed value that ships.
+        {{ namespace(v=smtp).v.host }}   ->  smtp://:@   (empty)
+        {{ dict(smtp).get('user') }}     ->  None        (garbage)
+
+    `namespace()` hands its keyword straight back, and `dict()` strips
+    the forgiving wrapper and restores the very `None` that
+    `_UnsetIntegration.get` exists to prevent. Both read the
+    integration, so both are dereferences, and the barrier was
+    protecting exactly one case -- `dict(...)` -- that turned out to be
+    the bug rather than a false positive.
+
+    Over-popping is deliberate and safe throughout: the expression does
+    mention the name, and losing one env var on an integration nobody
+    configured beats a malformed value that ships.
     """
     stack = [target]
     while stack:
@@ -513,8 +523,6 @@ def _can_evaluate_to(target, name):
         if isinstance(node, nodes.Name):
             if node.name == name:
                 return True
-            continue
-        if isinstance(node, nodes.Call):
             continue
         stack.extend(node.iter_child_nodes())
     return False
@@ -891,13 +899,37 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 return True
         return False
 
+    def _strings_in(value):
+        """Every string inside `value`, however nested.
+
+        A compose env value is usually a scalar, but YAML permits a list
+        or a mapping, and `yaml.dump` turns those into template text
+        just the same. Skipping non-strings meant `A: ['{{ smtp.host }}']`
+        was never examined and rendered `['']` -- present but empty, the
+        failure this pass exists to stop. `_items_removed` already
+        treats container-valued env vars as in scope.
+        """
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for nested in value.values():
+                yield from _strings_in(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from _strings_in(nested)
+
     def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
-        if not isinstance(value, str):
+        texts = [
+            text for text in _strings_in(value)
+            if '{{' in text or '{%' in text
+        ]
+        if not texts:
             return ()
-        if '{{' not in value and '{%' not in value:
-            return ()
-        return tuple(t for t in unset_types if _dereferences(value, t))
+        return tuple(
+            t for t in unset_types
+            if any(_dereferences(text, t) for text in texts)
+        )
 
 
     def _log_pop(key, name, matched):

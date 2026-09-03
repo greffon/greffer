@@ -461,15 +461,32 @@ class MalformedComposeShapesDoNotCrashTests(TestCase):
         compose = self._run({'services': {'app': {'environment': ['SMTP_HOST']}}})
         self.assertEqual(compose['services']['app']['environment'], ['SMTP_HOST'])
 
-    def test_a_non_string_env_value_is_kept(self):
-        # YAML gives `K: 1` an int, and `K: [a]` a list. Stringifying
-        # instead of skipping would scan their repr for Jinja.
+    def test_a_scalar_that_is_not_a_string_is_kept(self):
+        # YAML gives `K: 1` an int and `K: ~` None. Neither can carry a
+        # reference, and stringifying instead of skipping would scan
+        # their repr for Jinja.
         compose = self._run({'services': {'app': {'environment': {
-            'N': 1, 'B': True, 'L': ['{{ smtp.host }}'], 'NONE': None,
+            'N': 1, 'B': True, 'NONE': None,
         }}}})
         self.assertEqual(
             compose['services']['app']['environment'],
-            {'N': 1, 'B': True, 'L': ['{{ smtp.host }}'], 'NONE': None},
+            {'N': 1, 'B': True, 'NONE': None},
+        )
+
+    def test_a_container_valued_env_var_IS_scanned(self):
+        # `yaml.dump` turns a list or mapping value into template text
+        # just like a scalar, so skipping non-strings left
+        # `L: ['{{ smtp.host }}']` to render `['']` -- present but
+        # empty, the failure this pass exists to stop.
+        compose = self._run({'services': {'app': {'environment': {
+            'L': ['{{ smtp.host }}'],
+            'M': {'k': '{{ smtp.host }}'},
+            'DEEP': [{'k': ['{{ oidc.issuer }}']}],
+            'PLAIN': ['nothing templated'],
+        }}}})
+        self.assertEqual(
+            compose['services']['app']['environment'],
+            {'PLAIN': ['nothing templated']},
         )
 
     def test_a_service_without_an_environment_block_is_skipped(self):
@@ -1863,13 +1880,17 @@ class CallParenthesisTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def test_a_call_result_is_not_the_integration(self):
-        # `\)*` in the pattern crossed the call's paren, so this matched
-        # `oidc).get` and the key was deleted -- while it renders
-        # `fallback` perfectly well.
-        value = '{{ dict(oidc).get("issuer", "fallback") }}'
-        self.assertEqual(Template(value).render(oidc={}), 'fallback')
-        self.assertTrue(self._survives(value))
+    def test_a_call_that_launders_the_type_still_pops(self):
+        # A call was briefly treated as a barrier, on the theory that
+        # its result is not its operand. In practice a call is the
+        # easiest way to launder the type back into something
+        # unprotected: `dict(smtp)` strips the forgiving wrapper and
+        # restores the literal `None` that `_UnsetIntegration.get`
+        # exists to prevent, and `namespace(v=smtp).v` hands it straight
+        # back. Both READ the integration, so both are dereferences.
+        self.assertFalse(self._survives('{{ dict(oidc).get("issuer", "x") }}'))
+        self.assertFalse(self._survives("{{ dict(smtp).get('user') }}"))
+        self.assertFalse(self._survives('{{ namespace(v=smtp).v.host }}'))
 
     def test_a_dereference_inside_a_call_argument_still_pops(self):
         # `{{ range(smtp.port)|list }}` dereferences the type right
@@ -1885,13 +1906,10 @@ class CallParenthesisTests(TestCase):
         # it, so there is nothing to strip.
         self.assertTrue(self._survives('{{ f(oidc) }}'))
 
-    def test_a_call_result_is_not_the_integration_with_a_spaced_paren(self):
-        # `dict (oidc)` -- Jinja allows whitespace before a call's paren,
-        # and a lookbehind on the character before `(` saw the space and
-        # read it as grouping. The lexer sees the callee token itself.
-        value = '{{ dict (oidc).get("issuer", "fallback") }}'
-        self.assertEqual(Template(value).render(oidc={}), 'fallback')
-        self.assertTrue(self._survives(value))
+    def test_a_spaced_call_paren_is_still_a_call(self):
+        # `dict (oidc)` -- Jinja allows whitespace before a call's
+        # paren, and it reads the integration either way.
+        self.assertFalse(self._survives('{{ dict (oidc).get("issuer", "x") }}'))
 
     def test_a_parenthesised_reference_still_pops(self):
         # The form the parens were there for in the first place.
@@ -1984,11 +2002,12 @@ class ReferenceFormTests(TestCase):
             'smtp://{{ (smtp or {}).user }}:{{ (smtp or {}).password }}'
             '@{{ (smtp or {}).host }}:{{ (smtp or {}).port }}'))
 
-    def test_a_call_is_still_a_barrier(self):
-        # A call's RESULT is not its operand, so descending through one
-        # would over-pop. This is the same call-versus-grouping line the
-        # parser draws everywhere else, and it is why the search stops.
-        self.assertTrue(self._survives('{{ dict(oidc).get("x") }}'))
+    def test_a_call_does_not_launder_the_type(self):
+        # The seventh route, and its mirror. `namespace()` hands its
+        # keyword back unchanged; `dict()` strips the forgiving wrapper.
+        # One rendered `smtp://:@`, the other the literal `None`.
+        self.assertFalse(self._survives('{{ namespace(v=oidc).v.issuer }}'))
+        self.assertFalse(self._survives('{{ dict(oidc).get("x") }}'))
 
     def test_an_unrelated_name_is_not_swept_up(self):
         self.assertTrue(self._survives('{{ other.host }}'))
