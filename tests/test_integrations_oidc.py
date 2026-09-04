@@ -1467,6 +1467,20 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
         self.assertFalse(self._survives(
             "{% if instance_port == '' and oidc.port|int > 0 %}a{% else %}b{% endif %}"))
 
+    def test_no_stand_in_answer_is_constant(self):
+        # The invariant, stated as a test. A coercion that answers the
+        # same way under every assignment collapses a compound guard
+        # just as thoroughly as a constant `__bool__` did -- learned
+        # four times over, one dunder at a time.
+        for value in (
+            '{% if config.PORT|int > 0 and oidc.port|int > 0 %}a{% else %}b{% endif %}',
+            '{% if config.X|float > 0 and smtp.port|int %}a{% endif %}',
+            '{% if config.X|abs > 0 and smtp.port|int %}a{% endif %}',
+            '{% if config.X|string and smtp.port|int %}a{% endif %}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
     def test_scalar_predicates_follow_the_assignment_too(self):
         # `__bool__` was not the only constant. `__len__` returned 0 and
         # comparisons returned False for every assignment, so
