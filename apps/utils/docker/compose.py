@@ -597,7 +597,11 @@ class _Anything:
         return 0
 
     def __len__(self):
-        return 0
+        # Follows the assignment, like `__bool__` and the comparisons.
+        # A constant 0 made `{% if config|length > 0 and oidc.port|int %}`
+        # short-circuit at the length under every assignment, so the
+        # unset field was never reached.
+        return 1 if self._truthy else 0
 
     def __eq__(self, _):
         # Follows the assignment like `__bool__` does. Returning a
