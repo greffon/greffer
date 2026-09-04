@@ -622,6 +622,24 @@ class _Accommodating:
 
     __radd__ = __add__
 
+    def __lt__(self, _):
+        # A guard can compare one field and concatenate another:
+        # `{% if oidc.port > 0 and oidc.scopes + [] %}`. Without
+        # comparisons the numeric shape failed the concatenation, the
+        # others failed the comparison, and this one failed it too.
+        return True
+
+    __gt__ = __le__ = __ge__ = __lt__
+
+    def __eq__(self, _):
+        return True
+
+    def __ne__(self, _):
+        return False
+
+    def __hash__(self):
+        return 1
+
     def __getattr__(self, _):
         return self
 
@@ -1219,22 +1237,31 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         then sorted field names, then sorted env keys; a list-form env
         keeps its own order.
         """
-        for service_name in sorted(services):
-            service = services[service_name]
-            if not isinstance(service, dict):
+        document = compose if isinstance(compose, dict) else {}
+        for top in sorted(document, key=str):
+            if top != 'services':
+                # `configs` sorts before `services`, and a `{% set %}`
+                # there defines a name for everything the services then
+                # render. Only `services` holds poppable env keys, so
+                # the rest contribute definitions and nothing else.
+                yield None, document[top]
                 continue
-            for field in sorted(service, key=str):
-                value = service[field]
-                if field != 'environment':
-                    yield None, value
-                elif isinstance(value, dict):
-                    for key in sorted(value, key=str):
-                        yield (service_name, key), value[key]
-                elif isinstance(value, list):
-                    for index, entry in enumerate(value):
-                        yield (service_name, index), entry
-                else:
-                    yield None, value
+            for service_name in sorted(services):
+                service = services[service_name]
+                if not isinstance(service, dict):
+                    continue
+                for field in sorted(service, key=str):
+                    value = service[field]
+                    if field != 'environment':
+                        yield None, value
+                    elif isinstance(value, dict):
+                        for key in sorted(value, key=str):
+                            yield (service_name, key), value[key]
+                    elif isinstance(value, list):
+                        for index, entry in enumerate(value):
+                            yield (service_name, index), entry
+                    else:
+                        yield None, value
 
     # A value sees only the `{% set %}` statements BEFORE it. Prefixing
     # every one of them defined names the real render does not have
