@@ -712,20 +712,28 @@ def _guard_only_value_still_renders(text, name, context, prelude=''):
         # The value never mentions this integration, so a failure here
         # cannot be about it.
         return True
-    others = {n: context[n] for n in used - {name} if n in context}
+    borrowed = {n: context[n] for n in used - {name} if n in context}
+
+    def others():
+        """A fresh copy for EVERY attempt.
+
+        A guard may call a mutating method on another value --
+        `{% if config.pop('X') and oidc.port|int > 0 %}` -- so the probe
+        must not touch deployment inputs, and the attempts must not
+        touch each other's: sharing one copy meant the unset attempt
+        popped `X` before failing, and every populated retry then failed
+        on the missing key, which read as "not the integration's fault"
+        and kept a key the render dies on.
+        """
+        try:
+            return copy.deepcopy(borrowed)
+        except Exception:
+            # Not everything is copyable. Rendering against the original
+            # is what this did before, and beats not probing at all.
+            return dict(borrowed)
+
     try:
-        # A COPY. A guard may call a mutating method on another value --
-        # `{% if config.pop('X') and oidc %}` -- and the probe was
-        # popping from the very dict the real render then reads, so the
-        # second `pop` raised on a key the probe had removed. An
-        # exploratory render must not touch deployment inputs.
-        others = copy.deepcopy(others)
-    except Exception:
-        # Not everything is copyable. Rendering against the original is
-        # what this did before, and is better than not probing at all.
-        pass
-    try:
-        template.render(**dict(others, **{name: _UnsetIntegration()}))
+        template.render(**dict(others(), **{name: _UnsetIntegration()}))
     except Exception:
         pass
     else:
@@ -743,7 +751,7 @@ def _guard_only_value_still_renders(text, name, context, prelude=''):
     # would have rendered.
     for populated in _populated_shapes():
         try:
-            template.render(**dict(others, **{name: populated}))
+            template.render(**dict(others(), **{name: populated}))
         except Exception:
             continue
         return False
@@ -1149,35 +1157,43 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             for nested in value:
                 yield from _strings_in(nested)
 
-    def _set_prelude():
-        """Every `{% set %}` the document performs, in service order.
+    def _set_texts(value):
+        try:
+            return [text for text in _strings_in(value) if '{% set' in text]
+        except RecursionError:
+            return []
 
-        An approximation of the dumped document on purpose: the probe
-        needs the NAMES those statements define, and collecting them all
-        is closer to the real render than pretending none exist. A
-        statement that cannot render on its own makes the probe fail for
-        both bindings, which is read as "not the integration's fault"
-        and keeps the key -- the same answer as before.
+    def _ordered_slots():
+        """(service, key, value) in the order `yaml.dump` emits them.
+
+        `yaml.dump` sorts keys, so the document is sorted service names
+        then sorted env keys; a list-form env keeps its own order.
         """
-        pieces = []
-        for service in services.values():
+        for service_name in sorted(services):
+            service = services[service_name]
             if not isinstance(service, dict):
                 continue
             env = service.get('environment')
-            values = (env.values() if isinstance(env, dict)
-                      else env if isinstance(env, list) else ())
-            for value in values:
-                try:
-                    for text in _strings_in(value):
-                        if '{% set' in text:
-                            pieces.append(text)
-                except RecursionError:
-                    continue
-        return ''.join(pieces)
+            if isinstance(env, dict):
+                for key in sorted(env):
+                    yield service_name, key, env[key]
+            elif isinstance(env, list):
+                for index, entry in enumerate(env):
+                    yield service_name, index, entry
 
-    prelude = _set_prelude()
+    # A value sees only the `{% set %}` statements BEFORE it. Prefixing
+    # every one of them defined names the real render does not have
+    # there yet: with `A_GUARD` reading `feature` and a later `Z_SET`
+    # defining it, the render evaluates `A_GUARD` with `feature`
+    # undefined and produces `off`, while the probe reached the unset
+    # field and dropped a key that renders fine.
+    preludes = {}
+    seen = []
+    for service_name, key, value in _ordered_slots():
+        preludes[(service_name, key)] = ''.join(seen)
+        seen.extend(_set_texts(value))
 
-    def matching_unset_types(value):
+    def matching_unset_types(value, prelude=''):
         """Which unset types `value` dereferences, in tuple order."""
         try:
             texts = [
@@ -1220,15 +1236,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         env = service.get('environment')
         if isinstance(env, dict):
             for key, value in list(env.items()):
-                matched = matching_unset_types(value)
+                matched = matching_unset_types(
+                    value, preludes.get((name, key), ''))
                 if matched:
                     _log_pop(key, name, matched)
                     env.pop(key, None)
         elif isinstance(env, list):
             kept = []
-            for e in env:
+            for index, e in enumerate(env):
                 matched = (
-                    matching_unset_types(e.split('=', 1)[1])
+                    matching_unset_types(e.split('=', 1)[1],
+                                         preludes.get((name, index), ''))
                     if isinstance(e, str) and '=' in e
                     else ()
                 )
