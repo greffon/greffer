@@ -1617,6 +1617,18 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
         self.assertNotIn('B_GUARD', kept)
         self.assertIn('A_SET', kept)
 
+    def test_a_set_that_comes_later_does_not_count(self):
+        # `yaml.dump` sorts keys, so `Z_SET` is emitted after `A_GUARD`
+        # and the render evaluates the guard with `feature` still
+        # undefined -- it produces `off` and the key ships. Prefixing
+        # every set in the document dropped a key that renders fine.
+        kept = self._strip({
+            'A_GUARD': '{% if feature and oidc.port|int > 0 %}on'
+                       '{% else %}off{% endif %}',
+            'Z_SET': '{% set feature = true %}',
+        })
+        self.assertIn('A_GUARD', kept)
+
     def test_without_the_set_the_guard_is_unreachable_and_kept(self):
         kept = self._strip({
             'B_GUARD': '{% if feature and oidc.port|int > 0 %}x{% endif %}',
@@ -1640,6 +1652,19 @@ class TheProbeDoesNotTouchDeploymentInputsTests(TestCase):
             dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return info, 'K' in compose['services']['a']['environment']
+
+    def test_each_probe_attempt_gets_its_own_copy(self):
+        # One shared copy was not enough: the unset attempt popped `X`
+        # before failing on the integration, and every populated retry
+        # then failed on the missing key, so the failure read as
+        # unrelated and the key was kept for the render to die on.
+        compose = {'services': {'a': {'environment': {
+            'K': "{% if config.pop('X') and oidc.port|int > 0 %}a{% endif %}"}}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {}, 'config': {'X': '1'}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertNotIn('K', compose['services']['a']['environment'])
+        self.assertEqual(info['config'], {'X': '1'})
 
     def test_a_mutating_guard_leaves_the_context_intact(self):
         info, kept = self._run(
