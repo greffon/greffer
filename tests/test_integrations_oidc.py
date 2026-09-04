@@ -1617,6 +1617,29 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
         self.assertNotIn('B_GUARD', kept)
         self.assertIn('A_SET', kept)
 
+    def test_a_definition_in_a_top_level_field_counts(self):
+        # `configs` sorts before `services`, so its `{% set %}` is
+        # emitted first and defines a name for every service after it.
+        compose = {
+            'configs': {'c': '{% set feature = true %}'},
+            'services': {'a': {'environment': {
+                'K': '{% if feature and oidc.port|int > 0 %}x{% endif %}'}}},
+        }
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertNotIn('K', compose['services']['a']['environment'])
+
+    def test_a_top_level_field_after_services_does_not_count(self):
+        compose = {
+            'volumes': {'v': '{% set feature = true %}'},
+            'services': {'a': {'environment': {
+                'K': '{% if feature and oidc.port|int > 0 %}on'
+                     '{% else %}off{% endif %}'}}},
+        }
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('K', compose['services']['a']['environment'])
+
     def test_a_definition_outside_environment_counts(self):
         # The whole service is dumped and rendered as one template, so a
         # `{% set %}` in `command` defines a name for the env values
@@ -1733,6 +1756,13 @@ class ThePopulatedSideTriesMoreThanOneShapeTests(TestCase):
             dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
+
+    def test_a_comparison_and_a_concatenation_in_one_guard(self):
+        # The numeric shape failed the concatenation, the others failed
+        # the comparison, and the accommodating one implemented no
+        # comparisons either -- so nothing was attributable.
+        self.assertFalse(self._survives(
+            '{% if oidc.port > 0 and oidc.scopes + [] %}x{% endif %}'))
 
     def test_one_guard_can_need_two_shapes_at_once(self):
         # `oidc.scopes + []` and `oidc.issuer + ''` in one expression:
