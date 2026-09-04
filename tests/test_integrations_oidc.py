@@ -1617,6 +1617,32 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
         self.assertNotIn('B_GUARD', kept)
         self.assertIn('A_SET', kept)
 
+    def test_a_definition_outside_environment_counts(self):
+        # The whole service is dumped and rendered as one template, so a
+        # `{% set %}` in `command` defines a name for the env values
+        # after it -- `command` sorts before `environment`.
+        compose = {'services': {'a': {
+            'command': '{% set feature = true %}run',
+            'environment': {
+                'K': '{% if feature and oidc.port|int > 0 %}x{% endif %}'},
+        }}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertNotIn('K', compose['services']['a']['environment'])
+
+    def test_a_definition_in_a_LATER_field_does_not_count(self):
+        # `zcommand` sorts after `environment`, so the render evaluates
+        # the guard with `feature` still undefined and the key ships.
+        compose = {'services': {'a': {
+            'zcommand': '{% set feature = true %}run',
+            'environment': {
+                'K': '{% if feature and oidc.port|int > 0 %}on'
+                     '{% else %}off{% endif %}'},
+        }}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('K', compose['services']['a']['environment'])
+
     def test_a_definition_is_recognised_by_the_parser_not_the_spelling(self):
         # A substring check for `{% set` missed both of these: whitespace
         # control is part of the tag, and a macro defines a name too.
@@ -1714,6 +1740,13 @@ class ThePopulatedSideTriesMoreThanOneShapeTests(TestCase):
         # unrelated and the key was kept.
         self.assertFalse(self._survives(
             "{% if [oidc.scopes + [], oidc.issuer + ''] %}x{% endif %}"))
+
+    def test_a_second_unset_type_does_not_hide_the_first(self):
+        # On a fresh instance both are unset, so every attribution
+        # attempt for one failed on the OTHER: neither was blamed and
+        # the key stayed for the render to die on.
+        self.assertFalse(self._survives(
+            '{% if oidc.port|int >= 0 and smtp.port|int >= 0 %}x{% endif %}'))
 
     def test_a_list_valued_field_is_attributable(self):
         self.assertFalse(self._survives('{% if oidc.scopes + [] %}a{% endif %}'))

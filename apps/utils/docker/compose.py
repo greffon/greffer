@@ -762,8 +762,18 @@ def _guard_only_value_still_renders(text, name, context, prelude=''):
     # one of them rendering is enough to say a configured integration
     # would have rendered.
     for populated in _populated_shapes():
+        attempt = others()
+        # Every unset type, not just this one. On a fresh instance both
+        # are unset, so `{% if oidc.port|int >= 0 and smtp.port|int >= 0 %}`
+        # failed each attribution attempt on the OTHER type: neither was
+        # ever blamed and the key stayed for the render to die on. The
+        # question is "would this render with the integrations
+        # configured?", so the retry configures all of them.
+        for key, value in attempt.items():
+            if isinstance(value, _UnsetIntegration):
+                attempt[key] = populated
         try:
-            template.render(**dict(others(), **{name: populated}))
+            template.render(**dict(attempt, **{name: populated}))
         except Exception:
             continue
         return False
@@ -1197,22 +1207,34 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         return defining
 
     def _ordered_slots():
-        """(service, key, value) in the order `yaml.dump` emits them.
+        """(slot, value) in the order `yaml.dump` emits them.
 
-        `yaml.dump` sorts keys, so the document is sorted service names
-        then sorted env keys; a list-form env keeps its own order.
+        EVERY field, not just `environment`: the whole service is dumped
+        and rendered as one template, so a `{% set %}` in `command`
+        defines a name for the env values that follow it. Fields that
+        are not env entries carry no slot -- they contribute
+        definitions, they are not candidates for popping.
+
+        `yaml.dump` sorts keys, so the order is sorted service names,
+        then sorted field names, then sorted env keys; a list-form env
+        keeps its own order.
         """
         for service_name in sorted(services):
             service = services[service_name]
             if not isinstance(service, dict):
                 continue
-            env = service.get('environment')
-            if isinstance(env, dict):
-                for key in sorted(env):
-                    yield service_name, key, env[key]
-            elif isinstance(env, list):
-                for index, entry in enumerate(env):
-                    yield service_name, index, entry
+            for field in sorted(service, key=str):
+                value = service[field]
+                if field != 'environment':
+                    yield None, value
+                elif isinstance(value, dict):
+                    for key in sorted(value, key=str):
+                        yield (service_name, key), value[key]
+                elif isinstance(value, list):
+                    for index, entry in enumerate(value):
+                        yield (service_name, index), entry
+                else:
+                    yield None, value
 
     # A value sees only the `{% set %}` statements BEFORE it. Prefixing
     # every one of them defined names the real render does not have
@@ -1222,8 +1244,9 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # field and dropped a key that renders fine.
     preludes = {}
     seen = []
-    for service_name, key, value in _ordered_slots():
-        preludes[(service_name, key)] = ''.join(seen)
+    for slot, value in _ordered_slots():
+        if slot is not None:
+            preludes[slot] = ''.join(seen)
         seen.extend(_set_texts(value))
 
     def matching_unset_types(value, prelude=''):
