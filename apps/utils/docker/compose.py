@@ -665,7 +665,7 @@ class _PopulatedProbe(dict):
         return _ProbeValue(1)
 
 
-def _guard_only_value_still_renders(text, name):
+def _guard_only_value_still_renders(text, name, defined):
     """Would this value render with the integration unset?
 
     `_reads` exempts a guard because "the mapping decides, its contents
@@ -684,6 +684,15 @@ def _guard_only_value_still_renders(text, name):
     unset binding. Everything except the integration is bound to
     `_Anything`, so a failure here is attributable to the integration
     rather than to context this probe does not have.
+
+    `defined` is the set of names the REAL render will bind. A name
+    outside it is left unbound here rather than given a stand-in,
+    because definedness is not something the probe has to guess at --
+    the caller knows it exactly. Binding every name made
+    `{% if feature is not defined and oidc.port|int > 0 %}` short
+    circuit in every assignment, so the guard was never reached and the
+    key was kept, while the real render (no `feature`) reaches the unset
+    field and raises.
     """
     env = Environment()
     try:
@@ -712,7 +721,7 @@ def _guard_only_value_still_renders(text, name):
     # `_PROBE_NAME_LIMIT` only the two extremes are tried, leaving a
     # residual rather than spending exponential time on a shape nothing
     # writes.
-    others = sorted(used - {name})
+    others = sorted(n for n in used - {name} if n in defined)
     if len(others) <= _PROBE_NAME_LIMIT:
         assignments = itertools.product((False, True), repeat=len(others))
     else:
@@ -998,6 +1007,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # `_document_renders` copies it per call -- see there for why once
     # at this call site was not enough.
     render_context = _compose_render_context(greffon_info)
+    defined_names = frozenset(render_context)
     rendered_before = _document_renders(compose, render_context)
     snapshot = None
     if rendered_before:
@@ -1165,7 +1175,8 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         return tuple(
             t for t in unset_types
             if any(_dereferences(text, t)
-                   or not _guard_only_value_still_renders(text, t)
+                   or not _guard_only_value_still_renders(
+                       text, t, defined_names)
                    for text in texts)
         )
 

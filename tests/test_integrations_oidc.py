@@ -1379,9 +1379,14 @@ class AGuardWhoseTestCannotEvaluateStillPopsTests(TestCase):
     hole in the exemption this feature added.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1441,9 +1446,14 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
     not appear in cannot fail *because of* the integration.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1465,7 +1475,8 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
         # circuited in all of them and the unset field was never reached
         # -- while the real render raises.
         self.assertFalse(self._survives(
-            "{% if instance_port == '' and oidc.port|int > 0 %}a{% else %}b{% endif %}"))
+            "{% if instance_port == '' and oidc.port|int > 0 %}a{% else %}b{% endif %}",
+            instance_port=8080))
 
     def test_no_stand_in_answer_is_constant(self):
         # The invariant, stated as a test. A coercion that answers the
@@ -1479,7 +1490,7 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
             '{% if config.X|string and smtp.port|int %}a{% endif %}',
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(value))
+                self.assertFalse(self._survives(value, config={'PORT': '8080', 'X': '1'}))
 
     def test_scalar_predicates_follow_the_assignment_too(self):
         # `__bool__` was not the only constant. `__len__` returned 0 and
@@ -1492,7 +1503,7 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
             '{% if config|count > 0 and smtp.port|int %}a{% endif %}',
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(value))
+                self.assertFalse(self._survives(value, config={'PORT': '8080', 'X': '1'}))
 
     def test_a_chained_field_is_still_attributed(self):
         # The populated side has to survive a CHAIN as well as a filter;
@@ -1523,9 +1534,14 @@ class TheProbeTriesEveryTruthAssignmentTests(TestCase):
     render for every guard the catalog actually ships.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1537,13 +1553,65 @@ class TheProbeTriesEveryTruthAssignmentTests(TestCase):
             '{% if config and oidc.port|int > 0 %}a{% else %}b{% endif %}',
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(value))
+                self.assertFalse(self._survives(
+                    value, config={'PORT': '8080', 'X': '1'}, feature=True))
 
     def test_a_guard_that_renders_under_every_assignment_is_kept(self):
         for value in ('{% if config and smtp %}a{% else %}b{% endif %}',
                       '{% if config and smtp.host %}a{% else %}b{% endif %}'):
             with self.subTest(value=value):
-                self.assertTrue(self._survives(value))
+                self.assertTrue(self._survives(value, config={'PORT': '8080', 'X': '1'}))
+
+
+class DefinednessIsNotSomethingTheProbeGuessesTests(TestCase):
+    """A name the real render will not bind is left unbound in the probe.
+
+    Giving every other name a stand-in made them all DEFINED, and
+    definedness is testable:
+
+        {% if feature is not defined and oidc.port|int > 0 %}
+
+    short circuited in every truth assignment because `feature` was
+    always bound, so the guard was never reached and the key was kept --
+    while the real render, with no `feature`, reaches the unset field
+    and raises `UndefinedError` out of `create_compose`. The pre-strip
+    render fails too, so there is no snapshot and the undo cannot save
+    it.
+
+    The caller knows the answer exactly, so the probe is told rather
+    than made to enumerate a third state per name.
+    """
+
+    def _survives(self, value, **names):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_an_unbound_name_reaches_the_unset_field(self):
+        for value in (
+            '{% if feature is not defined and oidc.port|int > 0 %}a'
+            '{% else %}b{% endif %}',
+            '{% if feature is undefined and smtp.port|int %}a{% endif %}',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
+
+    def test_the_same_guard_is_kept_once_the_name_is_bound(self):
+        # Not a blanket pop: bound, the guard short circuits for real
+        # too, and the key ships.
+        self.assertTrue(self._survives(
+            '{% if feature is not defined and oidc.port|int > 0 %}a'
+            '{% else %}b{% endif %}', feature=True))
+
+    def test_a_bound_name_can_be_what_reaches_the_field(self):
+        self.assertFalse(self._survives(
+            '{% if feature is defined and oidc.port|int > 0 %}a'
+            '{% else %}b{% endif %}', feature=True))
+        self.assertTrue(self._survives(
+            '{% if feature is defined and oidc.port|int > 0 %}a'
+            '{% else %}b{% endif %}'))
 
 
 class AGuardCanLeakThroughACallArgumentTests(TestCase):
@@ -1557,9 +1625,14 @@ class AGuardCanLeakThroughACallArgumentTests(TestCase):
     guard silent because the document renders fine.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1647,9 +1720,14 @@ class DominationWasTriedAndWithdrawnTests(TestCase):
     regression.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1705,9 +1783,14 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
     configured.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -1995,9 +2078,14 @@ class TheAcceptedOverPopTests(TestCase):
     and be re-examined, not deleted unread.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2444,9 +2532,14 @@ class ConstructScanningTests(TestCase):
     is a way of getting exactly one of those two halves wrong.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2509,9 +2602,14 @@ class DelimiterInsideStringLiteralTests(TestCase):
     pop, and raised at render.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2577,9 +2675,14 @@ class NotOurVariableTests(TestCase):
     with no error anywhere.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2623,9 +2726,14 @@ class ShadowedNameIsNotPoppedTests(TestCase):
     accepts would have read the opposite of the truth.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2663,9 +2771,14 @@ class ShadowedNameIsNotPoppedTests(TestCase):
 class CallParenthesisTests(TestCase):
     """A call's closing paren is not the integration's."""
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2711,9 +2824,14 @@ class CallParenthesisTests(TestCase):
 class NestedBracesTests(TestCase):
     """A mapping's braces are not the construct's terminator."""
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -2741,9 +2859,14 @@ class ReferenceFormTests(TestCase):
     the pattern required a `.` or `[` immediately after the token.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
@@ -3049,9 +3172,14 @@ class JinjaFormsTheContractCoversTests(TestCase):
     from hand-written text scanning to parsing the Jinja AST.
     """
 
-    def _survives(self, value):
+    def _survives(self, value, **names):
+        # `names` are the OTHER context names the case assumes exist.
+        # The probe leaves an unbound name undefined, exactly as the
+        # real render does, so a guard on `config` or `feature` means
+        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
-        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
