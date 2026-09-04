@@ -559,9 +559,22 @@ class _Anything:
     the only thing that can make the probe fail is the integration's own
     semantics. Without it, `{{ config.PORT|int }}` would look like a
     failure and a working key would be popped.
+
+    THE INVARIANT: nothing here may answer with a constant. Every value
+    this returns varies with `truthy`, because the probe enumerates
+    truth assignments precisely so that a compound guard cannot hide
+    half of itself behind a short circuit -- and a coercion that always
+    answers the same way defeats that just as thoroughly as a constant
+    `__bool__` did. That was learned four times over, one dunder at a
+    time (`__bool__`, then the comparisons, then `__len__`, then the
+    numeric and string coercions), so the rule is stated once here
+    rather than rediscovered on the next one.
     """
 
     __slots__ = ('_truthy',)
+
+    def __init__(self, truthy=False):
+        object.__setattr__(self, '_truthy', truthy)
 
     def __getattr__(self, _):
         return self
@@ -573,48 +586,40 @@ class _Anything:
         return self
 
     def __iter__(self):
-        return iter(())
-
-    def __str__(self):
-        return ''
-
-    def __init__(self, truthy=False):
-        object.__setattr__(self, '_truthy', truthy)
+        return iter((self,) if self._truthy else ())
 
     def __bool__(self):
         return self._truthy
 
-    def __int__(self):
-        return 0
-
-    def __float__(self):
-        return 0.0
-
-    def __round__(self, *a):
-        return 0
-
-    def __abs__(self):
-        return 0
-
     def __len__(self):
-        # Follows the assignment, like `__bool__` and the comparisons.
-        # A constant 0 made `{% if config|length > 0 and oidc.port|int %}`
-        # short-circuit at the length under every assignment, so the
-        # unset field was never reached.
         return 1 if self._truthy else 0
 
+    def __int__(self):
+        return 1 if self._truthy else 0
+
+    def __float__(self):
+        return 1.0 if self._truthy else 0.0
+
+    def __round__(self, *a):
+        return 1 if self._truthy else 0
+
+    def __abs__(self):
+        return 1 if self._truthy else 0
+
+    def __index__(self):
+        return 1 if self._truthy else 0
+
+    def __str__(self):
+        return 'x' if self._truthy else ''
+
     def __eq__(self, _):
-        # Follows the assignment like `__bool__` does. Returning a
-        # constant made every assignment take the same path through a
-        # comparison, so `{% if instance_port == '' and oidc.port|int %}`
-        # short-circuited in both and the unset field was never reached.
         return self._truthy
 
     def __ne__(self, _):
         return not self._truthy
 
     def __hash__(self):
-        return 0
+        return 1 if self._truthy else 0
 
     def __lt__(self, _):
         return self._truthy
