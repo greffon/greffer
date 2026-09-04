@@ -1617,6 +1617,19 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
         self.assertNotIn('B_GUARD', kept)
         self.assertIn('A_SET', kept)
 
+    def test_a_definition_is_recognised_by_the_parser_not_the_spelling(self):
+        # A substring check for `{% set` missed both of these: whitespace
+        # control is part of the tag, and a macro defines a name too.
+        for definition in ('{%- set feature = true %}',
+                           '{% macro feature() %}1{% endmacro %}'):
+            with self.subTest(definition=definition):
+                kept = self._strip({
+                    'A_DEF': definition,
+                    'B_GUARD': '{% if feature and oidc.port|int > 0 %}'
+                               'x{% endif %}',
+                })
+                self.assertNotIn('B_GUARD', kept)
+
     def test_a_set_that_comes_later_does_not_count(self):
         # `yaml.dump` sorts keys, so `Z_SET` is emitted after `A_GUARD`
         # and the render evaluates the guard with `feature` still
