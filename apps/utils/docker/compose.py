@@ -1,6 +1,5 @@
 import yaml
 import asyncio
-import itertools
 import time
 import copy
 import re
@@ -552,102 +551,24 @@ def _call_consumes(value, name):
     return False
 
 
-class _Anything:
-    """A stand-in that absorbs everything, for the probe below.
-
-    Every name EXCEPT the integration is bound to this while probing, so
-    the only thing that can make the probe fail is the integration's own
-    semantics. Without it, `{{ config.PORT|int }}` would look like a
-    failure and a working key would be popped.
-
-    THE INVARIANT: nothing here may answer with a constant. Every value
-    this returns varies with `truthy`, because the probe enumerates
-    truth assignments precisely so that a compound guard cannot hide
-    half of itself behind a short circuit -- and a coercion that always
-    answers the same way defeats that just as thoroughly as a constant
-    `__bool__` did. That was learned four times over, one dunder at a
-    time (`__bool__`, then the comparisons, then `__len__`, then the
-    numeric and string coercions), so the rule is stated once here
-    rather than rediscovered on the next one.
-    """
-
-    __slots__ = ('_truthy',)
-
-    def __init__(self, truthy=False):
-        object.__setattr__(self, '_truthy', truthy)
-
-    def __getattr__(self, _):
-        return self
-
-    def __getitem__(self, _):
-        return self
-
-    def __call__(self, *a, **k):
-        return self
-
-    def __iter__(self):
-        return iter((self,) if self._truthy else ())
-
-    def __bool__(self):
-        return self._truthy
-
-    def __len__(self):
-        return 1 if self._truthy else 0
-
-    def __int__(self):
-        return 1 if self._truthy else 0
-
-    def __float__(self):
-        return 1.0 if self._truthy else 0.0
-
-    def __round__(self, *a):
-        return 1 if self._truthy else 0
-
-    def __abs__(self):
-        return 1 if self._truthy else 0
-
-    def __index__(self):
-        return 1 if self._truthy else 0
-
-    def __str__(self):
-        return 'x' if self._truthy else ''
-
-    def __eq__(self, _):
-        return self._truthy
-
-    def __ne__(self, _):
-        return not self._truthy
-
-    def __hash__(self):
-        return 1 if self._truthy else 0
-
-    def __lt__(self, _):
-        return self._truthy
-
-    __gt__ = __le__ = __ge__ = __lt__
-
-    def __add__(self, _):
-        return self
-
-    __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
-
-
-# 2^n renders, so a ceiling. Every guard in the catalog names nothing
-# but the integration (n = 0); 6 allows 64.
-_PROBE_NAME_LIMIT = 6
-
-
 class _ProbeValue(int):
     """A field of `_PopulatedProbe`: numeric, and chainable.
 
     An `int` so it serialises and survives `|int`/`|abs`/`|round`/`>`;
-    attribute access returns itself so a chain like `smtp.a.b` keeps
-    working, which a bare `1` did not.
+    attribute access and indexing return itself so `smtp.a.b` and
+    `smtp.a[0]` keep working, which a bare `1` did not.
     """
 
     __slots__ = ()
 
     def __getattr__(self, _):
+        return self
+
+    def __getitem__(self, _):
+        # A configured field can be list-like, and a guard can index it
+        # before the operation that fails: `{{ oidc.values[0]|int }}`.
+        # Without this the POPULATED side raised too, the failure looked
+        # unattributable, and the key was kept for the render to fail on.
         return self
 
     def __call__(self, *a, **k):
@@ -659,13 +580,26 @@ class _PopulatedProbe(dict):
 
     Every field answers a value that actually works, so a probe failure
     that persists against it is not the integration's fault.
+
+    A `dict` method shadows a field of the same name: Jinja resolves
+    `oidc.values` to the built-in before it ever reaches `__missing__`,
+    so `{{ oidc.values[0] }}` raised on this side too and the failure
+    looked unattributable. The names are shadowed so a field wins,
+    which is the only reading that makes this object an "as if
+    configured" stand-in. Serialisation is unaffected: `|tojson` and
+    `dict()` go through the C slots, not these attributes.
     """
 
     def __missing__(self, _):
         return _ProbeValue(1)
 
+    def __getattribute__(self, attr):
+        if attr.startswith('__'):
+            return object.__getattribute__(self, attr)
+        return _ProbeValue(1)
 
-def _guard_only_value_still_renders(text, name, defined):
+
+def _guard_only_value_still_renders(text, name, context):
     """Would this value render with the integration unset?
 
     `_reads` exempts a guard because "the mapping decides, its contents
@@ -681,18 +615,21 @@ def _guard_only_value_still_renders(text, name, defined):
     the undo never runs. Popping the key instead deploys cleanly.
 
     So a value the scan calls guard-only is rendered once against the
-    unset binding. Everything except the integration is bound to
-    `_Anything`, so a failure here is attributable to the integration
-    rather than to context this probe does not have.
+    unset binding, with every OTHER name bound to the value the real
+    render will give it. That makes the unset side EXACT: this is the
+    same expression, the same context, the only difference being that
+    the type under test is unset.
 
-    `defined` is the set of names the REAL render will bind. A name
-    outside it is left unbound here rather than given a stand-in,
-    because definedness is not something the probe has to guess at --
-    the caller knows it exactly. Binding every name made
-    `{% if feature is not defined and oidc.port|int > 0 %}` short
-    circuit in every assignment, so the guard was never reached and the
-    key was kept, while the real render (no `feature`) reaches the unset
-    field and raises.
+    Every other name used to be a stand-in that absorbed everything,
+    and six rounds of review were spent teaching it to imitate a real
+    value -- truthiness, then comparisons, then `__len__`, then the
+    numeric and string coercions, then definedness, then `is mapping`.
+    Each fix closed one predicate and the next review found another,
+    because "behaves like an arbitrary value" is not something an
+    object can be. The real value is right there in the render context,
+    so the probe uses it and the whole class is gone. A name the
+    context does not carry stays unbound, which is also what the render
+    does with it.
     """
     env = Environment()
     try:
@@ -704,55 +641,29 @@ def _guard_only_value_still_renders(text, name, defined):
         return True
     if name not in used:
         # The value never mentions this integration, so a failure here
-        # cannot be about it. Probing anyway popped working keys:
-        # `{{ config|tojson }}` fails only because the probe binds
-        # `config` to a stand-in that will not serialise, and the key
-        # was removed while the real render produced `{"X": "1"}`.
+        # cannot be about it.
         return True
-    # EVERY truth assignment of the stand-ins, not one pair. A compound
-    # guard short-circuits, so a single assignment hides part of the
-    # expression: with all-false `{% if config and not feature and
-    # oidc.port|int > 0 %}` stops at `config`, with all-true it stops at
-    # `not feature`, and the real context -- populated `config`, false
-    # `feature` -- reaches the unset field and raises.
-    #
-    # The count is 2^(other names), which is 1 for every guard in the
-    # catalog today: they mention nothing but the integration. Past
-    # `_PROBE_NAME_LIMIT` only the two extremes are tried, leaving a
-    # residual rather than spending exponential time on a shape nothing
-    # writes.
-    others = sorted(n for n in used - {name} if n in defined)
-    if len(others) <= _PROBE_NAME_LIMIT:
-        assignments = itertools.product((False, True), repeat=len(others))
+    others = {n: context[n] for n in used - {name} if n in context}
+    try:
+        template.render(**dict(others, **{name: _UnsetIntegration()}))
+    except Exception:
+        pass
     else:
-        assignments = ((False,) * len(others), (True,) * len(others))
-    for combo in assignments:
-        stand_ins = {n: _Anything(t) for n, t in zip(others, combo)}
-        try:
-            template.render(**dict(stand_ins, **{name: _UnsetIntegration()}))
-        except Exception:
-            pass
-        else:
-            continue
-        # It failed -- but a stand-in is not a real value, so the
-        # failure is only evidence about the INTEGRATION if the same
-        # render SUCCEEDS once the integration is populated. Judging by
-        # "raised at all" blamed the integration for
-        # `{% if config|tojson and oidc %}`, where it is `config|tojson`
-        # that cannot cope with a stand-in, and popped a key the real
-        # context renders as `off`.
-        #
-        # The populated side has to be a value that actually works --
-        # numbers serialise, compare and take `|int`/`|abs`. Using the
-        # absorb-everything stand-in here made `{{ smtp.host|tojson }}`
-        # look unattributable, because that stand-in is not JSON
-        # serialisable either.
-        try:
-            template.render(**dict(stand_ins, **{name: _PopulatedProbe()}))
-        except Exception:
-            continue
-        return False
-    return True
+        return True
+    # It failed -- but that is evidence about the INTEGRATION only if
+    # the same render SUCCEEDS once the integration is populated.
+    # Judging by "raised at all" blamed the integration for a guard
+    # whose OTHER operand cannot render at all, and popped a key that
+    # was failing for its own reasons.
+    #
+    # The populated side has to answer with something that actually
+    # works -- numbers serialise, compare, index and take
+    # `|int`/`|abs`.
+    try:
+        template.render(**dict(others, **{name: _PopulatedProbe()}))
+    except Exception:
+        return True
+    return False
 
 
 def _reads(ast, name):
@@ -1007,7 +918,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # `_document_renders` copies it per call -- see there for why once
     # at this call site was not enough.
     render_context = _compose_render_context(greffon_info)
-    defined_names = frozenset(render_context)
     rendered_before = _document_renders(compose, render_context)
     snapshot = None
     if rendered_before:
@@ -1176,7 +1086,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             t for t in unset_types
             if any(_dereferences(text, t)
                    or not _guard_only_value_still_renders(
-                       text, t, defined_names)
+                       text, t, render_context)
                    for text in texts)
         )
 

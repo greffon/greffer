@@ -1469,41 +1469,57 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
                 self.assertTrue(self._survives(value))
 
     def test_a_comparison_does_not_hide_the_unset_field(self):
-        # The stand-in's comparisons follow the assignment too. Returning
-        # a constant made every assignment take the same path, so
-        # `{% if instance_port == '' and oidc.port|int > 0 %}` short
-        # circuited in all of them and the unset field was never reached
-        # -- while the real render raises.
+        # A stand-in answered comparisons out of its own truthiness, so
+        # this guard took the same branch under every assignment and the
+        # unset field was never reached -- while the real render, where
+        # `instance_port` really is `''`, reaches it and raises. The
+        # probe now uses the real value, so it takes the real branch.
         self.assertFalse(self._survives(
             "{% if instance_port == '' and oidc.port|int > 0 %}a{% else %}b{% endif %}",
-            instance_port=8080))
+            instance_port=''))
 
-    def test_no_stand_in_answer_is_constant(self):
-        # The invariant, stated as a test. A coercion that answers the
-        # same way under every assignment collapses a compound guard
-        # just as thoroughly as a constant `__bool__` did -- learned
-        # four times over, one dunder at a time.
+    def test_a_coercion_takes_the_real_branch(self):
+        # `__int__`, `__float__`, `__len__` and friends each answered the
+        # same way under every stand-in assignment, so a compound guard
+        # short circuited at the coercion and never reached the unset
+        # field. With the real `config` the coercion answers what the
+        # render will answer, and the field is reached.
         for value in (
             '{% if config.PORT|int > 0 and oidc.port|int > 0 %}a{% else %}b{% endif %}',
-            '{% if config.X|float > 0 and smtp.port|int %}a{% endif %}',
-            '{% if config.X|abs > 0 and smtp.port|int %}a{% endif %}',
-            '{% if config.X|string and smtp.port|int %}a{% endif %}',
-        ):
-            with self.subTest(value=value):
-                self.assertFalse(self._survives(value, config={'PORT': '8080', 'X': '1'}))
-
-    def test_scalar_predicates_follow_the_assignment_too(self):
-        # `__bool__` was not the only constant. `__len__` returned 0 and
-        # comparisons returned False for every assignment, so
-        # `{% if config|length > 0 and oidc.port|int > 0 %}` short
-        # circuited at the length in all of them and the unset field was
-        # never reached -- while the real render raises.
-        for value in (
+            '{% if config.PORT|float > 0 and smtp.port|int %}a{% endif %}',
             '{% if config|length > 0 and oidc.port|int > 0 %}a{% else %}b{% endif %}',
             '{% if config|count > 0 and smtp.port|int %}a{% endif %}',
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(value, config={'PORT': '8080', 'X': '1'}))
+                self.assertFalse(self._survives(
+                    value, config={'PORT': '8080', 'X': '1'}))
+
+    def test_a_type_test_takes_the_real_branch(self):
+        # `is mapping` is decided by the object's CONCRETE TYPE, which no
+        # amount of truthiness-varying dunders could imitate: a stand-in
+        # is not a dict, so this short circuited and the key was kept
+        # for the real render to fail on.
+        self.assertFalse(self._survives(
+            '{% if config is mapping and oidc.port|int > 0 %}a{% else %}b{% endif %}',
+            config={'PORT': '8080'}))
+
+    def test_a_guard_that_fails_for_its_own_reasons_is_not_blamed(self):
+        # `config.X|abs` raises on a string whatever the integration
+        # does, so popping the key would not save the render. Only a
+        # failure the populated integration fixes is the integration's.
+        self.assertTrue(self._survives(
+            '{% if config.X|abs > 0 and smtp.port|int %}a{% endif %}',
+            config={'X': 'not-a-number'}))
+
+    def test_an_indexed_field_is_still_attributed(self):
+        # A configured field can be list-like, and a guard can index it
+        # before the operation that fails. The populated stand-in did
+        # not absorb indexing, so IT raised too, the failure looked
+        # unattributable, and the key was kept for the render to fail on.
+        for value in ('{% if oidc.values[0]|int > 0 %}a{% endif %}',
+                      '{% if smtp.hosts[0].port|int %}a{% endif %}'):
+            with self.subTest(value=value):
+                self.assertFalse(self._survives(value))
 
     def test_a_chained_field_is_still_attributed(self):
         # The populated side has to survive a CHAIN as well as a filter;
@@ -1519,48 +1535,62 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
                 self.assertTrue(self._survives(value))
 
 
-class TheProbeTriesEveryTruthAssignmentTests(TestCase):
-    """One truth assignment hides half a compound guard.
-
-    A guard short-circuits, so probing with the stand-ins all-false --
-    or even all-false and all-true -- leaves part of the expression
-    unevaluated:
+class TheProbeUsesTheRealValueOfEveryOtherNameTests(TestCase):
+    """A compound guard reaches the unset field only on one branch.
 
         {% if config and not feature and oidc.port|int > 0 %}
 
-    all-false stops at `config`, all-true stops at `not feature`, and
-    the real context (populated `config`, false `feature`) reaches the
-    unset field and raises. Every assignment is tried, which is one
-    render for every guard the catalog actually ships.
+    Stand-ins forced a choice about each other name's truthiness, and
+    whichever way it was made, some guard short circuited before the
+    integration. Enumerating all 2^n assignments covered that, until
+    the next review found a predicate the stand-in decided by type
+    rather than by truth (`is mapping`) and the enumeration could not
+    reach it at all.
+
+    The real values are in the render context, so the probe takes the
+    branch the render takes. Nothing to enumerate, and nothing to
+    imitate.
     """
 
     def _survives(self, value, **names):
-        # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def test_a_guard_needing_mixed_truth_values_is_popped(self):
-        for value in (
-            '{% if config and not feature and oidc.port|int > 0 %}a'
-            '{% else %}b{% endif %}',
-            '{% if not config and feature and smtp.port|int %}a{% endif %}',
-            '{% if config and oidc.port|int > 0 %}a{% else %}b{% endif %}',
+    def test_a_guard_whose_real_branch_reaches_the_field_is_popped(self):
+        for value, names in (
+            ('{% if config and not feature and oidc.port|int > 0 %}a'
+             '{% else %}b{% endif %}',
+             {'config': {'PORT': '8080'}, 'feature': False}),
+            ('{% if not config and feature and smtp.port|int %}a{% endif %}',
+             {'config': {}, 'feature': True}),
+            ('{% if config and oidc.port|int > 0 %}a{% else %}b{% endif %}',
+             {'config': {'PORT': '8080'}}),
         ):
             with self.subTest(value=value):
-                self.assertFalse(self._survives(
-                    value, config={'PORT': '8080', 'X': '1'}, feature=True))
+                self.assertFalse(self._survives(value, **names))
 
-    def test_a_guard_that_renders_under_every_assignment_is_kept(self):
+    def test_the_same_guard_is_kept_when_the_real_branch_misses_it(self):
+        # Not a blanket pop. Flip the operand that decides, and the
+        # render never reaches the field, so the key ships.
+        for value, names in (
+            ('{% if config and not feature and oidc.port|int > 0 %}a'
+             '{% else %}b{% endif %}',
+             {'config': {'PORT': '8080'}, 'feature': True}),
+            ('{% if not config and feature and smtp.port|int %}a{% endif %}',
+             {'config': {'PORT': '8080'}, 'feature': True}),
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value, **names))
+
+    def test_a_guard_that_renders_either_way_is_kept(self):
         for value in ('{% if config and smtp %}a{% else %}b{% endif %}',
                       '{% if config and smtp.host %}a{% else %}b{% endif %}'):
             with self.subTest(value=value):
-                self.assertTrue(self._survives(value, config={'PORT': '8080', 'X': '1'}))
+                self.assertTrue(
+                    self._survives(value, config={'PORT': '8080'}))
 
 
 class DefinednessIsNotSomethingTheProbeGuessesTests(TestCase):
