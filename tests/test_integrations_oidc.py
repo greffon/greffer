@@ -1593,6 +1593,71 @@ class TheProbeUsesTheRealValueOfEveryOtherNameTests(TestCase):
                     self._survives(value, config={'PORT': '8080'}))
 
 
+class TheProbeDoesNotTouchDeploymentInputsTests(TestCase):
+    """An exploratory render must not mutate the context it borrows.
+
+    A guard can call a mutating method on another value --
+    `{% if config.pop('X') and oidc %}` -- and the probe was popping
+    from the very dict the real render then reads, so the second `pop`
+    raised on a key that was already gone. Without the probe the single
+    render succeeds, so this was damage the probe itself caused.
+    """
+
+    def _run(self, value, **names):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
+        _delete_unset_integration_env_keys(compose, info)
+        return info, 'K' in compose['services']['a']['environment']
+
+    def test_a_mutating_guard_leaves_the_context_intact(self):
+        info, kept = self._run(
+            "{% if config.pop('X') and oidc %}a{% else %}b{% endif %}",
+            config={'X': '1'})
+        self.assertEqual(info['config'], {'X': '1'})
+        # And the key survives: the real render pops once and succeeds.
+        self.assertTrue(kept)
+
+
+class ThePopulatedSideTriesMoreThanOneShapeTests(TestCase):
+    """A configured field is not always a number.
+
+    Every populated field had the concrete type `int`, so a guard doing
+    anything else with it -- `{{ oidc.scopes + [] }}` on a list-valued
+    field -- raised on the populated side too. The failure then looked
+    unattributable, the key was kept, and the real unset render raised.
+
+    The question this side asks is existential: is there a configured
+    value that makes this render? So it tries a few shapes and takes
+    any success.
+    """
+
+    def _survives(self, value, **names):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **names))
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_list_valued_field_is_attributable(self):
+        self.assertFalse(self._survives('{% if oidc.scopes + [] %}a{% endif %}'))
+
+    def test_a_string_valued_field_is_attributable(self):
+        self.assertFalse(
+            self._survives('{% if smtp.host ~ "x" and smtp.port|int %}a{% endif %}'))
+
+    def test_a_mapping_valued_field_is_attributable(self):
+        self.assertFalse(
+            self._survives('{% if oidc.claims["k"]|int > 0 %}a{% endif %}'))
+
+    def test_a_value_no_shape_can_save_is_still_not_blamed(self):
+        # `config.X|abs` raises on a string whatever the integration is,
+        # so no populated shape rescues it and the key is kept.
+        self.assertTrue(self._survives(
+            '{% if config.X|abs > 0 and smtp.port|int %}a{% endif %}',
+            config={'X': 'not-a-number'}))
+
+
 class DefinednessIsNotSomethingTheProbeGuessesTests(TestCase):
     """A name the real render will not bind is left unbound in the probe.
 

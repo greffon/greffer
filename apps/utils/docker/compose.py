@@ -590,13 +590,35 @@ class _PopulatedProbe(dict):
     `dict()` go through the C slots, not these attributes.
     """
 
+    def __init__(self, field=None):
+        super().__init__()
+        object.__setattr__(self, '_field', field if field is not None
+                           else _ProbeValue(1))
+
     def __missing__(self, _):
-        return _ProbeValue(1)
+        return object.__getattribute__(self, '_field')
 
     def __getattribute__(self, attr):
-        if attr.startswith('__'):
+        if attr.startswith('__') or attr == '_field':
             return object.__getattribute__(self, attr)
-        return _ProbeValue(1)
+        return object.__getattribute__(self, '_field')
+
+
+def _populated_shapes():
+    """The shapes a configured field could plausibly have.
+
+    One shape cannot stand for all of them: every field used to be an
+    `int`, so `{{ oidc.scopes + [] }}` raised on the populated side as
+    well and a real failure looked unattributable. The question this
+    side asks is existential -- "is there a configured value that makes
+    this render?" -- so it tries a few and takes any success.
+    """
+    return (
+        _PopulatedProbe(),                          # numeric, chainable
+        _PopulatedProbe('x'),                       # string
+        _PopulatedProbe([_ProbeValue(1)]),          # list
+        _PopulatedProbe({'k': _ProbeValue(1)}),     # mapping
+    )
 
 
 def _guard_only_value_still_renders(text, name, context):
@@ -645,6 +667,17 @@ def _guard_only_value_still_renders(text, name, context):
         return True
     others = {n: context[n] for n in used - {name} if n in context}
     try:
+        # A COPY. A guard may call a mutating method on another value --
+        # `{% if config.pop('X') and oidc %}` -- and the probe was
+        # popping from the very dict the real render then reads, so the
+        # second `pop` raised on a key the probe had removed. An
+        # exploratory render must not touch deployment inputs.
+        others = copy.deepcopy(others)
+    except Exception:
+        # Not everything is copyable. Rendering against the original is
+        # what this did before, and is better than not probing at all.
+        pass
+    try:
         template.render(**dict(others, **{name: _UnsetIntegration()}))
     except Exception:
         pass
@@ -657,13 +690,17 @@ def _guard_only_value_still_renders(text, name, context):
     # was failing for its own reasons.
     #
     # The populated side has to answer with something that actually
-    # works -- numbers serialise, compare, index and take
-    # `|int`/`|abs`.
-    try:
-        template.render(**dict(others, **{name: _PopulatedProbe()}))
-    except Exception:
-        return True
-    return False
+    # works, and no single type does: a number serialises and takes
+    # `|int`, a list concatenates, a mapping subscripts by name. Any
+    # one of them rendering is enough to say a configured integration
+    # would have rendered.
+    for populated in _populated_shapes():
+        try:
+            template.render(**dict(others, **{name: populated}))
+        except Exception:
+            continue
+        return False
+    return True
 
 
 def _reads(ast, name):
