@@ -604,6 +604,46 @@ class _PopulatedProbe(dict):
         return object.__getattribute__(self, '_field')
 
 
+class _Accommodating:
+    """A field that answers whichever way the operand asks.
+
+    One guard can require different shapes of different fields:
+
+        {% if [oidc.scopes + [], oidc.issuer + ''] %}
+
+    renders for a configured `{'scopes': [], 'issuer': 'x'}`, but every
+    UNIFORM shape fails one half of it, so the failure looked unrelated
+    and the key was kept. `__add__` returning the other operand covers
+    both halves without claiming to be any one type.
+    """
+
+    def __add__(self, other):
+        return other
+
+    __radd__ = __add__
+
+    def __getattr__(self, _):
+        return self
+
+    def __getitem__(self, _):
+        return self
+
+    def __call__(self, *a, **k):
+        return self
+
+    def __bool__(self):
+        return True
+
+    def __int__(self):
+        return 1
+
+    def __str__(self):
+        return 'x'
+
+    def __iter__(self):
+        return iter((self,))
+
+
 def _populated_shapes():
     """The shapes a configured field could plausibly have.
 
@@ -618,10 +658,11 @@ def _populated_shapes():
         _PopulatedProbe('x'),                       # string
         _PopulatedProbe([_ProbeValue(1)]),          # list
         _PopulatedProbe({'k': _ProbeValue(1)}),     # mapping
+        _PopulatedProbe(_Accommodating()),          # per-operand
     )
 
 
-def _guard_only_value_still_renders(text, name, context):
+def _guard_only_value_still_renders(text, name, context, prelude=''):
     """Would this value render with the integration unset?
 
     `_reads` exempts a guard because "the mapping decides, its contents
@@ -653,6 +694,12 @@ def _guard_only_value_still_renders(text, name, context):
     context does not carry stays unbound, which is also what the render
     does with it.
     """
+    # The whole compose is dumped and rendered as ONE template, so a
+    # `{% set %}` in one env value defines a name for every value after
+    # it. Probing the value alone left that name undefined, the guard
+    # short circuited, and the key was kept for the real render to fail
+    # on. `prelude` carries those definitions in.
+    text = prelude + text
     env = Environment()
     try:
         template = env.from_string(text)
@@ -1102,6 +1149,34 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             for nested in value:
                 yield from _strings_in(nested)
 
+    def _set_prelude():
+        """Every `{% set %}` the document performs, in service order.
+
+        An approximation of the dumped document on purpose: the probe
+        needs the NAMES those statements define, and collecting them all
+        is closer to the real render than pretending none exist. A
+        statement that cannot render on its own makes the probe fail for
+        both bindings, which is read as "not the integration's fault"
+        and keeps the key -- the same answer as before.
+        """
+        pieces = []
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            env = service.get('environment')
+            values = (env.values() if isinstance(env, dict)
+                      else env if isinstance(env, list) else ())
+            for value in values:
+                try:
+                    for text in _strings_in(value):
+                        if '{% set' in text:
+                            pieces.append(text)
+                except RecursionError:
+                    continue
+        return ''.join(pieces)
+
+    prelude = _set_prelude()
+
     def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
         try:
@@ -1123,7 +1198,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             t for t in unset_types
             if any(_dereferences(text, t)
                    or not _guard_only_value_still_renders(
-                       text, t, render_context)
+                       text, t, render_context, prelude)
                    for text in texts)
         )
 

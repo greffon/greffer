@@ -1593,6 +1593,37 @@ class TheProbeUsesTheRealValueOfEveryOtherNameTests(TestCase):
                     self._survives(value, config={'PORT': '8080'}))
 
 
+class ANameDefinedByAnotherEnvValueTests(TestCase):
+    """The whole compose is dumped and rendered as ONE template.
+
+    A `{% set %}` in one env value therefore defines a name for every
+    value after it. Probing a value in isolation left that name
+    undefined, the guard short circuited, and the key was kept while
+    the real document reached the unset field and raised. The
+    definitions are collected once and prefixed onto each probe.
+    """
+
+    def _strip(self, env):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def test_a_set_elsewhere_makes_the_guard_reachable(self):
+        kept = self._strip({
+            'A_SET': '{% set feature = true %}',
+            'B_GUARD': '{% if feature and oidc.port|int > 0 %}x{% endif %}',
+        })
+        self.assertNotIn('B_GUARD', kept)
+        self.assertIn('A_SET', kept)
+
+    def test_without_the_set_the_guard_is_unreachable_and_kept(self):
+        kept = self._strip({
+            'B_GUARD': '{% if feature and oidc.port|int > 0 %}x{% endif %}',
+        })
+        self.assertIn('B_GUARD', kept)
+
+
 class TheProbeDoesNotTouchDeploymentInputsTests(TestCase):
     """An exploratory render must not mutate the context it borrows.
 
@@ -1638,6 +1669,13 @@ class ThePopulatedSideTriesMoreThanOneShapeTests(TestCase):
             dict({'id': 'i1', 'integrations': {}}, **names))
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
+
+    def test_one_guard_can_need_two_shapes_at_once(self):
+        # `oidc.scopes + []` and `oidc.issuer + ''` in one expression:
+        # every uniform shape fails one half, so the failure looked
+        # unrelated and the key was kept.
+        self.assertFalse(self._survives(
+            "{% if [oidc.scopes + [], oidc.issuer + ''] %}x{% endif %}"))
 
     def test_a_list_valued_field_is_attributable(self):
         self.assertFalse(self._survives('{% if oidc.scopes + [] %}a{% endif %}'))
