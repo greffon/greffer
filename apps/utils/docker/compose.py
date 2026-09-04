@@ -662,6 +662,18 @@ def _populated_shapes():
     )
 
 
+# Statements that bind a name for the rest of the document. The compose
+# is dumped and rendered as ONE template, so any of these in an earlier
+# env value is context an isolated probe would otherwise lack.
+_DEFINING_NODES = (
+    nodes.Assign,
+    nodes.AssignBlock,
+    nodes.Macro,
+    nodes.Import,
+    nodes.FromImport,
+)
+
+
 def _guard_only_value_still_renders(text, name, context, prelude=''):
     """Would this value render with the integration unset?
 
@@ -1158,10 +1170,31 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 yield from _strings_in(nested)
 
     def _set_texts(value):
+        """Texts that DEFINE a name for everything after them.
+
+        Asked of the parser, not of the spelling. A substring check for
+        `{% set` missed `{%- set feature = true %}` (whitespace control
+        is part of the tag) and `{% macro enabled() %}`, both of which
+        define a name the real document then has and an isolated probe
+        does not.
+        """
         try:
-            return [text for text in _strings_in(value) if '{% set' in text]
+            texts = list(_strings_in(value))
         except RecursionError:
             return []
+        defining = []
+        for text in texts:
+            if '{%' not in text:
+                continue
+            try:
+                tree = Environment().parse(text)
+            except Exception:
+                # A fragment that does not parse alone defines nothing
+                # this probe can use.
+                continue
+            if any(True for _ in tree.find_all(_DEFINING_NODES)):
+                defining.append(text)
+        return defining
 
     def _ordered_slots():
         """(service, key, value) in the order `yaml.dump` emits them.
