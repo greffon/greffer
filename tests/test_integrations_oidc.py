@@ -1322,6 +1322,32 @@ class AMethodCalledOnTheMappingIsNotAGuardTests(TestCase):
                 self.assertIn('K', self._strip({'K': value}))
 
 
+class TheCauseIsNamedWithoutTouchingTheContextTests(TestCase):
+    """`_why_it_will_not_render` RENDERS, so it copies first.
+
+    It exists only to name the failure for the ERROR log, but it is a
+    real render of catalog text, and a value that mutates the context
+    would corrupt `greffon_info` permanently --
+    `create_volumes_then_copy_files` consumes `volumes` immediately
+    after. `TheGuardRendersAgainstItsOwnCopyTests` covers
+    `_document_renders`; nothing reached this path, which needs a
+    RENDER-time failure rather than a parse-time one.
+    """
+
+    def test_the_caller_context_survives_naming_the_cause(self):
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {},
+             'volumes': {'v1': 'a', 'v2': 'b'}})
+        context = compose_module._compose_render_context(info)
+        compose = {'services': {'a': {'environment': {
+            'A': '{{ volumes.popitem() and "" }}',
+            'M': '{% macro u() %}{{ oidc.x }}{% endmacro %}',
+            'U': '{{ u() }}',
+        }}}}
+        compose_module._why_it_will_not_render(compose, context)
+        self.assertEqual(context['volumes'], {'v1': 'a', 'v2': 'b'})
+
+
 class ABrokenDocumentGetsTheCruderAnswerTests(TestCase):
     """When the document does not parse, every value takes main's rule.
 
@@ -1453,6 +1479,17 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
                 return True
             except Exception:
                 return False
+
+        # BOTH directions. Skipping the listed names could only ever
+        # catch under-listing, so adding a harmless test to the set --
+        # which over-pops a working setting -- passed unnoticed.
+        overlisted = [
+            name for name in sorted(compose_module._COERCING_TESTS)
+            if renders('{%% if smtp.port is %s %%}a{%% else %%}b{%% endif %%}'
+                       % name, unset)]
+        self.assertEqual(overlisted, [], (
+            'these are listed as coercing but answer harmlessly on an '
+            'unset field, so listing them pops a setting that works'))
 
         unclassified = []
         for name in sorted(compose_module._COMPOSE_RENDER_ENV.tests):
