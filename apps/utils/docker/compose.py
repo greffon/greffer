@@ -465,46 +465,6 @@ def _render_json_value(value, greffon_info, dest_name):
     return value
 
 
-# The undo below costs one dump+compile+render per attempt. It tries
-# keys in batches of _UNDO_CHUNK and only splits a batch that fails, so
-# a clean run needs ceil(n / _UNDO_CHUNK) attempts.
-#
-# The bound is WALL CLOCK, not a render count, because what a render
-# costs is catalog-controlled and unbounded -- `{{ range(20000000)|sum }}`
-# or a large string multiply take seconds each -- so capping the count
-# capped the wrong thing.
-#
-# It bounds the LOOP, not the request. A render already in flight when
-# the deadline passes still runs to completion, and the two guard
-# renders plus the final all-at-once retry sit outside the loop
-# entirely, so the true worst case is roughly `budget + 4R` for a
-# single-render cost R. With R unbounded this is a mitigation, not a
-# guarantee: a compose that renders slowly can still occupy `/start/`
-# for a long time -- as it can on `main`, which renders it once. Real
-# catalog entries never reach the loop at all; when they do the whole
-# undo is milliseconds. Bounding R itself needs a sandbox or a
-# watchdog, which is the custom-compose epic's problem, not this
-# function's.
-_UNDO_CHUNK = 8
-_UNDO_TIME_BUDGET = 5.0
-
-# The probe renders. `main` answered this question with one regex match,
-# so a compose that makes the probe run thousands of times turns a
-# microsecond pass into seconds of CPU inside `/start/` -- on a worker
-# that runs `--workers 1` and holds the per-instance lock across the
-# call. Measured on this branch before the bound: 4.4s for 2000 guarded
-# values, 7.6s for 50 guards of 400 operands, against ~1ms on `main`.
-#
-# Real catalog entries spend 4-10ms in the whole pass, so the budget is
-# three orders of magnitude above what legitimate input needs.
-#
-# Past it, the answer falls back to `main`'s: a value that mentions the
-# type is popped. That is the SAFE direction of the asymmetry (a missing
-# env var on an instance that did not configure the integration, rather
-# than a 500), and it is the verdict this catalog already ships with.
-_PROBE_TIME_BUDGET = 2.0
-
-
 # Filters that read an attribute off their operand, so they dereference
 # without producing a `Getattr` node. `attr` names the attribute
 # positionally; the rest take an `attribute=` keyword.
@@ -567,144 +527,7 @@ def _call_consumes(value, name):
     return False
 
 
-class _ProbeValue(int):
-    """A field of `_PopulatedProbe`: numeric, and chainable.
-
-    An `int` so it serialises and survives `|int`/`|abs`/`|round`/`>`;
-    attribute access and indexing return itself so `smtp.a.b` and
-    `smtp.a[0]` keep working, which a bare `1` did not.
-    """
-
-    __slots__ = ()
-
-    def __getattr__(self, _):
-        return self
-
-    def __getitem__(self, _):
-        # A configured field can be list-like, and a guard can index it
-        # before the operation that fails: `{{ oidc.values[0]|int }}`.
-        # Without this the POPULATED side raised too, the failure looked
-        # unattributable, and the key was kept for the render to fail on.
-        return self
-
-    def __call__(self, *a, **k):
-        return self
-
-
-class _PopulatedProbe(dict):
-    """The integration as if it were configured, for attribution only.
-
-    Every field answers a value that actually works, so a probe failure
-    that persists against it is not the integration's fault.
-
-    A `dict` method shadows a field of the same name: Jinja resolves
-    `oidc.values` to the built-in before it ever reaches `__missing__`,
-    so `{{ oidc.values[0] }}` raised on this side too and the failure
-    looked unattributable. The names are shadowed so a field wins,
-    which is the only reading that makes this object an "as if
-    configured" stand-in. Serialisation is unaffected: `|tojson` and
-    `dict()` go through the C slots, not these attributes.
-    """
-
-    def __init__(self, field=None):
-        super().__init__()
-        object.__setattr__(self, '_field', field if field is not None
-                           else _ProbeValue(1))
-
-    def __missing__(self, _):
-        return object.__getattribute__(self, '_field')
-
-    def __getattribute__(self, attr):
-        if attr.startswith('__') or attr == '_field':
-            return object.__getattribute__(self, attr)
-        return object.__getattribute__(self, '_field')
-
-
-class _Accommodating:
-    """A field that answers whichever way the operand asks.
-
-    One guard can require different shapes of different fields:
-
-        {% if [oidc.scopes + [], oidc.issuer + ''] %}
-
-    renders for a configured `{'scopes': [], 'issuer': 'x'}`, but every
-    UNIFORM shape fails one half of it, so the failure looked unrelated
-    and the key was kept. `__add__` returning the other operand covers
-    both halves without claiming to be any one type.
-    """
-
-    def __add__(self, other):
-        return other
-
-    __radd__ = __add__
-
-    def __lt__(self, _):
-        # A guard can compare one field and concatenate another:
-        # `{% if oidc.port > 0 and oidc.scopes + [] %}`. Without
-        # comparisons the numeric shape failed the concatenation, the
-        # others failed the comparison, and this one failed it too.
-        return True
-
-    __gt__ = __le__ = __ge__ = __lt__
-
-    def __eq__(self, _):
-        return True
-
-    def __ne__(self, _):
-        return False
-
-    def __hash__(self):
-        return 1
-
-    def __getattr__(self, _):
-        return self
-
-    def __getitem__(self, _):
-        return self
-
-    def __call__(self, *a, **k):
-        return self
-
-    def __bool__(self):
-        return True
-
-    def __int__(self):
-        return 1
-
-    def __str__(self):
-        return 'x'
-
-    def __iter__(self):
-        return iter((self,))
-
-
-def _populated_shapes():
-    """The shapes a configured field could plausibly have.
-
-    One shape cannot stand for all of them: every field used to be an
-    `int`, so `{{ oidc.scopes + [] }}` raised on the populated side as
-    well and a real failure looked unattributable. The question this
-    side asks is existential -- "is there a configured value that makes
-    this render?" -- so it tries a few and takes any success.
-    """
-    return (
-        _PopulatedProbe(),                          # numeric, chainable
-        _PopulatedProbe('x'),                       # string
-        _PopulatedProbe([_ProbeValue(1)]),          # list
-        _PopulatedProbe({'k': _ProbeValue(1)}),     # mapping
-        _PopulatedProbe(_Accommodating()),          # per-operand
-    )
-
-
-# Statements that bind a name for the rest of the document. The compose
-# is dumped and rendered as ONE template, so any of these in an earlier
-# env value is context an isolated probe would otherwise lack.
-_DEFINING_NODES = (
-    nodes.Assign,
-    nodes.AssignBlock,
-    nodes.Macro,
-)
-# `Import`/`FromImport` were here and are NOT: `_COMPOSE_ENV` has no
+# `Import`/`FromImport` were here and are NOT: `_COMPOSE_RENDER_ENV` has no
 # loader, so `{% import 'x' as v %}` parses and then always raises
 # `TypeError: no loader for this environment specified` -- in the unset
 # attempt and in every populated retry alike. The probe answers "keeps"
@@ -740,118 +563,7 @@ _DEFINING_NODES = (
 # was measured, not assumed: all 32 catalog entries render BYTE
 # IDENTICALLY sandboxed and unsandboxed, in both the configured and
 # unset scenarios (64/64).
-_COMPOSE_ENV = SandboxedEnvironment()
-
-
-def _guard_only_value_still_renders(text, name, context, prelude='',
-                                    deadline=None):
-    """Would this value render with the integration unset?
-
-    `_reads` exempts a guard because "the mapping decides, its contents
-    never reach the output". True for what the guard RETURNS -- but the
-    test itself still has to evaluate, and `_UnsetField` absorbs
-    attribute access and calls, not arithmetic or serialisation:
-
-        {% if smtp.port|int > 0 %}true{% else %}false{% endif %}
-
-    raises `UndefinedError` unset, and `|abs`, `|round` and `|tojson`
-    raise bare `TypeError`. That is not recoverable later: the document
-    fails to render BEFORE the strip, so the guard takes no snapshot and
-    the undo never runs. Popping the key instead deploys cleanly.
-
-    So a value the scan calls guard-only is rendered once against the
-    unset binding, with every OTHER name bound to the value the real
-    render will give it. That makes the unset side EXACT: this is the
-    same expression, the same context, the only difference being that
-    the type under test is unset.
-
-    Every other name used to be a stand-in that absorbed everything,
-    and six rounds of review were spent teaching it to imitate a real
-    value -- truthiness, then comparisons, then `__len__`, then the
-    numeric and string coercions, then definedness, then `is mapping`.
-    Each fix closed one predicate and the next review found another,
-    because "behaves like an arbitrary value" is not something an
-    object can be. The real value is right there in the render context,
-    so the probe uses it and the whole class is gone. A name the
-    context does not carry stays unbound, which is also what the render
-    does with it.
-    """
-    if deadline is not None and time.monotonic() > deadline:
-        # Out of budget: answer as `main` does and pop. See
-        # `_PROBE_TIME_BUDGET`.
-        return False
-    # The whole compose is dumped and rendered as ONE template, so a
-    # `{% set %}` in one env value defines a name for every value after
-    # it. Probing the value alone left that name undefined, the guard
-    # short circuited, and the key was kept for the real render to fail
-    # on. `prelude` carries those definitions in.
-    text = prelude + text
-    env = _COMPOSE_ENV
-    try:
-        template = env.from_string(text)
-        used = meta.find_undeclared_variables(env.parse(text))
-    except Exception:
-        # Unparseable values are already handled by the caller's
-        # fallback; this probe has nothing to add.
-        return True
-    if name not in used:
-        # The value never mentions this integration, so a failure here
-        # cannot be about it.
-        return True
-    borrowed = {n: context[n] for n in used - {name} if n in context}
-
-    def others():
-        """A fresh copy for EVERY attempt.
-
-        A guard may call a mutating method on another value --
-        `{% if config.pop('X') and oidc.port|int > 0 %}` -- so the probe
-        must not touch deployment inputs, and the attempts must not
-        touch each other's: sharing one copy meant the unset attempt
-        popped `X` before failing, and every populated retry then failed
-        on the missing key, which read as "not the integration's fault"
-        and kept a key the render dies on.
-        """
-        try:
-            return copy.deepcopy(borrowed)
-        except Exception:
-            # Not everything is copyable. Rendering against the original
-            # is what this did before, and beats not probing at all.
-            return dict(borrowed)
-
-    try:
-        template.render(**dict(others(), **{name: _UnsetIntegration()}))
-    except Exception:
-        pass
-    else:
-        return True
-    # It failed -- but that is evidence about the INTEGRATION only if
-    # the same render SUCCEEDS once the integration is populated.
-    # Judging by "raised at all" blamed the integration for a guard
-    # whose OTHER operand cannot render at all, and popped a key that
-    # was failing for its own reasons.
-    #
-    # The populated side has to answer with something that actually
-    # works, and no single type does: a number serialises and takes
-    # `|int`, a list concatenates, a mapping subscripts by name. Any
-    # one of them rendering is enough to say a configured integration
-    # would have rendered.
-    for populated in _populated_shapes():
-        attempt = others()
-        # Every unset type, not just this one. On a fresh instance both
-        # are unset, so `{% if oidc.port|int >= 0 and smtp.port|int >= 0 %}`
-        # failed each attribution attempt on the OTHER type: neither was
-        # ever blamed and the key stayed for the render to die on. The
-        # question is "would this render with the integrations
-        # configured?", so the retry configures all of them.
-        for key, value in attempt.items():
-            if isinstance(value, _UnsetIntegration):
-                attempt[key] = populated
-        try:
-            template.render(**dict(attempt, **{name: populated}))
-        except Exception:
-            continue
-        return False
-    return True
+_COMPOSE_RENDER_ENV = SandboxedEnvironment()
 
 
 def _reads(ast, name):
@@ -951,73 +663,10 @@ def _document_renders(compose, render_context):
     except Exception:
         return False
     try:
-        _COMPOSE_ENV.from_string(yaml.dump(compose)).render(**context)
+        _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose)).render(**context)
     except Exception:
         return False
     return True
-
-
-def _env_items_by_service(compose):
-    """`{service: [item]}` where an item is what the strip can remove.
-
-    Mapping form gives `(key, value)` pairs; list form gives the raw
-    `"KEY=value"` entries. ITEMS, not key names: a list-form
-    `environment` may legally carry the same name twice, and popping one
-    occurrence must not read as "nothing was popped" -- that made a
-    required pop invisible to the undo, which then silently restored
-    glitchtip's `EMAIL_URL` to render `smtp://:@`. Keying on the whole
-    item also stops the undo removing the OTHER occurrence, which
-    matching by name would.
-
-    Lists, not sets: the order these come out in decides which pops are
-    replayed first, and a set of strings iterates differently between
-    processes. Keeping the document's own order makes the undo
-    reproducible without sorting anything.
-    """
-    services = compose.get('services') if isinstance(compose, dict) else None
-    if not isinstance(services, dict):
-        return {}
-    found = {}
-    for name, service in services.items():
-        if not isinstance(service, dict):
-            continue
-        env = service.get('environment')
-        if isinstance(env, dict):
-            found[name] = [(k, v) for k, v in env.items()]
-        elif isinstance(env, list):
-            found[name] = list(env)
-    return found
-
-
-def _items_removed(before, after):
-    """Multiset difference, order-preserving.
-
-    `list.remove` compares with `==`, so this works for the unhashable
-    values YAML can produce (a list- or dict-valued env var), which a
-    `Counter` would refuse.
-    """
-    remaining = list(after)
-    removed = []
-    for item in before:
-        if item in remaining:
-            remaining.remove(item)
-        else:
-            removed.append(item)
-    return removed
-
-
-def _remove_env_item(compose, service_name, item):
-    """Remove ONE occurrence of `item` from one service's env block."""
-    service = compose.get('services', {}).get(service_name)
-    if not isinstance(service, dict):
-        return
-    env = service.get('environment')
-    if isinstance(env, dict):
-        key, value = item
-        if key in env and env[key] == value:
-            del env[key]
-    elif isinstance(env, list) and item in env:
-        env.remove(item)
 
 
 def _delete_unset_integration_env_keys(compose, greffon_info):
@@ -1047,11 +696,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        before Jinja renders.
 
     The guarantee is "absent integration => no env var", with one
-    documented exception: a pop the document guard has to undo (see
-    `_reapply_pops_that_keep_it_renderable`) leaves the key in place,
-    where it renders EMPTY through the binding rather than being absent.
-    That is the weaker outcome, taken only when the alternative is a
-    document that will not render at all.
+    documented exception: if the strip breaks the document, every pop is
+    put back (see the restore at the end of this function), and those
+    keys render EMPTY through the binding rather than being absent. That
+    is the weaker outcome, taken only when the alternative is a document
+    that will not render at all.
 
     SCOPE: both passes look only at ``services[*].environment``. A
     reference from ``command``, ``labels``, ``env_file`` or anywhere else
@@ -1267,8 +916,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         or a mapping, and `yaml.dump` turns those into template text
         just the same. Skipping non-strings meant `A: ['{{ smtp.host }}']`
         was never examined and rendered `['']` -- present but empty, the
-        failure this pass exists to stop. `_items_removed` already
-        treats container-valued env vars as in scope.
+        failure this pass exists to stop.
         """
         if isinstance(value, str):
             yield value
@@ -1278,72 +926,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         elif isinstance(value, (list, tuple)):
             for nested in value:
                 yield from _strings_in(nested)
-
-    def _set_texts(value):
-        """Texts that DEFINE a name for everything after them.
-
-        Asked of the parser, not of the spelling. A substring check for
-        `{% set` missed `{%- set feature = true %}` (whitespace control
-        is part of the tag) and `{% macro enabled() %}`, both of which
-        define a name the real document then has and an isolated probe
-        does not.
-        """
-        try:
-            texts = list(_strings_in(value))
-        except RecursionError:
-            return []
-        defining = []
-        for text in texts:
-            if '{%' not in text:
-                continue
-            try:
-                tree = _COMPOSE_ENV.parse(text)
-            except Exception:
-                # A fragment that does not parse alone defines nothing
-                # this probe can use.
-                continue
-            if any(True for _ in tree.find_all(_DEFINING_NODES)):
-                defining.append(text)
-        return defining
-
-    def _ordered_slots():
-        """(slot, value) in the order `yaml.dump` emits them.
-
-        EVERY field, not just `environment`: the whole service is dumped
-        and rendered as one template, so a `{% set %}` in `command`
-        defines a name for the env values that follow it. Fields that
-        are not env entries carry no slot -- they contribute
-        definitions, they are not candidates for popping.
-
-        `yaml.dump` sorts keys, so the order is sorted service names,
-        then sorted field names, then sorted env keys; a list-form env
-        keeps its own order.
-        """
-        document = compose if isinstance(compose, dict) else {}
-        for top in sorted(document, key=str):
-            if top != 'services':
-                # `configs` sorts before `services`, and a `{% set %}`
-                # there defines a name for everything the services then
-                # render. Only `services` holds poppable env keys, so
-                # the rest contribute definitions and nothing else.
-                yield None, document[top]
-                continue
-            for service_name in sorted(services):
-                service = services[service_name]
-                if not isinstance(service, dict):
-                    continue
-                for field in sorted(service, key=str):
-                    value = service[field]
-                    if field != 'environment':
-                        yield None, value
-                    elif isinstance(value, dict):
-                        for key in sorted(value, key=str):
-                            yield (service_name, key), value[key]
-                    elif isinstance(value, list):
-                        for index, entry in enumerate(value):
-                            yield (service_name, index), entry
-                    else:
-                        yield None, value
 
     # A value sees only the `{% set %}` statements BEFORE it. Prefixing
     # every one of them defined names the real render does not have
@@ -1355,21 +937,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # how to read a value that will not parse on its own. See
     # `_dereferences`.
     try:
-        _COMPOSE_ENV.parse(yaml.dump(compose))
+        _COMPOSE_RENDER_ENV.parse(yaml.dump(compose))
         document_parses = True
     except Exception:
         document_parses = False
 
-    probe_deadline = time.monotonic() + _PROBE_TIME_BUDGET
-
-    preludes = {}
-    seen = []
-    for slot, value in _ordered_slots():
-        if slot is not None:
-            preludes[slot] = ''.join(seen)
-        seen.extend(_set_texts(value))
-
-    def matching_unset_types(value, prelude=''):
+    def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
         try:
             texts = [
@@ -1388,10 +961,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             return ()
         return tuple(
             t for t in unset_types
-            if any(_dereferences(text, t)
-                   or not _guard_only_value_still_renders(
-                       text, t, render_context, prelude, probe_deadline)
-                   for text in texts)
+            if any(_dereferences(text, t) for text in texts)
         )
 
 
@@ -1412,17 +982,15 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         env = service.get('environment')
         if isinstance(env, dict):
             for key, value in list(env.items()):
-                matched = matching_unset_types(
-                    value, preludes.get((name, key), ''))
+                matched = matching_unset_types(value)
                 if matched:
                     _log_pop(key, name, matched)
                     env.pop(key, None)
         elif isinstance(env, list):
             kept = []
-            for index, e in enumerate(env):
+            for e in env:
                 matched = (
-                    matching_unset_types(e.split('=', 1)[1],
-                                         preludes.get((name, index), ''))
+                    matching_unset_types(e.split('=', 1)[1])
                     if isinstance(e, str) and '=' in e
                     else ()
                 )
@@ -1432,160 +1000,26 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 kept.append(e)
             service['environment'] = kept
 
-    # `snapshot is not None` already implies the document rendered
-    # before and could be copied; re-testing `rendered_before` here
-    # would be a second spelling of the same condition.
-    if snapshot is not None and not _document_renders(compose, render_context):
-        _reapply_pops_that_keep_it_renderable(
-            compose, snapshot, greffon_info, render_context)
-    return compose
-
-
-def _reapply_pops_that_keep_it_renderable(
-        compose, snapshot, greffon_info, render_context):
-    """Keep every pop that is safe on its own; undo only the ones that
-    break the document.
-
-    Reverting the strip WHOLESALE was wrong, because the document is one
-    template but the damage is local: a malformed value in one service
-    un-popped every correctly-popped key in every OTHER service, and
-    glitchtip's `EMAIL_URL` came back to render `smtp://:@`, which is the
-    exact malformed URL the strip exists to prevent. "Weaker guarantee
-    but still a working deploy" was not true for that app.
-
-    So rebuild from the snapshot and re-apply the pops one at a time,
-    keeping each only while the document still RENDERS -- compiling is
-    not enough, which is what `_document_renders` argues at length. The
-    pops that
-    are fine survive; the one that straddles a construct is dropped.
-
-    Cost is paid only here, in the case that already went wrong -- the
-    common path is the two `_document_renders` calls above. Order is
-    deterministic so the outcome does not depend on dict iteration luck.
-    """
-    before = _env_items_by_service(snapshot)
-    after = _env_items_by_service(compose)
-    popped = [
-        (service, item)
-        for service, items in before.items()
-        for item in _items_removed(items, after.get(service, ()))
-    ]
-
-    # Deciding one pop at a time costs a full dump+compile+render per
-    # step, which is quadratic in the number of popped keys. Chunk it:
-    # try a whole batch, and only fall back to one-at-a-time for a batch
-    # that fails. A real catalog entry pops 10-30 keys and almost never
-    # reaches here at all; the custom-compose epic makes this input
-    # user-controlled, so the work is also capped.
+    # The strip must not make things WORSE. If the document rendered
+    # before and does not now, the pops are the only thing that changed,
+    # so put them all back and let the deploy fail the way it would have
+    # without this pass -- loudly, and identically to `main`.
     #
-    # Running out of budget undoes only the pops not yet DECIDED, never
-    # the ones already kept. Restoring everything wholesale was the
-    # earlier behaviour and it re-introduced the bug this function
-    # exists to prevent: glitchtip's `EMAIL_URL` came back to render
-    # `smtp://:@`. Degrading has to preserve the decisions already made.
-    last_good = copy.deepcopy(snapshot)
-    kept, undone = [], []
-    deadline = time.monotonic() + _UNDO_TIME_BUDGET
-
-    def out_of_time():
-        return time.monotonic() >= deadline
-
-    def label(service, item):
-        name = item[0] if isinstance(item, tuple) else str(item).split('=', 1)[0]
-        return f'{service}.{name}'
-
-    def try_removing(batch):
-        """Apply `batch` to a copy of `last_good`; keep it if it renders."""
-        nonlocal last_good
-        trial = copy.deepcopy(last_good)
-        for service, item in batch:
-            _remove_env_item(trial, service, item)
-        if _document_renders(trial, render_context):
-            last_good = trial
-            return True
-        return False
-
-    def decide(items):
-        """Decide as many of `items` as the deadline allows.
-
-        Returns how many were decided. Tries a whole batch first and
-        splits only a batch that fails, so a clean run costs
-        ceil(n / _UNDO_CHUNK) renders instead of n.
-        """
-        index = 0
-        while index < len(items) and not out_of_time():
-            chunk = items[index:index + _UNDO_CHUNK]
-            if try_removing(chunk):
-                kept.extend(label(*one) for one in chunk)
-                index += len(chunk)
-                continue
-            if len(chunk) == 1:
-                undone.append(label(*chunk[0]))
-                index += 1
-                continue
-            # The batch failed, so decide its members individually.
-            # `index` only advances past ones actually decided, so
-            # running out of time mid-chunk leaves the rest outstanding.
-            for one in chunk:
-                if out_of_time():
-                    break
-                if try_removing([one]):
-                    kept.append(label(*one))
-                else:
-                    undone.append(label(*one))
-                index += 1
-        return index
-
-    decided = decide(popped)
-    if decided < len(popped):
-        rest = popped[decided:]
-        # One cheap attempt at the whole remainder. When the key that
-        # broke the document was already decided, everything left is
-        # fine together and this recovers it in a single render.
-        #
-        # When it was NOT -- `rest` then contains it -- this fails and
-        # every key in `rest` is restored, must-pop ones included. That
-        # is a REAL residual, not a safe degradation: it is how
-        # `EMAIL_URL: smtp://@` comes back, and it is triggered by wall
-        # clock, so a loaded node reaches it where an idle one does not.
-        #
-        # Reserving part of the budget for this phase was tried and
-        # MEASURED WORSE: the only input that distinguished the two kept
-        # the malformed key where spending the whole budget up front
-        # popped it. Splitting a fixed budget cannot buy work that is
-        # not there. Deciding `rest` needs budget the deadline has by
-        # definition already spent, so the honest answer is to make the
-        # residual loud rather than pretend to fix it -- see the log
-        # below, which names every key involved.
-        #
-        # This CAN re-apply the full set, when the deadline passed before
-        # anything was decided. That costs one render.
-        if try_removing(rest):
-            kept.extend(label(*one) for one in rest)
-            decided = len(popped)
-
-    if decided < len(popped):
-        outstanding = popped[decided:]
-        undone.extend(label(*one) for one in outstanding)
+    # Wholesale, not key by key. A chunked undo that kept every pop it
+    # could was tried: ~210 lines, a wall-clock budget that made the
+    # deployed file depend on how loaded the node was, and zero firings
+    # across the whole catalog. Restoring everything is the same answer
+    # for every input that exists, and a comprehensible one for those
+    # that do not.
+    if snapshot is not None and not _document_renders(compose, render_context):
         logger.error(
-            'integration strip on instance %s ran out of its %.1fs undo '
-            'budget with %d of %d keys still undecided; they keep their '
-            'value and will render EMPTY rather than being absent, so this '
-            'instance may come up misconfigured: %s',
-            greffon_info.get('id'), _UNDO_TIME_BUDGET, len(outstanding),
-            len(popped), ', '.join(label(*one) for one in outstanding),
+            'integrations: the env strip broke the compose document for '
+            '%s; restoring every popped key and deploying it unchanged',
+            greffon_info.get('id'),
         )
-
-    logger.warning(
-        'integration strip left instance %s unrenderable; kept %s and undid '
-        '%s, which stay in the compose and render through the unset binding '
-        'instead of being absent',
-        greffon_info.get('id'),
-        ', '.join(kept) or 'nothing',
-        ', '.join(undone) or 'nothing',
-    )
-    compose.clear()
-    compose.update(last_good)
+        compose.clear()
+        compose.update(snapshot)
+    return compose
 
 
 def _compose_render_context(greffon_info):
@@ -1838,7 +1272,7 @@ def create_compose(compose, greffon_info):
     # `environment`, the other `logging`), so the order is free.
     _inject_instance_log_rotation(compose)
     _delete_unset_integration_env_keys(compose, greffon_info)
-    t = _COMPOSE_ENV.from_string(yaml.dump(compose))
+    t = _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose))
     compose_file = t.render(**_compose_render_context(greffon_info))
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
