@@ -1255,6 +1255,58 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class EveryBuiltinTestIsClassifiedTests(TestCase):
+    """A tripwire, because `_COERCING_TESTS` is a hardcoded name list.
+
+    A future Jinja that adds a coercing test, or a custom test
+    registered on `_COMPOSE_RENDER_ENV`, reopens the exact hole this
+    list closed -- silently, and in the BAD direction: a kept key and a
+    500, not an over-pop. So rather than trusting the list, enumerate
+    the environment's tests and check each one against the unset
+    binding: it must either tolerate an unset field, or be named.
+    """
+
+    def test_no_unlisted_test_raises_on_an_unset_field(self):
+        unset = compose_module._compose_render_context(
+            _compute_integrations_context({'id': 'i1', 'integrations': {}}))
+        # A NUMBER, not '587'. With a string port, `is even` raises
+        # when configured too, so nothing looked like a gap and this
+        # test passed against a deliberately incomplete list.
+        configured = compose_module._compose_render_context(
+            _compute_integrations_context(
+                {'id': 'i1', 'integrations': {'smtp': {'port': 587}}}))
+
+        def renders(template, context):
+            try:
+                compose_module._COMPOSE_RENDER_ENV.from_string(
+                    template).render(**context)
+                return True
+            except Exception:
+                return False
+
+        unclassified = []
+        for name in sorted(compose_module._COMPOSE_RENDER_ENV.tests):
+            if name in compose_module._COERCING_TESTS:
+                continue
+            for expression in ('smtp.port is %s' % name,
+                               'smtp.port is %s(1)' % name):
+                template = (
+                    '{%% if %s %%}a{%% else %%}b{%% endif %%}' % expression)
+                # The ONLY discriminator: does it work when the
+                # integration is configured and fail when it is not?
+                # Filtering on the exception TYPE instead let the
+                # coercing tests through -- `is even` raises TypeError,
+                # the same class as a wrong-arity call -- so this test
+                # passed against a deliberately incomplete list.
+                if (renders(template, configured)
+                        and not renders(template, unset)):
+                    unclassified.append(expression)
+        self.assertEqual(unclassified, [], (
+            'these tests raise on an unset field but are not in '
+            '_COERCING_TESTS, so a guard using one keeps its key and '
+            'fails the render'))
+
+
 class AGuardWhoseTESTCoercesIsNotExemptTests(TestCase):
     """`nodes.Test` is a guard slot, and some tests coerce.
 
