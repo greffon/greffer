@@ -1265,6 +1265,102 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class AMethodCalledOnTheMappingIsNotAGuardTests(TestCase):
+    """`_UnsetIntegration` is a real dict, so its methods are real.
+
+    The coercion rules modelled Undefined coercion only. A dict method
+    invoked on the mapping raises for an entirely different reason --
+    `smtp.popitem()` KeyError, `smtp.get()` TypeError,
+    `smtp.pop("host")` KeyError -- so the guard exemption held, the key
+    was kept, and the render died where `main` pops it and deploys.
+
+    One of them is worse than a 500: `smtp.update({...})` MUTATES the
+    binding, so a sibling `{% if smtp %}` in the same document renders
+    `on` and the greffon is told SMTP is configured when it is not.
+    """
+
+    def _strip(self, env):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def _renders(self, env):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose_module._COMPOSE_RENDER_ENV.from_string(
+            yaml.dump(compose)).render(
+                **compose_module._compose_render_context(info))
+
+    def test_a_dict_method_on_the_mapping_is_popped(self):
+        for value in ('{{ "x" if smtp.popitem() else "y" }}',
+                      '{{ "x" if smtp.get() else "y" }}',
+                      '{{ "x" if smtp.pop("host") else "y" }}',
+                      '{% if smtp.fromkeys() %}a{% endif %}',
+                      '{% for x in [1] if smtp.popitem() %}a{% endfor %}'):
+            with self.subTest(value=value):
+                self.assertEqual(self._strip({'K': value}), {})
+
+    def test_a_mutating_guard_cannot_lie_to_a_sibling(self):
+        # `A` makes the binding truthy for everything after it, so `B`
+        # would render `on` -- SMTP reported as configured when it is
+        # not. Popping `A` is what stops that.
+        rendered = self._renders({
+            'A': '{{ "" if smtp.update({"host": "LEAK"}) else "" }}',
+            'B': '{{ "on" if smtp else "off" }}',
+        })
+        self.assertIn("B: 'off'", rendered)
+        self.assertNotIn('LEAK', rendered)
+
+    def test_a_method_on_a_FIELD_is_still_a_guard(self):
+        # The shape the exemption exists for, and the one the catalog
+        # writes: `_UnsetField.__call__` absorbs it and returns itself.
+        for value in ('{{ "a" if smtp.host.startswith("h") else "b" }}',
+                      '{% if smtp.host.upper() %}x{% else %}y{% endif %}'):
+            with self.subTest(value=value):
+                self.assertIn('K', self._strip({'K': value}))
+
+
+class ABrokenDocumentGetsTheCruderAnswerTests(TestCase):
+    """When the document does not parse, every value takes main's rule.
+
+    Two shapes reached the AST branch and were kept, each turning a
+    compose `main` deploys into a 500: `{% raw %}` left open at the end
+    of a value parses ALONE (raw-at-EOF is tolerated) but leaves the
+    document unterminated; and a straddle whose parseable half mentions
+    the type only inside `{% raw %}`, so the AST says "no read" while
+    the other half has already been popped.
+
+    Nothing is being protected once the document is broken: the deploy
+    fails as it stands, popping cannot break a working document, and
+    popping is what makes it render again.
+    """
+
+    def _strip(self, env):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def test_an_unterminated_raw_block_is_popped(self):
+        self.assertEqual(
+            self._strip({'K0': '{% raw %}{{ smtp.h }}{% endraw %}{% raw %}'}),
+            {})
+
+    def test_a_raw_shielded_half_of_a_straddle_is_popped_too(self):
+        self.assertEqual(self._strip({
+            'K0': '{% block b %}{{ "a" if smtp.port is gt(1) else "b" }}',
+            'K1': '{{ u() }}{% raw %}{{ smtp.h }}{% endraw %}',
+        }), {})
+
+    def test_a_VALID_document_still_uses_the_parser(self):
+        # The crude rule applies only to a broken document. Here it
+        # parses, so `{% raw %}` correctly shields the mention.
+        self.assertIn('K', self._strip(
+            {'K': '{% raw %}{{ smtp.host }}{% endraw %}'}))
+
+
 class EveryCoercingOperatorIsPinnedTests(TestCase):
     """One case per member of `_COERCING_NODES`, not a sample.
 
@@ -1808,8 +1904,12 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
     def test_a_loop_filter_is_a_guard(self):
         # Renders the author's fallback when unset and the other branch
         # when configured, exactly like the `{% if %}` form beside it.
-        loop = ("{% for x in ['off'] if not smtp %}{{ x }}{% endfor %}"
-                "{% for x in ['on'] if smtp %}{{ x }}{% endfor %}")
+        # DOUBLE quotes: `yaml.dump` doubles single ones, which breaks
+        # the document and sends every value down the crude fallback --
+        # so a single-quoted spelling would test the quoting bug rather
+        # than the guard rule this test is about.
+        loop = ('{% for x in ["off"] if not smtp %}{{ x }}{% endfor %}'
+                '{% for x in ["on"] if smtp %}{{ x }}{% endfor %}')
         self.assertTrue(self._survives(loop))
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         self.assertEqual(Template(loop).render(**_compose_render_context(info)), 'off')
@@ -2245,20 +2345,33 @@ class AcceptedResidualTests(TestCase):
     in a paragraph nobody re-reads.
     """
 
-    def test_a_quoted_type_token_inside_a_literal_is_kept_and_then_fails(self):
+    def test_a_quoted_type_token_inside_a_literal_is_no_longer_a_residual(self):
+        # This used to be an accepted residual: the token sits inside a
+        # string literal, so it is not a reference, the key was kept --
+        # and the render then failed anyway, because `yaml.dump` doubles
+        # those single quotes and breaks the document.
+        #
+        # It now ends better than it did. The broken document sends
+        # every value down the crude fallback, the offending value is
+        # popped, and what remains RENDERS. `main` pops it too, so this
+        # is main's outcome without main's 500.
         value = "{{ instance_host|default('smtp.acme.com') }}"
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
-        # Kept: the token is inside a string literal, so it is not a
-        # reference, and not popping it is the false-positive fix working.
+        self.assertNotIn('K', compose['services']['a']['environment'])
+        compose_module._COMPOSE_RENDER_ENV.from_string(
+            yaml.dump(compose)).render(
+                **compose_module._compose_render_context(info))
+
+    def test_the_same_token_with_DOUBLE_quotes_is_kept(self):
+        # The false-positive fix, on a value that survives the dump: the
+        # token is data inside a literal, not a reference.
+        value = '{{ instance_host|default("smtp.acme.com") }}'
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
         self.assertIn('K', compose['services']['a']['environment'])
-        # And then the dump mangles it. `main` pops this key by accident
-        # and deploys without it.
-        ctx = _compose_render_context(info)
-        ctx['instance_host'] = 'h'
-        with self.assertRaises(TemplateSyntaxError):
-            Template(yaml.dump(compose)).render(**ctx)
 
     def test_the_same_shape_without_a_type_token_breaks_main_too(self):
         # Shows the hazard is not ours: nothing here mentions an
