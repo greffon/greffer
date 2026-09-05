@@ -578,6 +578,33 @@ _COERCING_TESTS = frozenset({
 })
 
 
+def _calls_a_method_on(node, name):
+    """Is this a method invoked on the integration MAPPING itself?
+
+    `_UnsetIntegration` is a real dict, so `smtp.popitem()` raises
+    KeyError, `smtp.get()` raises TypeError, `smtp.pop("host")` raises
+    KeyError -- none of which is Undefined coercion, so the rules above
+    never saw them. Worse than a 500: `{{ "" if smtp.update({"host":
+    "x"}) else "" }}` MUTATES the binding, and a sibling
+    `{% if smtp %}` in the same document then renders `on`, telling the
+    greffon SMTP is configured when it is not.
+
+    Only when the receiver is the mapping. A call on a FIELD --
+    `{{ "a" if smtp.host.startswith("h") else "b" }}` -- stays exempt,
+    because `_UnsetField.__call__` absorbs it and returns itself. That
+    is the shape the catalog actually writes, and the exemption exists
+    for it.
+    """
+    if not isinstance(node, nodes.Call):
+        return False
+    callee = node.node
+    if isinstance(callee, nodes.Name):
+        return callee.name == name
+    return (isinstance(callee, nodes.Getattr)
+            and isinstance(callee.node, nodes.Name)
+            and callee.node.name == name)
+
+
 def _guard_coerces(value, name):
     """Does this guard apply an operation to the type that RAISES unset?
 
@@ -613,6 +640,8 @@ def _guard_coerces(value, name):
                 return True
             if (isinstance(candidate, nodes.Test)
                     and candidate.name in _COERCING_TESTS):
+                return True
+            if _calls_a_method_on(candidate, name):
                 return True
     return False
 
@@ -935,6 +964,16 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         survives -- `find_undeclared_variables` gets the scoping right
         and does not report it. `main` pops it.
         """
+        if not document_parses:
+            # The document is already broken, so nothing is being
+            # protected: the deploy fails as it stands, popping cannot
+            # break a working document, and popping may well FIX it --
+            # which is what `main` does here, with the same crude
+            # question. Applied to every value, not only the ones that
+            # fail to parse alone: a value can parse perfectly and still
+            # be what breaks the document (`{% raw %}` left open at the
+            # end of it), or be the half that a straddle needs.
+            return re.search(rf'\b{re.escape(name)}\b', value) is not None
         try:
             return _reads(parser_env.parse(value), name)
         except Exception:
