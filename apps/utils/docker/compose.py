@@ -563,7 +563,16 @@ _COERCING_NODES = (
     nodes.Add, nodes.Sub, nodes.Mul, nodes.Div, nodes.FloorDiv,
     nodes.Mod, nodes.Pow, nodes.Neg, nodes.Pos,
 )
-_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne'})
+# Comparisons that answer harmlessly on an unset field, checked by
+# rendering each against the binding: `==`/`!=` give False, and both
+# membership operators give False/True rather than raising. Ordering
+# (`<`, `>`, `<=`, `>=`) genuinely coerces and is absent on purpose.
+#
+# `in`/`notin` were missing, which over-popped
+# `{% if smtp.tls_mode in ["tls","starttls"] %}` -- a guard one word
+# away from the eight shipping `== "starttls"` entries the exemption
+# exists to protect, and one `main` keeps and renders.
+_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne', 'in', 'notin'})
 
 # Tests that coerce their operand, found by enumerating every builtin
 # test in `_COMPOSE_RENDER_ENV` against the unset binding. `nodes.Test`
@@ -644,6 +653,36 @@ def _guard_coerces(value, name):
             if _calls_a_method_on(candidate, name):
                 return True
     return False
+
+
+# A Jinja block, including one left unterminated at the end of a value
+# (`{{ smtp.host }` -- which is exactly the shape that breaks a
+# document and sends everything down the fallback below).
+_JINJA_BLOCK_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{\{.*$|\{%.*$', re.S)
+
+
+def _named_in_a_jinja_block(value, name):
+    """Does the type appear as a NAME inside a Jinja block?
+
+    The fallback for everything the AST cannot answer, so its precision
+    decides two failure directions at once.
+
+    A bare `\bsmtp\b` over the whole value sprayed: it popped
+    `{{ mail.smtp }}` (an attribute of something else) and
+    `{{ instance_id }}-smtp` (plain text), dropping three working vars
+    where `main` deploys all three.
+
+    `main`'s own narrow `smtp` + `.`/`[` test is too narrow the other
+    way: it
+    does not see `{{ dict(smtp).get("user") }}`, which reads the type
+    through a wrapper and must be popped.
+
+    So: inside a block, and not preceded by a dot -- which is what
+    separates `smtp.host` and `dict(smtp)` from `mail.smtp`.
+    """
+    return any(
+        re.search(rf'(?<![.\w]){re.escape(name)}\b', block) is not None
+        for block in _JINJA_BLOCK_RE.findall(value))
 
 
 def _reads(ast, name):
@@ -833,6 +872,13 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         t for t in KNOWN_INTEGRATION_TYPES
         if not _is_integration_set(integrations.get(t))
     ]
+
+    # Every pop, from BOTH passes. The restore puts back pass 1's
+    # metadata-driven pops as well, and the ERROR line naming the
+    # restored keys is the only signal that an instance is quietly
+    # degraded -- listing only pass 2's undercounted exactly what an
+    # operator needs to see.
+    popped = []
     if not unset_types:
         return compose
 
@@ -905,12 +951,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     continue
                 env = service.get('environment')
                 if isinstance(env, dict):
+                    if key in env:
+                        popped.append('%s.%s' % (container, key))
                     env.pop(key, None)
                 elif isinstance(env, list):
                     prefix = f'{key}='
-                    service['environment'] = [
+                    kept_entries = [
                         e for e in env if not (isinstance(e, str) and e.startswith(prefix))
                     ]
+                    if len(kept_entries) != len(env):
+                        popped.append('%s.%s' % (container, key))
+                    service['environment'] = kept_entries
 
     # Pass 2 -- template-driven pop, for values the catalog templates
     # rather than declares.
@@ -965,6 +1016,11 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         and does not report it. `main` pops it.
         """
         if not document_parses:
+            # `main`'s shape, not a bare word match: a broken document
+            # is often repaired by exactly the pop `main` would make,
+            # and a bare `\bsmtp\b` additionally sprayed over
+            # `{{ mail.smtp }}` and `{{ instance_id }}-smtp`, dropping
+            # three working vars where `main` deploys all three.
             # The document is already broken, so nothing is being
             # protected: the deploy fails as it stands, popping cannot
             # break a working document, and popping may well FIX it --
@@ -973,9 +1029,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # fail to parse alone: a value can parse perfectly and still
             # be what breaks the document (`{% raw %}` left open at the
             # end of it), or be the half that a straddle needs.
-            return re.search(rf'\b{re.escape(name)}\b', value) is not None
+            return _named_in_a_jinja_block(value, name)
         try:
-            return _reads(parser_env.parse(value), name)
+            parsed = parser_env.parse(value)
+        except Exception:
+            # The value does not PARSE. In a document that does, it is a
+            # fragment of a construct spanning two env values, and
+            # popping one half breaks the whole -- so keep it, as `main`
+            # keeps it. (A document that does not parse returned above.)
+            return False
+        try:
+            return _reads(parsed, name)
         except Exception:
             # Deliberately bare: the body is a single `parse()` on
             # catalog-controlled input, so there is no logic of ours for
@@ -1021,9 +1085,15 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # `{{ oidc.issuer }` is better dropped than left to fail the
             # whole start. That is the crude question `main`'s successor
             # asked, and it stays for exactly this case.
-            if document_parses:
-                return False
-            return re.search(rf'\b{re.escape(name)}\b', value) is not None
+            # The value PARSED and only the analysis failed.
+            # `find_undeclared_variables` COMPILES,
+            # so an unknown filter or test (`{{ smtp.host|to_json }}`,
+            # the Ansible spelling) raises `TemplateAssertionError` here
+            # even though the value parsed and the document parses. That
+            # answered "not a reference", kept a value that plainly
+            # dereferences the unset type, and 500'd where `main` pops
+            # it and deploys.
+            return _named_in_a_jinja_block(value, name)
 
     def _strings_in(value):
         """Every string inside `value`, however nested.
@@ -1074,8 +1144,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             if any(_dereferences(text, t) for text in texts)
         )
 
-
-    popped = []
 
     def _log_pop(key, name, matched):
         # The types that MATCHED, not every unset type: on a fresh

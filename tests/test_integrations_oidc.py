@@ -792,6 +792,21 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         self.assertIn('app.B', joined)
         self.assertIn('render empty rather than being absent', joined)
 
+    def test_the_restore_log_names_pass_ONE_pops_too(self):
+        # The restore puts back the metadata-driven pops as well, and
+        # this line is the only signal an instance is degraded. It used
+        # to name pass 2's keys only.
+        compose = {'services': {'app': {'environment': {
+            'A_OPEN': '{% if oidc %}', 'B_MID': 'x',
+            'C_CLOSE': '{% endif %}'}}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'A_OPEN'}]}]})
+        with self.assertLogs('apps.utils.docker.compose', level='INFO') as caught:
+            _delete_unset_integration_env_keys(compose, info)
+        self.assertIn('app.A_OPEN', ''.join(caught.output))
+
     def test_a_compose_that_cannot_be_dumped_answers_no(self):
         # `_document_renders` must ANSWER for any input, never raise --
         # it runs on the `/start/` path. A generator makes `yaml.dump`
@@ -1265,6 +1280,96 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class TheFallbackAsksMainsQuestionTests(TestCase):
+    """What the AST cannot answer decides two failure directions.
+
+    Three shapes, three different right answers, found by differential
+    review against `main`:
+
+      an unknown FILTER or TEST makes `find_undeclared_variables`
+      raise -- it compiles -- even though the value and the document
+      both parse. Answering "not a reference" kept a value that plainly
+      dereferences the type, and 500'd where `main` pops and deploys.
+
+      a value that does not parse in a document that DOES is a fragment
+      of a straddling construct; popping half of it breaks the whole.
+
+      a bare `\bsmtp\b` over the whole value sprayed onto
+      `{{ mail.smtp }}` and `{{ instance_id }}-smtp`, dropping working
+      vars, while `main`'s narrow test misses `{{ dict(smtp).x }}`.
+    """
+
+    def _kept(self, env, **info):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        context = _compute_integrations_context(
+            dict({'id': 'i1', 'integrations': {}}, **info))
+        _delete_unset_integration_env_keys(compose, context)
+        return sorted(compose['services']['a']['environment'])
+
+    def test_an_unknown_filter_or_test_still_counts_as_a_reference(self):
+        # `|to_json` is the Ansible spelling; a community entry can
+        # easily carry one, or a Jinja version can drop a filter.
+        for value in ('{{ smtp.host|to_json }}',
+                      '{{ smtp.host|nosuchfilter }}',
+                      '{{ smtp.host is nosuchtest }}'):
+            with self.subTest(value=value):
+                self.assertEqual(self._kept({'K': value, 'OK': 'plain'}),
+                                 ['OK'])
+
+    def test_a_fragment_in_a_VALID_document_is_still_kept(self):
+        self.assertEqual(
+            self._kept({'A_PORT': '{{ smtp.port|int }}',
+                        'B_OPEN': '{% if smtp %}',
+                        'C_CLOSE': '{% endif %}'}),
+            ['B_OPEN', 'C_CLOSE'])
+
+    def test_a_broken_document_does_not_spray_onto_innocent_values(self):
+        # `main` pops only BAD, which repairs the document and deploys
+        # the other three. A bare word match dropped all of them.
+        self.assertEqual(
+            self._kept({'BAD': '{{ smtp.host }',
+                        'MODE': '{{ mail.smtp }}',
+                        'NAME': '{{ instance_id }}-smtp'},
+                       mail={'smtp': 'yes'}, instance_id='i1'),
+            ['MODE', 'NAME'])
+
+    def test_a_broken_document_still_sees_a_wrapped_read(self):
+        # ... and the narrow spelling `main` uses would miss this one.
+        self.assertEqual(
+            self._kept({'BAD': '{{ oidc.x }', 'W': '{{ dict(smtp).get("u") }}'}),
+            [])
+
+
+class MembershipIsNotACoercionTests(TestCase):
+    """`in` / `not in` answer on an unset field; ordering does not.
+
+    Checked by rendering each against the binding rather than assumed:
+    `smtp.tls_mode in ["tls"]` gives False, `not in` gives True, while
+    `smtp.port > 1` raises. Treating membership as coercing over-popped
+    a guard one word away from the eight shipping `== "starttls"`
+    entries the exemption exists to protect.
+    """
+
+    def _survives(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return 'K' in compose['services']['a']['environment']
+
+    def test_a_membership_guard_is_kept(self):
+        for value in (
+            '{% if smtp.tls_mode in ["tls","starttls"] %}on{% else %}off{% endif %}',
+            '{% if smtp.tls_mode not in ["none"] %}on{% else %}off{% endif %}',
+            '{{ "y" if "a" in smtp.host else "n" }}',
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self._survives(value))
+
+    def test_an_ordering_guard_is_still_popped(self):
+        self.assertFalse(self._survives(
+            '{% if smtp.port > 25 %}on{% else %}off{% endif %}'))
+
+
 class AMethodCalledOnTheMappingIsNotAGuardTests(TestCase):
     """`_UnsetIntegration` is a real dict, so its methods are real.
 
@@ -1312,6 +1417,14 @@ class AMethodCalledOnTheMappingIsNotAGuardTests(TestCase):
         })
         self.assertIn("B: 'off'", rendered)
         self.assertNotIn('LEAK', rendered)
+
+    def test_calling_the_MAPPING_itself_is_popped(self):
+        # `{% if smtp() %}` -- the receiver is the bare name, not a
+        # `Getattr`. Every other case here uses `smtp.method()`, so the
+        # bare-name branch was unexercised; without it the key is kept
+        # and the render raises
+        # `TypeError: '_UnsetIntegration' object is not callable`.
+        self.assertEqual(self._strip({'K': '{% if smtp() %}a{% endif %}'}), {})
 
     def test_a_method_on_a_FIELD_is_still_a_guard(self):
         # The shape the exemption exists for, and the one the catalog
@@ -1483,10 +1596,22 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
         # BOTH directions. Skipping the listed names could only ever
         # catch under-listing, so adding a harmless test to the set --
         # which over-pops a working setting -- passed unnoticed.
+        # BOTH spellings. Probing only `is <name>` meant an arg-taking
+        # test added to the set raised for ARITY, `renders` read that as
+        # "coercing, correctly listed", and `is in([1,2])` could be
+        # listed silently -- popping a guard that renders fine.
         overlisted = [
             name for name in sorted(compose_module._COERCING_TESTS)
-            if renders('{%% if smtp.port is %s %%}a{%% else %%}b{%% endif %%}'
-                       % name, unset)]
+            if any(renders(
+                '{%% if smtp.port is %s %%}a{%% else %%}b{%% endif %%}'
+                % spelling, unset)
+                for spelling in (name, '%s(1)' % name, '%s([1])' % name))]
+        # A name that is not a Jinja test at all raises for LOOKUP,
+        # which the probe would also read as "coercing".
+        self.assertLessEqual(
+            set(compose_module._COERCING_TESTS),
+            set(compose_module._COMPOSE_RENDER_ENV.tests),
+            'a name here is not a Jinja test, so nothing exercises it')
         self.assertEqual(overlisted, [], (
             'these are listed as coercing but answer harmlessly on an '
             'unset field, so listing them pops a setting that works'))
