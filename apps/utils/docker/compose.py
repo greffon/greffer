@@ -692,6 +692,19 @@ _DEFINING_NODES = (
 )
 
 
+# Exploratory renders run SANDBOXED. They evaluate catalog-author text
+# that the strip pass exists to DELETE, and they run BEFORE it does, so
+# a plain Environment would execute
+# `{{ cycler.__init__.__globals__.os.popen('id').read() }}` in a value
+# that never reaches the deployed file -- widening the exposure this
+# module already sandboxes baked files against (`_FILE_RENDER_ENV`).
+#
+# A SecurityError is just another render failure here: the probe reads
+# it as "does not render", which for a payload like that is the answer
+# that drops the key.
+_PROBE_ENV = SandboxedEnvironment()
+
+
 def _guard_only_value_still_renders(text, name, context, prelude=''):
     """Would this value render with the integration unset?
 
@@ -730,7 +743,7 @@ def _guard_only_value_still_renders(text, name, context, prelude=''):
     # short circuited, and the key was kept for the real render to fail
     # on. `prelude` carries those definitions in.
     text = prelude + text
-    env = Environment()
+    env = _PROBE_ENV
     try:
         template = env.from_string(text)
         used = meta.find_undeclared_variables(env.parse(text))
@@ -895,7 +908,7 @@ def _document_renders(compose, render_context):
     except Exception:
         return False
     try:
-        Environment().from_string(yaml.dump(compose)).render(**context)
+        _PROBE_ENV.from_string(yaml.dump(compose)).render(**context)
     except Exception:
         return False
     return True
@@ -1215,7 +1228,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             if '{%' not in text:
                 continue
             try:
-                tree = Environment().parse(text)
+                tree = _PROBE_ENV.parse(text)
             except Exception:
                 # A fragment that does not parse alone defines nothing
                 # this probe can use.
