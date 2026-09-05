@@ -488,6 +488,22 @@ def _render_json_value(value, greffon_info, dest_name):
 _UNDO_CHUNK = 8
 _UNDO_TIME_BUDGET = 5.0
 
+# The probe renders. `main` answered this question with one regex match,
+# so a compose that makes the probe run thousands of times turns a
+# microsecond pass into seconds of CPU inside `/start/` -- on a worker
+# that runs `--workers 1` and holds the per-instance lock across the
+# call. Measured on this branch before the bound: 4.4s for 2000 guarded
+# values, 7.6s for 50 guards of 400 operands, against ~1ms on `main`.
+#
+# Real catalog entries spend 4-10ms in the whole pass, so the budget is
+# three orders of magnitude above what legitimate input needs.
+#
+# Past it, the answer falls back to `main`'s: a value that mentions the
+# type is popped. That is the SAFE direction of the asymmetry (a missing
+# env var on an instance that did not configure the integration, rather
+# than a 500), and it is the verdict this catalog already ships with.
+_PROBE_TIME_BUDGET = 2.0
+
 
 # Filters that read an attribute off their operand, so they dereference
 # without producing a `Getattr` node. `attr` names the attribute
@@ -692,20 +708,40 @@ _DEFINING_NODES = (
 )
 
 
-# Exploratory renders run SANDBOXED. They evaluate catalog-author text
-# that the strip pass exists to DELETE, and they run BEFORE it does, so
-# a plain Environment would execute
-# `{{ cycler.__init__.__globals__.os.popen('id').read() }}` in a value
-# that never reaches the deployed file -- widening the exposure this
-# module already sandboxes baked files against (`_FILE_RENDER_ENV`).
+# The ONE environment the compose is rendered in -- by the guard, by
+# the probe, and by `create_compose` itself.
 #
-# A SecurityError is just another render failure here: the probe reads
-# it as "does not render", which for a payload like that is the answer
-# that drops the key.
-_PROBE_ENV = SandboxedEnvironment()
+# ONE, because the guard's whole claim is "the question I ask is the
+# question the render will ask". Two environments made that false in
+# both directions, and both were 500s at `/start/` on composes `main`
+# deploys:
+#
+#   permissive probe -> the sandbox resolved `"".__class__` to
+#   Undefined, so `{{ "a" if ("".__class__|length and smtp.host)
+#   else "b" }}` rendered `b` and the key was KEPT; the real render got
+#   the type object and `|length` raised.
+#
+#   strict probe -> a value the sandbox refuses but a plain render
+#   accepts (`{{ "ab".__len__() }}`) made the pre-strip document look
+#   unrenderable, which silently disables the undo net.
+#
+# SANDBOXED, because catalog text is community-controlled and this
+# module already sandboxes baked files against exactly this
+# (`_FILE_RENDER_ENV`): a plain Environment executes
+# `{{ cycler.__init__.__globals__.os.popen("id").read() }}` on a worker
+# holding the instance's secrets, the manager token and the Docker
+# socket. The strip pass made that worse by rendering values it exists
+# to DELETE, before deleting them.
+#
+# Sandboxing the deploy render is a change to `main`'s behaviour, so it
+# was measured, not assumed: all 32 catalog entries render BYTE
+# IDENTICALLY sandboxed and unsandboxed, in both the configured and
+# unset scenarios (64/64).
+_COMPOSE_ENV = SandboxedEnvironment()
 
 
-def _guard_only_value_still_renders(text, name, context, prelude=''):
+def _guard_only_value_still_renders(text, name, context, prelude='',
+                                    deadline=None):
     """Would this value render with the integration unset?
 
     `_reads` exempts a guard because "the mapping decides, its contents
@@ -737,13 +773,17 @@ def _guard_only_value_still_renders(text, name, context, prelude=''):
     context does not carry stays unbound, which is also what the render
     does with it.
     """
+    if deadline is not None and time.monotonic() > deadline:
+        # Out of budget: answer as `main` does and pop. See
+        # `_PROBE_TIME_BUDGET`.
+        return False
     # The whole compose is dumped and rendered as ONE template, so a
     # `{% set %}` in one env value defines a name for every value after
     # it. Probing the value alone left that name undefined, the guard
     # short circuited, and the key was kept for the real render to fail
     # on. `prelude` carries those definitions in.
     text = prelude + text
-    env = _PROBE_ENV
+    env = _COMPOSE_ENV
     try:
         template = env.from_string(text)
         used = meta.find_undeclared_variables(env.parse(text))
@@ -908,7 +948,7 @@ def _document_renders(compose, render_context):
     except Exception:
         return False
     try:
-        _PROBE_ENV.from_string(yaml.dump(compose)).render(**context)
+        _COMPOSE_ENV.from_string(yaml.dump(compose)).render(**context)
     except Exception:
         return False
     return True
@@ -1189,6 +1229,32 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # Deliberately does NOT also pop on a `{%` tag: that rule
             # popped values referencing no integration at all, and the
             # document guard below covers what it was for.
+            #
+            # The value does not parse ALONE. What that means depends
+            # on the document.
+            #
+            # If the DOCUMENT parses, this is a fragment of a construct
+            # that straddles two env values, and popping one half breaks
+            # the whole:
+            #
+            #     A_PORT:  '{{ smtp.port|int }}'    <- popped, correctly
+            #     B_OPEN:  '{% if smtp %}'          <- popped, wrongly
+            #     C_CLOSE: '{% endif %}'
+            #
+            # left a dangling `{% endif %}` and a TemplateSyntaxError at
+            # `/start/`, where `main` deploys. The undo cannot save it
+            # either: it snapshots only when the document rendered
+            # BEFORE the strip, and `{{ smtp.port|int }}` is exactly the
+            # class that does not. So keep it -- `main` keeps it too.
+            #
+            # If the document does NOT parse, nothing is being protected:
+            # the deploy fails as it stands, popping cannot break a
+            # working document, and a malformed value like
+            # `{{ oidc.issuer }` is better dropped than left to fail the
+            # whole start. That is the crude question `main`'s successor
+            # asked, and it stays for exactly this case.
+            if document_parses:
+                return False
             return re.search(rf'\b{re.escape(name)}\b', value) is not None
 
     def _strings_in(value):
@@ -1228,7 +1294,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             if '{%' not in text:
                 continue
             try:
-                tree = _PROBE_ENV.parse(text)
+                tree = _COMPOSE_ENV.parse(text)
             except Exception:
                 # A fragment that does not parse alone defines nothing
                 # this probe can use.
@@ -1282,6 +1348,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # defining it, the render evaluates `A_GUARD` with `feature`
     # undefined and produces `off`, while the probe reached the unset
     # field and dropped a key that renders fine.
+    # Whether the DOCUMENT is a valid template, which is what decides
+    # how to read a value that will not parse on its own. See
+    # `_dereferences`.
+    try:
+        _COMPOSE_ENV.parse(yaml.dump(compose))
+        document_parses = True
+    except Exception:
+        document_parses = False
+
+    probe_deadline = time.monotonic() + _PROBE_TIME_BUDGET
+
     preludes = {}
     seen = []
     for slot, value in _ordered_slots():
@@ -1310,7 +1387,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             t for t in unset_types
             if any(_dereferences(text, t)
                    or not _guard_only_value_still_renders(
-                       text, t, render_context, prelude)
+                       text, t, render_context, prelude, probe_deadline)
                    for text in texts)
         )
 
@@ -1758,7 +1835,7 @@ def create_compose(compose, greffon_info):
     # `environment`, the other `logging`), so the order is free.
     _inject_instance_log_rotation(compose)
     _delete_unset_integration_env_keys(compose, greffon_info)
-    t = Template(yaml.dump(compose))
+    t = _COMPOSE_ENV.from_string(yaml.dump(compose))
     compose_file = t.render(**_compose_render_context(greffon_info))
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
