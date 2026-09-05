@@ -778,11 +778,13 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
             self._run({'A': '{# oidc note', 'B': '{{ oidc.host }} #}'})
         joined = ''.join(caught.output)
         self.assertIn('ERROR', joined)
-        self.assertIn('restoring every popped key', joined)
         self.assertIn('i1', joined)
-        # Every pop is logged individually, so the operator can still
-        # see which keys came back.
-        self.assertIn('dropping env', joined)
+        # The restore SUCCEEDS, so the deploy works and this line is the
+        # only signal that the instance is degraded. It has to say WHY
+        # and WHICH keys, or an operator cannot act on it.
+        self.assertIn('TemplateSyntaxError', joined)
+        self.assertIn('app.B', joined)
+        self.assertIn('render empty rather than being absent', joined)
 
     def test_a_compose_that_cannot_be_dumped_answers_no(self):
         # `_document_renders` must ANSWER for any input, never raise --
@@ -1253,6 +1255,102 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class AGuardThatCoercesAFieldIsNotExemptTests(TestCase):
+    """The guard exemption assumed too much.
+
+    It rests on "a guard renders correctly when the integration is
+    unset", which is true for bare truthiness and for `==`/`!=` -- the
+    shape eight shipping entries use -- and FALSE the moment the guard
+    coerces a field. `|int`, `|round`, `|abs`, arithmetic and ordering
+    comparisons all raise through `_UnsetField`, so the key was kept and
+    `/start/` returned 500 where `main` pops the key and deploys.
+
+    Found by an independent review after the probe that used to catch it
+    by rendering was deleted. The replacement is a pure AST rule: no
+    render, so no cost and no DoS surface.
+    """
+
+    def _kept_and_renders(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        kept = 'K' in compose['services']['a']['environment']
+        try:
+            compose_module._COMPOSE_RENDER_ENV.from_string(
+                yaml.dump(compose)).render(
+                    **compose_module._compose_render_context(info))
+            renders = True
+        except Exception:
+            renders = False
+        return kept, renders
+
+    def test_a_coercing_guard_is_popped(self):
+        for value in (
+            '{{ "true" if smtp.port|int == 465 else "false" }}',
+            '{% if smtp.port|int > 0 %}a{% else %}b{% endif %}',
+            '{% if smtp.port > 25 %}a{% else %}b{% endif %}',
+            '{% if smtp.port + 1 %}a{% endif %}',
+            '{% if oidc.port|round > 0 %}a{% else %}b{% endif %}',
+            '{% if oidc.port|abs %}a{% endif %}',
+        ):
+            with self.subTest(value=value):
+                kept, renders = self._kept_and_renders(value)
+                self.assertFalse(kept)
+                self.assertTrue(renders)
+
+    def test_a_guard_that_only_TESTS_is_still_exempt(self):
+        # The exemption is why 8 shipping entries keep their mail-off
+        # settings instead of having them stripped, so it must survive.
+        for value in (
+            '{{ "true" if smtp.tls_mode == "starttls" else "false" }}',
+            '{% if smtp %}on{% else %}off{% endif %}',
+            '{% if smtp.host %}x{% else %}y{% endif %}',
+            '{% if smtp.host != "" %}a{% else %}b{% endif %}',
+            '{{ "a" if smtp.host.startswith("h") else "b" }}',
+        ):
+            with self.subTest(value=value):
+                kept, renders = self._kept_and_renders(value)
+                self.assertTrue(kept)
+                self.assertTrue(renders)
+
+
+class TheScannerReachesEveryDereferenceShapeTests(TestCase):
+    """Three input shapes a mutation audit found unpinned.
+
+    Each is a real dereference of an unset integration, so each must be
+    popped: left in, it renders present-but-empty, which is the
+    glitchtip `smtp://:@` failure class.
+    """
+
+    def _kept(self, env):
+        compose = {'services': {'a': {'environment': env}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def test_a_starred_call_argument_forfeits_the_guard_exemption(self):
+        # `_call_consumes` reads `args` and `kwargs`; a guard can hand
+        # the mapping over as `*args` or `**kwargs` just as well.
+        for value in (
+            '{% set l=[] %}{% if l.extend(*smtp) %}{% endif %}{{ l[0] }}',
+            '{% set d={} %}{% if d.update(**smtp) %}{% endif %}{{ d.host }}',
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self._kept({'K': value}), {})
+
+    def test_a_statement_only_value_is_scanned(self):
+        # No `{{` anywhere: the dereference lives in the `for` iterable.
+        # The scan gate has to admit `{%` too, and every other statement
+        # test happened to also contain `{{`.
+        self.assertEqual(
+            self._kept({'K': '{% for h in smtp.hosts %}x{% endfor %}'}), {})
+
+    def test_a_list_form_value_containing_an_equals_sign_is_scanned(self):
+        # `KEY=value` splits ONCE: a value that itself contains `=` is
+        # otherwise truncated, and the reference in its tail is missed.
+        self.assertEqual(self._kept(['K=a={{ smtp.host }}']), [])
+
+
 class ExploratoryRendersAreSandboxedTests(TestCase):
     """The pre-strip render evaluates text the strip pass then DELETES.
 
@@ -1301,9 +1399,8 @@ class AGuardCanLeakThroughACallArgumentTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -1396,9 +1493,8 @@ class DominationWasTriedAndWithdrawnTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -1459,9 +1555,8 @@ class TheReadRuleIsCompleteByConstructionTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -1754,9 +1849,8 @@ class TheAcceptedOverPopTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2038,9 +2132,8 @@ class ConstructScanningTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2108,9 +2201,8 @@ class DelimiterInsideStringLiteralTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2181,9 +2273,8 @@ class NotOurVariableTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2232,9 +2323,8 @@ class ShadowedNameIsNotPoppedTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2277,9 +2367,8 @@ class CallParenthesisTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2330,9 +2419,8 @@ class NestedBracesTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2365,9 +2453,8 @@ class ReferenceFormTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))
@@ -2678,9 +2765,8 @@ class JinjaFormsTheContractCoversTests(TestCase):
 
     def _survives(self, value, **names):
         # `names` are the OTHER context names the case assumes exist.
-        # The probe leaves an unbound name undefined, exactly as the
-        # real render does, so a guard on `config` or `feature` means
-        # something different depending on whether it is bound at all.
+        # They go into the render context; the pop decision itself is a
+        # parse and never consults them.
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context(
             dict({'id': 'i1', 'integrations': {}}, **names))

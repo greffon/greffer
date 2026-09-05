@@ -1,6 +1,5 @@
 import yaml
 import asyncio
-import time
 import copy
 import re
 import json
@@ -527,29 +526,16 @@ def _call_consumes(value, name):
     return False
 
 
-# `Import`/`FromImport` were here and are NOT: `_COMPOSE_RENDER_ENV` has no
-# loader, so `{% import 'x' as v %}` parses and then always raises
-# `TypeError: no loader for this environment specified` -- in the unset
-# attempt and in every populated retry alike. The probe answers "keeps"
-# either way, so listing them changed no outcome any compose can reach.
-
-
-# The ONE environment the compose is rendered in -- by the guard, by
-# the probe, and by `create_compose` itself.
+# The ONE environment the compose is rendered in -- by the document
+# guard and by `create_compose` itself.
 #
 # ONE, because the guard's whole claim is "the question I ask is the
-# question the render will ask". Two environments made that false in
-# both directions, and both were 500s at `/start/` on composes `main`
-# deploys:
-#
-#   permissive probe -> the sandbox resolved `"".__class__` to
-#   Undefined, so `{{ "a" if ("".__class__|length and smtp.host)
-#   else "b" }}` rendered `b` and the key was KEPT; the real render got
-#   the type object and `|length` raised.
-#
-#   strict probe -> a value the sandbox refuses but a plain render
-#   accepts (`{{ "ab".__len__() }}`) made the pre-strip document look
-#   unrenderable, which silently disables the undo net.
+# question the render will ask". While these were two environments that
+# claim was false in both directions, and both ways were 500s at
+# `/start/` on composes `main` deploys: a value the guard's environment
+# accepted but the deploy's refused was kept and then failed, and one
+# the guard refused made the document look unrenderable, which silently
+# disabled the net below.
 #
 # SANDBOXED, because catalog text is community-controlled and this
 # module already sandboxes baked files against exactly this
@@ -564,6 +550,56 @@ def _call_consumes(value, name):
 # IDENTICALLY sandboxed and unsandboxed, in both the configured and
 # unset scenarios (64/64).
 _COMPOSE_RENDER_ENV = SandboxedEnvironment()
+
+
+# Operations that RAISE on `_UnsetField` instead of answering falsily.
+# The guard exemption assumes a guard renders correctly when the
+# integration is unset, and for bare truthiness and `==`/`!=` it does.
+# It does not for these: `{{ "true" if smtp.port|int == 465 else
+# "false" }}` raises UndefinedError, and `main` pops that key and
+# deploys. Reproduced against main before this was written.
+_COERCING_NODES = (
+    nodes.Filter,
+    nodes.Add, nodes.Sub, nodes.Mul, nodes.Div, nodes.FloorDiv,
+    nodes.Mod, nodes.Pow, nodes.Neg, nodes.Pos,
+)
+_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne'})
+
+
+def _guard_coerces(value, name):
+    """Does this guard apply an operation to the type that RAISES unset?
+
+    The exemption exists because a guard on an unset integration renders
+    the "off" branch rather than failing -- true for `{% if smtp %}` and
+    for `== "starttls"`, which is the shape eight shipping entries use.
+    It is false the moment the guard coerces a FIELD: `|int`, `|round`,
+    `|abs`, arithmetic, or an ordering comparison all raise through
+    `_UnsetField`, and the key is then kept for the render to die on.
+
+    Ordering, not equality: `==` and `!=` on an Undefined answer False,
+    which is why the catalog's `== "starttls"` guards are safe and must
+    stay exempt.
+    """
+    # `value` is whatever sits in the slot: a node, a list of them, or
+    # None -- `For.test` is None whenever the loop has no `if` filter,
+    # and iterating that raised, which `_dereferences` then swallowed
+    # into "not a dereference" and kept every such key.
+    candidates = value if isinstance(value, (list, tuple)) else [value]
+    for node in candidates:
+        if not isinstance(node, nodes.Node):
+            continue
+        for candidate in ([node] + list(node.find_all(nodes.Node))):
+            reaches = any(
+                n.name == name for n in candidate.find_all(nodes.Name))
+            if not reaches:
+                continue
+            if isinstance(candidate, _COERCING_NODES):
+                return True
+            if (isinstance(candidate, nodes.Compare)
+                    and any(op.op not in _SAFE_COMPARISON_OPS
+                            for op in candidate.ops)):
+                return True
+    return False
 
 
 def _reads(ast, name):
@@ -625,11 +661,28 @@ def _reads(ast, name):
         for field, value in node.iter_fields():
             child_guarded = guarded or (
                 (type(node), field) in _GUARD_SLOTS
-                and not _call_consumes(value, name))
+                and not _call_consumes(value, name)
+                and not _guard_coerces(value, name))
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
                     stack.append((item, child_guarded))
     return False
+
+
+def _why_it_will_not_render(compose, render_context):
+    """The render failure as text, for the restore's log line.
+
+    `_document_renders` answers yes/no and throws the exception away,
+    which left an operator with "the strip broke it" and no cause. This
+    re-runs the same render only to name the failure, on the path that
+    has already decided to restore.
+    """
+    try:
+        _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose)).render(
+            **copy.deepcopy(render_context))
+    except Exception as exc:
+        return '%s: %s' % (type(exc).__name__, exc)
+    return 'no longer reproducible'
 
 
 def _document_renders(compose, render_context):
@@ -927,12 +980,6 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             for nested in value:
                 yield from _strings_in(nested)
 
-    # A value sees only the `{% set %}` statements BEFORE it. Prefixing
-    # every one of them defined names the real render does not have
-    # there yet: with `A_GUARD` reading `feature` and a later `Z_SET`
-    # defining it, the render evaluates `A_GUARD` with `feature`
-    # undefined and produces `off`, while the probe reached the unset
-    # field and dropped a key that renders fine.
     # Whether the DOCUMENT is a valid template, which is what decides
     # how to read a value that will not parse on its own. See
     # `_dereferences`.
@@ -965,11 +1012,14 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         )
 
 
+    popped = []
+
     def _log_pop(key, name, matched):
         # The types that MATCHED, not every unset type: on a fresh
         # instance both smtp and oidc are unset, so naming the whole set
         # would report a key that references only oidc as
         # "unset type: smtp, oidc" and make the field noise.
+        popped.append('%s.%s' % (name, key))
         logger.info(
             'integrations: dropping env %s from service %s '
             '(references unset type: %s)',
@@ -1012,10 +1062,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     # for every input that exists, and a comprehensible one for those
     # that do not.
     if snapshot is not None and not _document_renders(compose, render_context):
+        # The restore SUCCEEDS, so the deploy then works -- with those
+        # keys present and empty instead of absent. This line is the
+        # only signal that the instance is quietly degraded, so it
+        # carries the cause and the keys, not just the id.
         logger.error(
             'integrations: the env strip broke the compose document for '
-            '%s; restoring every popped key and deploying it unchanged',
+            '%s (%s); restoring %s, which will render empty rather than '
+            'being absent',
             greffon_info.get('id'),
+            _why_it_will_not_render(compose, render_context),
+            ', '.join(popped) or 'nothing',
         )
         compose.clear()
         compose.update(snapshot)
