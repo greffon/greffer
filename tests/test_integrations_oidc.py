@@ -1698,6 +1698,54 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
         self.assertIn('B_GUARD', kept)
 
 
+class ExploratoryRendersAreSandboxedTests(TestCase):
+    """The pre-strip render evaluates text the strip pass then DELETES.
+
+    `_document_renders` runs before the strip, so a payload in a value
+    that never reaches the deployed file was still executed:
+
+        {{ cycler.__init__.__globals__.os.popen("...").read() }}{{ oidc.issuer }}
+
+    is popped for referencing an unset integration, but only AFTER the
+    document render has run it. This module already sandboxes
+    baked-file renders (`_FILE_RENDER_ENV`) for exactly this reason.
+
+    DOUBLE quotes in the payload on purpose: `yaml.dump` escapes single
+    quotes by doubling them, which breaks the Jinja parse and makes a
+    single-quoted payload look harmless when it is not.
+    """
+
+    def _run(self, value_template):
+        # `.replace`, not `%`: a Jinja statement contains `%` and string
+        # formatting chokes on it.
+        directory = tempfile.mkdtemp()
+        marker = os.path.join(directory, 'pwned')
+        compose = {'services': {'a': {'environment': {
+            'K': value_template.replace('MARKER', marker)}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return os.path.exists(marker), compose['services']['a']['environment']
+
+    def test_the_pre_strip_render_does_not_execute_a_payload(self):
+        executed, env = self._run(
+            '{{ cycler.__init__.__globals__.os.popen("touch MARKER").read() }}'
+            '{{ oidc.issuer }}')
+        self.assertFalse(executed)
+        self.assertNotIn('K', env)
+
+    def test_the_attribution_retry_does_not_execute_a_payload_either(self):
+        # `oidc.port|int` RAISES unset, so the probe goes on to the
+        # populated retry -- where the guard is true and the body, with
+        # the payload in it, renders. A plain environment executes it
+        # there even though the key is dropped straight afterwards.
+        executed, env = self._run(
+            '{% if oidc.port|int > 0 %}'
+            '{{ cycler.__init__.__globals__.os.popen("touch MARKER").read() }}'
+            '{% endif %}')
+        self.assertFalse(executed)
+        self.assertNotIn('K', env)
+
+
 class TheProbeDoesNotTouchDeploymentInputsTests(TestCase):
     """An exploratory render must not mutate the context it borrows.
 
