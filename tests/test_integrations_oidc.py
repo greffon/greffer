@@ -1255,6 +1255,66 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class AGuardWhoseTESTCoercesIsNotExemptTests(TestCase):
+    """`nodes.Test` is a guard slot, and some tests coerce.
+
+    Found by enumerating every builtin test in the environment against
+    the unset binding rather than by picking examples. `is gt`, `is ge`,
+    `is lt`, `is le`, `is even`, `is odd` and `is divisibleby` all raise
+    on an unset field; every other builtin test answers harmlessly.
+
+    Two levels had to know: the test sitting in someone else's guard
+    slot, and the test's OWN operand slot -- `(Test, 'node')` is a guard
+    slot too, so a coercing test re-exempted its own operand and the
+    withdrawal was silently undone.
+    """
+
+    def _kept_and_renders(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        kept = 'K' in compose['services']['a']['environment']
+        try:
+            compose_module._COMPOSE_RENDER_ENV.from_string(
+                yaml.dump(compose)).render(
+                    **compose_module._compose_render_context(info))
+            renders = True
+        except Exception:
+            renders = False
+        return kept, renders
+
+    def test_a_coercing_test_is_popped(self):
+        for value in (
+            '{% if smtp.port is gt(1) %}a{% else %}b{% endif %}',
+            '{% if smtp.port is ge(1) %}a{% else %}b{% endif %}',
+            '{% if smtp.port is lt(1) %}a{% else %}b{% endif %}',
+            '{% if smtp.port is even %}a{% else %}b{% endif %}',
+            '{% if smtp.port is odd %}a{% else %}b{% endif %}',
+            '{% if smtp.port is divisibleby(2) %}a{% else %}b{% endif %}',
+            '{% if smtp.port is not gt(1) %}a{% else %}b{% endif %}',
+            '{{ "a" if oidc.port is even else "b" }}',
+            '{% for k in [1] if smtp.port is gt(1) %}x{% endfor %}',
+        ):
+            with self.subTest(value=value):
+                kept, renders = self._kept_and_renders(value)
+                self.assertFalse(kept)
+                self.assertTrue(renders)
+
+    def test_a_test_that_does_not_coerce_stays_exempt(self):
+        # Not the whole node type: these answer harmlessly unset, and
+        # popping them would strip settings that work.
+        for value in (
+            '{% if smtp is defined %}a{% else %}b{% endif %}',
+            '{% if smtp is mapping %}a{% else %}b{% endif %}',
+            '{% if smtp.host is string %}a{% else %}b{% endif %}',
+            '{% if smtp.host is none %}a{% else %}b{% endif %}',
+        ):
+            with self.subTest(value=value):
+                kept, renders = self._kept_and_renders(value)
+                self.assertTrue(kept)
+                self.assertTrue(renders)
+
+
 class AGuardThatCoercesAFieldIsNotExemptTests(TestCase):
     """The guard exemption assumed too much.
 
