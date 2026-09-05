@@ -245,6 +245,78 @@ class DeleteUnsetIntegrationEnvKeysTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
 
 
+class OidcIsAKnownIntegrationTypeTests(TestCase):
+    """`oidc` alongside `smtp`, so a catalog entry can declare OIDC env
+    keys that are stripped when no OIDC integration is configured.
+
+    The manager cannot link one to an instance yet (`GreffonInstance`
+    has a single `smtp_config` FK), so in practice `oidc` arrives unset
+    on every instance and these keys are always stripped -- which is
+    the correct behaviour for an unconfigured integration, and is the
+    whole of what this change enables until per-instance linking lands.
+    """
+
+    def _strip(self, env, integrations):
+        compose = {'services': {'app': {'environment': dict(env)}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['app']['environment'], info
+
+    def test_oidc_is_registered(self):
+        self.assertIn('oidc', KNOWN_INTEGRATION_TYPES)
+
+    def test_an_unset_oidc_reference_is_stripped(self):
+        for value in ('{{ oidc.issuer }}',
+                      "{{ oidc['issuer'] }}",
+                      '{{ oidc.issuer }}/.well-known/openid-configuration',
+                      '{{ oidc.issuer.split("/")[0] }}'):
+            with self.subTest(value=value):
+                env, _ = self._strip({'K': value, 'OTHER': 'plain'}, {})
+                self.assertEqual(env, {'OTHER': 'plain'})
+
+    def test_a_configured_oidc_renders_its_issuer(self):
+        issuer = 'https://kc.example.com/realms/main'
+        env, info = self._strip(
+            {'ISS': '{{ oidc.issuer }}',
+             'URL': '{{ oidc.issuer }}/.well-known/openid-configuration'},
+            {'oidc': {'issuer': issuer}})
+        rendered = yaml.safe_load(
+            Template(yaml.dump({'services': {'app': {'environment': env}}}))
+            .render(**info))
+        self.assertEqual(
+            rendered['services']['app']['environment'],
+            {'ISS': issuer,
+             'URL': issuer + '/.well-known/openid-configuration'})
+
+    def test_an_empty_oidc_config_counts_as_unset(self):
+        # Same rule `smtp` already follows: half a config is not a
+        # config, so the env keys go rather than rendering empty.
+        for integrations in ({'oidc': {}}, {'oidc': None}):
+            with self.subTest(integrations=integrations):
+                env, _ = self._strip({'K': '{{ oidc.issuer }}'}, integrations)
+                self.assertEqual(env, {})
+
+    def test_smtp_and_oidc_are_stripped_independently(self):
+        env, _ = self._strip(
+            {'S': '{{ smtp.host }}', 'O': '{{ oidc.issuer }}', 'P': 'plain'},
+            {'smtp': {'host': 'mail.example.com'}})
+        self.assertEqual(sorted(env), ['P', 'S'])
+
+    def test_an_oidc_destination_is_stripped_by_the_metadata_pass(self):
+        # Pass 1 works off `destinations`, so it needs the type to be
+        # known even when the compose value is not a Jinja reference.
+        compose = {'services': {'app': {'environment': {
+            'OIDC_ISSUER': 'placeholder', 'OTHER': 'plain'}}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'OIDC_ISSUER'}]}]})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         {'OTHER': 'plain'})
+
+
 class GreffonInfoIntegrationsThreadingTests(TestCase):
     """`create_greffon_info` must surface the start-request's
     `integrations` field into greffon_info so the render pipeline can

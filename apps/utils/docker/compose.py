@@ -154,10 +154,23 @@ def get_greffon_path(greffon_info):
 
 # Feature #4 (integrations): the set of integration types the catalog
 # may reference via `{{ <type>.<field> }}` in compose YAML AND via
-# `destination.type: <type>` in metadata.json. V1 ships SMTP only; new
-# types slot in additively here AND in the manager (per-type FK on
-# GreffonInstance) AND in the catalog validator.
-KNOWN_INTEGRATION_TYPES = ('smtp',)
+# `destination.type: <type>` in metadata.json. New types slot in
+# additively here AND in the manager (per-type FK on GreffonInstance)
+# AND in the catalog validator.
+#
+# `oidc` exposes ONE field, `issuer` -- the manager's OIDC integration
+# has no others yet, since per-instance client registration does not
+# exist. An entry needing `client_id`/`client_secret` cannot work, and
+# the catalog validator rejects those field names for that reason.
+#
+# Note what adding a type here does NOT do: the manager still has to
+# link one to an instance. `GreffonInstance` carries a single
+# `smtp_config` FK (`limit_choices_to={'type': 'smtp'}`), so `oidc`
+# arrives unset on every instance today and its env keys are stripped.
+# That is the correct behaviour for an unconfigured integration, and it
+# is also why an OIDC greffon cannot yet receive an issuer: the
+# per-instance link is platform-identity Feature #3, not this line.
+KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
 def _is_integration_set(value):
