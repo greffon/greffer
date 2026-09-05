@@ -611,10 +611,30 @@ class ParseFailureFallbackTests(TestCase):
         with patch('apps.utils.docker.compose.Environment') as env_cls:
             env_cls.return_value.parse.side_effect = Boom('from the parser')
             try:
-                kept = self._kept('{{ oidc.issuer }}')
+                self._kept('{{ oidc.issuer }}')
             except Boom:
                 self.fail('a parser exception escaped _dereferences')
-        self.assertFalse(kept)
+
+    def test_an_unparseable_value_in_an_unparseable_document_is_popped(self):
+        # Nothing is being protected: the document already fails to
+        # render, so popping cannot break a working deploy and a
+        # malformed value is better dropped than left to fail the start.
+        self.assertFalse(self._kept('{{ oidc.issuer }'))
+
+    def test_an_unparseable_value_in_a_VALID_document_is_kept(self):
+        # It is a fragment of a construct that straddles two env values.
+        # Popping the opening half left a dangling `{% endif %}` and a
+        # TemplateSyntaxError at /start/, where main deploys.
+        compose = {'services': {'a': {'environment': {
+            'A_PORT': '{{ smtp.port|int }}',
+            'B_OPEN': '{% if smtp %}',
+            'C_CLOSE': '{% endif %}'}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        kept = compose['services']['a']['environment']
+        self.assertEqual(sorted(kept), ['B_OPEN', 'C_CLOSE'])
+        compose_module._COMPOSE_ENV.from_string(yaml.dump(compose)).render(
+            **compose_module._compose_render_context(info))
 
     def test_a_keyboard_interrupt_is_NOT_swallowed(self):
         # `Exception`, not `BaseException`: the broad catch is about the
@@ -1696,6 +1716,39 @@ class ANameDefinedByAnotherEnvValueTests(TestCase):
             'B_GUARD': '{% if feature and oidc.port|int > 0 %}x{% endif %}',
         })
         self.assertIn('B_GUARD', kept)
+
+
+class TheProbePassIsBoundedTests(TestCase):
+    """`main` answered this with one regex; the probe renders.
+
+    A compose with thousands of guarded values, or guards with hundreds
+    of operands, turned a microsecond pass into seconds of CPU inside
+    `/start/` -- on a worker that runs `--workers 1` and holds the
+    per-instance lock across the call.
+
+    Past the budget the answer falls back to `main`'s: a value that
+    mentions the type is popped. That is the safe direction of the
+    asymmetry, and the verdict this catalog already ships with.
+    """
+
+    # A guard the probe KEEPS: it renders `off` with oidc unset. A
+    # guard that RAISES unset would be popped either way and would not
+    # tell the two paths apart.
+    GUARD = '{% if oidc %}on{% else %}off{% endif %}'
+
+    def _strip(self, count):
+        compose = {'services': {'a': {'environment': {
+            'K%d' % i: self.GUARD for i in range(count)}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def test_past_the_budget_the_answer_falls_back_to_popping(self):
+        with patch.object(compose_module, '_PROBE_TIME_BUDGET', -1.0):
+            self.assertEqual(self._strip(3), {})
+
+    def test_within_the_budget_the_probe_still_decides(self):
+        self.assertEqual(len(self._strip(3)), 3)
 
 
 class ExploratoryRendersAreSandboxedTests(TestCase):
