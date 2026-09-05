@@ -46,7 +46,7 @@ class GreffonStartRequest(BaseModel):
     ports: dict[str, Any] = Field(default_factory=dict)
     # Feature #4 (integrations): per-type config blobs the manager
     # resolves from the user's selected Integration rows. Each top-level
-    # key is an integration type ("smtp", later "telegram", "slack");
+    # key is an integration type ("smtp", "oidc", later "telegram");
     # the value is the type-specific config (e.g. for smtp: host, port,
     # username, password, from_address, tls_mode).
     #

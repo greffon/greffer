@@ -158,15 +158,20 @@ def get_greffon_path(greffon_info):
 # additively here AND in the manager (per-type FK on GreffonInstance)
 # AND in the catalog validator.
 #
-# `oidc` exposes ONE field, `issuer` -- the manager's OIDC integration
-# has no others yet, since per-instance client registration does not
-# exist. An entry needing `client_id`/`client_secret` cannot work, and
-# the catalog validator rejects those field names for that reason.
+# `oidc` exposes ONE field, `issuer`. The manager's OIDC integration
+# type carries only that (`apps/integrations/types/oidc.py`), because
+# per-instance client registration does not exist -- so an entry
+# needing `client_id`/`client_secret` cannot work. The catalog
+# validator gains a matching field allowlist in greffon-catalog#88;
+# until that merges, nothing on the catalog side rejects those names.
 #
 # Note what adding a type here does NOT do: the manager still has to
-# link one to an instance. `GreffonInstance` carries a single
-# `smtp_config` FK (`limit_choices_to={'type': 'smtp'}`), so `oidc`
-# arrives unset on every instance today and its env keys are stripped.
+# link one to an instance. An operator CAN create an OIDC integration
+# (the type is registered on manager main), but `GreffonInstance`
+# carries a single `smtp_config` FK (`limit_choices_to={'type':
+# 'smtp'}`) and `_build_integrations_payload` has one hardcoded smtp
+# branch -- so `oidc` arrives unset on every instance today and its env
+# keys are stripped.
 # That is the correct behaviour for an unconfigured integration, and it
 # is also why an OIDC greffon cannot yet receive an issuer: the
 # per-instance link is platform-identity Feature #3, not this line.
