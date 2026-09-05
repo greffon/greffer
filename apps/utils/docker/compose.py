@@ -703,9 +703,12 @@ _DEFINING_NODES = (
     nodes.Assign,
     nodes.AssignBlock,
     nodes.Macro,
-    nodes.Import,
-    nodes.FromImport,
 )
+# `Import`/`FromImport` were here and are NOT: `_COMPOSE_ENV` has no
+# loader, so `{% import 'x' as v %}` parses and then always raises
+# `TypeError: no loader for this environment specified` -- in the unset
+# attempt and in every populated retry alike. The probe answers "keeps"
+# either way, so listing them changed no outcome any compose can reach.
 
 
 # The ONE environment the compose is rendered in -- by the guard, by

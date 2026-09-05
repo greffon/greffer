@@ -1447,23 +1447,26 @@ class AGuardWhoseTestCannotEvaluateStillPopsTests(TestCase):
                 self.assertTrue(self._survives(value))
 
     def test_the_probe_does_not_blame_the_type_for_other_context(self):
-        # Everything but the integration is bound to a total stand-in,
-        # so a value that needs real context is not popped for failing
-        # in a probe that cannot supply it.
+        # A value that needs real context is not popped for failing in
+        # a probe that lacks it: the probe binds the REAL value of every
+        # other name, so `config.PORT` is what the render will see.
         self.assertTrue(self._survives(
-            '{% if smtp %}{{ config.PORT|int }}{% else %}0{% endif %}'
-            if False else
-            '{% if smtp %}on{% else %}{{ config.PORT|int }}{% endif %}'))
+            '{% if smtp %}on{% else %}{{ config.PORT|int }}{% endif %}',
+            config={'PORT': '8080'}))
 
 
 class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
     """The probe must not pop a value that never mentions the type.
 
-    It binds every OTHER name to a stand-in, and the stand-in cannot do
-    everything a real value can. `{{ config|tojson }}` fails only
-    because the stand-in will not serialise -- the key was removed while
-    the real render produced `{"X": "1"}`. A value the integration does
-    not appear in cannot fail *because of* the integration.
+    A value the integration does not appear in cannot fail *because of*
+    the integration, so the probe answers early for it.
+
+    This used to matter far more: every other name was bound to a
+    stand-in object, and `{{ config|tojson }}` failed only because that
+    stand-in would not serialise -- the key was removed while the real
+    render produced `{"X": "1"}`. The stand-ins are gone (the probe
+    binds the real values now), and the early answer stays because it
+    is still the honest one.
     """
 
     def _survives(self, value, **names):
@@ -1477,12 +1480,14 @@ class TheProbeOnlyJudgesTheIntegrationTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return 'K' in compose['services']['a']['environment']
 
-    def test_an_unrelated_operand_that_trips_the_stand_in_is_not_blamed(self):
-        # A stand-in is not a real value. `{% if config|tojson and oidc %}`
-        # fails the probe because the STAND-IN for `config` will not
-        # serialise, not because of `oidc` -- and it renders `off`
-        # against a real dict. A failure counts only if the same render
-        # succeeds once the integration is populated.
+    def test_an_unrelated_operand_is_not_blamed_on_the_integration(self):
+        # A failure counts only if the same render SUCCEEDS once the
+        # integration is populated. Historically this was the case that
+        # forced the rule: every other name was a stand-in, and
+        # `{% if config|tojson and oidc %}` failed because that stand-in
+        # would not serialise, not because of `oidc`. `config` is
+        # unbound here, so the guard short circuits and the value ships
+        # either way -- the attribution rule is what keeps it.
         for value in ('{% if config|tojson and oidc %}on{% else %}off{% endif %}',
                       '{% if config|tojson and smtp.host %}a{% else %}b{% endif %}'):
             with self.subTest(value=value):
@@ -1749,6 +1754,35 @@ class TheProbePassIsBoundedTests(TestCase):
 
     def test_within_the_budget_the_probe_still_decides(self):
         self.assertEqual(len(self._strip(3)), 3)
+
+
+class AnEmptyConfigIsNotConfiguredTests(TestCase):
+    """`{}` means the user did not pick the integration.
+
+    `_is_integration_set` says so and its docstring explains why (half a
+    config renders env vars the greffon then fails on), but nothing in
+    this file pinned it. Treating `{}` as CONFIGURED keeps the key and
+    leaves the name bound to an empty mapping, so `/start/` 500s on the
+    field access.
+    """
+
+    def _strip(self, integrations):
+        compose = {'services': {'a': {'environment': {
+            'K': '{{ oidc.issuer }}'}}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a']['environment']
+
+    def test_an_empty_config_is_stripped_like_an_absent_one(self):
+        for integrations in ({'oidc': {}}, {'oidc': None}, {}):
+            with self.subTest(integrations=integrations):
+                self.assertEqual(self._strip(integrations), {})
+
+    def test_a_populated_config_is_kept(self):
+        self.assertEqual(
+            self._strip({'oidc': {'issuer': 'https://k/realms/r'}}),
+            {'K': '{{ oidc.issuer }}'})
 
 
 class ExploratoryRendersAreSandboxedTests(TestCase):
