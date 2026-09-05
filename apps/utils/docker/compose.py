@@ -565,6 +565,18 @@ _COERCING_NODES = (
 )
 _SAFE_COMPARISON_OPS = frozenset({'eq', 'ne'})
 
+# Tests that coerce their operand, found by enumerating every builtin
+# test in `_COMPOSE_RENDER_ENV` against the unset binding. `nodes.Test`
+# is a GUARD SLOT, so without naming these the withdrawal never saw
+# them: `{% if smtp.port is gt(1) %}` kept its key and 500'd. Not the
+# whole node type -- `is defined`, `is string`, `is mapping`, `is eq`
+# and the rest answer harmlessly on an unset field, and killing the
+# exemption for those would strip settings that work.
+_COERCING_TESTS = frozenset({
+    'gt', 'greaterthan', 'ge', 'lt', 'lessthan', 'le',
+    'even', 'odd', 'divisibleby',
+})
+
 
 def _guard_coerces(value, name):
     """Does this guard apply an operation to the type that RAISES unset?
@@ -598,6 +610,9 @@ def _guard_coerces(value, name):
             if (isinstance(candidate, nodes.Compare)
                     and any(op.op not in _SAFE_COMPARISON_OPS
                             for op in candidate.ops)):
+                return True
+            if (isinstance(candidate, nodes.Test)
+                    and candidate.name in _COERCING_TESTS):
                 return True
     return False
 
@@ -659,8 +674,17 @@ def _reads(ast, name):
                 continue
             return True
         for field, value in node.iter_fields():
-            child_guarded = guarded or (
+            # `(Test, 'node')` is itself a guard slot, so a coercing
+            # test re-exempted its own operand one level down and the
+            # withdrawal above never took effect. The test's NAME has to
+            # be consulted here, where its operand is being descended
+            # into, not only where the test sits in someone else's slot.
+            slot_guards = (
                 (type(node), field) in _GUARD_SLOTS
+                and not (isinstance(node, nodes.Test)
+                         and node.name in _COERCING_TESTS))
+            child_guarded = guarded or (
+                slot_guards
                 and not _call_consumes(value, name)
                 and not _guard_coerces(value, name))
             for item in (value if isinstance(value, list) else [value]):
