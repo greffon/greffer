@@ -139,7 +139,7 @@ class DeleteUnsetOIDCEnvKeysTests(TestCase):
 
     def test_bracket_form_reference_is_stripped(self):
         # `{{ oidc['issuer'] }}` is valid Jinja and semantically the same
-        # as the attribute form, so pass 2's regex must catch it too.
+        # as the attribute form, so pass 2's scan must catch it too.
         compose = {
             'services': {
                 'grafana': {'environment': {'UNDECLARED': "{{ oidc['issuer'] }}"}},
@@ -747,9 +747,12 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         )
         self.assertEqual(compose['services']['app']['environment'], {})
 
-    def test_a_split_block_is_undone_but_a_clean_pop_is_kept(self):
-        # The point of scoping the undo: `H` is a clean pop and survives,
-        # while the straddling half that broke the document is restored.
+    def test_a_guard_half_is_not_popped_so_the_clean_pop_stands(self):
+        # No restore happens here, despite the name this test used to
+        # carry. `A` is a GUARD (`{% if oidc %}`) and is kept, so the
+        # document never breaks and `H` pops normally. The wholesale
+        # restore, and what it costs, is
+        # `test_a_clean_pop_beside_it_is_restored_TOO`.
         compose, info = self._run({
             'A': '{% if oidc %}', 'B': 'x', 'C': '{% endif %}',
             'H': '{{ oidc.issuer }}',
@@ -783,6 +786,9 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         # only signal that the instance is degraded. It has to say WHY
         # and WHICH keys, or an operator cannot act on it.
         self.assertIn('TemplateSyntaxError', joined)
+        # The CLASS name alone is satisfied by a log line that drops the
+        # message, which is the half an operator actually needs.
+        self.assertIn('Missing end of comment tag', joined)
         self.assertIn('app.B', joined)
         self.assertIn('render empty rather than being absent', joined)
 
@@ -934,11 +940,14 @@ class ACallOnAnUnsetFieldRendersNothingTests(TestCase):
 class DuplicateListFormKeysTests(TestCase):
     """A list-form `environment` may carry the same NAME twice.
 
-    The undo used to diff by key name, so popping one occurrence left
-    the name still present and the pop read as "nothing was popped". It
-    was then never replayed and the referencing entry came back -- a
-    silent under-pop rendering `EMAIL_URL=smtp://`, the malformed URL
-    the strip exists to prevent, while the guard reported success.
+    Only one of the two entries references the integration, so a scan
+    that works by NAME rather than by entry pops the wrong one, or
+    reports "nothing was popped" while the referencing entry survives
+    and renders `EMAIL_URL=smtp://` -- the malformed URL the strip
+    exists to prevent.
+
+    (The key-diffing undo this once guarded against is gone; the shape
+    it protected is still worth pinning, which is why the class stays.)
     """
 
     DUPES = ['EMAIL_URL=static', 'EMAIL_URL=smtp://{{ smtp.host }}',
@@ -1140,9 +1149,10 @@ class TheGuardRendersAgainstItsOwnCopyTests(TestCase):
 class TheContextIsCopiedPerRenderTests(TestCase):
     """Copying the guard's context ONCE was not enough.
 
-    The guard renders several times: before the strip, after it, and
-    once per undo trial. Sharing one copy across them means a catalog
-    expression that mutates the context corrupts every later verdict,
+    The guard renders twice -- before the strip and after it -- plus
+    once more to name the cause when the restore fires. Sharing one copy
+    across them means a catalog expression that mutates the context
+    corrupts every later verdict,
     so the guard answers a different question than `create_compose`
     will ask with its own fresh context. Both directions shipped bugs.
     """
@@ -1253,6 +1263,70 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
         self.assertEqual(
             self._strip({'oidc': {'issuer': 'https://k/realms/r'}}),
             {'K': '{{ oidc.issuer }}'})
+
+
+class EveryCoercingOperatorIsPinnedTests(TestCase):
+    """One case per member of `_COERCING_NODES`, not a sample.
+
+    A mutation audit removed each arithmetic node in turn and the suite
+    stayed green for eight of them: only `Filter` and `Add` were
+    exercised. Every one of those mutants is a kept key and a 500 at
+    `/start/`, so the list deserves a case per member rather than a
+    representative.
+    """
+
+    def _kept_and_renders(self, value):
+        compose = {'services': {'a': {'environment': {'K': value}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        kept = 'K' in compose['services']['a']['environment']
+        try:
+            compose_module._COMPOSE_RENDER_ENV.from_string(
+                yaml.dump(compose)).render(
+                    **compose_module._compose_render_context(info))
+            renders = True
+        except Exception:
+            renders = False
+        return kept, renders
+
+    def test_every_arithmetic_operator_withdraws_the_exemption(self):
+        for expression in ('oidc.port + 1', 'oidc.port - 1', 'oidc.port * 2',
+                           'oidc.port / 2', 'oidc.port // 2', 'oidc.port % 2',
+                           'oidc.port ** 2', '-oidc.port', '+oidc.port'):
+            with self.subTest(expression=expression):
+                kept, renders = self._kept_and_renders(
+                    '{%% if %s %%}x{%% else %%}y{%% endif %%}' % expression)
+                self.assertFalse(kept)
+                self.assertTrue(renders)
+
+    def test_every_ordering_comparison_withdraws_the_exemption(self):
+        for operator in ('>', '<', '>=', '<='):
+            expression = 'oidc.port %s 5' % operator
+            with self.subTest(expression=expression):
+                kept, renders = self._kept_and_renders(
+                    '{%% if %s %%}x{%% else %%}y{%% endif %%}' % expression)
+                self.assertFalse(kept)
+                self.assertTrue(renders)
+
+    def test_a_chained_comparison_withdraws_on_the_unsafe_link(self):
+        # `ops` holds both; `any` withdraws because one of them orders.
+        kept, renders = self._kept_and_renders(
+            '{% if oidc.port == 1 < 5 %}x{% else %}y{% endif %}')
+        self.assertFalse(kept)
+        self.assertTrue(renders)
+
+    def test_a_coercion_that_does_not_touch_the_type_is_not_blamed(self):
+        # The exemption is withdrawn only when the coercion REACHES the
+        # integration. Without that check this guard is popped, which
+        # discards a setting that renders perfectly well.
+        #
+        # `other` is a name, not a literal: `find_undeclared_variables`
+        # const-folds `(1|int)` to a Const before the rule ever sees it,
+        # so a literal operand would prove nothing.
+        kept, renders = self._kept_and_renders(
+            '{% if smtp and (other|int) %}on{% else %}off{% endif %}')
+        self.assertTrue(kept)
+        self.assertTrue(renders)
 
 
 class EveryBuiltinTestIsClassifiedTests(TestCase):
@@ -1483,7 +1557,12 @@ class ExploratoryRendersAreSandboxedTests(TestCase):
     def _run(self, value_template):
         # `.replace`, not `%`: a Jinja statement contains `%` and string
         # formatting chokes on it.
-        directory = tempfile.mkdtemp()
+        #
+        # A context manager, not `mkdtemp()`: this leaked a directory
+        # per run, and the assertion is `os.path.exists` INSIDE it, so a
+        # full or read-only temp filesystem would pass it for the wrong
+        # reason.
+        directory = self.enterContext(tempfile.TemporaryDirectory())
         marker = os.path.join(directory, 'pwned')
         compose = {'services': {'a': {'environment': {
             'K': value_template.replace('MARKER', marker)}}}}
