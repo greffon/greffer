@@ -6,9 +6,10 @@
 #   - _is_integration_set classifier (the unset/empty/set boundary).
 #   - _compute_integrations_context lifts each known type into the
 #     Jinja-context shape.
-#   - _delete_unset_integration_env_keys strips catalog-declared SMTP
-#     env keys when the user didn't pick an SMTP integration, in both
-#     mapping- and list-form `environment:` blocks.
+#   - _delete_unset_integration_env_keys strips catalog-declared
+#     integration env keys (SMTP and OIDC) when the user didn't pick
+#     that integration, in both mapping- and list-form `environment:`
+#     blocks, and leaves everything else alone.
 #   - End-to-end Jinja render: with the integration set, `{{ smtp.host }}`
 #     resolves to the dict's host; with it unset, the env key is gone.
 
@@ -263,8 +264,13 @@ class OidcIsAKnownIntegrationTypeTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return compose['services']['app']['environment'], info
 
-    def test_oidc_is_registered(self):
-        self.assertIn('oidc', KNOWN_INTEGRATION_TYPES)
+    def test_the_known_types_are_exactly_smtp_and_oidc(self):
+        # assertEqual, not assertIn. An accidental EXTRA entry here
+        # silently strips catalog env keys for a type nothing supplies
+        # -- `{{ ldap.url }}` would start disappearing -- and membership
+        # alone cannot see that. The catalog validator's parity tripwire
+        # asserts this same tuple in the same form.
+        self.assertEqual(KNOWN_INTEGRATION_TYPES, ('smtp', 'oidc'))
 
     def test_an_unset_oidc_reference_is_stripped(self):
         for value in ('{{ oidc.issuer }}',
@@ -298,10 +304,60 @@ class OidcIsAKnownIntegrationTypeTests(TestCase):
                 self.assertEqual(env, {})
 
     def test_smtp_and_oidc_are_stripped_independently(self):
+        # Values, not just key names: a comparison on `sorted(env)` alone
+        # would pass with the surviving reference corrupted.
         env, _ = self._strip(
             {'S': '{{ smtp.host }}', 'O': '{{ oidc.issuer }}', 'P': 'plain'},
             {'smtp': {'host': 'mail.example.com'}})
-        self.assertEqual(sorted(env), ['P', 'S'])
+        self.assertEqual(env, {'S': '{{ smtp.host }}', 'P': 'plain'})
+
+    def test_the_predicate_does_not_over_match(self):
+        # Each of these is a guard the predicate depends on, and each
+        # was unpinned -- the `\b`, the required `.`/`[` after the name,
+        # the `{{` prefilter, and the str check. Every one of them
+        # failing looks the same from outside: an env var vanishes.
+        for value in ('{{ foo_smtp.bar }}',   # \b: not our type
+                      '{{ oidc }}',           # the mapping, no field
+                      'oidc.issuer',          # no Jinja at all
+                      '{ oidc.issuer }'):     # not a Jinja expression
+            with self.subTest(value=value):
+                env, _ = self._strip({'K': value}, {})
+                self.assertEqual(env, {'K': value})
+
+    def test_a_non_string_env_value_is_left_alone(self):
+        env, _ = self._strip({'K': 5, 'L': True}, {})
+        self.assertEqual(env, {'K': 5, 'L': True})
+
+    def test_list_form_is_stripped_by_EACH_pass_independently(self):
+        # The existing list-form test supplies both a destination AND a
+        # Jinja value, so the two passes mask each other; neither branch
+        # was pinned on its own.
+        compose = {'services': {'app': {'environment': [
+            'K={{ oidc.issuer }}', 'OTHER=plain']}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['OTHER=plain'])
+
+        compose = {'services': {'app': {'environment': [
+            'OIDC_ISSUER=placeholder', 'OTHER=plain']}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'OIDC_ISSUER'}]}]})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['OTHER=plain'])
+
+    def test_a_list_entry_matching_on_the_KEY_side_is_kept(self):
+        # `oidc.issuer=...` is an env var NAME that happens to contain
+        # the token; only the value side is a Jinja reference.
+        compose = {'services': {'app': {'environment': [
+            'oidc.issuer={{ instance_url }}']}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['oidc.issuer={{ instance_url }}'])
 
     def test_an_oidc_destination_is_stripped_by_the_metadata_pass(self):
         # Pass 1 works off `destinations`, so it needs the type to be
