@@ -273,6 +273,13 @@ class OidcIsAKnownIntegrationTypeTests(TestCase):
         self.assertEqual(KNOWN_INTEGRATION_TYPES, ('smtp', 'oidc'))
 
     def test_an_unset_oidc_reference_is_stripped(self):
+        # The bracket spelling is stripped here, but an entry author
+        # should not lift it out of this test: in MAPPING-form
+        # `environment:` it cannot render once oidc IS configured,
+        # because `yaml.dump` doubles the inner single quotes and
+        # `oidc[''issuer'']` is a TemplateSyntaxError. Dot form, or
+        # list-form `environment:`, both work. The catalog documents
+        # the same workaround at nextcloud/1.0/docker-compose.yml:23.
         for value in ('{{ oidc.issuer }}',
                       "{{ oidc['issuer'] }}",
                       '{{ oidc.issuer }}/.well-known/openid-configuration',
@@ -302,6 +309,31 @@ class OidcIsAKnownIntegrationTypeTests(TestCase):
             with self.subTest(integrations=integrations):
                 env, _ = self._strip({'K': '{{ oidc.issuer }}'}, integrations)
                 self.assertEqual(env, {})
+
+    def test_a_truthy_NON_DICT_oidc_blob_counts_as_unset(self):
+        # Both cases above are FALSY, so they cannot tell whether
+        # `_is_integration_set` checks the TYPE or just truthiness.
+        # A manager that sent the issuer as a bare string would
+        # otherwise count as configured: the key survives, `oidc` binds
+        # to a str, and `{{ oidc.issuer }}` renders empty -- a var
+        # that is present and wrong, which is worse than absent.
+        for blob in ('https://id.example.com', ['issuer'], 42):
+            with self.subTest(blob=blob):
+                env, info = self._strip({'K': '{{ oidc.issuer }}'},
+                                        {'oidc': blob})
+                self.assertEqual(env, {})
+                self.assertEqual(info['oidc'], {})
+
+    def test_oidc_is_stripped_when_SMTP_is_the_configured_one(self):
+        # The other half of the independence claim. In the test above
+        # smtp is configured, so "kept because configured" and "kept
+        # because smtp is not a known type at all" look identical --
+        # a tuple of ('oidc',) alone passes it. Here smtp is the unset
+        # one, so only a tuple containing BOTH gives this answer.
+        env, _ = self._strip(
+            {'S': '{{ smtp.host }}', 'O': '{{ oidc.issuer }}', 'P': 'plain'},
+            {'oidc': {'issuer': 'https://id.example.com'}})
+        self.assertEqual(env, {'O': '{{ oidc.issuer }}', 'P': 'plain'})
 
     def test_smtp_and_oidc_are_stripped_independently(self):
         # Values, not just key names: a comparison on `sorted(env)` alone
