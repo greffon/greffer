@@ -1160,6 +1160,14 @@ class TheGuardRendersAgainstItsOwnCopyTests(TestCase):
         # Must not raise; the strip proceeds without the guard.
         _delete_unset_integration_env_keys(compose, info)
         self.assertNotIn('H', compose['services']['app']['environment'])
+        # The assertion above holds whichever way the uncopyable branch
+        # answers, so it does NOT pin the direction the name promises.
+        # `_document_renders` is called twice with the same context, so
+        # a constant makes both calls agree and no strip outcome can
+        # tell the two constants apart. What IS observable is that the
+        # answer is reached without raising and without consulting the
+        # context, so pin that instead of implying more.
+        self.assertFalse(compose_module._document_renders(compose, info))
 
 
 class TheContextIsCopiedPerRenderTests(TestCase):
@@ -1279,6 +1287,50 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
         self.assertEqual(
             self._strip({'oidc': {'issuer': 'https://k/realms/r'}}),
             {'K': '{{ oidc.issuer }}'})
+
+
+class EveryBlockAlternativeIsLoadBearingTests(TestCase):
+    """`_JINJA_BLOCK_RE` has four alternatives and `re.S`; nothing
+    pinned three of them.
+
+    They only matter on the fallback path -- a document that does not
+    parse -- so every fixture here carries a deliberately broken key to
+    get there. Each alternative failing looks the same from outside: an
+    env var vanishes, or one that should vanish survives to 500.
+    """
+
+    def _kept(self, env):
+        compose = {'services': {'a': {'environment': dict(env)}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': {}, 'instance_id': 'i1'})
+        _delete_unset_integration_env_keys(compose, info)
+        return sorted(compose['services']['a'].get('environment', {}))
+
+    def test_a_complete_statement_block_is_matched_as_itself(self):
+        # Without the `{%...%}` alternative a complete block falls to
+        # `{%.*$`, which under re.S swallows to the end of the value --
+        # so the plain text `smtp` between the tags reads as a name and
+        # a working var is dropped.
+        self.assertEqual(
+            self._kept({'BAD': '{{ oidc.x }',
+                        'NAME': '{% if instance_id %}smtp{% endif %}'}),
+            ['NAME'])          # BAD names `oidc`, so it goes either way
+
+    def test_an_unterminated_statement_is_still_a_block(self):
+        # `{% if smtp.host %` never closes, so only the open-ended
+        # statement alternative can see it. Without that alternative
+        # the value has no block at all and the key survives.
+        self.assertEqual(self._kept({'BAD': '{{ oidc.x }',
+                                     'K': '{% if smtp.host %'}),
+                         [])
+
+    def test_a_block_may_span_a_newline(self):
+        # yaml.dump folds long values, so a block really does arrive
+        # split across lines. Without re.S `.` stops at the newline and
+        # the reference is invisible.
+        self.assertEqual(self._kept({'BAD': '{{ oidc.x }',
+                                     'K': '{{ smtp.host\n }}'}),
+                         [])
 
 
 class TheFallbackAsksMainsQuestionTests(TestCase):
@@ -1982,6 +2034,14 @@ class AGuardCanLeakThroughACallArgumentTests(TestCase):
             '{% set d={} %}{% for x in [1] if d.update(h=smtp.host) %}'
             '{% endfor %}{{ d.h }}',
             '{% set l=[] %}{% if l.append(smtp) %}{% endif %}{{ l[0].host }}',
+            # NESTED, not sitting directly in the slot. Every case above
+            # puts the call at the top of the guard, so scanning `[item]`
+            # alone covers them and the `find_all(nodes.Call)` that makes
+            # the rule work on a compound test is never exercised.
+            '{% set l=[] %}{% if 1 and l.append(smtp.host) %}{% endif %}'
+            '{{ l[0] }}',
+            '{% set l=[] %}{% if not l.append(smtp.host) %}{% endif %}'
+            '{{ l[0] }}',
         ):
             with self.subTest(value=value):
                 self.assertFalse(self._survives(value))
@@ -2487,13 +2547,16 @@ class GetOnAnUnsetIntegrationTests(TestCase):
         )
 
     def test_a_present_key_is_returned(self):
-        info = _compute_integrations_context(
-            {'id': 'i1', 'integrations': {'smtp': {'host': 'mail.x'}}})
-        ctx = _compose_render_context(info)
-        self.assertEqual(
-            Template('{% set s = smtp %}{{ s.get("host") }}').render(**ctx),
-            'mail.x',
-        )
+        # Directly, not through the render context. A CONFIGURED type is
+        # bound to a plain `dict`, so routing this through
+        # `_compose_render_context` ran `dict.get` and never entered the
+        # override it is named after -- which is why deleting the
+        # override's `key in self` fast path broke no test.
+        blob = compose_module._UnsetIntegration({'host': 'mail.x'})
+        self.assertEqual(blob.get('host'), 'mail.x')
+        # And an explicit default must not win over a present key, which
+        # is the only thing the fast path decides.
+        self.assertEqual(blob.get('host', 'fallback'), 'mail.x')
 
     def test_it_is_still_a_dict(self):
         # The binding must stay dict-shaped for everything else.
