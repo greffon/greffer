@@ -822,7 +822,16 @@ def _reads(ast, name):
             # The test's NAME has to be consulted where its operand is
             # descended into, not only where the test sits in someone
             # else's slot.
-            withdrawn = is_slot and (
+            # `not guarded` restores a short-circuit the seal dropped.
+            # The old expression was `guarded or (...)`, so once a guard
+            # above vouched for this subtree Python stopped evaluating
+            # the helpers. Recomputing them unconditionally took
+            # `_test_is_hazardous` from O(n) to O(n^2) calls on nested
+            # guards. It is behaviour-preserving: `child_guarded` is
+            # `guarded or ...`, so guardedness never goes back to False
+            # once set, no deeper Name is ever reported, and `sealed`
+            # only ever feeds `child_guarded`.
+            withdrawn = not guarded and is_slot and (
                 _test_is_hazardous(node)
                 or _call_consumes(value, name)
                 or _guard_coerces(value, name))
@@ -1032,9 +1041,19 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                         popped.append('%s.%s' % (container, key))
                     env.pop(key, None)
                 elif isinstance(env, list):
+                    # `KEY=value` AND a bare `KEY`. The bare form is
+                    # legal compose and means "import this variable from
+                    # the host", so leaving it behind does not render an
+                    # empty value -- it hands the container whatever the
+                    # GREFFER HOST has in its environment under that
+                    # name. For an integration the user never configured
+                    # that is worse than the failure this pass exists to
+                    # stop: not a missing var, but someone else's.
                     prefix = f'{key}='
                     kept_entries = [
-                        e for e in env if not (isinstance(e, str) and e.startswith(prefix))
+                        e for e in env
+                        if not (isinstance(e, str)
+                                and (e == key or e.startswith(prefix)))
                     ]
                     if len(kept_entries) != len(env):
                         popped.append('%s.%s' % (container, key))
@@ -1150,7 +1169,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # explicitly.
             return _named_in_a_jinja_block(value, name)
 
-    def _strings_in(value):
+    def _strings_in(value, seen=None):
         """Every string inside `value`, however nested.
 
         A compose env value is usually a scalar, but YAML permits a list
@@ -1158,15 +1177,34 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         just the same. Skipping non-strings meant `A: ['{{ smtp.host }}']`
         was never examined and rendered `['']` -- present but empty, the
         failure this pass exists to stop.
+
+        Each CONTAINER is visited once, by identity. YAML anchors make
+        one object reachable by many paths, so a compact document builds
+        a shared tree that this walk otherwise re-descends once per
+        path: measured at 0.9s for depth 8, 3.4s for 12 and 80s for 16,
+        doubling with every extra level, from a file small enough to
+        sit in a catalog entry. `RecursionError` does not save it --
+        the depth stays tiny, only the path COUNT explodes -- so
+        `/start/` just hangs.
+
+        Visiting a shared subtree once is enough for the question being
+        asked. This yields strings only to decide whether ANY of them
+        dereferences an unset type, and a second visit to the same
+        object cannot change that answer.
         """
         if isinstance(value, str):
             yield value
-        elif isinstance(value, dict):
-            for nested in value.values():
-                yield from _strings_in(nested)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                yield from _strings_in(nested)
+            return
+        if not isinstance(value, (dict, list, tuple)):
+            return
+        if seen is None:
+            seen = set()
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        nested_values = value.values() if isinstance(value, dict) else value
+        for nested in nested_values:
+            yield from _strings_in(nested, seen)
 
     # Whether the DOCUMENT is a valid template, which is what decides
     # how to read a value that will not parse on its own. See

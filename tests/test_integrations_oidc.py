@@ -1289,6 +1289,118 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
             {'K': '{{ oidc.issuer }}'})
 
 
+class AnAliasedContainerIsWalkedOnceTests(TestCase):
+    """YAML anchors let one object be reachable by many paths.
+
+    `_strings_in` recursed per PATH, not per object, so a shared binary
+    tree built with anchors -- a few lines of catalog YAML -- doubled
+    the work per level: measured through the real strip at 0.9s for
+    depth 8, 3.4s for 12 and 80.8s for 16. `RecursionError` never
+    fires, because the DEPTH stays tiny and only the path COUNT
+    explodes, so `/start/` simply hangs on a community-authored compose.
+
+    Counted, not timed. A wall-clock budget is the obvious way to write
+    this and the wrong one: it has to be loose enough to survive a
+    loaded machine, which makes it too loose to catch the regression at
+    a depth where the unfixed code still returns -- the first version
+    of this test passed against the reverted memo. Counting container
+    visits is exact, independent of load, and FAILS FAST rather than
+    hanging.
+    """
+
+    class _CountingList(list):
+        """A container that records how many times it is walked."""
+
+        def __init__(self, items):
+            super().__init__(items)
+            self.visits = 0
+
+        def __iter__(self):
+            self.visits += 1
+            return super().__iter__()
+
+    def _aliased_tree(self, depth, leaf):
+        """A tree of `depth + 1` containers reachable by 2**depth paths."""
+        containers = [self._CountingList([leaf, 'plain'])]
+        for _ in range(depth):
+            # The SAME object twice, which is what a YAML alias builds.
+            containers.append(self._CountingList([containers[-1]] * 2))
+        return containers[-1], containers
+
+    def _strip(self, root):
+        compose = {'services': {'a': {'environment': {'K': root}}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['a'].get('environment', {})
+
+    def test_the_walk_does_not_grow_with_the_path_count(self):
+        depth = 10
+        root, containers = self._aliased_tree(depth, '{{ smtp.host }}')
+        self.assertEqual(self._strip(root), {},
+                         'the aliased leaf must still be found')
+        visits = sum(c.visits for c in containers)
+        # Linear in CONTAINERS (a small multiple of depth, one pass per
+        # top-level call), never in PATHS. Without the memo this is
+        # 2**(depth+1)-1 per call.
+        self.assertLess(
+            visits, 2 ** depth,
+            'the walk is growing with the number of paths, not the '
+            'number of containers: %d visits over %d containers'
+            % (visits, len(containers)))
+
+    def test_the_alias_shortcut_does_not_lose_a_reference(self):
+        # Visiting a shared subtree once is only sound because the
+        # question is "does ANY string dereference the type". Pin that
+        # the answer still comes back through the aliased branch, and
+        # that an innocent tree of the same shape survives.
+        root, _ = self._aliased_tree(4, '{{ smtp.host }}')
+        self.assertEqual(self._strip(root), {})
+        root, _ = self._aliased_tree(4, '{{ instance_id }}')
+        self.assertEqual(sorted(self._strip(root)), ['K'])
+
+    def test_a_self_referential_value_still_does_not_crash(self):
+        # The pre-existing RecursionError guard covers a value that
+        # contains itself; the memo must not change that answer.
+        loop = ['{{ smtp.host }}']
+        loop.append(loop)
+        self.assertEqual(self._strip(loop), {})
+
+
+class ABareListEnvEntryIsRemovedTests(TestCase):
+    """`environment: [OIDC_CLIENT_ID]` with no `=` is legal compose.
+
+    It means "import this variable from the host". Pass 1 matched only
+    `KEY=`, so the bare form survived a strip for an integration the
+    user never configured -- and docker-compose then handed the
+    container whatever the GREFFER HOST has under that name. That is
+    worse than the failure this pass exists to stop: not a missing
+    variable, but someone else's.
+    """
+
+    def _strip(self, entries):
+        compose = {'services': {'app': {'environment': list(entries)}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app',
+                 'key': 'OIDC_CLIENT_ID'}]}]})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['app']['environment']
+
+    def test_a_bare_key_is_removed_like_an_assigned_one(self):
+        self.assertEqual(
+            self._strip(['OIDC_CLIENT_ID', 'OTHER=plain']), ['OTHER=plain'])
+        self.assertEqual(
+            self._strip(['OIDC_CLIENT_ID=x', 'OTHER=plain']), ['OTHER=plain'])
+
+    def test_a_key_that_merely_starts_the_same_is_kept(self):
+        # Exact match or `KEY=`, not a prefix: `OIDC_CLIENT_IDENTITY`
+        # is a different variable and must survive.
+        self.assertEqual(
+            self._strip(['OIDC_CLIENT_IDENTITY', 'OIDC_CLIENT_IDX=1']),
+            ['OIDC_CLIENT_IDENTITY', 'OIDC_CLIENT_IDX=1'])
+
+
 class EveryBlockAlternativeIsLoadBearingTests(TestCase):
     """`_JINJA_BLOCK_RE` has four alternatives and `re.S`; nothing
     pinned three of them.
@@ -1478,6 +1590,12 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
         # test is still exempt, or every layered guard over-pops.
         ('{% if (smtp.host is defined) is string %}on{% else %}off{% endif %}', True),
         ('{% if (smtp is mapping) is boolean %}on{% else %}off{% endif %}', True),
+        # ...and it must not spread ACROSS fields either. Here the
+        # hazardous test is `is gt`, but the type is only in its
+        # ARGUMENT, in a guard of its own. Sealing the whole node
+        # rather than the withdrawn field pops this, which is an
+        # over-pop of a value that renders in both states.
+        ('{{ 4 is gt(2 if smtp else 1) }}', True),
         ('{% if smtp %}{% if smtp.host is defined %}a{% endif %}{% endif %}', True),
         # Coercion, ordering, arithmetic, dict methods.
         ('{% if smtp.port > 25 %}on{% else %}off{% endif %}', False),
@@ -1511,28 +1629,46 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
         self.assertEqual(outcomes, {True, False})
 
     def test_the_table_keeps_a_witness_for_every_withdrawal_rule(self):
-        # Deleting rows is the SILENT way to revert a fix. The five
-        # membership rows are the only thing pinning
-        # `_SAFE_COMPARISON_OPS`; drop them and `'in', 'notin'` can go
-        # back with all tests green, restoring a reproduced 500. The
-        # outcome-set check above does not notice, because unrelated
-        # `False` rows keep the set at {True, False}.
+        # Deleting rows is the SILENT way to revert a fix: this table
+        # is the ONLY thing pinning `_SAFE_COMPARISON_OPS` and the
+        # seal, so dropping the rows lets either 500 come back with the
+        # suite green. The outcome-set check above does not notice,
+        # because unrelated rows keep the set at {True, False}.
+        #
+        # EXACT PAIRS, not substrings. A substring witness is defeated
+        # by a decoy: a row with no Jinja delimiters at all is always
+        # kept and always renders, so
+        # `('plain text (smtp.host is defined) is nonempty', True)`
+        # satisfied a `'is nonempty' in value` check while the row that
+        # actually exercised the rule was gone.
         witnesses = {
-            'membership (Compare)': ' in "tls starttls" ',
-            'membership (Test)': 'is in(',
-            'unknown test': 'is nonempty',
-            'nested re-grant': '(smtp.host is defined) is nonempty',
-            'ordering': 'smtp.port > 25',
-            'filter coercion': 'smtp.port|int',
-            'method on the mapping': 'smtp.popitem()',
-            'exempt guard': '{% if smtp %}on',
-            'exempt equality': 'smtp.tls_mode == "starttls"',
+            'membership (Compare)':
+                ('{% if smtp.tls_mode in "tls starttls" %}on{% else %}off{% endif %}', False),
+            'membership (Test)':
+                ('{% if smtp.tls_mode is in("starttls") %}on{% else %}off{% endif %}', False),
+            'unknown test':
+                ('{% if smtp.host is nonempty %}on{% else %}off{% endif %}', False),
+            'nested re-grant':
+                ('{% if (smtp.host is defined) is nonempty %}on{% else %}off{% endif %}', False),
+            'ordering':
+                ('{% if smtp.port > 25 %}on{% else %}off{% endif %}', False),
+            'filter coercion':
+                ('{% if smtp.port|int > 25 %}on{% else %}off{% endif %}', False),
+            'method on the mapping':
+                ('{{ "x" if smtp.popitem() else "y" }}', False),
+            'exempt guard':
+                ('{% if smtp %}on{% else %}off{% endif %}', True),
+            'exempt equality':
+                ('{{ "on" if smtp.tls_mode == "starttls" else "off" }}', True),
+            'seal does not spread (nested)':
+                ('{% if (smtp.host is defined) is string %}on{% else %}off{% endif %}', True),
+            'seal does not spread (across fields)':
+                ('{{ 4 is gt(2 if smtp else 1) }}', True),
         }
-        table = [value for value, _ in self._SHAPES]
-        for rule, fragment in witnesses.items():
+        for rule, pair in witnesses.items():
             with self.subTest(rule=rule):
-                self.assertTrue(
-                    any(fragment in value for value in table),
+                self.assertIn(
+                    pair, self._SHAPES,
                     'no row left exercising %s -- a fix it pins can now '
                     'be reverted silently' % rule)
 
@@ -1844,6 +1980,13 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
             # arg-taking, and probing `is filter(1)` raises for ARITY in
             # both contexts -- exactly the trap this helper exists to
             # avoid, reintroduced one level up.
+            # Defensive, and deliberately unpinnable with today's
+            # builtins: only `filter` and `test` carry `jinja_pass_arg`,
+            # and both render fine on an unset field at the correct
+            # arity, so no builtin distinguishes this line. It matters
+            # for a CUSTOM pass-environment test registered on
+            # `_COMPOSE_RENDER_ENV`, which is the case this class's
+            # docstring promises to cover.
             if getattr(fn, 'jinja_pass_arg', None) is not None:
                 required = required[1:]
             if len(required) <= 1:                # only the operand
