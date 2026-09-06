@@ -620,7 +620,10 @@ def _test_is_hazardous(node):
       render time in a boolean slot, so `{% if smtp.host is nonempty %}`
       -- an Ansible spelling, or just `is defiend` -- parses cleanly,
       reads nothing, keeps its key, and then dies with
-      TemplateRuntimeError where `main` pops the key and deploys.
+      TemplateRuntimeError. `main` keeps and dies on the `{% if %}`
+      spelling too -- its pass 2 needs `{{` in the value -- so this is
+      a 500 turned into an accepted over-pop, not a regression this
+      branch introduced and then repaired.
 
     Consulted in BOTH places, which is the whole point of the helper:
     where the test sits in someone else's guard slot, and where its own
@@ -655,11 +658,17 @@ def _calls_a_method_on(node, name):
     if isinstance(callee, nodes.Name):
         return callee.name == name
     # The `isinstance(..., nodes.Name)` narrowing is AttributeError
-    # safety rather than a rule: only `Filter` and `Test` can otherwise
-    # sit here carrying a `.name`, and both are already withdrawn --
-    # `Filter` by `_COERCING_NODES`, and a `Test` named after an
-    # integration type is not a spelling any deployable compose can
-    # reach. So no fixture distinguishes it from `getattr(..., None)`.
+    # safety rather than a rule. From parseable source the only other
+    # nodes that can sit here carrying a `.name` are `Filter` and
+    # `Test`, and widening to them changes no strip decision -- but
+    # NOT for the reason it is tempting to give. `_COERCING_NODES` does
+    # not save the `Filter` case: a filter node named `smtp` contains no
+    # `Name('smtp')`, so it fails `_guard_coerces`'s own `reaches`
+    # check. What saves it is `_call_consumes`, which is tested first at
+    # the single call site -- reaching the type through such a callee
+    # requires `Name` inside the `Call`, which is either in the callee
+    # subtree (so the Filter/Test reaches it and fires) or in the args
+    # (so `_call_consumes` fires).
     return (isinstance(callee, nodes.Getattr)
             and isinstance(callee.node, nodes.Name)
             and callee.node.name == name)
@@ -712,7 +721,7 @@ _JINJA_BLOCK_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{\{.*$|\{%.*$', re.S)
 
 
 def _named_in_a_jinja_block(value, name):
-    """Does the type appear as a NAME inside a Jinja block?
+    r"""Does the type appear as a NAME inside a Jinja block?
 
     The fallback for everything the AST cannot answer, so its precision
     decides two failure directions at once.
@@ -723,9 +732,8 @@ def _named_in_a_jinja_block(value, name):
     where `main` pops only the broken one and deploys them.
 
     `main`'s own narrow `smtp` + `.`/`[` test is too narrow the other
-    way: it
-    does not see `{{ dict(smtp).get("user") }}`, which reads the type
-    through a wrapper and must be popped.
+    way: it does not see `{{ dict(smtp).get("user") }}`, which reads the
+    type through a wrapper and must be popped.
 
     So: inside a block, and preceded by neither a dot nor a word
     character -- the dot separates `smtp.host` and `dict(smtp)` from
@@ -785,28 +793,44 @@ def _reads(ast, name):
     # (`{% filter upper %}..{% endfilter %}`) has that slot EMPTY, so it
     # raised an uncaught AttributeError out of `/start/`. Pushing only
     # `Node` instances makes that unrepresentable rather than guarded.
-    stack = [(ast, False)]
+    # Three-valued walk. `guarded` says a guard above vouches for this
+    # subtree; `sealed` says a withdrawal above it did not, and no slot
+    # deeper down may vouch for it either.
+    #
+    # The seal is what makes a withdrawal stick. Guardedness alone is
+    # monotone -- it can only go False -> True -- so refusing the
+    # exemption at one level did nothing to stop the next level
+    # granting it again. `(Test, 'node')` is itself a guard slot, so a
+    # HARMLESS test nested inside a hazardous one re-granted what the
+    # hazardous one had just been denied:
+    #
+    #     {% if smtp.host is nonempty %}                 popped
+    #     {% if (smtp.host is defined) is nonempty %}    KEPT, and 500s
+    #
+    # Same for a `CondExpr` inside a hazardous test. The first spelling
+    # was fixed and tested; the second differs only by a pair of
+    # parentheses and died with the same TemplateRuntimeError.
+    stack = [(ast, False, False)]
     while stack:
-        node, guarded = stack.pop()
+        node, guarded, sealed = stack.pop()
         if isinstance(node, nodes.Name) and node.name == name:
             if guarded:
                 continue
             return True
         for field, value in node.iter_fields():
-            # `(Test, 'node')` is itself a guard slot, so a coercing
-            # test re-exempted its own operand one level down and the
-            # withdrawal above never took effect. The test's NAME has to
-            # be consulted here, where its operand is being descended
-            # into, not only where the test sits in someone else's slot.
-            slot_guards = ((type(node), field) in _GUARD_SLOTS
-                           and not _test_is_hazardous(node))
-            child_guarded = guarded or (
-                slot_guards
-                and not _call_consumes(value, name)
-                and not _guard_coerces(value, name))
+            is_slot = (type(node), field) in _GUARD_SLOTS
+            # The test's NAME has to be consulted where its operand is
+            # descended into, not only where the test sits in someone
+            # else's slot.
+            withdrawn = is_slot and (
+                _test_is_hazardous(node)
+                or _call_consumes(value, name)
+                or _guard_coerces(value, name))
+            child_sealed = sealed or withdrawn
+            child_guarded = guarded or (is_slot and not child_sealed)
             for item in (value if isinstance(value, list) else [value]):
                 if isinstance(item, nodes.Node):
-                    stack.append((item, child_guarded))
+                    stack.append((item, child_guarded, child_sealed))
     return False
 
 
