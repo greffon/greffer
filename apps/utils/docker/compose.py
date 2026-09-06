@@ -1042,14 +1042,21 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     env.pop(key, None)
                 elif isinstance(env, list):
                     # Read the entry the way compose does: split on the
-                    # first `=` and take the NAME. Matching only
-                    # `KEY=` left a bare `KEY` behind, which is legal
-                    # compose meaning "import this variable from the
-                    # host" -- so for an integration the user never
-                    # configured, the container got whatever the GREFFER
-                    # HOST has under that name. Worse than the failure
-                    # this pass exists to stop: not a missing var, but
-                    # someone else's.
+                    # first `=` and take the NAME. Matching only `KEY=`
+                    # left a bare `KEY` behind, which is legal compose
+                    # meaning "import this variable from the host".
+                    #
+                    # Scope, measured rather than assumed: the child
+                    # process env is already scrubbed to
+                    # `_COMPOSE_ENV_ALLOWLIST` (PATH, HOME and four
+                    # DOCKER_* names), so a bare key cannot reach an
+                    # arbitrary greffer secret through the environment
+                    # -- only those six. The live vector is the OTHER
+                    # source compose reads for a bare key: a `.env`
+                    # beside the rendered compose file. `apply_
+                    # configuration` writes `file`/`json` destinations
+                    # into that same directory under a catalog-supplied
+                    # name, so a catalog can put one there.
                     #
                     # The `.strip()` covers ` KEY`, `KEY ` and
                     # `KEY =x`. Those are malformed compose -- a name
@@ -1200,6 +1207,15 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         asked. This yields strings only to decide whether ANY of them
         dereferences an unset type, and a second visit to the same
         object cannot change that answer.
+
+        `seen` holds ids, and nothing here keeps the objects alive, so
+        this is only safe because the tree is EXTERNALLY ROOTED: it
+        comes from `yaml.safe_load`, is reachable from `compose` for
+        the whole call, and is plain dict/list/str throughout. Give it
+        a container that hands back a fresh temporary per iteration and
+        CPython reuses the address, `seen` matches the wrong object and
+        a real reference is dropped. No compose can produce that, but
+        the reason is lifetime, not the soundness argument above.
         """
         if isinstance(value, str):
             yield value
@@ -1240,11 +1256,14 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             ]
         except RecursionError:
             # A YAML alias can make an env value refer to itself
-            # (`A: &a [..., *a]`), and `safe_load` accepts it. Walking
-            # that never terminates. `main` renders such a compose, so
-            # raising here would turn a working deploy into a 500 --
-            # pop instead, which is the same answer this function gives
-            # for anything else it cannot read.
+            # (`A: &a [..., *a]`). The memo above now terminates that
+            # case and gives the RIGHT answer for it -- an innocent
+            # cycle keeps its key instead of being popped, which is
+            # what `main` does -- so this arm no longer catches the
+            # self-referential value it was written for. It stays for
+            # genuine DEPTH: a value nested past the interpreter limit
+            # still raises here, and popping is the same answer this
+            # function gives for anything else it cannot read.
             return tuple(unset_types)
         if not texts:
             return ()
@@ -1306,10 +1325,17 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
         # keys present and empty instead of absent. This line is the
         # only signal that the instance is quietly degraded, so it
         # carries the cause and the keys, not just the id.
+        # Not "will render empty": that is true for the common
+        # `KEY: '{{ smtp.host }}'` shape and wrong for the two
+        # host-passthrough spellings, a bare `KEY` in list form and
+        # `KEY:` with no value, which come back as passthrough rather
+        # than as an empty string. Say what actually happened -- the
+        # keys are back as the catalog wrote them -- and let the
+        # operator read the entry.
         logger.error(
             'integrations: the env strip broke the compose document for '
-            '%s (%s); restoring %s, which will render empty rather than '
-            'being absent',
+            '%s (%s); restoring %s as the catalog declared them, so the '
+            'instance deploys with those keys present',
             greffon_info.get('id'),
             _why_it_will_not_render(compose, render_context),
             ', '.join(popped) or 'nothing',

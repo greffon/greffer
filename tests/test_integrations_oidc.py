@@ -791,7 +791,13 @@ class TheStripNeverBreaksTheDocumentTests(TestCase):
         # message, which is the half an operator actually needs.
         self.assertIn('Missing end of comment tag', joined)
         self.assertIn('app.B', joined)
-        self.assertIn('render empty rather than being absent', joined)
+        # What the line PROMISES the operator. It used to say the keys
+        # "will render empty rather than being absent", which is true
+        # for `KEY: '{{ smtp.host }}'` and false for the two
+        # host-passthrough spellings -- a bare `KEY` in list form, and
+        # `KEY:` with no value -- which come back as passthrough.
+        self.assertIn('as the catalog declared them', joined)
+        self.assertNotIn('render empty', joined)
 
     def test_the_restore_log_names_pass_ONE_pops_too(self):
         # The restore puts back the metadata-driven pops as well, and
@@ -1292,25 +1298,29 @@ class AnEmptyConfigIsNotConfiguredTests(TestCase):
 class AnAliasedContainerIsWalkedOnceTests(TestCase):
     """YAML anchors let one object be reachable by many paths.
 
-    `_strings_in` recursed per PATH, not per object, so a shared binary
-    tree built with anchors -- a few lines of catalog YAML -- doubled
-    the work per level: measured through the real strip at 0.9s for
-    depth 8, 3.4s for 12 and 80.8s for 16. `RecursionError` never
-    fires, because the DEPTH stays tiny and only the path COUNT
-    explodes, so `/start/` simply hangs on a community-authored compose.
+    `_strings_in` recursed per PATH, not per object, so a shared tree
+    built with anchors doubled the work per level: measured through the
+    real strip at 0.9s for depth 8, 3.4s for 12 and 80.8s for 16.
+    `RecursionError` never fires, because the DEPTH stays tiny and only
+    the path COUNT explodes, so `/start/` simply hangs on a
+    community-authored compose.
 
     Counted, not timed. A wall-clock budget is the obvious way to write
     this and the wrong one: it has to be loose enough to survive a
     loaded machine, which makes it too loose to catch the regression at
     a depth where the unfixed code still returns -- the first version
-    of this test passed against the reverted memo. Counting container
-    visits is exact, independent of load, and FAILS FAST rather than
-    hanging.
+    of this test asserted 3s at depth 13 and PASSED against the
+    reverted memo, whose own timings are not even monotonic under load
+    (4.2s at depth 13, 3.2s at 15). Counting is exact and fails fast.
+
+    Every container KIND, because the memo covers three and the first
+    version of this test exercised one. A mapping is the shape an
+    anchor is normally written in (`x-common: &common {...}`), so a
+    memo that skipped dicts left the whole blow-up intact -- 32767
+    visits where 15 are needed -- and passed the entire suite.
     """
 
     class _CountingList(list):
-        """A container that records how many times it is walked."""
-
         def __init__(self, items):
             super().__init__(items)
             self.visits = 0
@@ -1319,12 +1329,42 @@ class AnAliasedContainerIsWalkedOnceTests(TestCase):
             self.visits += 1
             return super().__iter__()
 
-    def _aliased_tree(self, depth, leaf):
-        """A tree of `depth + 1` containers reachable by 2**depth paths."""
-        containers = [self._CountingList([leaf, 'plain'])]
+    class _CountingTuple(tuple):
+        def __new__(cls, items):
+            return super().__new__(cls, items)
+
+        def __init__(self, items):
+            self.visits = 0
+
+        def __iter__(self):
+            self.visits += 1
+            return super().__iter__()
+
+    class _CountingDict(dict):
+        def __init__(self, items):
+            super().__init__(items)
+            self.visits = 0
+
+        def values(self):
+            # `_strings_in` reaches a mapping's children through
+            # `.values()`, so that is the call to count.
+            self.visits += 1
+            return super().values()
+
+    def _aliased_tree(self, depth, leaf, kind):
+        """`depth + 1` containers reachable by 2**depth paths."""
+        def make(items):
+            if kind is dict:
+                return self._CountingDict(
+                    {'a': items[0], 'b': items[1]})
+            if kind is tuple:
+                return self._CountingTuple(items)
+            return self._CountingList(items)
+
+        containers = [make([leaf, 'plain'])]
         for _ in range(depth):
             # The SAME object twice, which is what a YAML alias builds.
-            containers.append(self._CountingList([containers[-1]] * 2))
+            containers.append(make([containers[-1], containers[-1]]))
         return containers[-1], containers
 
     def _strip(self, root):
@@ -1335,35 +1375,52 @@ class AnAliasedContainerIsWalkedOnceTests(TestCase):
 
     def test_the_walk_does_not_grow_with_the_path_count(self):
         depth = 10
-        root, containers = self._aliased_tree(depth, '{{ smtp.host }}')
-        self.assertEqual(self._strip(root), {},
-                         'the aliased leaf must still be found')
-        visits = sum(c.visits for c in containers)
-        # Linear in CONTAINERS (a small multiple of depth, one pass per
-        # top-level call), never in PATHS. Without the memo this is
-        # 2**(depth+1)-1 per call.
-        self.assertLess(
-            visits, 2 ** depth,
-            'the walk is growing with the number of paths, not the '
-            'number of containers: %d visits over %d containers'
-            % (visits, len(containers)))
+        for kind in (list, dict, tuple):
+            with self.subTest(kind=kind.__name__):
+                root, containers = self._aliased_tree(
+                    depth, '{{ smtp.host }}', kind)
+                self.assertEqual(self._strip(root), {},
+                                 'the aliased leaf must still be found')
+                visits = sum(c.visits for c in containers)
+                # Bounded BOTH ways. An upper bound alone is vacuous: a
+                # strip that stopped walking the value altogether would
+                # record ~0 visits and sail past it. And the bound is
+                # linear in CONTAINERS -- `2 ** depth` allowed 1024
+                # where the real figure is 44, which is 23x of slack in
+                # the direction that matters.
+                self.assertGreaterEqual(
+                    visits, len(containers),
+                    'every container should have been walked once')
+                self.assertLessEqual(
+                    visits, 8 * len(containers),
+                    'the walk is growing with the number of paths, not '
+                    'the number of containers: %d visits over %d '
+                    'containers' % (visits, len(containers)))
 
     def test_the_alias_shortcut_does_not_lose_a_reference(self):
         # Visiting a shared subtree once is only sound because the
         # question is "does ANY string dereference the type". Pin that
         # the answer still comes back through the aliased branch, and
         # that an innocent tree of the same shape survives.
-        root, _ = self._aliased_tree(4, '{{ smtp.host }}')
-        self.assertEqual(self._strip(root), {})
-        root, _ = self._aliased_tree(4, '{{ instance_id }}')
-        self.assertEqual(sorted(self._strip(root)), ['K'])
+        for kind in (list, dict, tuple):
+            with self.subTest(kind=kind.__name__):
+                root, _ = self._aliased_tree(4, '{{ smtp.host }}', kind)
+                self.assertEqual(self._strip(root), {})
+                root, _ = self._aliased_tree(4, '{{ instance_id }}', kind)
+                self.assertEqual(sorted(self._strip(root)), ['K'])
 
     def test_a_self_referential_value_still_does_not_crash(self):
-        # The pre-existing RecursionError guard covers a value that
-        # contains itself; the memo must not change that answer.
+        # The value contains itself. The memo now terminates this,
+        # where the pre-existing `RecursionError` guard used to catch
+        # it -- so assert both the reference IS seen and an innocent
+        # cycle is left alone, which the guard could not do.
         loop = ['{{ smtp.host }}']
         loop.append(loop)
         self.assertEqual(self._strip(loop), {})
+
+        innocent = ['{{ instance_id }}']
+        innocent.append(innocent)
+        self.assertEqual(sorted(self._strip(innocent)), ['K'])
 
 
 class ABareListEnvEntryIsRemovedTests(TestCase):
