@@ -654,6 +654,12 @@ def _calls_a_method_on(node, name):
     callee = node.node
     if isinstance(callee, nodes.Name):
         return callee.name == name
+    # The `isinstance(..., nodes.Name)` narrowing is AttributeError
+    # safety rather than a rule: only `Filter` and `Test` can otherwise
+    # sit here carrying a `.name`, and both are already withdrawn --
+    # `Filter` by `_COERCING_NODES`, and a `Test` named after an
+    # integration type is not a spelling any deployable compose can
+    # reach. So no fixture distinguishes it from `getattr(..., None)`.
     return (isinstance(callee, nodes.Getattr)
             and isinstance(callee.node, nodes.Name)
             and callee.node.name == name)
@@ -1150,6 +1156,13 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     def matching_unset_types(value):
         """Which unset types `value` dereferences, in tuple order."""
         try:
+            # The delimiter check is a PERFORMANCE filter, not a
+            # semantic one, and no test can pin it: every path out of
+            # `_dereferences` needs a Jinja delimiter to answer yes --
+            # `_named_in_a_jinja_block` matches only alternatives that
+            # open with one, and `find_undeclared_variables` on
+            # delimiter-free text returns an empty set. Dropping it
+            # changes no answer, only how many values get parsed.
             texts = [
                 text for text in _strings_in(value)
                 if '{{' in text or '{%' in text
@@ -1230,6 +1243,12 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             _why_it_will_not_render(compose, render_context),
             ', '.join(popped) or 'nothing',
         )
+        # `clear()` before `update()` is belt-and-braces and no test
+        # can pin it: the strip only ever pops keys from a service's
+        # `environment`, so the snapshot and the live document always
+        # have the same top-level keys and `update` alone restores
+        # completely. It stays so a future pass that adds a top-level
+        # key cannot leave it behind on the rescue path.
         compose.clear()
         compose.update(snapshot)
     return compose
