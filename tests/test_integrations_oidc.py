@@ -11,6 +11,7 @@
 #     fails if the tuple entry is removed.
 #   - Adding the type does not disturb SMTP.
 
+import inspect
 import itertools
 import logging
 import os
@@ -1325,7 +1326,7 @@ class TheFallbackAsksMainsQuestionTests(TestCase):
 
     def test_a_broken_document_does_not_spray_onto_innocent_values(self):
         # `main` pops only BAD, which repairs the document and deploys
-        # the other three. A bare word match dropped all of them.
+        # the other two. A bare word match dropped all three.
         self.assertEqual(
             self._kept({'BAD': '{{ smtp.host }',
                         'MODE': '{{ mail.smtp }}',
@@ -1340,34 +1341,110 @@ class TheFallbackAsksMainsQuestionTests(TestCase):
             [])
 
 
-class MembershipIsNotACoercionTests(TestCase):
-    """`in` / `not in` answer on an unset field; ordering does not.
+class WhateverSurvivesTheStripMustRenderTests(TestCase):
+    """The invariant the guard exemption has now broken twice.
 
-    Checked by rendering each against the binding rather than assumed:
-    `smtp.tls_mode in ["tls"]` gives False, `not in` gives True, while
-    `smtp.port > 1` raises. Treating membership as coercing over-popped
-    a guard one word away from the eight shipping `== "starttls"`
-    entries the exemption exists to protect.
+    Every withdrawal rule in `_guard_coerces` exists because a KEPT
+    value 500'd at `/start/`. A test that asserts only "the key
+    survives" cannot see that, and twice it did not:
+
+    * `in`/`notin` were added to `_SAFE_COMPARISON_OPS` behind three
+      fixtures that all happened to put the container on the right.
+      `{% if smtp.tls_mode in "tls starttls" %}` -- same operator,
+      string on the right -- raised TypeError, where `main` deploys.
+    * A test Jinja does not have (`is nonempty`, or a misspelt
+      `is defiend`) resolves at RENDER when it sits in a guard, so
+      `_reads` answered cleanly, `(nodes.Test, 'node')` kept the
+      exemption, and the render died.
+
+    So render the survivor. The table below is the whole guard
+    vocabulary in one place: for each shape, whether the strip KEEPS
+    it, and -- either way -- that the document still renders.
     """
 
-    def _survives(self, value):
+    # (value, kept). `kept=False` is an over-pop we accept: one env var
+    # missing on an integration nobody configured. `kept=True` with a
+    # render failure is the 500 this class exists to stop.
+    _SHAPES = (
+        ('{% if smtp %}on{% else %}off{% endif %}', True),
+        ('{{ "on" if smtp.tls_mode == "starttls" else "off" }}', True),
+        ('{{ "on" if smtp.tls_mode != "none" else "off" }}', True),
+        ('{{ "a" if smtp.host.startswith("h") else "b" }}', True),
+        # Membership. Deliberately popped in EVERY direction, including
+        # the two that would render: a rule that exempts only a
+        # list/tuple/dict literal on the right would keep those, but no
+        # catalog entry writes a membership guard at all, so it would
+        # protect nothing that ships and is not worth the branch.
+        ('{% if smtp.tls_mode in ["tls","starttls"] %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.tls_mode in "tls starttls" %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.port in 25 %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.tls_mode not in ["none"] %}on{% else %}off{% endif %}', False),
+        ('{{ "y" if "a" in smtp.host else "n" }}', False),
+        # The same operator spelled as a TEST. `nodes.Test` is a guard
+        # slot and the Compare rule never sees this, so it needed its
+        # own entry in `_COERCING_TESTS`.
+        ('{% if smtp.tls_mode is in("starttls") %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.tls_mode is in(["tls"]) %}on{% else %}off{% endif %}', False),
+        # ...but `is callable` really is safe: it was a wrong-arity
+        # probe artefact, not a coercion.
+        ('{% if smtp.tls_mode is callable %}on{% else %}off{% endif %}', True),
+        # Tests the environment does not have, in guard position.
+        ('{% if smtp.host is nonempty %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.host is defiend %}on{% else %}off{% endif %}', False),
+        ('{{ "on" if smtp.host is blank else "off" }}', False),
+        # Tests it does have, which answer harmlessly and stay exempt.
+        ('{% if smtp.host is defined %}on{% else %}off{% endif %}', True),
+        ('{% if smtp is mapping %}on{% else %}off{% endif %}', True),
+        # Coercion, ordering, arithmetic, dict methods.
+        ('{% if smtp.port > 25 %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.port|int > 25 %}on{% else %}off{% endif %}', False),
+        ('{% if smtp.port is gt(1) %}on{% else %}off{% endif %}', False),
+        ('{{ "x" if smtp.popitem() else "y" }}', False),
+    )
+
+    def _strip(self, value):
         compose = {'services': {'a': {'environment': {'K': value}}}}
         info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
         _delete_unset_integration_env_keys(compose, info)
-        return 'K' in compose['services']['a']['environment']
+        return compose, info
 
-    def test_a_membership_guard_is_kept(self):
-        for value in (
-            '{% if smtp.tls_mode in ["tls","starttls"] %}on{% else %}off{% endif %}',
-            '{% if smtp.tls_mode not in ["none"] %}on{% else %}off{% endif %}',
-            '{{ "y" if "a" in smtp.host else "n" }}',
-        ):
+    def test_every_guard_shape_renders_after_the_strip(self):
+        for value, kept in self._SHAPES:
             with self.subTest(value=value):
-                self.assertTrue(self._survives(value))
+                compose, info = self._strip(value)
+                self.assertEqual(
+                    'K' in compose['services']['a']['environment'], kept,
+                    'strip decision changed for this shape')
+                # The point of the class: whatever is left must render.
+                compose_module._COMPOSE_RENDER_ENV.from_string(
+                    yaml.dump(compose)).render(
+                        **compose_module._compose_render_context(info))
 
-    def test_an_ordering_guard_is_still_popped(self):
-        self.assertFalse(self._survives(
-            '{% if smtp.port > 25 %}on{% else %}off{% endif %}'))
+    def test_the_table_covers_both_outcomes(self):
+        # A table that drifted to all-popped would still pass the
+        # render assertion above while testing nothing about keeping.
+        outcomes = {kept for _, kept in self._SHAPES}
+        self.assertEqual(outcomes, {True, False})
+
+    def test_a_kept_shape_renders_its_off_branch_not_an_empty_string(self):
+        # The exemption's whole premise: an unset guard picks the OFF
+        # branch. If it rendered empty instead, keeping the key would
+        # be silently wrong rather than merely useless.
+        compose, info = self._strip(
+            '{% if smtp %}on{% else %}off{% endif %}')
+        rendered = yaml.safe_load(
+            compose_module._COMPOSE_RENDER_ENV.from_string(
+                yaml.dump(compose)).render(
+                    **compose_module._compose_render_context(info)))
+        self.assertEqual(
+            rendered['services']['a']['environment'], {'K': 'off'})
+
+    def test_an_unknown_test_still_pops_from_output_position(self):
+        # Output position takes a different route -- it raises
+        # TemplateAssertionError out of `find_undeclared_variables` and
+        # falls to the third arm -- so it needs its own case.
+        compose, _ = self._strip('{{ smtp.host is nonempty }}')
+        self.assertEqual(compose['services']['a']['environment'], {})
 
 
 class AMethodCalledOnTheMappingIsNotAGuardTests(TestCase):
@@ -1581,9 +1658,19 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
         # A NUMBER, not '587'. With a string port, `is even` raises
         # when configured too, so nothing looked like a gap and this
         # test passed against a deliberately incomplete list.
+        #
+        # And a STRING field beside it, because one operand type cannot
+        # discriminate for every test. The check needs a configured
+        # value the test ACCEPTS: `is even` needs the number, while
+        # `is in("x")` raises on a number whether or not the
+        # integration is set -- so probing only `smtp.port` read `in`
+        # as "raises either way, not our problem" and missed a 500.
         configured = compose_module._compose_render_context(
             _compute_integrations_context(
-                {'id': 'i1', 'integrations': {'smtp': {'port': 587}}}))
+                {'id': 'i1',
+                 'integrations': {'smtp': {'port': 587,
+                                           'tls_mode': 'starttls'}}}))
+        operands = ('smtp.port', 'smtp.tls_mode')
 
         def renders(template, context):
             try:
@@ -1593,19 +1680,49 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
             except Exception:
                 return False
 
+        def spellings(name):
+            """Every VALID-ARITY way to write `is <name>`.
+
+            Arity matters in both directions. Probing only `is <name>`
+            let an arg-taking test raise for arity and read as
+            "coercing, correctly listed". Probing extra args on a
+            one-argument test does the same thing in reverse: `is
+            callable("x")` raises "takes exactly one argument (2
+            given)", which is not a coercion at all -- `is callable`
+            renders fine on an unset field. So ask the function how
+            many arguments it wants.
+            """
+            fn = compose_module._COMPOSE_RENDER_ENV.tests[name]
+            try:
+                required = [
+                    prm for prm in inspect.signature(fn).parameters.values()
+                    if prm.kind in (prm.POSITIONAL_ONLY,
+                                    prm.POSITIONAL_OR_KEYWORD)
+                    and prm.default is prm.empty]
+            except (TypeError, ValueError):       # a builtin with no sig
+                return (name,)
+            if len(required) <= 1:                # only the operand
+                return (name,)
+            return ('%s(1)' % name, '%s([1])' % name, '%s("x")' % name)
+
         # BOTH directions. Skipping the listed names could only ever
         # catch under-listing, so adding a harmless test to the set --
         # which over-pops a working setting -- passed unnoticed.
-        # BOTH spellings. Probing only `is <name>` meant an arg-taking
-        # test added to the set raised for ARITY, `renders` read that as
-        # "coercing, correctly listed", and `is in([1,2])` could be
-        # listed silently -- popping a guard that renders fine.
+        #
+        # "Overlisted" means NO valid spelling raises. A test whose
+        # safety depends on its ARGUMENT is correctly listed: `is
+        # in([1])` renders on an unset field but `is in("x")` raises,
+        # and since the strip cannot know which one a catalog author
+        # will write, the conservative answer is to pop both. Requiring
+        # every spelling to raise would have rejected `in` and left the
+        # 500 open.
         overlisted = [
             name for name in sorted(compose_module._COERCING_TESTS)
-            if any(renders(
-                '{%% if smtp.port is %s %%}a{%% else %%}b{%% endif %%}'
-                % spelling, unset)
-                for spelling in (name, '%s(1)' % name, '%s([1])' % name))]
+            if all(renders(
+                '{%% if %s is %s %%}a{%% else %%}b{%% endif %%}'
+                % (operand, spelling), unset)
+                for spelling in spellings(name)
+                for operand in operands)]
         # A name that is not a Jinja test at all raises for LOOKUP,
         # which the probe would also read as "coercing".
         self.assertLessEqual(
@@ -1620,8 +1737,9 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
         for name in sorted(compose_module._COMPOSE_RENDER_ENV.tests):
             if name in compose_module._COERCING_TESTS:
                 continue
-            for expression in ('smtp.port is %s' % name,
-                               'smtp.port is %s(1)' % name):
+            for expression in ('%s is %s' % (operand, spelling)
+                               for spelling in spellings(name)
+                               for operand in operands):
                 template = (
                     '{%% if %s %%}a{%% else %%}b{%% endif %%}' % expression)
                 # The ONLY discriminator: does it work when the

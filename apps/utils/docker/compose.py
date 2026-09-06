@@ -564,15 +564,26 @@ _COERCING_NODES = (
     nodes.Mod, nodes.Pow, nodes.Neg, nodes.Pos,
 )
 # Comparisons that answer harmlessly on an unset field, checked by
-# rendering each against the binding: `==`/`!=` give False, and both
-# membership operators give False/True rather than raising. Ordering
+# rendering each against the binding: `==`/`!=` give False. Ordering
 # (`<`, `>`, `<=`, `>=`) genuinely coerces and is absent on purpose.
 #
-# `in`/`notin` were missing, which over-popped
+# `in`/`notin` were briefly listed here, to keep
 # `{% if smtp.tls_mode in ["tls","starttls"] %}` -- a guard one word
 # away from the eight shipping `== "starttls"` entries the exemption
-# exists to protect, and one `main` keeps and renders.
-_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne', 'in', 'notin'})
+# exists to protect. That was wrong: membership is safe only when the
+# RIGHT operand is a container comparing by `==`. With the unset field
+# on the left of a string or a number it raises, and the key is kept
+# for the render to die on:
+#
+#   {% if smtp.tls_mode in "tls starttls" %}   TypeError: 'in <string>'
+#   {% if smtp.port in 25 %}                   TypeError: not a container
+#
+# `main` pops both and deploys, so listing them turned an accepted
+# over-pop into a 500. A narrower rule (exempt only when the right
+# operand is a list/tuple/dict literal) would keep the bracket form,
+# but no catalog entry writes a membership guard at all -- 0 across
+# 399 YAMLs -- so the exemption would protect nothing that ships.
+_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne'})
 
 # Tests that coerce their operand, found by enumerating every builtin
 # test in `_COMPOSE_RENDER_ENV` against the unset binding. `nodes.Test`
@@ -581,10 +592,44 @@ _SAFE_COMPARISON_OPS = frozenset({'eq', 'ne', 'in', 'notin'})
 # whole node type -- `is defined`, `is string`, `is mapping`, `is eq`
 # and the rest answer harmlessly on an unset field, and killing the
 # exemption for those would strip settings that work.
+# `in` is here for the same reason it is absent from
+# `_SAFE_COMPARISON_OPS`: `{% if smtp.tls_mode is in("starttls") %}` is
+# the operator spelled as a TEST, so the Compare rule never sees it,
+# and it raises the same TypeError.
+#
+# When re-deriving this set by enumeration, discard wrong-ARITY
+# failures: probing `is callable("x")` raises "takes exactly one
+# argument (2 given)", which looks like a coercion and is not --
+# `is callable` renders fine on an unset field. The same trap once put
+# `is even` on the wrong side of the line.
 _COERCING_TESTS = frozenset({
     'gt', 'greaterthan', 'ge', 'lt', 'lessthan', 'le',
-    'even', 'odd', 'divisibleby',
+    'even', 'odd', 'divisibleby', 'in',
 })
+
+
+def _test_is_hazardous(node):
+    """A `nodes.Test` that must NOT confer the guard exemption.
+
+    Two ways a test breaks the exemption's promise that an unset guard
+    renders its off-branch harmlessly:
+
+    * it COERCES the operand (`is gt`, `is even`), which raises through
+      `_UnsetField`; and
+    * the environment does not HAVE it. Jinja resolves a test name at
+      render time in a boolean slot, so `{% if smtp.host is nonempty %}`
+      -- an Ansible spelling, or just `is defiend` -- parses cleanly,
+      reads nothing, keeps its key, and then dies with
+      TemplateRuntimeError where `main` pops the key and deploys.
+
+    Consulted in BOTH places, which is the whole point of the helper:
+    where the test sits in someone else's guard slot, and where its own
+    `(Test, 'node')` slot is descended into. Naming it in only one of
+    them lets the test re-exempt its own operand one level down.
+    """
+    return (isinstance(node, nodes.Test)
+            and (node.name in _COERCING_TESTS
+                 or node.name not in _COMPOSE_RENDER_ENV.tests))
 
 
 def _calls_a_method_on(node, name):
@@ -647,8 +692,7 @@ def _guard_coerces(value, name):
                     and any(op.op not in _SAFE_COMPARISON_OPS
                             for op in candidate.ops)):
                 return True
-            if (isinstance(candidate, nodes.Test)
-                    and candidate.name in _COERCING_TESTS):
+            if _test_is_hazardous(candidate):
                 return True
             if _calls_a_method_on(candidate, name):
                 return True
@@ -669,16 +713,17 @@ def _named_in_a_jinja_block(value, name):
 
     A bare `\bsmtp\b` over the whole value sprayed: it popped
     `{{ mail.smtp }}` (an attribute of something else) and
-    `{{ instance_id }}-smtp` (plain text), dropping three working vars
-    where `main` deploys all three.
+    `{{ instance_id }}-smtp` (plain text), dropping both working vars
+    where `main` pops only the broken one and deploys them.
 
     `main`'s own narrow `smtp` + `.`/`[` test is too narrow the other
     way: it
     does not see `{{ dict(smtp).get("user") }}`, which reads the type
     through a wrapper and must be popped.
 
-    So: inside a block, and not preceded by a dot -- which is what
-    separates `smtp.host` and `dict(smtp)` from `mail.smtp`.
+    So: inside a block, and preceded by neither a dot nor a word
+    character -- the dot separates `smtp.host` and `dict(smtp)` from
+    `mail.smtp`, and the `\w` half stops `{{ mysmtp }}` matching.
     """
     return any(
         re.search(rf'(?<![.\w]){re.escape(name)}\b', block) is not None
@@ -747,10 +792,8 @@ def _reads(ast, name):
             # withdrawal above never took effect. The test's NAME has to
             # be consulted here, where its operand is being descended
             # into, not only where the test sits in someone else's slot.
-            slot_guards = (
-                (type(node), field) in _GUARD_SLOTS
-                and not (isinstance(node, nodes.Test)
-                         and node.name in _COERCING_TESTS))
+            slot_guards = ((type(node), field) in _GUARD_SLOTS
+                           and not _test_is_hazardous(node))
             child_guarded = guarded or (
                 slot_guards
                 and not _call_consumes(value, name)
@@ -830,9 +873,13 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        ``destination.type`` matches an unset integration. Works when
        the manager sent the full catalog destination set.
 
-    2. **Template-driven** (new — fixes Nextcloud install on no-SMTP):
-       walk every service's environment and pop any entry whose value
-       contains ``{{ <unset-type>.* }}``. Works even when the manager
+    2. **Template-driven** (fixes Nextcloud install on no-SMTP): walk
+       every service's environment, parse each value with Jinja and pop
+       any that READS an unset type. Not a text match: it sees
+       ``{{ smtp }}``, ``{% for k in smtp %}`` and ``dict(smtp).get()``,
+       and it deliberately KEEPS a value where the type only decides a
+       branch (``{% if smtp %}``), which renders harmlessly when unset.
+       Works even when the manager
        only sent user-submitted configurations (the historical shape):
        Nextcloud's ``MAIL_FROM_ADDRESS: '{{ smtp.from_address.split(...) }}'``
        has no per-instance value (user didn't pick SMTP, so the manager
@@ -1020,7 +1067,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # is often repaired by exactly the pop `main` would make,
             # and a bare `\bsmtp\b` additionally sprayed over
             # `{{ mail.smtp }}` and `{{ instance_id }}-smtp`, dropping
-            # three working vars where `main` deploys all three.
+            # both working vars where `main` deploys them.
             # The document is already broken, so nothing is being
             # protected: the deploy fails as it stands, popping cannot
             # break a working document, and popping may well FIX it --
@@ -1050,49 +1097,27 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # the third fix shipped. `Exception`, not `BaseException`,
             # so a KeyboardInterrupt still stops the process.
             #
-            # Fall back to the crudest form of the question: does the
-            # name occur at all? A value that never mentions `oidc`
-            # cannot dereference it except by aliasing, the residual
-            # named above. What is left -- broken and not mentioning the
-            # name -- keeps `main`'s behaviour and fails the render
-            # loudly, rather than being silently dropped from a deploy
-            # that then comes up misconfigured.
+            # This arm is the THIRD case, and only it: the value
+            # parsed, the document parses, and the ANALYSIS failed.
+            # (A broken document returned at the top; a value that
+            # cannot parse inside a parsing document returned just
+            # above.) Fall back to the same textual question those arms
+            # ask -- name inside a Jinja block -- rather than to "the
+            # name occurs at all", which is the bare `\bsmtp\b` rule
+            # `_named_in_a_jinja_block` exists to replace.
             #
-            # Deliberately does NOT also pop on a `{%` tag: that rule
-            # popped values referencing no integration at all, and the
-            # document guard below covers what it was for.
+            # Reached because `find_undeclared_variables` COMPILES, so
+            # an unknown filter (`{{ smtp.host|to_json }}`, the Ansible
+            # spelling) raises `TemplateAssertionError` even though the
+            # value parsed. Answering "not a reference" there kept a
+            # value that plainly dereferences the unset type, and 500'd
+            # where `main` pops it and deploys.
             #
-            # The value does not parse ALONE. What that means depends
-            # on the document.
-            #
-            # If the DOCUMENT parses, this is a fragment of a construct
-            # that straddles two env values, and popping one half breaks
-            # the whole:
-            #
-            #     A_PORT:  '{{ smtp.port|int }}'    <- popped, correctly
-            #     B_OPEN:  '{% if smtp %}'          <- popped, wrongly
-            #     C_CLOSE: '{% endif %}'
-            #
-            # left a dangling `{% endif %}` and a TemplateSyntaxError at
-            # `/start/`, where `main` deploys. The undo cannot save it
-            # either: it snapshots only when the document rendered
-            # BEFORE the strip, and `{{ smtp.port|int }}` is exactly the
-            # class that does not. So keep it -- `main` keeps it too.
-            #
-            # If the document does NOT parse, nothing is being protected:
-            # the deploy fails as it stands, popping cannot break a
-            # working document, and a malformed value like
-            # `{{ oidc.issuer }` is better dropped than left to fail the
-            # whole start. That is the crude question `main`'s successor
-            # asked, and it stays for exactly this case.
-            # The value PARSED and only the analysis failed.
-            # `find_undeclared_variables` COMPILES,
-            # so an unknown filter or test (`{{ smtp.host|to_json }}`,
-            # the Ansible spelling) raises `TemplateAssertionError` here
-            # even though the value parsed and the document parses. That
-            # answered "not a reference", kept a value that plainly
-            # dereferences the unset type, and 500'd where `main` pops
-            # it and deploys.
+            # A test Jinja does not have raises here too, but only in
+            # OUTPUT position (`{{ smtp.host is nonempty }}`). In a
+            # GUARD it resolves at render instead, so this arm never
+            # sees it and `_guard_coerces` withdraws the exemption
+            # explicitly.
             return _named_in_a_jinja_block(value, name)
 
     def _strings_in(value):
