@@ -1041,19 +1041,28 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                         popped.append('%s.%s' % (container, key))
                     env.pop(key, None)
                 elif isinstance(env, list):
-                    # `KEY=value` AND a bare `KEY`. The bare form is
-                    # legal compose and means "import this variable from
-                    # the host", so leaving it behind does not render an
-                    # empty value -- it hands the container whatever the
-                    # GREFFER HOST has in its environment under that
-                    # name. For an integration the user never configured
-                    # that is worse than the failure this pass exists to
-                    # stop: not a missing var, but someone else's.
-                    prefix = f'{key}='
+                    # Read the entry the way compose does: split on the
+                    # first `=` and take the NAME. Matching only
+                    # `KEY=` left a bare `KEY` behind, which is legal
+                    # compose meaning "import this variable from the
+                    # host" -- so for an integration the user never
+                    # configured, the container got whatever the GREFFER
+                    # HOST has under that name. Worse than the failure
+                    # this pass exists to stop: not a missing var, but
+                    # someone else's.
+                    #
+                    # The `.strip()` covers ` KEY`, `KEY ` and
+                    # `KEY =x`. Those are malformed compose -- a name
+                    # with a space is not a name the host will have --
+                    # so this closes no live hole; it is here so the
+                    # rule matches compose's own parsing rather than
+                    # relying on the spelling being unusable. It stays
+                    # exact on the name, so `OIDC_CLIENT_IDENTITY` and
+                    # `OIDC_CLIENT_IDX=1` survive.
                     kept_entries = [
                         e for e in env
                         if not (isinstance(e, str)
-                                and (e == key or e.startswith(prefix)))
+                                and e.split('=', 1)[0].strip() == key)
                     ]
                     if len(kept_entries) != len(env):
                         popped.append('%s.%s' % (container, key))

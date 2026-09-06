@@ -1387,18 +1387,30 @@ class ABareListEnvEntryIsRemovedTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         return compose['services']['app']['environment']
 
-    def test_a_bare_key_is_removed_like_an_assigned_one(self):
-        self.assertEqual(
-            self._strip(['OIDC_CLIENT_ID', 'OTHER=plain']), ['OTHER=plain'])
-        self.assertEqual(
-            self._strip(['OIDC_CLIENT_ID=x', 'OTHER=plain']), ['OTHER=plain'])
+    def test_every_spelling_of_the_key_is_removed(self):
+        # Read the way compose reads it: name is everything before the
+        # first `=`. The whitespace forms are malformed compose -- a
+        # name with a space is not one the host will have -- so they
+        # close no live hole; they are here because the rule should
+        # match compose's parsing rather than lean on the spelling
+        # being unusable.
+        for entry in ('OIDC_CLIENT_ID',        # bare: host passthrough
+                      'OIDC_CLIENT_ID=',       # empty assignment
+                      'OIDC_CLIENT_ID=x',
+                      ' OIDC_CLIENT_ID',
+                      'OIDC_CLIENT_ID ',
+                      'OIDC_CLIENT_ID =x'):
+            with self.subTest(entry=entry):
+                self.assertEqual(
+                    self._strip([entry, 'OTHER=plain']), ['OTHER=plain'])
 
     def test_a_key_that_merely_starts_the_same_is_kept(self):
-        # Exact match or `KEY=`, not a prefix: `OIDC_CLIENT_IDENTITY`
-        # is a different variable and must survive.
-        self.assertEqual(
-            self._strip(['OIDC_CLIENT_IDENTITY', 'OIDC_CLIENT_IDX=1']),
-            ['OIDC_CLIENT_IDENTITY', 'OIDC_CLIENT_IDX=1'])
+        # Exact on the NAME, not a prefix: each of these is a different
+        # variable and must survive. Case matters too -- env names are
+        # case-sensitive, so the lowercase spelling is not this key.
+        entries = ['OIDC_CLIENT_IDENTITY', 'OIDC_CLIENT_IDX=1',
+                   'oidc_client_id', 'OIDC_CLIENT=1']
+        self.assertEqual(self._strip(entries), entries)
 
 
 class EveryBlockAlternativeIsLoadBearingTests(TestCase):
