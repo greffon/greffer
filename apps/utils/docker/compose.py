@@ -1,9 +1,11 @@
 import yaml
 import asyncio
+import copy
+import re
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined, Template
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template, meta, nodes
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 import docker
@@ -80,7 +82,6 @@ def get_nginx_service(greffon):
     }
 
 
-
 def create_compose_template_from_greffon(compose, greffon_info):
     for service_name, service in compose['services'].items():
         service['ports'] = []
@@ -154,10 +155,164 @@ def get_greffon_path(greffon_info):
 
 # Feature #4 (integrations): the set of integration types the catalog
 # may reference via `{{ <type>.<field> }}` in compose YAML AND via
-# `destination.type: <type>` in metadata.json. V1 ships SMTP only; new
-# types slot in additively here AND in the manager (per-type FK on
-# GreffonInstance) AND in the catalog validator.
-KNOWN_INTEGRATION_TYPES = ('smtp',)
+# `destination.type: <type>` in metadata.json. New types slot in
+# additively here AND in the manager (per-type FK on GreffonInstance)
+# AND in the catalog validator.
+#
+# `oidc` is listed here BEFORE anything in the catalog references it,
+# and that order is deliberate. This tuple is the gate on both passes
+# below: a type absent from it is never lifted into the Jinja context,
+# so a catalog entry containing `{{ oidc.issuer }}` shipped first would
+# raise `UndefinedError: 'oidc' is undefined` at render and the instance
+# would never deploy -- the same failure class as the known-broken
+# `nextcloud/1.0`. Listing the type first makes an unset OIDC integration
+# strip those env keys instead.
+#
+# That covers `services[*].environment` and ONLY that. Be precise about
+# the limit, because it is the half Feature #3 will need: a baked config
+# file (`_render_baked_file`) renders under `StrictUndefined`, where
+# `oidc = {}` still raises on `{{ oidc.issuer }}` -- verified, it gives
+# `'dict object' has no attribute 'issuer'` and a 422. The shapes that
+# TOLERATE an empty mapping do now render, though, which is less than
+# "raises either way" would suggest: `{{ oidc }}` and `|tojson` give
+# `{}`, `.get(k, d)` gives `d`, and `{% if oidc %}` takes the else
+# branch. Same semantics `smtp` has shipped with.
+#
+# `|default` depends on WHAT it is applied to, and the difference is
+# easy to get backwards. The mapping is DEFINED -- an empty dict -- so
+# `{{ oidc|default('d') }}` renders `{}`, not `d`. A missing FIELD is
+# undefined, so `{{ oidc.issuer|default('d') }}` does render `d`.
+#
+# So the loud-refusal guarantee covers a DEREFERENCE, not every
+# reference -- a realm file written with `|default` on a field renders
+# that default rather than refusing. A Keycloak-style realm file referencing
+# `{{ oidc.* }}` is still NOT made deployable by this change, and
+# whoever writes the client-injection half needs a real value there
+# rather than an empty default.
+#
+# Note this greffer half is independent of how the manager REGISTERS an
+# OIDC client (platform-identity Feature #3, manager side). All the
+# greffer does is thread whatever per-type blob the manager sends into
+# the render; it holds no provider credential and makes no call to the
+# provider.
+KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
+
+
+# Distinguishes `.get(k)` from `.get(k, none)`. Using `None` as the
+# sentinel treated an explicitly passed `none` as "no default", so
+# `{{ oidc.get('issuer', none) is none }}` took the opposite branch from
+# a plain empty dict -- the one behaviour this wrapper exists to keep.
+_OMITTED = object()
+
+
+class _UnsetField(ChainableUndefined):
+    """A field of an integration the user did not configure.
+
+    Undefined, exactly as it was when unset types were a plain `{}`, so
+    `{{ smtp.host }}` renders `''` and `{{ smtp.host|default(25) }}`
+    renders `25` -- both matching that binding byte for byte.
+
+    What it adds is that going DEEPER cannot fail: `ChainableUndefined`
+    survives an attribute chain but still raises when CALLED, and
+    `{{ smtp.from_address.split('@')[0] }}` is a shape the catalog ships,
+    so `__call__` is absorbed. Iteration needs no override: the base
+    `Undefined` already yields nothing, and only `StrictUndefined`
+    refuses -- an explicit `__iter__` here was dead code. The result is strictly
+    better than the old binding rather than different from it: identical
+    wherever `{}` rendered, and rendering where `{}` raised.
+    """
+
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+class _UnsetIntegration(dict):
+    """How an integration type the user did not configure is bound at
+    COMPOSE render time.
+
+    The env-key strip pass below removes the keys a catalog entry
+    declares for an unset type, but it works by reading template TEXT,
+    and eight adversarial rounds established it cannot be made complete:
+    a macro argument moves the dereference onto another name, and
+    `map(attribute='a.b')` hides the path inside a string literal the
+    scanner has to blank for other reasons. Each round closed one hole
+    and the next found another, which is the signature of an undecidable
+    question rather than a bug.
+
+    So the deploy must not DEPEND on the scan being complete. This is a
+    real `dict`, so everything that worked when unset types were bound to
+    a plain `{}` still works -- `|tojson` gives `{}`, `|int` gives `0`,
+    `|pprint` gives `{}`, `.get('k', 'd')` gives `'d'`, `{% if oidc %}`
+    is falsy -- and its FIELDS are `_UnsetField`, which keeps `{}`'s
+    behaviour one level down (`{{ oidc.issuer }}` renders `''`,
+    `|default` fires) while chaining deeper instead of raising.
+
+    Checked shape by shape against a plain `{}`: identical wherever `{}`
+    rendered, and rendering where `{}` raised. An earlier version had
+    `__missing__` return `self`, which made a one-level dereference
+    render the literal `{}` -- strictly worse than what it replaced, for
+    the depth that is by far the most common.
+
+    That combination is the point, and it is why this is NOT a
+    `ChainableUndefined` subclass. That version chained correctly but
+    stopped being a dict, which BROKE `{{ oidc|tojson }}` (a natural way
+    to pass a whole blob, and an uncaught 500 in `create_compose`),
+    turned `|int` into an UndefinedError, and rendered the literal text
+    `Undefined` into the compose file for `|pprint`. Every one of those
+    was a regression against the `{}` it replaced -- the fix was worse
+    than the failure it prevented for any template that did not chain.
+
+    Scoped deliberately to the compose render. `greffon_info` still holds
+    a plain `{}`, so `_render_baked_file` keeps raising ConfigRenderError
+    (422) on `{{ oidc.issuer }}` rather than writing a silently empty
+    config file: a baked file is content, where quiet truncation is worse
+    than a loud refusal, and it has no strip pass to remove the key.
+    """
+
+    def get(self, key, default=_OMITTED):
+        """`dict.get`, except that a missing key with no default gives
+        the forgiving Undefined rather than `None`.
+
+        `{{ smtp.get('host') }}` otherwise rendered the literal string
+        `None` into a container's environment -- a value that is neither
+        empty nor correct, which is the whole class this object exists
+        to prevent. A caller who passes an explicit default still gets
+        it, so `.get(k, 'x')` is unchanged.
+        """
+        if key in self:
+            return self[key]
+        return self[key] if default is _OMITTED else default
+
+    def __missing__(self, key):
+        # A FIELD is undefined, not another empty mapping. Returning
+        # `self` here made `{{ smtp.host }}` render the literal `{}`
+        # where a plain `{}` binding rendered `''` -- a garbage value the
+        # container then tries to use as a hostname, in place of the
+        # benign empty one it used to get. That is a regression against
+        # the type already shipping, and the docstring above claimed the
+        # opposite of it.
+        #
+        # This is what makes attribute access arrive here at all, which
+        # is not obvious: Jinja's `Environment.getattr` tries `getattr()`
+        # and falls back to `getitem()`, so `{{ oidc.issuer }}` is a
+        # missing KEY.
+        # Named, not a shared no-name singleton. A few operations still
+        # raise through `_UnsetField` -- `|int`, comparisons, arithmetic
+        # -- and with no name the message was `None is undefined`, so a
+        # 500 out of `create_compose` identified neither the type nor the
+        # field. `main` named the field, so that was a diagnosability
+        # regression on precisely the residual class this design accepts.
+        # The allocation happens only on the rare path the strip pass
+        # missed.
+        # `obj=dict(self)`, not `self`. Jinja renders the object's type
+        # into the message, so passing the wrapper leaked
+        # `apps.utils.docker.compose._UnsetIntegration object` into a 500
+        # an operator has to read. A plain dict restores main's wording,
+        # `'dict object' has no attribute 'issuer'`, which is what they
+        # would recognise.
+        return _UnsetField(name=key, obj=dict(self))
 
 
 def _is_integration_set(value):
@@ -178,12 +333,48 @@ def _compute_integrations_context(greffon_info):
 
     Unset types become empty dicts — Jinja's default Undefined resolves
     `{{ smtp.host }}` on `{}` to an empty string rather than blowing up
-    with AttributeError on None. The companion delete-on-unset pass
-    strips those keys from the compose entirely; the empty-dict default
-    is purely belt-and-braces in case a future delete-pass bug leaves
-    a stray `{{ smtp.* }}` in place.
+    with AttributeError on None.
+
+    That `{}` is NOT belt-and-braces, whatever this docstring used to
+    claim. `_compose_render_context` reads it as the signal to install
+    the forgiving binding, and that binding is load-bearing: the strip
+    pass cannot be made complete (aliasing and `|map(attribute=...)`
+    move a dereference off the name entirely), so something has to
+    survive what it misses. The two mechanisms divide as follows —
+    the strip pass produces NO KEY, the binding produces an EMPTY VALUE.
+    Only the strip pass can deliver the first, which is what glitchtip
+    needs: an `EMAIL_URL` present but empty renders `smtp://:@:`, a
+    malformed URL its app parses at boot.
+
+    NOTE for the per-instance OIDC blobs of platform-identity Feature #3:
+    `_is_integration_set` is `bool(dict)`, so a blob with ANY key reads
+    as configured and switches BOTH mechanisms off. A half-written row —
+    persisted before client registration finished, or a provider variant
+    with a different shape — therefore reaches the render as a
+    configured integration.
+
+    What happens then depends on the SHAPE of the reference, and the
+    quiet case is the likely one:
+
+        {{ oidc.client_secret }}     ''   — Jinja's own default for a
+                                            one-level miss. No error.
+        {{ oidc.client_secret.x }}   UndefinedError
+        {{ oidc.client_secret|int }} UndefinedError
+
+    So a half-registered client does NOT reliably fail loudly: the
+    commonest shape of all, reading a secret directly, deploys an empty
+    string. This is identical to `main` and to any plain dict, so it is
+    not a regression — but Feature #3 must not lean on a refusal that
+    only covers chained access. Enforce the shape in the catalog
+    validator, or have the manager refuse to send an incomplete blob.
     """
-    integrations = greffon_info.get('integrations') or {}
+    integrations = greffon_info.get('integrations')
+    # Shape-defensive for the same reason `_compute_config_context` is:
+    # this runs eagerly for EVERY greffon at start, so a malformed
+    # manager payload must not 500 a deploy that works today. A non-
+    # mapping `integrations` is no integrations.
+    if not isinstance(integrations, dict):
+        integrations = {}
     for t in KNOWN_INTEGRATION_TYPES:
         value = integrations.get(t)
         # Always set the key so the Jinja context has a stable shape;
@@ -273,13 +464,446 @@ def _render_json_value(value, greffon_info, dest_name):
     return value
 
 
+# Filters that read an attribute off their operand, so they dereference
+# without producing a `Getattr` node. `attr` names the attribute
+# positionally; the rest take an `attribute=` keyword.
+# Slots whose occupant only DECIDES something: the mapping's contents
+# never reach the output through them. An occurrence of the type inside
+# one of these is a guard, not a read.
+# These are every such slot Jinja has, not a sample: the classes with a
+# `test` field are `If`, `CondExpr` and `For` (the `{% for x in xs if
+# cond %}` filter), plus `Test.node`, the thing an `is` test examines.
+# `For.test` was missed at first, and the cost shows why the list is
+# derived rather than recalled -- `{% for x in ['off'] if not smtp %}`
+# is the same guard as `{% if not smtp %}`, renders the same `off` on
+# an unset integration, and was popped while the `{% if %}` spelling
+# was kept.
+_GUARD_SLOTS = frozenset({
+    (nodes.If, 'test'),
+    (nodes.CondExpr, 'test'),
+    (nodes.For, 'test'),
+    (nodes.Test, 'node'),
+})
+
+
+def _call_consumes(value, name):
+    """Does a call in this subtree take the integration as an ARGUMENT?
+
+    A guard is exempt because it only DECIDES -- the mapping's contents
+    cannot reach the output through a test. Passing them INTO a call
+    breaks that, because the call can stash them somewhere the value
+    prints afterwards:
+
+        {% set l=[] %}{% if l.append(smtp.host) %}{% endif %}{{ l[0] }}
+
+    read `smtp.host` inside an `If.test` and printed it outside, so the
+    guard exemption kept a value rendering `smtp://` in the glitchtip
+    shape -- present and malformed.
+
+    Arguments only, not the receiver. `{% if oidc.issuer.startswith("h") %}`
+    calls a method ON the integration and uses the result to decide;
+    nothing leaves the test. Treating every call as unsafe popped that,
+    which is an ordinary catalog idiom and a working conditional.
+    """
+    for item in (value if isinstance(value, list) else [value]):
+        if not isinstance(item, nodes.Node):
+            continue
+        calls = ([item] if isinstance(item, nodes.Call) else []) + list(
+            item.find_all(nodes.Call))
+        for call in calls:
+            passed = list(call.args or []) + [
+                kw.value for kw in (call.kwargs or [])]
+            for extra in (call.dyn_args, call.dyn_kwargs):
+                if extra is not None:
+                    passed.append(extra)
+            for arg in passed:
+                if not isinstance(arg, nodes.Node):
+                    continue
+                if isinstance(arg, nodes.Name) and arg.name == name:
+                    return True
+                if any(n.name == name for n in arg.find_all(nodes.Name)):
+                    return True
+    return False
+
+
+# The ONE environment the compose is rendered in -- by the document
+# guard and by `create_compose` itself.
+#
+# ONE, because the guard's whole claim is "the question I ask is the
+# question the render will ask". While these were two environments that
+# claim was false in both directions, and both ways were 500s at
+# `/start/` on composes `main` deploys: a value the guard's environment
+# accepted but the deploy's refused was kept and then failed, and one
+# the guard refused made the document look unrenderable, which silently
+# disabled the net below.
+#
+# SANDBOXED, because catalog text is community-controlled and this
+# module already sandboxes baked files against exactly this
+# (`_FILE_RENDER_ENV`): a plain Environment executes
+# `{{ cycler.__init__.__globals__.os.popen("id").read() }}` on a worker
+# holding the instance's secrets, the manager token and the Docker
+# socket. The strip pass made that worse by rendering values it exists
+# to DELETE, before deleting them.
+#
+# Sandboxing the deploy render is a change to `main`'s behaviour, so it
+# was measured, not assumed: all 32 catalog entries render BYTE
+# IDENTICALLY sandboxed and unsandboxed, in both the configured and
+# unset scenarios (64/64).
+_COMPOSE_RENDER_ENV = SandboxedEnvironment()
+
+
+# Operations that RAISE on `_UnsetField` instead of answering falsily.
+# The guard exemption assumes a guard renders correctly when the
+# integration is unset, and for bare truthiness and `==`/`!=` it does.
+# It does not for these: `{{ "true" if smtp.port|int == 465 else
+# "false" }}` raises UndefinedError, and `main` pops that key and
+# deploys. Reproduced against main before this was written.
+_COERCING_NODES = (
+    nodes.Filter,
+    nodes.Add, nodes.Sub, nodes.Mul, nodes.Div, nodes.FloorDiv,
+    nodes.Mod, nodes.Pow, nodes.Neg, nodes.Pos,
+)
+# Comparisons that answer harmlessly on an unset field, checked by
+# rendering each against the binding: `==`/`!=` give False. Ordering
+# (`<`, `>`, `<=`, `>=`) genuinely coerces and is absent on purpose.
+#
+# `in`/`notin` were briefly listed here, to keep
+# `{% if smtp.tls_mode in ["tls","starttls"] %}` -- a guard one word
+# away from the eight shipping `== "starttls"` entries the exemption
+# exists to protect. That was wrong: membership is safe only when the
+# RIGHT operand is a container comparing by `==`. With the unset field
+# on the left of a string or a number it raises, and the key is kept
+# for the render to die on:
+#
+#   {% if smtp.tls_mode in "tls starttls" %}   TypeError: 'in <string>'
+#   {% if smtp.port in 25 %}                   TypeError: not a container
+#
+# `main` pops both and deploys, so listing them turned an accepted
+# over-pop into a 500. A narrower rule (exempt only when the right
+# operand is a list/tuple/dict literal) would keep the bracket form,
+# but no catalog entry writes a membership guard at all -- 0 across
+# 399 YAMLs -- so the exemption would protect nothing that ships.
+_SAFE_COMPARISON_OPS = frozenset({'eq', 'ne'})
+
+# Tests that coerce their operand, found by enumerating every builtin
+# test in `_COMPOSE_RENDER_ENV` against the unset binding. `nodes.Test`
+# is a GUARD SLOT, so without naming these the withdrawal never saw
+# them: `{% if smtp.port is gt(1) %}` kept its key and 500'd. Not the
+# whole node type -- `is defined`, `is string`, `is mapping`, `is eq`
+# and the rest answer harmlessly on an unset field, and killing the
+# exemption for those would strip settings that work.
+# `in` is here for the same reason it is absent from
+# `_SAFE_COMPARISON_OPS`: `{% if smtp.tls_mode is in("starttls") %}` is
+# the operator spelled as a TEST, so the Compare rule never sees it,
+# and it raises the same TypeError.
+#
+# When re-deriving this set by enumeration, discard wrong-ARITY
+# failures: probing `is callable("x")` raises "takes exactly one
+# argument (2 given)", which looks like a coercion and is not --
+# `is callable` renders fine on an unset field. The same trap once put
+# `is even` on the wrong side of the line.
+_COERCING_TESTS = frozenset({
+    'gt', 'greaterthan', 'ge', 'lt', 'lessthan', 'le',
+    'even', 'odd', 'divisibleby', 'in',
+})
+
+
+def _test_is_hazardous(node):
+    """A `nodes.Test` that must NOT confer the guard exemption.
+
+    Two ways a test breaks the exemption's promise that an unset guard
+    renders its off-branch harmlessly:
+
+    * it COERCES the operand (`is gt`, `is even`), which raises through
+      `_UnsetField`; and
+    * the environment does not HAVE it. Jinja resolves a test name at
+      render time in a boolean slot, so `{% if smtp.host is nonempty %}`
+      -- an Ansible spelling, or just `is defiend` -- parses cleanly,
+      reads nothing, keeps its key, and then dies with
+      TemplateRuntimeError. `main` keeps and dies on the `{% if %}`
+      spelling too -- its pass 2 needs `{{` in the value -- so this is
+      a 500 turned into an accepted over-pop, not a regression this
+      branch introduced and then repaired.
+
+    Consulted in BOTH places, which is the whole point of the helper:
+    where the test sits in someone else's guard slot, and where its own
+    `(Test, 'node')` slot is descended into. Naming it in only one of
+    them lets the test re-exempt its own operand one level down.
+    """
+    return (isinstance(node, nodes.Test)
+            and (node.name in _COERCING_TESTS
+                 or node.name not in _COMPOSE_RENDER_ENV.tests))
+
+
+def _calls_a_method_on(node, name):
+    """Is this a method invoked on the integration MAPPING itself?
+
+    `_UnsetIntegration` is a real dict, so `smtp.popitem()` raises
+    KeyError, `smtp.get()` raises TypeError, `smtp.pop("host")` raises
+    KeyError -- none of which is Undefined coercion, so the rules above
+    never saw them. Worse than a 500: `{{ "" if smtp.update({"host":
+    "x"}) else "" }}` MUTATES the binding, and a sibling
+    `{% if smtp %}` in the same document then renders `on`, telling the
+    greffon SMTP is configured when it is not.
+
+    Only when the receiver is the mapping. A call on a FIELD --
+    `{{ "a" if smtp.host.startswith("h") else "b" }}` -- stays exempt,
+    because `_UnsetField.__call__` absorbs it and returns itself. That
+    is the shape the catalog actually writes, and the exemption exists
+    for it.
+    """
+    if not isinstance(node, nodes.Call):
+        return False
+    callee = node.node
+    if isinstance(callee, nodes.Name):
+        return callee.name == name
+    # The `isinstance(..., nodes.Name)` narrowing is AttributeError
+    # safety rather than a rule. From parseable source the only other
+    # nodes that can sit here carrying a `.name` are `Filter` and
+    # `Test`, and widening to them changes no strip decision -- but
+    # NOT for the reason it is tempting to give. `_COERCING_NODES` does
+    # not save the `Filter` case: a filter node named `smtp` contains no
+    # `Name('smtp')`, so it fails `_guard_coerces`'s own `reaches`
+    # check. What saves it is `_call_consumes`, which is tested first at
+    # the single call site -- reaching the type through such a callee
+    # requires `Name` inside the `Call`, which is either in the callee
+    # subtree (so the Filter/Test reaches it and fires) or in the args
+    # (so `_call_consumes` fires).
+    return (isinstance(callee, nodes.Getattr)
+            and isinstance(callee.node, nodes.Name)
+            and callee.node.name == name)
+
+
+def _guard_coerces(value, name):
+    """Does this guard apply an operation to the type that RAISES unset?
+
+    The exemption exists because a guard on an unset integration renders
+    the "off" branch rather than failing -- true for `{% if smtp %}` and
+    for `== "starttls"`, which is the shape eight shipping entries use.
+    It is false the moment the guard coerces a FIELD: `|int`, `|round`,
+    `|abs`, arithmetic, or an ordering comparison all raise through
+    `_UnsetField`, and the key is then kept for the render to die on.
+
+    Ordering, not equality: `==` and `!=` on an Undefined answer False,
+    which is why the catalog's `== "starttls"` guards are safe and must
+    stay exempt.
+    """
+    # `value` is whatever sits in the slot: a node, a list of them, or
+    # None -- `For.test` is None whenever the loop has no `if` filter,
+    # and iterating that raised, which `_dereferences` then swallowed
+    # into "not a dereference" and kept every such key.
+    candidates = value if isinstance(value, (list, tuple)) else [value]
+    for node in candidates:
+        if not isinstance(node, nodes.Node):
+            continue
+        for candidate in ([node] + list(node.find_all(nodes.Node))):
+            reaches = any(
+                n.name == name for n in candidate.find_all(nodes.Name))
+            if not reaches:
+                continue
+            if isinstance(candidate, _COERCING_NODES):
+                return True
+            if (isinstance(candidate, nodes.Compare)
+                    and any(op.op not in _SAFE_COMPARISON_OPS
+                            for op in candidate.ops)):
+                return True
+            if _test_is_hazardous(candidate):
+                return True
+            if _calls_a_method_on(candidate, name):
+                return True
+    return False
+
+
+# A Jinja block, including one left unterminated at the end of a value
+# (`{{ smtp.host }` -- which is exactly the shape that breaks a
+# document and sends everything down the fallback below).
+_JINJA_BLOCK_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{\{.*$|\{%.*$', re.S)
+
+
+def _named_in_a_jinja_block(value, name):
+    r"""Does the type appear as a NAME inside a Jinja block?
+
+    The fallback for everything the AST cannot answer, so its precision
+    decides two failure directions at once.
+
+    A bare `\bsmtp\b` over the whole value sprayed: it popped
+    `{{ mail.smtp }}` (an attribute of something else) and
+    `{{ instance_id }}-smtp` (plain text), dropping both working vars
+    where `main` pops only the broken one and deploys them.
+
+    `main`'s own narrow `smtp` + `.`/`[` test is too narrow the other
+    way: it does not see `{{ dict(smtp).get("user") }}`, which reads the
+    type through a wrapper and must be popped.
+
+    So: inside a block, and preceded by neither a dot nor a word
+    character -- the dot separates `smtp.host` and `dict(smtp)` from
+    `mail.smtp`, and the `\w` half stops `{{ mysmtp }}` matching.
+    """
+    return any(
+        re.search(rf'(?<![.\w]){re.escape(name)}\b', block) is not None
+        for block in _JINJA_BLOCK_RE.findall(value))
+
+
+def _reads(ast, name):
+    """Does this parsed template READ the top-level `name`?
+
+    Asked in two halves, and the split is the point.
+
+    The BASE is `meta.find_undeclared_variables`, which is Jinja's own
+    answer to "which variables does this template use". It is complete
+    by construction: every occurrence, in every construct, present and
+    future. Enumerating the constructs that read a variable was tried
+    instead and was wrong ELEVEN times -- bare-`Name` targets only,
+    `|attr()`, whole-mapping filters (`|urlencode`, `|items`),
+    `namespace(v=smtp).v`, `dict(smtp).get()`, `{% for k in smtp %}`,
+    `{{ smtp }}`, `{{ smtp ~ "" }}` -- each found by a different review,
+    each an under-pop that shipped a malformed value. A list reached
+    that way is evidence of nothing about the twelfth case.
+
+    What is enumerated instead is the GUARD positions, and that
+    inversion is what makes the failure direction safe. Miss a read
+    construct and the base rule still catches it. Miss a guard slot and
+    the cost is one env var over-popped on an integration nobody
+    configured -- the trade this module makes everywhere.
+
+    A guard renders CORRECTLY on an unset integration, because the
+    binding is a falsy empty mapping: `{% if smtp %}on{% else %}off
+    {% endif %}` gives `off`, and `{{ 'y' if smtp.host else 'n' }}`
+    gives `n`. Popping those would discard a working setting.
+
+    `|default` is NOT a guard, contrary to what this code claimed for
+    two rounds. The binding is DEFINED, so `{{ smtp|default('x') }}`
+    renders `{}` rather than `x` -- there is no author handling to
+    preserve, only garbage to remove. (`default(x, true)` does fire, and
+    is over-popped; that is the accepted direction.)
+
+    Left incomplete on purpose: aliasing and dataflow.
+    `{% set a = smtp %}{{ a.host }}` moves the read onto another name,
+    and `find_undeclared_variables` reports `smtp` for it, so it is
+    popped -- but a macro parameter carrying it across two env values is
+    not something any single-value analysis can follow. The binding and
+    the document guard cover that.
+    """
+    if name not in meta.find_undeclared_variables(ast):
+        return False
+
+    # Only real nodes are ever pushed, which is why there is no
+    # empty-slot check here. The previous implementation walked a
+    # `Filter`'s operand directly, and a filter BLOCK
+    # (`{% filter upper %}..{% endfilter %}`) has that slot EMPTY, so it
+    # raised an uncaught AttributeError out of `/start/`. Pushing only
+    # `Node` instances makes that unrepresentable rather than guarded.
+    # Three-valued walk. `guarded` says a guard above vouches for this
+    # subtree; `sealed` says a withdrawal above it did not, and no slot
+    # deeper down may vouch for it either.
+    #
+    # The seal is what makes a withdrawal stick. Guardedness alone is
+    # monotone -- it can only go False -> True -- so refusing the
+    # exemption at one level did nothing to stop the next level
+    # granting it again. `(Test, 'node')` is itself a guard slot, so a
+    # HARMLESS test nested inside a hazardous one re-granted what the
+    # hazardous one had just been denied:
+    #
+    #     {% if smtp.host is nonempty %}                 popped
+    #     {% if (smtp.host is defined) is nonempty %}    KEPT, and 500s
+    #
+    # Same for a `CondExpr` inside a hazardous test. The first spelling
+    # was fixed and tested; the second differs only by a pair of
+    # parentheses and died with the same TemplateRuntimeError.
+    stack = [(ast, False, False)]
+    while stack:
+        node, guarded, sealed = stack.pop()
+        if isinstance(node, nodes.Name) and node.name == name:
+            if guarded:
+                continue
+            return True
+        for field, value in node.iter_fields():
+            is_slot = (type(node), field) in _GUARD_SLOTS
+            # The test's NAME has to be consulted where its operand is
+            # descended into, not only where the test sits in someone
+            # else's slot.
+            # `not guarded` restores a short-circuit the seal dropped.
+            # The old expression was `guarded or (...)`, so once a guard
+            # above vouched for this subtree Python stopped evaluating
+            # the helpers. Recomputing them unconditionally took
+            # `_test_is_hazardous` from O(n) to O(n^2) calls on nested
+            # guards. It is behaviour-preserving: `child_guarded` is
+            # `guarded or ...`, so guardedness never goes back to False
+            # once set, no deeper Name is ever reported, and `sealed`
+            # only ever feeds `child_guarded`.
+            withdrawn = not guarded and is_slot and (
+                _test_is_hazardous(node)
+                or _call_consumes(value, name)
+                or _guard_coerces(value, name))
+            child_sealed = sealed or withdrawn
+            child_guarded = guarded or (is_slot and not child_sealed)
+            for item in (value if isinstance(value, list) else [value]):
+                if isinstance(item, nodes.Node):
+                    stack.append((item, child_guarded, child_sealed))
+    return False
+
+
+def _why_it_will_not_render(compose, render_context):
+    """The render failure as text, for the restore's log line.
+
+    `_document_renders` answers yes/no and throws the exception away,
+    which left an operator with "the strip broke it" and no cause. This
+    re-runs the same render only to name the failure, on the path that
+    has already decided to restore.
+    """
+    try:
+        _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose)).render(
+            **copy.deepcopy(render_context))
+    except Exception as exc:
+        return '%s: %s' % (type(exc).__name__, exc)
+    return 'no longer reproducible'
+
+
+def _document_renders(compose, render_context):
+    """Does the compose survive the WHOLE render once dumped?
+
+    Dump, compile, render -- the three steps `create_compose` performs,
+    with the same context, so the answer is the one that matters rather
+    than an approximation of it. Compiling alone was not enough twice
+    over: a family of `TemplateAssertionError`s comes only from the
+    compile step, and a symbol can be DEFINED in one env value and USED
+    in another, so popping the definition leaves a document that
+    compiles and then raises `'u' is undefined`.
+
+    The context is deep-copied PER CALL, and that is load-bearing.
+    Copying it once at the call site and reusing it was not enough: a
+    catalog expression that mutates the context corrupts the copy, and
+    every later verdict then answers a different question than
+    `create_compose` will ask with its own fresh context. Both
+    directions shipped real bugs -- a mutation that removes made the
+    guard undo every pop, so glitchtip's `EMAIL_URL` went out as
+    `smtp://:@`; a mutation that adds made the guard approve a document
+    that then raised at `/start/`.
+
+    A context that will not copy means the question cannot be asked
+    safely, so the answer is no.
+
+    Any failure is a no, including a compose that will not dump.
+    """
+    try:
+        context = copy.deepcopy(render_context)
+    except Exception:
+        return False
+    try:
+        _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose)).render(**context)
+    except Exception:
+        return False
+    return True
+
+
 def _delete_unset_integration_env_keys(compose, greffon_info):
     """For each known integration type whose config is unset, pop every
     env key in the compose that would expand to an unset-integration
-    Jinja reference. This guarantees ``absent ⇒ no env var`` regardless
-    of how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
+    Jinja reference. This aims at ``absent ⇒ no env var`` regardless of
+    how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
     crucially, regardless of whether the catalog destination metadata
-    actually reached the greffer for this start.
+    actually reached the greffer for this start. See below for the one
+    case where it settles for less.
 
     Two passes:
 
@@ -288,9 +912,13 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        ``destination.type`` matches an unset integration. Works when
        the manager sent the full catalog destination set.
 
-    2. **Template-driven** (new — fixes Nextcloud install on no-SMTP):
-       walk every service's environment and pop any entry whose value
-       contains ``{{ <unset-type>.* }}``. Works even when the manager
+    2. **Template-driven** (fixes Nextcloud install on no-SMTP): walk
+       every service's environment, parse each value with Jinja and pop
+       any that READS an unset type. Not a text match: it sees
+       ``{{ smtp }}``, ``{% for k in smtp %}`` and ``dict(smtp).get()``,
+       and it deliberately KEEPS a value where the type only decides a
+       branch (``{% if smtp %}``), which renders harmlessly when unset.
+       Works even when the manager
        only sent user-submitted configurations (the historical shape):
        Nextcloud's ``MAIL_FROM_ADDRESS: '{{ smtp.from_address.split(...) }}'``
        has no per-instance value (user didn't pick SMTP, so the manager
@@ -298,31 +926,110 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
        the template pass catches it directly from the compose body
        before Jinja renders.
 
+    The guarantee is "absent integration => no env var", with one
+    documented exception: if the strip breaks the document, every pop is
+    put back (see the restore at the end of this function), and those
+    keys render EMPTY through the binding rather than being absent. That
+    is the weaker outcome, taken only when the alternative is a document
+    that will not render at all.
+
+    SCOPE: both passes look only at ``services[*].environment``. A
+    reference from ``command``, ``labels``, ``env_file`` or anywhere else
+    is NOT popped, and the binding does not save every such case either
+    (it absorbs attribute access, but ``{{ oidc.port|int }}`` still
+    raises). Those render exactly as they do on ``main`` -- this function
+    narrows the failure, it does not eliminate it. The guarantee is
+    "absent integration => no env var", not "no reference anywhere".
+
     Defensive on shape: catalog metadata is supposed to use mapping-
     form ``environment:`` per the Feature #2 validator, but compose
     YAML also permits list form (``KEY=value``); both passes handle
     each form.
     """
-    integrations = greffon_info.get('integrations') or {}
-    services = compose.get('services', {}) if isinstance(compose, dict) else {}
+    integrations = greffon_info.get('integrations')
+    if not isinstance(integrations, dict):
+        integrations = {}
+    services = compose.get('services') if isinstance(compose, dict) else None
+    if not isinstance(services, dict):
+        # `services:` with an empty body parses to None.
+        services = {}
 
     unset_types = [
         t for t in KNOWN_INTEGRATION_TYPES
         if not _is_integration_set(integrations.get(t))
     ]
+
+    # Every pop, from BOTH passes. The restore puts back pass 1's
+    # metadata-driven pops as well, and the ERROR line naming the
+    # restored keys is the only signal that an instance is quietly
+    # degraded -- listing only pass 2's undercounted exactly what an
+    # operator needs to see.
+    popped = []
     if not unset_types:
         return compose
 
+    # Whether the document renders is a property of the WHOLE document,
+    # but both passes decide one value at a time, and a Jinja construct
+    # can span two of them. Popping one half leaves the other dangling
+    # and fails the entire render -- a 500 at `/start/`, far worse than
+    # the env var the pop was worth.
+    #
+    # Reviews found this in shapes that argue against ever fixing it
+    # value-by-value: `{% raw %}` PARSES alone (so it is kept) while its
+    # `{% endraw %}` does not (so it is popped), and a `{# comment`
+    # opener holds no Jinja delimiter at all (so it is never examined)
+    # while the `{{ oidc.host }} #}` closing it is a genuine reference
+    # that must be popped. No per-value rule is right about both.
+    #
+    # So stop enumerating shapes and check the invariant instead: if the
+    # document was usable before the strip and is not after, the pops
+    # that broke it are undone. Costs one extra parse of a document we
+    # are about to render anyway, and catches shapes nobody predicted --
+    # including that popping a `{% raw %}` pair UN-SHIELDS what sat
+    # between it, so the strip can add constructs, not only remove
+    # them.
+    # The exact context `create_compose` renders with, so the guard's
+    # question is the render's question and not a proxy for it.
+    # `_document_renders` copies it per call -- see there for why once
+    # at this call site was not enough.
+    render_context = _compose_render_context(greffon_info)
+    rendered_before = _document_renders(compose, render_context)
+    snapshot = None
+    if rendered_before:
+        try:
+            snapshot = copy.deepcopy(compose)
+        except Exception:
+            # No snapshot means no undo; the guard below keys on
+            # `snapshot is not None`. A compose holding something
+            # uncopyable (a module dumps but does not deepcopy) is not
+            # the shape this defends, and raising here would be the very
+            # 500 it exists to avoid.
+            pass
+
     # Pass 1 — metadata-driven pop (unchanged behavior).
     for t in unset_types:
-        for configuration in greffon_info.get('configurations', []) or []:
-            for destination in configuration.get('destinations', []) or []:
+        configurations = greffon_info.get('configurations')
+        if not isinstance(configurations, list):
+            configurations = []
+        for configuration in configurations:
+            if not isinstance(configuration, dict):
+                continue
+            destinations = configuration.get('destinations')
+            if not isinstance(destinations, list):
+                continue
+            for destination in destinations:
                 if not isinstance(destination, dict):
                     continue
                 if destination.get('type') != t:
                     continue
                 container = destination.get('container')
                 key = destination.get('key')
+                # `isinstance(str)`, not just truthiness: catalog
+                # metadata is JSON, so either of these can arrive as a
+                # list, and an unhashable dict lookup raises TypeError
+                # straight out of `/start/`.
+                if not isinstance(container, str) or not isinstance(key, str):
+                    continue
                 if not container or not key:
                     continue
                 service = services.get(container)
@@ -330,52 +1037,368 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                     continue
                 env = service.get('environment')
                 if isinstance(env, dict):
+                    if key in env:
+                        popped.append('%s.%s' % (container, key))
                     env.pop(key, None)
                 elif isinstance(env, list):
-                    prefix = f'{key}='
-                    service['environment'] = [
-                        e for e in env if not (isinstance(e, str) and e.startswith(prefix))
+                    # Read the entry the way compose does: split on the
+                    # first `=` and take the NAME. Matching only `KEY=`
+                    # left a bare `KEY` behind, which is legal compose
+                    # meaning "import this variable from the host".
+                    #
+                    # Scope, measured rather than assumed: the child
+                    # process env is already scrubbed to
+                    # `_COMPOSE_ENV_ALLOWLIST` (PATH, HOME and four
+                    # DOCKER_* names), so a bare key cannot reach an
+                    # arbitrary greffer secret through the environment
+                    # -- only those six. The live vector is the OTHER
+                    # source compose reads for a bare key: a `.env`
+                    # beside the rendered compose file. `apply_
+                    # configuration` writes `file`/`json` destinations
+                    # into that same directory under a catalog-supplied
+                    # name, so a catalog can put one there.
+                    #
+                    # The `.strip()` covers ` KEY`, `KEY ` and
+                    # `KEY =x`. Those are malformed compose -- a name
+                    # with a space is not a name the host will have --
+                    # so this closes no live hole; it is here so the
+                    # rule matches compose's own parsing rather than
+                    # relying on the spelling being unusable. It stays
+                    # exact on the name, so `OIDC_CLIENT_IDENTITY` and
+                    # `OIDC_CLIENT_IDX=1` survive.
+                    kept_entries = [
+                        e for e in env
+                        if not (isinstance(e, str)
+                                and e.split('=', 1)[0].strip() == key)
                     ]
+                    if len(kept_entries) != len(env):
+                        popped.append('%s.%s' % (container, key))
+                    service['environment'] = kept_entries
 
-    # Pass 2 — template-driven pop. We want to pop any env value that
-    # would expand to a reference of an unset integration type, e.g.
-    # ``{{ smtp.host }}``, ``{{ smtp.from_address.split('@')[0] }}``,
-    # the dict-index form
-    # ``{{ {"tls": "ssl", "starttls": "tls", "none": ""}[smtp.tls_mode] }}``,
-    # AND the bracket-key form ``{{ smtp['from_address'] }}`` (valid
-    # Jinja, semantically identical to ``smtp.from_address`` for our
-    # purposes — Codex P2 on PR #35).
+    # Pass 2 -- template-driven pop, for values the catalog templates
+    # rather than declares.
     #
-    # Cheap + robust: require both ``{{`` and a word-bounded ``<type>``
-    # immediately followed by ``.`` (attr) or ``[`` (bracket) in the
-    # value. ``\b`` before the type prevents ``foo_smtp.bar`` false
-    # positives.
-    import re
-    type_patterns = {
-        t: re.compile(r'\b' + re.escape(t) + r'(?:\.\w|\[)')
-        for t in unset_types
-    }
+    # ASKS JINJA'S OWN PARSER rather than approximating it. Five
+    # hand-rolled scanners preceded this and each leaked somewhere a
+    # regex approximates a grammar: string literals holding delimiters,
+    # statement blocks, spaced dots, nested mapping braces, call parens,
+    # and finally a normalisation that backtracked quadratically on a
+    # whitespace run -- a denial of service on catalog-controlled input
+    # reached through `/start/`. The parser does not approximate; string
+    # literals, comments, `{% raw %}`, whitespace and nesting are its
+    # job. See the commit history for which scanner failed how.
+    #
+    # A reference is any USE of the type that is not a guard. Which
+    # uses exist is Jinja's answer, not ours -- see `_reads`, and the
+    # eleven constructs that had to be added one at a time before the
+    # question was asked that way round.
+    parser_env = Environment()
 
-    def value_references_unset(value):
-        if not isinstance(value, str):
-            return False
-        if '{{' not in value:
-            return False
-        return any(p.search(value) for p in type_patterns.values())
+    def _dereferences(value, name):
+        """Does `value` read the top-level `name` and dereference it?
 
-    for service in services.values():
+        Asks Jinja's PARSER. A dereference is a `Getattr`/`Getitem` whose
+        target is a `Name` for the type -- which is what the question
+        literally is, so there is nothing left to approximate.
+
+        Hand-written scanners preceded it and were repeatedly wrong
+        about string literals holding delimiters, nesting, and
+        call-versus-grouping parens. The parser has already resolved
+        all of that.
+
+        Still incomplete in one place, and it is a dataflow one rather
+        than a syntactic one: aliasing (`{% set a = oidc %}{{ a.issuer }}`,
+        a macro argument) moves the dereference onto another name
+        entirely, and no amount of looking at THIS expression can follow
+        it.
+
+        The binding covers the SIMPLE aliases -- `{{ base }}` where
+        `base` was set from `oidc.url` renders empty rather than
+        raising. It does NOT cover a name bound to a definition that
+        gets popped: the binding knows `oidc`, not the macro named after
+        it. `{% macro u() %}{{ oidc.x }}{% endmacro %}` in one env value
+        and `{{ u() }}` in another raises `'u' is undefined`. That is
+        what the document guard is for.
+
+        Handles a locally shadowed name correctly, which is worth
+        stating because it used to be listed here as an accepted
+        over-pop. `{% for smtp in xs %}{{ smtp.a }}{% endfor %}` binds
+        the name locally and never touches the integration, so the key
+        survives -- `find_undeclared_variables` gets the scoping right
+        and does not report it. `main` pops it.
+        """
+        if not document_parses:
+            # `main`'s shape, not a bare word match: a broken document
+            # is often repaired by exactly the pop `main` would make,
+            # and a bare `\bsmtp\b` additionally sprayed over
+            # `{{ mail.smtp }}` and `{{ instance_id }}-smtp`, dropping
+            # both working vars where `main` deploys them.
+            # The document is already broken, so nothing is being
+            # protected: the deploy fails as it stands, popping cannot
+            # break a working document, and popping may well FIX it --
+            # which is what `main` does here, with the same crude
+            # question. Applied to every value, not only the ones that
+            # fail to parse alone: a value can parse perfectly and still
+            # be what breaks the document (`{% raw %}` left open at the
+            # end of it), or be the half that a straddle needs.
+            return _named_in_a_jinja_block(value, name)
+        try:
+            parsed = parser_env.parse(value)
+        except Exception:
+            # The value does not PARSE. In a document that does, it is a
+            # fragment of a construct spanning two env values, and
+            # popping one half breaks the whole -- so keep it, as `main`
+            # keeps it. (A document that does not parse returned above.)
+            return False
+        try:
+            return _reads(parsed, name)
+        except Exception:
+            # Deliberately bare: the body is a single `parse()` on
+            # catalog-controlled input, so there is no logic of ours for
+            # a broad catch to hide, and anything escaping is a 500 at
+            # `/start/`. Naming the classes was tried and failed four
+            # times -- the last, `SyntaxError` from CPython via Jinja's
+            # number lexer on `{{ 0.１ }}`, was found by fuzzing after
+            # the third fix shipped. `Exception`, not `BaseException`,
+            # so a KeyboardInterrupt still stops the process.
+            #
+            # This arm is the THIRD case, and only it: the value
+            # parsed, the document parses, and the ANALYSIS failed.
+            # (A broken document returned at the top; a value that
+            # cannot parse inside a parsing document returned just
+            # above.) Fall back to the same textual question those arms
+            # ask -- name inside a Jinja block -- rather than to "the
+            # name occurs at all", which is the bare `\bsmtp\b` rule
+            # `_named_in_a_jinja_block` exists to replace.
+            #
+            # Reached because `find_undeclared_variables` COMPILES, so
+            # an unknown filter (`{{ smtp.host|to_json }}`, the Ansible
+            # spelling) raises `TemplateAssertionError` even though the
+            # value parsed. Answering "not a reference" there kept a
+            # value that plainly dereferences the unset type, and 500'd
+            # where `main` pops it and deploys.
+            #
+            # A test Jinja does not have raises here too, but only in
+            # OUTPUT position (`{{ smtp.host is nonempty }}`). In a
+            # GUARD it resolves at render instead, so this arm never
+            # sees it and `_guard_coerces` withdraws the exemption
+            # explicitly.
+            return _named_in_a_jinja_block(value, name)
+
+    def _strings_in(value, seen=None):
+        """Every string inside `value`, however nested.
+
+        A compose env value is usually a scalar, but YAML permits a list
+        or a mapping, and `yaml.dump` turns those into template text
+        just the same. Skipping non-strings meant `A: ['{{ smtp.host }}']`
+        was never examined and rendered `['']` -- present but empty, the
+        failure this pass exists to stop.
+
+        Each CONTAINER is visited once, by identity. YAML anchors make
+        one object reachable by many paths, so a compact document builds
+        a shared tree that this walk otherwise re-descends once per
+        path: measured at 0.9s for depth 8, 3.4s for 12 and 80s for 16,
+        doubling with every extra level, from a file small enough to
+        sit in a catalog entry. `RecursionError` does not save it --
+        the depth stays tiny, only the path COUNT explodes -- so
+        `/start/` just hangs.
+
+        Visiting a shared subtree once is enough for the question being
+        asked. This yields strings only to decide whether ANY of them
+        dereferences an unset type, and a second visit to the same
+        object cannot change that answer.
+
+        `seen` holds ids, and nothing here keeps the objects alive, so
+        this is only safe because the tree is EXTERNALLY ROOTED: it
+        comes from `yaml.safe_load`, is reachable from `compose` for
+        the whole call, and is plain dict/list/str throughout. Give it
+        a container that hands back a fresh temporary per iteration and
+        CPython reuses the address, `seen` matches the wrong object and
+        a real reference is dropped. No compose can produce that, but
+        the reason is lifetime, not the soundness argument above.
+        """
+        if isinstance(value, str):
+            yield value
+            return
+        if not isinstance(value, (dict, list, tuple)):
+            return
+        if seen is None:
+            seen = set()
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        nested_values = value.values() if isinstance(value, dict) else value
+        for nested in nested_values:
+            yield from _strings_in(nested, seen)
+
+    # Whether the DOCUMENT is a valid template, which is what decides
+    # how to read a value that will not parse on its own. See
+    # `_dereferences`.
+    try:
+        _COMPOSE_RENDER_ENV.parse(yaml.dump(compose))
+        document_parses = True
+    except Exception:
+        document_parses = False
+
+    def matching_unset_types(value):
+        """Which unset types `value` dereferences, in tuple order."""
+        try:
+            # The delimiter check is a PERFORMANCE filter, not a
+            # semantic one, and no test can pin it: every path out of
+            # `_dereferences` needs a Jinja delimiter to answer yes --
+            # `_named_in_a_jinja_block` matches only alternatives that
+            # open with one, and `find_undeclared_variables` on
+            # delimiter-free text returns an empty set. Dropping it
+            # changes no answer, only how many values get parsed.
+            texts = [
+                text for text in _strings_in(value)
+                if '{{' in text or '{%' in text
+            ]
+        except RecursionError:
+            # A YAML alias can make an env value refer to itself
+            # (`A: &a [..., *a]`). The memo above now terminates that
+            # case and gives the RIGHT answer for it -- an innocent
+            # cycle keeps its key instead of being popped, which is
+            # what `main` does -- so this arm no longer catches the
+            # self-referential value it was written for. It stays for
+            # genuine DEPTH: a value nested past the interpreter limit
+            # still raises here, and popping is the same answer this
+            # function gives for anything else it cannot read.
+            return tuple(unset_types)
+        if not texts:
+            return ()
+        return tuple(
+            t for t in unset_types
+            if any(_dereferences(text, t) for text in texts)
+        )
+
+
+    def _log_pop(key, name, matched):
+        # The types that MATCHED, not every unset type: on a fresh
+        # instance both smtp and oidc are unset, so naming the whole set
+        # would report a key that references only oidc as
+        # "unset type: smtp, oidc" and make the field noise.
+        popped.append('%s.%s' % (name, key))
+        logger.info(
+            'integrations: dropping env %s from service %s '
+            '(references unset type: %s)',
+            key, name, ', '.join(matched),
+        )
+
+    for name, service in services.items():
         if not isinstance(service, dict):
             continue
         env = service.get('environment')
         if isinstance(env, dict):
-            for key in [k for k, v in env.items() if value_references_unset(v)]:
-                env.pop(key, None)
+            for key, value in list(env.items()):
+                matched = matching_unset_types(value)
+                if matched:
+                    _log_pop(key, name, matched)
+                    env.pop(key, None)
         elif isinstance(env, list):
-            service['environment'] = [
-                e for e in env
-                if not (isinstance(e, str) and '=' in e and value_references_unset(e.split('=', 1)[1]))
-            ]
+            kept = []
+            for e in env:
+                matched = (
+                    matching_unset_types(e.split('=', 1)[1])
+                    if isinstance(e, str) and '=' in e
+                    else ()
+                )
+                if matched:
+                    _log_pop(e.split('=', 1)[0], name, matched)
+                    continue
+                kept.append(e)
+            service['environment'] = kept
+
+    # The strip must not make things WORSE. If the document rendered
+    # before and does not now, the pops are the only thing that changed,
+    # so put them all back and let the deploy fail the way it would have
+    # without this pass -- loudly, and identically to `main`.
+    #
+    # Wholesale, not key by key. A chunked undo that kept every pop it
+    # could was tried: ~210 lines, a wall-clock budget that made the
+    # deployed file depend on how loaded the node was, and zero firings
+    # across the whole catalog. Restoring everything is the same answer
+    # for every input that exists, and a comprehensible one for those
+    # that do not.
+    if snapshot is not None and not _document_renders(compose, render_context):
+        # The restore SUCCEEDS, so the deploy then works -- with those
+        # keys present and empty instead of absent. This line is the
+        # only signal that the instance is quietly degraded, so it
+        # carries the cause and the keys, not just the id.
+        # Not "will render empty": that is true for the common
+        # `KEY: '{{ smtp.host }}'` shape and wrong for the two
+        # host-passthrough spellings, a bare `KEY` in list form and
+        # `KEY:` with no value, which come back as passthrough rather
+        # than as an empty string. Say what actually happened -- the
+        # keys are back as the catalog wrote them -- and let the
+        # operator read the entry.
+        logger.error(
+            'integrations: the env strip broke the compose document for '
+            '%s (%s); restoring %s as the catalog declared them, so the '
+            'instance deploys with those keys present',
+            greffon_info.get('id'),
+            _why_it_will_not_render(compose, render_context),
+            ', '.join(popped) or 'nothing',
+        )
+        # `clear()` before `update()` is belt-and-braces and no test
+        # can pin it: the strip only ever pops keys from a service's
+        # `environment`, so the snapshot and the live document always
+        # have the same top-level keys and `update` alone restores
+        # completely. It stays so a future pass that adds a top-level
+        # key cannot leave it behind on the rescue path.
+        compose.clear()
+        compose.update(snapshot)
     return compose
+
+
+def _compose_render_context(greffon_info):
+    """`greffon_info` with UNSET integration types bound so nothing raises.
+
+    Unset only, deliberately. Wrapping configured types as well made a
+    missing FIELD on a configured integration render empty, where `main`
+    raises and names it:
+
+        {{ smtp.from_addres.split("@")[1] }}   # renamed or mistyped
+            main    UndefinedError: 'dict object' has no attribute ...
+            wrapped ''
+
+    `nextcloud` ships `{{ smtp.from_address.split("@")[1] }}` today, so
+    that turned a loud refusal into `MAIL_DOMAIN=""` on every instance
+    with SMTP configured. It also contradicted the rule this module
+    applies to baked files -- quiet truncation is worse than a loud
+    refusal -- by exempting the compose path from it.
+
+    The cost is that a PARTIALLY populated blob raises on a CHAINED
+    dereference of a field it does not carry. Only chained: reading the
+    field directly still renders `''`, exactly as a plain dict does, so
+    this is not a general "loud refusal" and Feature #3 must not treat
+    it as one (see `_compute_integrations_context`). Where it does fire,
+    it is the intended answer: a catalog entry reading an optional field
+    should say so with `|default`, which is explicit and reviewable,
+    rather than relying on the platform to paper over it.
+
+    A caller that deliberately populated the key still wins, which is the
+    same non-clobbering rule `_compute_integrations_context` follows.
+    """
+    context = dict(greffon_info)
+    for t in KNOWN_INTEGRATION_TYPES:
+        # Falsiness is the whole policy, and does two jobs at once.
+        # `_compute_integrations_context` writes `{}` for an unset type
+        # and the blob itself for a configured one, so this wraps unset
+        # types ONLY -- a configured blob is a non-empty dict, hence
+        # truthy, hence untouched. Re-deriving "unset" from
+        # `integrations` here would be a second, redundant spelling of
+        # the same condition that could drift from it.
+        #
+        # Falsy rather than `== {}` so that a `greffon_info` which
+        # already carries a top-level `oidc: None` is bound too.
+        # `_compute_integrations_context` uses `setdefault`, so such a
+        # key is never normalised to `{}`, and leaving it would let
+        # `{{ oidc.a.b }}` raise. A caller with a REAL preset still
+        # wins, because a usable blob is truthy.
+        if not context.get(t):
+            context[t] = _UnsetIntegration()
+    return context
 
 
 def _compute_instance_context(greffon_info):
@@ -569,10 +1592,17 @@ def create_compose(compose, greffon_info):
     # but BEFORE Jinja substitution; it pops the SMTP env keys whose
     # values would otherwise be templated `{{ smtp.host }}` strings.
     greffon_info = _compute_integrations_context(greffon_info)
-    _delete_unset_integration_env_keys(compose, greffon_info)
+    # Log rotation FIRST: the strip's document guard approves the exact
+    # text that will be rendered, and injecting afterwards changed that
+    # text. Appending content is not neutral to Jinja -- an unclosed
+    # `{% raw %}` is accepted at EOF and rejected once anything follows
+    # it -- so the guard could pass on a document that then failed to
+    # compile. Neither function reads what the other writes (one touches
+    # `environment`, the other `logging`), so the order is free.
     _inject_instance_log_rotation(compose)
-    t = Template(yaml.dump(compose))
-    compose_file = t.render(**greffon_info)
+    _delete_unset_integration_env_keys(compose, greffon_info)
+    t = _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose))
+    compose_file = t.render(**_compose_render_context(greffon_info))
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 
