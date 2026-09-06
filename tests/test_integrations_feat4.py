@@ -203,6 +203,57 @@ class DeleteUnsetIntegrationEnvKeysTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         self.assertEqual(compose['services']['plausible']['environment'], [])
 
+    def test_a_bare_list_entry_is_stripped_like_an_assigned_one(self):
+        # `- SMTP_PASSWORD`, with no `=`, is legal compose and does NOT
+        # mean "empty". It means "import this variable from the host",
+        # so leaving it behind for an integration the user never
+        # configured hands the container whatever the greffer process
+        # has under that name -- not a missing variable, someone
+        # else's. Matching only `KEY=` left every bare entry in place.
+        compose = {'services': {'plausible': {'environment': [
+            'SMTP_HOST_ADDR', 'KEEP=me']}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'], ['KEEP=me'])
+
+    def test_every_spelling_of_a_declared_key_is_stripped(self):
+        # Read the entry the way compose reads it: the NAME is
+        # everything before the first `=`. The whitespace forms are
+        # malformed compose -- a name with a space is not one the host
+        # will have -- so they close no live hole; they are here so the
+        # rule matches compose's parsing instead of leaning on the
+        # spelling being unusable, which is how the bare form was
+        # missed in the first place.
+        for entry in ('SMTP_HOST_ADDR',        # bare: host passthrough
+                      'SMTP_HOST_ADDR=',       # empty assignment
+                      'SMTP_HOST_ADDR=smtp.x',
+                      ' SMTP_HOST_ADDR',
+                      'SMTP_HOST_ADDR ',
+                      'SMTP_HOST_ADDR =smtp.x'):
+            with self.subTest(entry=entry):
+                compose = {'services': {'plausible': {'environment': [
+                    entry, 'KEEP=me']}}}
+                info = _compute_integrations_context(
+                    _greffon_info_with_smtp_destinations())
+                _delete_unset_integration_env_keys(compose, info)
+                self.assertEqual(
+                    compose['services']['plausible']['environment'],
+                    ['KEEP=me'])
+
+    def test_a_name_that_merely_starts_the_same_is_kept(self):
+        # Exact on the NAME, not a prefix, and case-sensitive as env
+        # names are. Each of these is a different variable.
+        entries = ['SMTP_HOST_ADDRESS', 'SMTP_HOST_ADDR_2=x',
+                   'smtp_host_addr', 'SMTP_HOST=x']
+        compose = {'services': {'plausible': {'environment': list(entries)}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'], entries)
+
     def test_set_smtp_leaves_keys_in_place(self):
         compose = self._compose_with_smtp_env('dict')
         info = _greffon_info_with_smtp_destinations()

@@ -332,9 +332,35 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 if isinstance(env, dict):
                     env.pop(key, None)
                 elif isinstance(env, list):
-                    prefix = f'{key}='
+                    # Read the entry the way compose does: the NAME is
+                    # everything before the first `=`.
+                    #
+                    # Matching `KEY=` alone left a BARE `KEY` in place,
+                    # and that is not an empty value -- it is compose's
+                    # "import this variable from the host" form. So for
+                    # an integration the user never configured, the
+                    # container received whatever the greffer process
+                    # has under that name instead of nothing at all.
+                    #
+                    # Bounded, not unbounded: `compose_env()` already
+                    # scrubs the child environment to
+                    # `_COMPOSE_ENV_ALLOWLIST`, so only those names can
+                    # arrive by that route. The unbounded source is the
+                    # other place compose looks for a bare key, a
+                    # `.env` beside the rendered compose file, which
+                    # `apply_configuration` can write under a
+                    # catalog-supplied destination name.
+                    #
+                    # `.strip()` covers ` KEY`, `KEY ` and `KEY =v`.
+                    # Those are malformed compose and close no live
+                    # hole; they are handled so this matches compose's
+                    # own parsing rather than resting on the spelling
+                    # being unusable, which is the assumption that let
+                    # the bare form through.
                     service['environment'] = [
-                        e for e in env if not (isinstance(e, str) and e.startswith(prefix))
+                        e for e in env
+                        if not (isinstance(e, str)
+                                and e.split('=', 1)[0].strip() == key)
                     ]
 
     # Pass 2 — template-driven pop. We want to pop any env value that
