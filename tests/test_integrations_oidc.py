@@ -1293,10 +1293,13 @@ class EveryBlockAlternativeIsLoadBearingTests(TestCase):
     """`_JINJA_BLOCK_RE` has four alternatives and `re.S`; nothing
     pinned three of them.
 
-    They only matter on the fallback path -- a document that does not
-    parse -- so every fixture here carries a deliberately broken key to
-    get there. Each alternative failing looks the same from outside: an
-    env var vanishes, or one that should vanish survives to 500.
+    They matter on the fallback paths. The fixtures here reach the one
+    that fires when the DOCUMENT does not parse, so each carries a
+    deliberately broken key; the same helper is also reached from the
+    third arm of `_dereferences`, when the document parses and only the
+    analysis failed. Each alternative failing looks the same from
+    outside: an env var vanishes, or one that should vanish survives
+    to 500.
     """
 
     def _kept(self, env):
@@ -1325,9 +1328,10 @@ class EveryBlockAlternativeIsLoadBearingTests(TestCase):
                          [])
 
     def test_a_block_may_span_a_newline(self):
-        # yaml.dump folds long values, so a block really does arrive
-        # split across lines. Without re.S `.` stops at the newline and
-        # the reference is invisible.
+        # A catalog author may break a long expression across lines in
+        # the source YAML, and the helper sees the raw env value, so the
+        # newline is really there. Without re.S `.` stops at it and the
+        # reference is invisible.
         self.assertEqual(self._kept({'BAD': '{{ oidc.x }',
                                      'K': '{{ smtp.host\n }}'}),
                          [])
@@ -1394,7 +1398,7 @@ class TheFallbackAsksMainsQuestionTests(TestCase):
 
 
 class WhateverSurvivesTheStripMustRenderTests(TestCase):
-    """The invariant the guard exemption has now broken twice.
+    """The invariant the guard exemption has now broken three times.
 
     Every withdrawal rule in `_guard_coerces` exists because a KEPT
     value 500'd at `/start/`. A test that asserts only "the key
@@ -1409,9 +1413,21 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
       `_reads` answered cleanly, `(nodes.Test, 'node')` kept the
       exemption, and the render died.
 
+    * A harmless test NESTED inside a hazardous one re-granted the
+      exemption the hazardous one had just been denied, so
+      `{% if (smtp.host is defined) is nonempty %}` 500'd while
+      `{% if smtp.host is nonempty %}`, one pair of parentheses away,
+      passed.
+
     So render the survivor. The table below is the whole guard
     vocabulary in one place: for each shape, whether the strip KEEPS
-    it, and -- either way -- that the document still renders.
+    it, and that the document still renders.
+
+    Read the render assertion honestly: on a `kept=False` row the
+    environment is empty, so there is no Jinja left and rendering
+    cannot fail. It has teeth only on the `kept=True` rows. What the
+    `kept=False` rows pin is the strip DECISION -- and that is the
+    assertion the membership and nested-test fixes depend on.
     """
 
     # (value, kept). `kept=False` is an over-pop we accept: one env var
@@ -1447,6 +1463,22 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
         # Tests it does have, which answer harmlessly and stay exempt.
         ('{% if smtp.host is defined %}on{% else %}off{% endif %}', True),
         ('{% if smtp is mapping %}on{% else %}off{% endif %}', True),
+        # NESTED. A harmless test inside a hazardous one used to
+        # re-grant the exemption the hazardous one had just been
+        # denied, because `(Test, 'node')` is a guard slot and
+        # guardedness only ever went False -> True. Each of these
+        # differs from a shape already above by one pair of
+        # parentheses, and each 500'd while that shape passed.
+        ('{% if (smtp.host is defined) is nonempty %}on{% else %}off{% endif %}', False),
+        ('{{ "a" if (smtp.host is defined) is nonempty else "b" }}', False),
+        ('{% if ("x" if smtp.host else "y") is nonempty %}on{% else %}off{% endif %}', False),
+        ('{% if (smtp.host is defined) is in("x") %}on{% else %}off{% endif %}', False),
+        ('{% if ((smtp.host is defined) is string) is nonempty %}on{% else %}off{% endif %}', False),
+        # ...and the seal must not spread: a safe test nested in a safe
+        # test is still exempt, or every layered guard over-pops.
+        ('{% if (smtp.host is defined) is string %}on{% else %}off{% endif %}', True),
+        ('{% if (smtp is mapping) is boolean %}on{% else %}off{% endif %}', True),
+        ('{% if smtp %}{% if smtp.host is defined %}a{% endif %}{% endif %}', True),
         # Coercion, ordering, arithmetic, dict methods.
         ('{% if smtp.port > 25 %}on{% else %}off{% endif %}', False),
         ('{% if smtp.port|int > 25 %}on{% else %}off{% endif %}', False),
@@ -1478,6 +1510,32 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
         outcomes = {kept for _, kept in self._SHAPES}
         self.assertEqual(outcomes, {True, False})
 
+    def test_the_table_keeps_a_witness_for_every_withdrawal_rule(self):
+        # Deleting rows is the SILENT way to revert a fix. The five
+        # membership rows are the only thing pinning
+        # `_SAFE_COMPARISON_OPS`; drop them and `'in', 'notin'` can go
+        # back with all tests green, restoring a reproduced 500. The
+        # outcome-set check above does not notice, because unrelated
+        # `False` rows keep the set at {True, False}.
+        witnesses = {
+            'membership (Compare)': ' in "tls starttls" ',
+            'membership (Test)': 'is in(',
+            'unknown test': 'is nonempty',
+            'nested re-grant': '(smtp.host is defined) is nonempty',
+            'ordering': 'smtp.port > 25',
+            'filter coercion': 'smtp.port|int',
+            'method on the mapping': 'smtp.popitem()',
+            'exempt guard': '{% if smtp %}on',
+            'exempt equality': 'smtp.tls_mode == "starttls"',
+        }
+        table = [value for value, _ in self._SHAPES]
+        for rule, fragment in witnesses.items():
+            with self.subTest(rule=rule):
+                self.assertTrue(
+                    any(fragment in value for value in table),
+                    'no row left exercising %s -- a fix it pins can now '
+                    'be reverted silently' % rule)
+
     def test_a_kept_shape_renders_its_off_branch_not_an_empty_string(self):
         # The exemption's whole premise: an unset guard picks the OFF
         # branch. If it rendered empty instead, keeping the key would
@@ -1490,6 +1548,22 @@ class WhateverSurvivesTheStripMustRenderTests(TestCase):
                     **compose_module._compose_render_context(info)))
         self.assertEqual(
             rendered['services']['a']['environment'], {'K': 'off'})
+
+    def test_a_container_value_pops_when_ONE_element_reads_the_type(self):
+        # `any`, not `all`, over the strings inside a value. Every other
+        # fixture in this file puts a scalar in `environment`, so
+        # `texts` has one element and the two are indistinguishable.
+        # With `all`, a list whose other entry is innocent keeps the
+        # key and renders `['', 'i1']` -- present and half empty, which
+        # is the failure pass 2 exists to stop.
+        for value in (['{{ smtp.host }}', '{{ instance_id }}'],
+                      {'h': '{{ smtp.host }}', 'i': '{{ instance_id }}'}):
+            with self.subTest(value=value):
+                compose = {'services': {'a': {'environment': {'K': value}}}}
+                info = _compute_integrations_context(
+                    {'id': 'i1', 'integrations': {}, 'instance_id': 'i1'})
+                _delete_unset_integration_env_keys(compose, info)
+                self.assertEqual(compose['services']['a']['environment'], {})
 
     def test_an_unknown_test_still_pops_from_output_position(self):
         # Output position takes a different route -- it raises
@@ -1702,6 +1776,17 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
     500, not an over-pop. So rather than trusting the list, enumerate
     the environment's tests and check each one against the unset
     binding: it must either tolerate an unset field, or be named.
+
+    Two classes it deliberately cannot express, because the
+    discriminator is "works configured, fails unset":
+
+    * a test that raises in BOTH states, such as `is filter` applied to
+      the MAPPING (it hashes the operand, and a configured blob is an
+      unhashable dict too). Not a gap the strip can close either --
+      `main` keeps and 500s on those as well, and no working config
+      makes them render.
+    * a custom test whose operand count is variable (`*args`), where
+      only the bare spelling gets probed.
     """
 
     def test_no_unlisted_test_raises_on_an_unset_field(self):
@@ -1753,6 +1838,14 @@ class EveryBuiltinTestIsClassifiedTests(TestCase):
                     and prm.default is prm.empty]
             except (TypeError, ValueError):       # a builtin with no sig
                 return (name,)
+            # `@pass_environment` / `@pass_context` tests take a leading
+            # argument Jinja supplies itself, so it is NOT an operand.
+            # Counting it made `is filter` and `is test` look
+            # arg-taking, and probing `is filter(1)` raises for ARITY in
+            # both contexts -- exactly the trap this helper exists to
+            # avoid, reintroduced one level up.
+            if getattr(fn, 'jinja_pass_arg', None) is not None:
+                required = required[1:]
             if len(required) <= 1:                # only the operand
                 return (name,)
             return ('%s(1)' % name, '%s([1])' % name, '%s("x")' % name)
@@ -1813,9 +1906,16 @@ class AGuardWhoseTESTCoercesIsNotExemptTests(TestCase):
     """`nodes.Test` is a guard slot, and some tests coerce.
 
     Found by enumerating every builtin test in the environment against
-    the unset binding rather than by picking examples. `is gt`, `is ge`,
-    `is lt`, `is le`, `is even`, `is odd` and `is divisibleby` all raise
-    on an unset field; every other builtin test answers harmlessly.
+    the unset binding rather than by picking examples. `is gt`,
+    `is greaterthan`, `is ge`, `is lt`, `is lessthan`, `is le`,
+    `is even`, `is odd`, `is divisibleby` and `is in` all raise on an
+    unset FIELD.
+
+    Coercion is only half the rule. A test the environment does not
+    HAVE -- `is nonempty`, or a misspelt `is defiend` -- resolves at
+    render time in a boolean slot, so it parses cleanly, reads nothing,
+    keeps its key and then dies with TemplateRuntimeError.
+    `_test_is_hazardous` carries both halves.
 
     Two levels had to know: the test sitting in someone else's guard
     slot, and the test's OWN operand slot -- `(Test, 'node')` is a guard
