@@ -159,42 +159,23 @@ def get_greffon_path(greffon_info):
 # additively here AND in the manager (per-type FK on GreffonInstance)
 # AND in the catalog validator.
 #
-# `oidc` is listed here BEFORE anything in the catalog references it,
-# and that order is deliberate. This tuple is the gate on both passes
-# below: a type absent from it is never lifted into the Jinja context,
-# so a catalog entry containing `{{ oidc.issuer }}` shipped first would
-# raise `UndefinedError: 'oidc' is undefined` at render and the instance
-# would never deploy -- the same failure class as the known-broken
-# `nextcloud/1.0`. Listing the type first makes an unset OIDC integration
-# strip those env keys instead.
+# `oidc` exposes ONE field, `issuer`. The manager's OIDC integration
+# type carries only that (`apps/integrations/types/oidc.py`), because
+# per-instance client registration does not exist -- so an entry
+# needing `client_id`/`client_secret` cannot work. The catalog
+# validator gains a matching field allowlist in greffon-catalog#88;
+# until that merges, nothing on the catalog side rejects those names.
 #
-# That covers `services[*].environment` and ONLY that. Be precise about
-# the limit, because it is the half Feature #3 will need: a baked config
-# file (`_render_baked_file`) renders under `StrictUndefined`, where
-# `oidc = {}` still raises on `{{ oidc.issuer }}` -- verified, it gives
-# `'dict object' has no attribute 'issuer'` and a 422. The shapes that
-# TOLERATE an empty mapping do now render, though, which is less than
-# "raises either way" would suggest: `{{ oidc }}` and `|tojson` give
-# `{}`, `.get(k, d)` gives `d`, and `{% if oidc %}` takes the else
-# branch. Same semantics `smtp` has shipped with.
-#
-# `|default` depends on WHAT it is applied to, and the difference is
-# easy to get backwards. The mapping is DEFINED -- an empty dict -- so
-# `{{ oidc|default('d') }}` renders `{}`, not `d`. A missing FIELD is
-# undefined, so `{{ oidc.issuer|default('d') }}` does render `d`.
-#
-# So the loud-refusal guarantee covers a DEREFERENCE, not every
-# reference -- a realm file written with `|default` on a field renders
-# that default rather than refusing. A Keycloak-style realm file referencing
-# `{{ oidc.* }}` is still NOT made deployable by this change, and
-# whoever writes the client-injection half needs a real value there
-# rather than an empty default.
-#
-# Note this greffer half is independent of how the manager REGISTERS an
-# OIDC client (platform-identity Feature #3, manager side). All the
-# greffer does is thread whatever per-type blob the manager sends into
-# the render; it holds no provider credential and makes no call to the
-# provider.
+# Note what adding a type here does NOT do: the manager still has to
+# link one to an instance. An operator CAN create an OIDC integration
+# (the type is registered on manager main), but `GreffonInstance`
+# carries a single `smtp_config` FK (`limit_choices_to={'type':
+# 'smtp'}`) and `_build_integrations_payload` has one hardcoded smtp
+# branch -- so `oidc` arrives unset on every instance today and its env
+# keys are stripped.
+# That is the correct behaviour for an unconfigured integration, and it
+# is also why an OIDC greffon cannot yet receive an issuer: the
+# per-instance link is platform-identity Feature #3, not this line.
 KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
@@ -1041,31 +1022,31 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                         popped.append('%s.%s' % (container, key))
                     env.pop(key, None)
                 elif isinstance(env, list):
-                    # Read the entry the way compose does: split on the
-                    # first `=` and take the NAME. Matching only `KEY=`
-                    # left a bare `KEY` behind, which is legal compose
-                    # meaning "import this variable from the host".
+                    # Read the entry the way compose does: the NAME is
+                    # everything before the first `=`.
                     #
-                    # Scope, measured rather than assumed: the child
-                    # process env is already scrubbed to
-                    # `_COMPOSE_ENV_ALLOWLIST` (PATH, HOME and four
-                    # DOCKER_* names), so a bare key cannot reach an
-                    # arbitrary greffer secret through the environment
-                    # -- only those six. The live vector is the OTHER
-                    # source compose reads for a bare key: a `.env`
-                    # beside the rendered compose file. `apply_
-                    # configuration` writes `file`/`json` destinations
-                    # into that same directory under a catalog-supplied
-                    # name, so a catalog can put one there.
+                    # Matching `KEY=` alone left a BARE `KEY` in place,
+                    # and that is not an empty value -- it is compose's
+                    # "import this variable from the host" form. So for
+                    # an integration the user never configured, the
+                    # container received whatever the greffer process
+                    # has under that name instead of nothing at all.
                     #
-                    # The `.strip()` covers ` KEY`, `KEY ` and
-                    # `KEY =x`. Those are malformed compose -- a name
-                    # with a space is not a name the host will have --
-                    # so this closes no live hole; it is here so the
-                    # rule matches compose's own parsing rather than
-                    # relying on the spelling being unusable. It stays
-                    # exact on the name, so `OIDC_CLIENT_IDENTITY` and
-                    # `OIDC_CLIENT_IDX=1` survive.
+                    # Bounded, not unbounded: `compose_env()` already
+                    # scrubs the child environment to
+                    # `_COMPOSE_ENV_ALLOWLIST`, so only those names can
+                    # arrive by that route. The unbounded source is the
+                    # other place compose looks for a bare key, a
+                    # `.env` beside the rendered compose file, which
+                    # `apply_configuration` can write under a
+                    # catalog-supplied destination name.
+                    #
+                    # `.strip()` covers ` KEY`, `KEY ` and `KEY =v`.
+                    # Those are malformed compose and close no live
+                    # hole; they are handled so this matches compose's
+                    # own parsing rather than resting on the spelling
+                    # being unusable, which is the assumption that let
+                    # the bare form through.
                     kept_entries = [
                         e for e in env
                         if not (isinstance(e, str)
