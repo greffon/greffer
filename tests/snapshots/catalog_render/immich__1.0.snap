@@ -1,0 +1,96 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:2283'
+    restart: unless-stopped
+    volumes:
+    - regress-immich_nginx_volume:/etc/nginx/
+  immich:
+    depends_on:
+    - immich_redis
+    - immich_database
+    environment:
+      DB_DATABASE_NAME: immich
+      DB_HOSTNAME: immich_database
+      DB_PASSWORD: 'regress-immich'
+      DB_USERNAME: immich
+      REDIS_HOSTNAME: immich_redis
+    image: ghcr.io/immich-app/immich-server:v2.7.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-immich_immich_upload:/data
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:v2.7.5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-immich_immich_model_cache:/cache
+  immich_database:
+    environment:
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_PASSWORD: 'regress-immich'
+      POSTGRES_USER: immich
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    shm_size: 128mb
+    volumes:
+    - regress-immich_immich_db_data:/var/lib/postgresql/data
+  immich_redis:
+    image: redis:6.2-bookworm
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-immich_immich_redis_data:/data
+version: '3'
+volumes:
+  regress-immich_immich_db_data:
+    name: regress-immich_immich_db_data
+  regress-immich_immich_model_cache:
+    name: regress-immich_immich_model_cache
+  regress-immich_immich_redis_data:
+    name: regress-immich_immich_redis_data
+  regress-immich_immich_upload:
+    name: regress-immich_immich_upload
+  regress-immich_nginx_volume:
+    name: regress-immich_nginx_volume

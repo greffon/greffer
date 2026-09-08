@@ -1,0 +1,35 @@
+networks:
+  greffon_internal_network: {}
+services:
+  code-server:
+    image: gitpod/openvscode-server:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    volumes:
+    - regress-vscode_project_data:/home/workspace
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-vscode_nginx_volume:/etc/nginx/
+version: '3'
+volumes:
+  regress-vscode_nginx_volume:
+    name: regress-vscode_nginx_volume
+  regress-vscode_project_data:
+    name: regress-vscode_project_data

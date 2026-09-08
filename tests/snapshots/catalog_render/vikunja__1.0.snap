@@ -1,0 +1,52 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3456'
+    restart: unless-stopped
+    volumes:
+    - regress-vikunja_nginx_volume:/etc/nginx/
+  vikunja:
+    environment:
+      VIKUNJA_DATABASE_PATH: /db/vikunja.db
+      VIKUNJA_DATABASE_TYPE: sqlite
+      VIKUNJA_MAILER_ENABLED: 'true'
+      VIKUNJA_MAILER_FORCESSL: 'false'
+      VIKUNJA_MAILER_FROMEMAIL: 'noreply@example.test'
+      VIKUNJA_MAILER_HOST: 'smtp.example.test'
+      VIKUNJA_MAILER_PASSWORD: 'pw'
+      VIKUNJA_MAILER_PORT: '587'
+      VIKUNJA_MAILER_USERNAME: 'mailer@example.test'
+      VIKUNJA_SERVICE_PUBLICURL: 'https://regress-vikunja-0.my.example.test'
+      VIKUNJA_SERVICE_SECRET: ''
+    image: vikunja/vikunja:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    user: 0:0
+    volumes:
+    - regress-vikunja_vikunja_files:/app/vikunja/files
+    - regress-vikunja_vikunja_db:/db
+version: '3'
+volumes:
+  regress-vikunja_nginx_volume:
+    name: regress-vikunja_nginx_volume
+  regress-vikunja_vikunja_db:
+    name: regress-vikunja_vikunja_db
+  regress-vikunja_vikunja_files:
+    name: regress-vikunja_vikunja_files

@@ -1,0 +1,36 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:5230'
+    restart: unless-stopped
+    volumes:
+    - regress-memos_nginx_volume:/etc/nginx/
+  memos:
+    image: ghcr.io/usememos/memos:stable
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-memos_memos_data:/var/opt/memos
+version: '3'
+volumes:
+  regress-memos_memos_data:
+    name: regress-memos_memos_data
+  regress-memos_nginx_volume:
+    name: regress-memos_nginx_volume

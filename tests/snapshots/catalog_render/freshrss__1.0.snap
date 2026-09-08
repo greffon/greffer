@@ -1,0 +1,42 @@
+networks:
+  greffon_internal_network: {}
+services:
+  freshrss:
+    environment:
+      CRON_MIN: '*/20'
+      TZ: UTC
+    image: freshrss/freshrss:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-freshrss_freshrss_data:/var/www/FreshRSS/data
+    - regress-freshrss_freshrss_extensions:/var/www/FreshRSS/extensions
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:80'
+    restart: unless-stopped
+    volumes:
+    - regress-freshrss_nginx_volume:/etc/nginx/
+version: '3'
+volumes:
+  regress-freshrss_freshrss_data:
+    name: regress-freshrss_freshrss_data
+  regress-freshrss_freshrss_extensions:
+    name: regress-freshrss_freshrss_extensions
+  regress-freshrss_nginx_volume:
+    name: regress-freshrss_nginx_volume

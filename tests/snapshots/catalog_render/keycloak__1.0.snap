@@ -1,0 +1,78 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:8080'
+    restart: unless-stopped
+    volumes:
+    - regress-keycloak_nginx_volume:/etc/nginx/
+  keycloak:
+    command:
+    - start
+    depends_on:
+    - postgresql
+    environment:
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ''
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_DB: postgres
+      KC_DB_PASSWORD: ''
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_URL_HOST: postgresql
+      KC_DB_USERNAME: keycloak
+      KC_HOSTNAME: 'https://regress-keycloak-0.my.example.test'
+      KC_HTTP_ENABLED: 'true'
+      KC_PROXY_HEADERS: xforwarded
+    image: quay.io/keycloak/keycloak:26.7.2
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: unless-stopped
+    volumes: []
+  postgresql:
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_PASSWORD: ''
+      POSTGRES_USER: keycloak
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -h 127.0.0.1 -U keycloak -d keycloak
+      timeout: 5s
+    image: postgres:16-alpine
+    labels:
+      com.greffon.backup.dump: pg_dump -U keycloak -d keycloak -Fc
+      com.greffon.backup.restore: pg_restore -U keycloak -d keycloak --clean --if-exists
+        --no-owner --single-transaction
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: unless-stopped
+    volumes:
+    - regress-keycloak_postgres_data:/var/lib/postgresql/data
+version: '3'
+volumes:
+  regress-keycloak_nginx_volume:
+    name: regress-keycloak_nginx_volume
+  regress-keycloak_postgres_data:
+    name: regress-keycloak_postgres_data

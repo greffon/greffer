@@ -1,0 +1,78 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:80'
+    restart: unless-stopped
+    volumes:
+    - regress-wordpress_nginx_volume:/etc/nginx/
+  wordpress:
+    depends_on:
+    - wordpress_db
+    environment:
+      WORDPRESS_AUTH_KEY: ''
+      WORDPRESS_AUTH_SALT: ''
+      WORDPRESS_CONFIG_EXTRA: "define('WP_HOME', 'https://regress-wordpress-0.my.example.test');\ndefine('WP_SITEURL',\
+        \ 'https://regress-wordpress-0.my.example.test');\n// The greffer's per-instance nginx terminates TLS\
+        \ and forwards\n// X-Forwarded-Proto: https, but WordPress/PHP behind Apache\
+        \ won't treat\n// the request as HTTPS unless told to. Without this, is_ssl()\
+        \ is false,\n// mismatches the https WP_SITEURL, and the admin/login flow\
+        \ 301-loops.\nif ( isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO']\
+        \ === 'https' ) {\n    $_SERVER['HTTPS'] = 'on';\n}\n"
+      WORDPRESS_DB_HOST: wordpress_db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_PASSWORD: 'regress-wordpress'
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_LOGGED_IN_KEY: ''
+      WORDPRESS_LOGGED_IN_SALT: ''
+      WORDPRESS_NONCE_KEY: ''
+      WORDPRESS_NONCE_SALT: ''
+      WORDPRESS_SECURE_AUTH_KEY: ''
+      WORDPRESS_SECURE_AUTH_SALT: ''
+    image: wordpress:7.0-php8.3-apache
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-wordpress_wordpress_data:/var/www/html
+  wordpress_db:
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_PASSWORD: 'regress-wordpress'
+      MARIADB_ROOT_PASSWORD: 'regress-wordpress'
+      MARIADB_USER: wordpress
+    image: mariadb:11
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-wordpress_wordpress_db_data:/var/lib/mysql
+version: '3'
+volumes:
+  regress-wordpress_nginx_volume:
+    name: regress-wordpress_nginx_volume
+  regress-wordpress_wordpress_data:
+    name: regress-wordpress_wordpress_data
+  regress-wordpress_wordpress_db_data:
+    name: regress-wordpress_wordpress_db_data
