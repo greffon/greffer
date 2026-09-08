@@ -6,9 +6,10 @@
 #   - _is_integration_set classifier (the unset/empty/set boundary).
 #   - _compute_integrations_context lifts each known type into the
 #     Jinja-context shape.
-#   - _delete_unset_integration_env_keys strips catalog-declared SMTP
-#     env keys when the user didn't pick an SMTP integration, in both
-#     mapping- and list-form `environment:` blocks.
+#   - _delete_unset_integration_env_keys strips catalog-declared
+#     integration env keys (SMTP and OIDC) when the user didn't pick
+#     that integration, in both mapping- and list-form `environment:`
+#     blocks, and leaves everything else alone.
 #   - End-to-end Jinja render: with the integration set, `{{ smtp.host }}`
 #     resolves to the dict's host; with it unset, the env key is gone.
 
@@ -203,6 +204,91 @@ class DeleteUnsetIntegrationEnvKeysTests(TestCase):
         _delete_unset_integration_env_keys(compose, info)
         self.assertEqual(compose['services']['plausible']['environment'], [])
 
+    def test_a_bare_list_entry_is_stripped_like_an_assigned_one(self):
+        # `- SMTP_PASSWORD`, with no `=`, is legal compose and does NOT
+        # mean "empty". It means "import this variable from the host",
+        # so leaving it behind for an integration the user never
+        # configured hands the container whatever the greffer process
+        # has under that name -- not a missing variable, someone
+        # else's. Matching only `KEY=` left every bare entry in place.
+        compose = {'services': {'plausible': {'environment': [
+            'SMTP_HOST_ADDR', 'KEEP=me']}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'], ['KEEP=me'])
+
+    def test_every_spelling_of_a_declared_key_is_stripped(self):
+        # Read the entry the way compose reads it: the NAME is
+        # everything before the first `=`. The whitespace forms are
+        # malformed compose -- a name with a space is not one the host
+        # will have -- so they close no live hole; they are here so the
+        # rule matches compose's parsing instead of leaning on the
+        # spelling being unusable, which is how the bare form was
+        # missed in the first place.
+        for entry in ('SMTP_HOST_ADDR',        # bare: host passthrough
+                      'SMTP_HOST_ADDR=',       # empty assignment
+                      'SMTP_HOST_ADDR=smtp.x',
+                      ' SMTP_HOST_ADDR',
+                      'SMTP_HOST_ADDR ',
+                      'SMTP_HOST_ADDR =smtp.x',
+                      # The FIRST `=` ends the name, not the last: a
+                      # password may contain one. Splitting from the
+                      # right reads the name as `SMTP_HOST_ADDR=a` and
+                      # leaves the entry in place.
+                      'SMTP_HOST_ADDR=a=b'):
+            with self.subTest(entry=entry):
+                compose = {'services': {'plausible': {'environment': [
+                    entry, 'KEEP=me']}}}
+                info = _compute_integrations_context(
+                    _greffon_info_with_smtp_destinations())
+                _delete_unset_integration_env_keys(compose, info)
+                self.assertEqual(
+                    compose['services']['plausible']['environment'],
+                    ['KEEP=me'])
+
+    def test_a_non_string_list_entry_is_left_alone(self):
+        # The strip runs inside `create_compose`, BEFORE docker-compose
+        # ever validates the file, so an `isinstance` slip here raises
+        # AttributeError out of the greffer render path instead of
+        # letting compose report its own clean error. A catalog can
+        # write `environment: [123]`.
+        compose = {'services': {'plausible': {'environment': [
+            123, None, {'a': 1}, 'KEEP=me']}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'],
+            [123, None, {'a': 1}, 'KEEP=me'])
+
+    def test_a_bare_entry_after_an_assignment_is_the_one_that_wins(self):
+        # Why the bare form matters more than "an extra unset key":
+        # compose resolves a LATER bare entry over an EARLIER explicit
+        # assignment, so leaving it behind does not merely add a stray
+        # variable -- it discards the catalog's own safe default and
+        # substitutes the host's value.
+        compose = {'services': {'plausible': {'environment': [
+            'SMTP_HOST_ADDR=safe_default', 'SMTP_HOST_ADDR', 'KEEP=me']}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'], ['KEEP=me'])
+
+    def test_a_name_that_merely_starts_the_same_is_kept(self):
+        # Exact on the NAME, not a prefix, and case-sensitive as env
+        # names are. Each of these is a different variable.
+        entries = ['SMTP_HOST_ADDRESS', 'SMTP_HOST_ADDR_2=x',
+                   'smtp_host_addr', 'SMTP_HOST=x']
+        compose = {'services': {'plausible': {'environment': list(entries)}}}
+        info = _compute_integrations_context(
+            _greffon_info_with_smtp_destinations())
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(
+            compose['services']['plausible']['environment'], entries)
+
     def test_set_smtp_leaves_keys_in_place(self):
         compose = self._compose_with_smtp_env('dict')
         info = _greffon_info_with_smtp_destinations()
@@ -243,6 +329,179 @@ class DeleteUnsetIntegrationEnvKeysTests(TestCase):
         info = _compute_integrations_context(info)
         # Should not raise.
         _delete_unset_integration_env_keys(compose, info)
+
+
+class OidcIsAKnownIntegrationTypeTests(TestCase):
+    """`oidc` alongside `smtp`, so a catalog entry can declare OIDC env
+    keys that are stripped when no OIDC integration is configured.
+
+    The manager cannot link one to an instance yet (`GreffonInstance`
+    has a single `smtp_config` FK), so in practice `oidc` arrives unset
+    on every instance and these keys are always stripped -- which is
+    the correct behaviour for an unconfigured integration, and is the
+    whole of what this change enables until per-instance linking lands.
+    """
+
+    def _strip(self, env, integrations):
+        compose = {'services': {'app': {'environment': dict(env)}}}
+        info = _compute_integrations_context(
+            {'id': 'i1', 'integrations': integrations})
+        _delete_unset_integration_env_keys(compose, info)
+        return compose['services']['app']['environment'], info
+
+    def test_the_known_types_are_exactly_smtp_and_oidc(self):
+        # assertEqual, not assertIn. An accidental EXTRA entry here
+        # silently strips catalog env keys for a type nothing supplies
+        # -- `{{ ldap.url }}` would start disappearing -- and membership
+        # alone cannot see that. The catalog validator's parity tripwire
+        # asserts this same tuple in the same form.
+        self.assertEqual(KNOWN_INTEGRATION_TYPES, ('smtp', 'oidc'))
+
+    def test_an_unset_oidc_reference_is_stripped(self):
+        # The bracket spelling is stripped here, but an entry author
+        # should not lift it out of this test: in MAPPING-form
+        # `environment:` it cannot render once oidc IS configured,
+        # because `yaml.dump` doubles the inner single quotes and
+        # `oidc[''issuer'']` is a TemplateSyntaxError. Dot form, or
+        # list-form `environment:`, both work. The catalog documents
+        # the same workaround at nextcloud/1.0/docker-compose.yml:23.
+        for value in ('{{ oidc.issuer }}',
+                      "{{ oidc['issuer'] }}",
+                      '{{ oidc.issuer }}/.well-known/openid-configuration',
+                      '{{ oidc.issuer.split("/")[0] }}'):
+            with self.subTest(value=value):
+                env, _ = self._strip({'K': value, 'OTHER': 'plain'}, {})
+                self.assertEqual(env, {'OTHER': 'plain'})
+
+    def test_a_configured_oidc_renders_its_issuer(self):
+        issuer = 'https://kc.example.com/realms/main'
+        env, info = self._strip(
+            {'ISS': '{{ oidc.issuer }}',
+             'URL': '{{ oidc.issuer }}/.well-known/openid-configuration'},
+            {'oidc': {'issuer': issuer}})
+        rendered = yaml.safe_load(
+            Template(yaml.dump({'services': {'app': {'environment': env}}}))
+            .render(**info))
+        self.assertEqual(
+            rendered['services']['app']['environment'],
+            {'ISS': issuer,
+             'URL': issuer + '/.well-known/openid-configuration'})
+
+    def test_an_empty_oidc_config_counts_as_unset(self):
+        # Same rule `smtp` already follows: half a config is not a
+        # config, so the env keys go rather than rendering empty.
+        for integrations in ({'oidc': {}}, {'oidc': None}):
+            with self.subTest(integrations=integrations):
+                env, _ = self._strip({'K': '{{ oidc.issuer }}'}, integrations)
+                self.assertEqual(env, {})
+
+    def test_a_truthy_NON_DICT_oidc_blob_counts_as_unset(self):
+        # Both cases above are FALSY, so they cannot tell whether
+        # `_is_integration_set` checks the TYPE or just truthiness.
+        # A manager that sent the issuer as a bare string would
+        # otherwise count as configured: the key survives, `oidc` binds
+        # to a str, and `{{ oidc.issuer }}` renders empty -- a var
+        # that is present and wrong, which is worse than absent.
+        for blob in ('https://id.example.com', ['issuer'], 42):
+            with self.subTest(blob=blob):
+                env, info = self._strip({'K': '{{ oidc.issuer }}'},
+                                        {'oidc': blob})
+                self.assertEqual(env, {})
+                self.assertEqual(info['oidc'], {})
+
+    def test_oidc_is_stripped_when_SMTP_is_the_configured_one(self):
+        # The other half of the independence claim. In the test above
+        # smtp is configured, so "kept because configured" and "kept
+        # because smtp is not a known type at all" look identical --
+        # a tuple of ('oidc',) alone passes it. Here smtp is the unset
+        # one, so only a tuple containing BOTH gives this answer.
+        env, _ = self._strip(
+            {'S': '{{ smtp.host }}', 'O': '{{ oidc.issuer }}', 'P': 'plain'},
+            {'oidc': {'issuer': 'https://id.example.com'}})
+        self.assertEqual(env, {'O': '{{ oidc.issuer }}', 'P': 'plain'})
+
+    def test_smtp_and_oidc_are_stripped_independently(self):
+        # Values, not just key names: a comparison on `sorted(env)` alone
+        # would pass with the surviving reference corrupted.
+        env, _ = self._strip(
+            {'S': '{{ smtp.host }}', 'O': '{{ oidc.issuer }}', 'P': 'plain'},
+            {'smtp': {'host': 'mail.example.com'}})
+        self.assertEqual(env, {'S': '{{ smtp.host }}', 'P': 'plain'})
+
+    def test_the_predicate_does_not_over_match(self):
+        # Each of these is a guard the predicate depends on, and each
+        # was unpinned -- the `\b`, the required `.`/`[` after the name,
+        # the `{{` prefilter, and the str check. Every one of them
+        # failing looks the same from outside: an env var vanishes.
+        for value in ('{{ foo_smtp.bar }}',   # \b: not our type
+                      'oidc.issuer',          # no Jinja at all
+                      '{ oidc.issuer }'):     # not a Jinja expression
+            with self.subTest(value=value):
+                env, _ = self._strip({'K': value}, {})
+                self.assertEqual(env, {'K': value})
+
+    def test_the_bare_mapping_is_popped_by_the_parser_pass(self):
+        # `{{ oidc }}` was in the list above while pass 2 was a regex
+        # requiring a `.` or `[` after the name. This branch asks
+        # Jinja's parser instead, which sees a read of the type with no
+        # field, and pops it.
+        #
+        # That is the better answer, not merely a different one: kept,
+        # it renders the literal `{}` into the container's environment
+        # -- a value that is neither empty nor correct, which is the
+        # class this pass exists to prevent. Popped, the variable is
+        # simply absent, which is what an unconfigured integration
+        # should look like.
+        env, _ = self._strip({'K': '{{ oidc }}', 'OTHER': 'plain'}, {})
+        self.assertEqual(env, {'OTHER': 'plain'})
+
+    def test_a_non_string_env_value_is_left_alone(self):
+        env, _ = self._strip({'K': 5, 'L': True}, {})
+        self.assertEqual(env, {'K': 5, 'L': True})
+
+    def test_list_form_is_stripped_by_EACH_pass_independently(self):
+        # The existing list-form test supplies both a destination AND a
+        # Jinja value, so the two passes mask each other; neither branch
+        # was pinned on its own.
+        compose = {'services': {'app': {'environment': [
+            'K={{ oidc.issuer }}', 'OTHER=plain']}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['OTHER=plain'])
+
+        compose = {'services': {'app': {'environment': [
+            'OIDC_ISSUER=placeholder', 'OTHER=plain']}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'OIDC_ISSUER'}]}]})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['OTHER=plain'])
+
+    def test_a_list_entry_matching_on_the_KEY_side_is_kept(self):
+        # `oidc.issuer=...` is an env var NAME that happens to contain
+        # the token; only the value side is a Jinja reference.
+        compose = {'services': {'app': {'environment': [
+            'oidc.issuer={{ instance_url }}']}}}
+        info = _compute_integrations_context({'id': 'i1', 'integrations': {}})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         ['oidc.issuer={{ instance_url }}'])
+
+    def test_an_oidc_destination_is_stripped_by_the_metadata_pass(self):
+        # Pass 1 works off `destinations`, so it needs the type to be
+        # known even when the compose value is not a Jinja reference.
+        compose = {'services': {'app': {'environment': {
+            'OIDC_ISSUER': 'placeholder', 'OTHER': 'plain'}}}}
+        info = _compute_integrations_context({
+            'id': 'i1', 'integrations': {},
+            'configurations': [{'name': 'c', 'destinations': [
+                {'type': 'oidc', 'container': 'app', 'key': 'OIDC_ISSUER'}]}]})
+        _delete_unset_integration_env_keys(compose, info)
+        self.assertEqual(compose['services']['app']['environment'],
+                         {'OTHER': 'plain'})
 
 
 class GreffonInfoIntegrationsThreadingTests(TestCase):
