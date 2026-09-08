@@ -434,12 +434,26 @@ class OidcIsAKnownIntegrationTypeTests(TestCase):
         # the `{{` prefilter, and the str check. Every one of them
         # failing looks the same from outside: an env var vanishes.
         for value in ('{{ foo_smtp.bar }}',   # \b: not our type
-                      '{{ oidc }}',           # the mapping, no field
                       'oidc.issuer',          # no Jinja at all
                       '{ oidc.issuer }'):     # not a Jinja expression
             with self.subTest(value=value):
                 env, _ = self._strip({'K': value}, {})
                 self.assertEqual(env, {'K': value})
+
+    def test_the_bare_mapping_is_popped_by_the_parser_pass(self):
+        # `{{ oidc }}` was in the list above while pass 2 was a regex
+        # requiring a `.` or `[` after the name. This branch asks
+        # Jinja's parser instead, which sees a read of the type with no
+        # field, and pops it.
+        #
+        # That is the better answer, not merely a different one: kept,
+        # it renders the literal `{}` into the container's environment
+        # -- a value that is neither empty nor correct, which is the
+        # class this pass exists to prevent. Popped, the variable is
+        # simply absent, which is what an unconfigured integration
+        # should look like.
+        env, _ = self._strip({'K': '{{ oidc }}', 'OTHER': 'plain'}, {})
+        self.assertEqual(env, {'OTHER': 'plain'})
 
     def test_a_non_string_env_value_is_left_alone(self):
         env, _ = self._strip({'K': 5, 'L': True}, {})
