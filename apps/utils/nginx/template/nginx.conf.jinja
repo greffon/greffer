@@ -88,7 +88,30 @@ http {
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # $remote_addr, NOT $proxy_add_x_forwarded_for. This sidecar is the trust
+    # boundary: it terminates TLS and is the first hop we control, so there is
+    # no upstream X-Forwarded-For worth preserving. The `add` form APPENDS the
+    # peer to whatever the client sent, and consumers take the LEFTMOST entry,
+    # so any unauthenticated client could choose the address an app records
+    # against a request. Demonstrated against the Keycloak greffon: a single
+    # `curl -H 'X-Forwarded-For: 203.0.113.77'` on a failed login wrote
+    # ipAddress=203.0.113.77 into its admin event log. On an identity provider
+    # that log is a security control, and a forgeable address is worse than an
+    # unhelpful one: it can frame a third party and poison anything built on it,
+    # such as a fail2ban rule.
+    #
+    # What each mode now yields, stated because they differ:
+    #   proxy mode  - the real client address (the sidecar's published port is
+    #                 what the browser connects to)
+    #   tunnel mode - the tunnel sidecar's address. rathole is a plain TCP
+    #                 tunnel: it adds no HTTP headers and no PROXY protocol, so
+    #                 the client's address is already lost at the transport
+    #                 before nginx sees it. Constant and unhelpful, but true,
+    #                 which is the point. If per-client attribution is ever
+    #                 needed through the tunnel it takes PROXY protocol on both
+    #                 rathole ends plus `real_ip_header proxy_protocol` here;
+    #                 do NOT reintroduce the append form to fake it.
+    proxy_set_header X-Forwarded-For $remote_addr;
     # The greffon_nginx terminates TLS on every instance and proxies plain
     # HTTP to the upstream container. Apps that compare the request
     # protocol against their configured public URL (Ghost is the canonical

@@ -90,6 +90,59 @@ class CreateNginxConfTests(unittest.TestCase):
         self.assertIn('location /', content)
         self.assertIn('proxy_pass http://app_8080/', content)
 
+    def test_real_template_does_not_append_client_xff(self):
+        """REGRESSION: the rendered nginx.conf MUST set ``X-Forwarded-For`` from
+        ``$remote_addr`` and MUST NOT use ``$proxy_add_x_forwarded_for``.
+
+        This sidecar is the trust boundary: it terminates TLS and is the first
+        hop we control, so there is no upstream value worth preserving. The
+        ``add`` form APPENDS the peer to whatever the client sent, and consumers
+        read the LEFTMOST entry, so any unauthenticated client could choose the
+        address an app records against a request. Proven against the Keycloak
+        greffon before this changed: one
+        ``curl -H 'X-Forwarded-For: 203.0.113.77'`` on a failed login wrote
+        ``ipAddress=203.0.113.77`` into its admin event log, which on an identity
+        provider is a security control.
+
+        Renders the *real* template so the assertion guards the file on disk.
+        """
+        from apps.utils.nginx.conf import create_nginx_conf
+
+        greffon_info = {
+            'id': 'xff-regression',
+            'ports': [
+                {'container_name': 'app', 'port_container': '8080'},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            greffon_path = os.path.join(tmpdir, greffon_info['id'])
+            os.makedirs(greffon_path)
+            with patch.dict(os.environ, {'GREFFON_PATH': tmpdir}):
+                create_nginx_conf(greffon_info)
+            with open(os.path.join(greffon_path, 'nginx.conf')) as f:
+                content = f.read()
+
+        self.assertIn(
+            'proxy_set_header X-Forwarded-For $remote_addr;',
+            content,
+            'X-Forwarded-For must carry the real peer, not a client-supplied chain',
+        )
+        # The directive name alone is not enough: the whole point is which
+        # variable feeds it. Assert the append form is gone from the DIRECTIVE,
+        # ignoring the comment above it that names it as the thing not to use.
+        directives = [
+            line for line in content.splitlines()
+            if 'proxy_set_header' in line and not line.strip().startswith('#')
+        ]
+        self.assertFalse(
+            [d for d in directives if '$proxy_add_x_forwarded_for' in d],
+            'the append form lets a client choose the address apps record',
+        )
+        # X-Real-IP already carried the peer; it must keep doing so, since some
+        # apps read that one instead.
+        self.assertIn('proxy_set_header X-Real-IP $remote_addr;', content)
+
     def test_real_template_streaming_label_disables_buffering(self):
         """A port flagged ``streaming`` (from the com.greffon.proxy.streaming
         label) MUST render the buffering-off directives, so SSE / long-poll
