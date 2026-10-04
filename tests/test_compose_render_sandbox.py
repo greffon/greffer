@@ -214,6 +214,64 @@ def test_a_baked_file_cannot_mutate_the_live_context_either(payload):
     _assert_context_untouched(info)
 
 
+# An evaluation error on VALID Jinja is a render failure too, not only a
+# parse error or a sandbox refusal. Before the broad catch these escaped
+# create_compose as a 500: the except named only TemplateError/TypeError/
+# ValueError, and arithmetic, lookup and recursion are none of those. A
+# user-entered `{{ config.X }}` reaches them, so this is the contract that
+# pins the exception SET, which narrowing or broadening the catch otherwise
+# slipped past.
+# Inner literals DOUBLE-quoted: yaml.dump doubles inner single quotes and
+# corrupts the parse (the same round-trip the escape tests above dodge), so a
+# single-quoted payload would fail as a TemplateSyntaxError and prove nothing.
+# Lenient undefined swallows a missing subscript into Undefined, so a bad
+# dict/list index does NOT raise here; arithmetic and explicit method calls
+# are what genuinely propagate. Two exception hierarchies the old enumerated
+# catch (TemplateError/TypeError/ValueError) let through: ArithmeticError and
+# LookupError.
+_EVAL_ERRORS = [
+    ('{{ 1 // 0 }}', ZeroDivisionError),
+    ('{{ 10.0 ** 400 }}', OverflowError),
+    ('{{ "x".encode("no-such-codec") }}', LookupError),
+]
+
+
+@pytest.mark.parametrize("expr,cause", _EVAL_ERRORS)
+def test_an_evaluation_error_is_a_render_error_not_a_500(expr, cause, tmp_path,
+                                                         monkeypatch):
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"X": expr}}}}
+    with pytest.raises(compose_mod.ConfigRenderError) as exc:
+        _render(compose, tmp_path, monkeypatch)
+    # The genuine evaluation error, surfaced as the mapped render failure --
+    # proof it reached the broad catch rather than a parse error masking it.
+    assert isinstance(exc.value.__cause__, cause), exc.value.__cause__
+
+
+def test_the_render_error_detail_is_bounded_and_names_only_the_type(tmp_path,
+                                                                    monkeypatch):
+    """The 422 detail the manager forwards names the exception TYPE, never
+    str(exc).
+
+    The message of a render failure can carry rendered bytes (a value an
+    expression was reading, quoted back; an unbounded length), and the manager
+    both logs and forwards whatever the greffer returns. Interpolating str(exc)
+    into the surfaced detail would leak that. Pinned on a failure whose message
+    is known and distinct from the type: ZeroDivisionError, message "integer
+    division by zero"."""
+    compose = {"services": {"app": {"image": "nginx:alpine",
+                                    "environment": {"X": "{{ 1 // 0 }}"}}}}
+    with pytest.raises(compose_mod.ConfigRenderError) as exc:
+        _render(compose, tmp_path, monkeypatch)
+    detail = str(exc.value)
+    assert "ZeroDivisionError" in detail, "detail should name the failure type"
+    assert "division by zero" not in detail, (
+        "detail echoed the exception MESSAGE; it must carry the type only")
+    assert len(detail) < 200, f"detail is not bounded: {len(detail)} chars"
+    # The full reason IS available server-side, just not to the caller.
+    assert "division by zero" in str(exc.value.__cause__)
+
+
 def test_the_escape_globals_are_gone(tmp_path, monkeypatch):
     """Pin the mechanism, not just the symptom: if a future edit restores
     Jinja's default globals, the payload tests above could pass for the wrong

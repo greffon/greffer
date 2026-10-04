@@ -682,23 +682,40 @@ def create_compose(compose, greffon_info):
     #
     # A render failure is a fact about the catalog entry, not a greffer
     # fault, so it leaves here as the same ConfigRenderError (-> 422) the
-    # baked-file path already uses, carrying the reason. As a bare exception
-    # it became a 500 whose body said only "internal_error": the manager
-    # forwards whatever status and detail the greffer returns, so the
-    # operator saw no cause and could not tell an unsafe or broken compose
-    # from a transient greffer fault. This covers the SecurityError the
-    # sandbox raises, and the TemplateSyntaxError, UndefinedError and
-    # TypeError a broken template raised before the sandbox existed.
+    # baked-file path already uses. As a bare exception it became a 500 whose
+    # body said only "internal_error": the manager forwards whatever status
+    # and detail the greffer returns, so the operator saw no cause and could
+    # not tell an unsafe or broken compose from a transient greffer fault.
     #
-    # yaml.dump stays outside the try: a dict that cannot be represented is
-    # greffer-side, and a 500 is the honest answer for that. The compose file
-    # is only written after the render succeeds.
+    # ANY exception from render(), not an enumerated few. Naming the classes
+    # (TemplateError/TypeError/ValueError) let evaluation-time errors on valid
+    # Jinja escape as a 500: `{{ 1 // 0 }}` raises ZeroDivisionError,
+    # `{{ 10.0 ** 400 }}` OverflowError, a recursive macro RecursionError, and
+    # a user-supplied `{{ config.X }}` reaches these today. Inside this try
+    # nothing but template evaluation runs, and the env has no custom filters
+    # or globals that could raise a greffer bug, so a broad catch cannot
+    # mislabel a greffer fault as a catalog error. yaml.dump stays OUTSIDE the
+    # try: a dict that cannot be represented is greffer-side, and a 500 is the
+    # honest answer there.
+    #
+    # The forwarded detail names the exception TYPE only, never str(exc). With
+    # the lenient undefined the body keeps, a rendered value can land inside
+    # the message text (a missing-attribute error quotes the base it was read
+    # from, which may be a resolved config value or minted key material), and
+    # the message is unbounded (a large rendered string becomes a large body
+    # the manager logs and forwards). The type is enough for the operator to
+    # know whether the compose is unsafe, malformed, or references something
+    # unset; the full reason goes to the greffer log, which is not caller-
+    # reachable. The compose file is only written after the render succeeds.
     dumped = yaml.dump(compose)
     try:
         compose_file = _COMPOSE_RENDER_ENV.from_string(dumped).render(**greffon_info)
-    except (TemplateError, TypeError, ValueError) as exc:
-        logger.error("compose render failed for %s: %s", greffon_info.get('id'), exc)
-        raise ConfigRenderError(f"docker-compose.yml: {exc}") from exc
+    except Exception as exc:
+        logger.error("compose render failed for %s: %s: %s",
+                     greffon_info.get('id'), type(exc).__name__, exc)
+        raise ConfigRenderError(
+            f"docker-compose.yml failed to render ({type(exc).__name__}); "
+            f"see the greffer log for the cause.") from exc
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 
