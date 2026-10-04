@@ -6,9 +6,12 @@ round-trip fix) touches the exact code path every existing deployment shares,
 so the merge gate for those changes is this: render every catalog entry and
 prove the bytes did not move.
 
-Snapshots live in ``tests/snapshots/catalog_render/``. Regenerate deliberately
-with ``CATALOG_RENDER_UPDATE=1 pytest tests/test_catalog_render_regression.py``
-and review the diff -- a surprise there is the point of the harness.
+Snapshots live in ``tests/snapshots/catalog_render/``, next to ``CATALOG_SHA``,
+the catalog commit they were made from. Regenerate deliberately with
+``CATALOG_RENDER_UPDATE=1 pytest tests/test_catalog_render_regression.py``
+against a git checkout of the catalog, review the diff -- a surprise there is
+the point of the harness -- and bump the pinned ``ref`` in both workflows to
+the new ``CATALOG_SHA``.
 
 Determinism matters more than fidelity here: the fixture pins ``port_host``
 and the instance id rather than allocating, because a snapshot that moves on
@@ -20,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
+import subprocess
 
 import pytest
 import yaml
@@ -67,6 +72,94 @@ def _entries():
 
 
 _ENTRIES = _entries()
+
+_SHA_FILE = _SNAP_DIR / "CATALOG_SHA"
+_WORKFLOWS = _HERE.parent / ".github" / "workflows"
+_MIN_ENTRIES = 25
+
+# Catalog entries known NOT to render, mapped to the reason. Empty: every entry
+# in the pinned catalog renders. An entry goes here only on purpose. The oracle
+# used to record a failed render AS its snapshot -- the error marker became the
+# expected bytes -- so a greffon that cannot deploy at all reported green, and
+# the regenerate workflow blessed it without anyone deciding to.
+_KNOWN_UNRENDERABLE: dict[str, str] = {}
+
+
+def _catalog_sha(root):
+    """The commit of the catalog checkout under test, or None when it cannot be
+    read: not a git checkout, no git, or a plain directory nested inside some
+    OTHER repository, whose HEAD would otherwise be reported as the catalog's."""
+    if root is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if len(out) != 2 or pathlib.Path(out[0]).resolve() != pathlib.Path(root).resolve():
+        return None
+    return out[1] if re.fullmatch(r"[0-9a-f]{40}", out[1]) else None
+
+
+def _recorded_sha():
+    """The catalog commit the committed snapshots describe."""
+    try:
+        return _SHA_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+_ACTUAL_SHA = _catalog_sha(_catalog_root())
+_PINNED_SHA = _recorded_sha()
+
+
+def _coverage_problem(entries, actual_sha, pinned_sha, check_sha=True):
+    """Why the oracle is NOT comparing the whole pinned catalog, or None.
+
+    A function rather than inline asserts so each refusal can be exercised
+    directly: the entry floor below was never once seen to fail, and a check
+    nothing has seen fail pins nothing."""
+    if not entries:
+        return ("no greffon-catalog checkout found, so the catalog render "
+                "oracle covered NOTHING. Point GREFFON_CATALOG_DIR at a catalog "
+                "checkout (CI must fetch one), or set GREFFON_CATALOG_OPTIONAL=1 "
+                "to accept the reduced coverage on purpose.")
+    if len(entries) < _MIN_ENTRIES:
+        return (f"only {len(entries)} catalog entries discovered; the oracle "
+                f"is supposed to cover the whole catalog (29 at the pinned "
+                f"commit)")
+    if not check_sha:
+        return None
+    if pinned_sha is None:
+        return (f"{_SHA_FILE.name} is missing, so nothing records which catalog "
+                f"commit the snapshots describe")
+    if actual_sha != pinned_sha:
+        found = (actual_sha[:12] if actual_sha
+                 else "an unreadable commit (not a git checkout?)")
+        return (f"the catalog under test is at {found}, but the snapshots were "
+                f"made from {pinned_sha[:12]}. Comparing them reports catalog "
+                f"drift as render regressions, and regenerating them would break "
+                f"CI, which checks out the pinned commit. Point "
+                f"GREFFON_CATALOG_DIR at a checkout of {pinned_sha}, e.g. "
+                f"`git -C greffon-catalog worktree add --detach <dir> "
+                f"{pinned_sha}`.")
+    return None
+
+
+def _render_problem(name, rendered, known_unrenderable):
+    """Why this render must be neither compared nor snapshotted, or None."""
+    failed = rendered.startswith("<<")
+    if failed and name not in known_unrenderable:
+        return (f"{name} does not render: {rendered}. A greffon that cannot "
+                f"render cannot deploy, so this is a failure, never a snapshot. "
+                f"If it is known and accepted, name it in _KNOWN_UNRENDERABLE "
+                f"with the reason.")
+    if not failed and name in known_unrenderable:
+        return (f"{name} renders now; remove it from _KNOWN_UNRENDERABLE so "
+                f"the allowlist cannot go stale.")
+    return None
 
 
 def _ports_for(version_dir: pathlib.Path):
@@ -161,8 +254,8 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
 
     Only host-port allocation is stubbed, because it probes real sockets and a
     snapshot that moves on its own proves nothing. Everything else is
-    production code. A catalog entry that cannot render today is itself a fact
-    worth pinning."""
+    production code. A render failure comes back as a ``<<...>>`` marker, and
+    the caller refuses it unless _KNOWN_UNRENDERABLE names the entry."""
     raw = compose_path.read_text()
     try:
         parsed = yaml.safe_load(raw)
@@ -233,12 +326,28 @@ def _render(compose_path: pathlib.Path, tmp_path: pathlib.Path) -> str:
 @pytest.mark.parametrize("name,compose_path", _ENTRIES,
                          ids=[n for n, _ in _ENTRIES])
 def test_catalog_entry_render_is_unchanged(name, compose_path, tmp_path):
+    if not _UPDATE and _ACTUAL_SHA != _PINNED_SHA:
+        # Reported once, loudly, by test_the_oracle_actually_covers_the_catalog,
+        # which never skips on this. Comparing here would turn catalog drift
+        # into one misleading "render changed" failure per entry, each pointing
+        # at the regenerate command -- the one fix that breaks CI.
+        pytest.skip("catalog under test is not the pinned commit")
     rendered = _render(compose_path, tmp_path)
+    # Before the snapshot is read OR written: regenerating must not bless it.
+    problem = _render_problem(name, rendered, _KNOWN_UNRENDERABLE)
+    if problem:
+        pytest.fail(problem)
     snap = _SNAP_DIR / (name.replace("/", "__") + ".snap")
     if _UPDATE:
+        if _ACTUAL_SHA is None:
+            pytest.fail(
+                "cannot read the catalog commit, so refusing to write snapshots "
+                "nothing could trace back to a catalog version. Point "
+                "GREFFON_CATALOG_DIR at a git checkout of the catalog.")
         snap.parent.mkdir(parents=True, exist_ok=True)
         snap.write_text(rendered)
-        pytest.skip(f"snapshot written for {name}")
+        _SHA_FILE.write_text(_ACTUAL_SHA + "\n")
+        pytest.skip(f"snapshot written for {name} at catalog {_ACTUAL_SHA[:12]}")
     if not snap.is_file():
         pytest.fail(
             f"no snapshot for {name}. Generate with "
@@ -258,13 +367,74 @@ def test_the_oracle_actually_covers_the_catalog():
     that checks out only the greffer repo. Set GREFFON_CATALOG_OPTIONAL=1 to
     opt out deliberately, and point GREFFON_CATALOG_DIR at a pinned catalog
     checkout in CI."""
-    if not _ENTRIES and os.getenv("GREFFON_CATALOG_OPTIONAL") == "1":
-        pytest.skip("catalog absent and explicitly marked optional")
-    assert _ENTRIES, (
-        "no greffon-catalog checkout found, so the catalog render oracle "
-        "covered NOTHING. Point GREFFON_CATALOG_DIR at a catalog checkout "
-        "(CI must fetch one), or set GREFFON_CATALOG_OPTIONAL=1 to accept "
-        "the reduced coverage on purpose.")
-    assert len(_ENTRIES) >= 25, (
-        f"only {len(_ENTRIES)} catalog entries discovered; the oracle is "
-        f"supposed to cover the whole catalog (30 at time of writing)")
+    # Regenerating is how the commit legitimately changes, so the commit is
+    # not checked in that mode; everything else still is.
+    problem = _coverage_problem(_ENTRIES, _ACTUAL_SHA, _PINNED_SHA,
+                                check_sha=not _UPDATE)
+    if problem and os.getenv("GREFFON_CATALOG_OPTIONAL") == "1":
+        pytest.skip(f"accepted as optional: {problem}")
+    assert problem is None, problem
+
+
+# Each refusal above, seen to fire. _coverage_problem and _render_problem run
+# against the real catalog in CI, where every entry renders and the commit
+# matches, so without these nothing would ever exercise the branches that
+# exist to say no.
+_SHA_A, _SHA_B = "a" * 40, "b" * 40
+_FULL = [(f"g{i}/1.0", None) for i in range(_MIN_ENTRIES + 4)]
+
+
+def test_the_coverage_floor_rejects_a_partial_catalog():
+    problem = _coverage_problem(_FULL[:3], _SHA_A, _SHA_A)
+    assert problem and "only 3" in problem
+
+
+def test_a_catalog_at_another_commit_is_refused_not_compared():
+    problem = _coverage_problem(_FULL, _SHA_B, _SHA_A)
+    assert problem and _SHA_A in problem and _SHA_B[:12] in problem
+
+
+def test_an_unreadable_catalog_commit_is_refused():
+    problem = _coverage_problem(_FULL, None, _SHA_A)
+    assert problem and "unreadable" in problem
+
+
+def test_the_pinned_catalog_at_its_commit_is_accepted():
+    assert _coverage_problem(_FULL, _SHA_A, _SHA_A) is None
+
+
+def test_a_failed_render_is_a_failure_not_a_snapshot():
+    problem = _render_problem("x/1.0", "<<RENDER FAILED SecurityError>>", {})
+    assert problem and "does not render" in problem
+
+
+def test_a_known_unrenderable_entry_is_accepted_with_its_reason():
+    assert _render_problem("x/1.0", "<<RENDER FAILED X>>", {"x/1.0": "why"}) is None
+
+
+def test_a_known_unrenderable_entry_that_renders_must_leave_the_list():
+    problem = _render_problem("x/1.0", "services: {}\n", {"x/1.0": "why"})
+    assert problem and "renders now" in problem
+
+
+def test_a_directory_inside_another_repo_has_no_catalog_commit():
+    # A plain tree nested in the greffer checkout would otherwise report the
+    # GREFFER's HEAD as the catalog's commit.
+    nested = _HERE / "snapshots"
+    assert _catalog_sha(nested) is None
+
+
+def test_ci_checks_out_the_catalog_the_snapshots_record():
+    """Both workflows that run this oracle must pin the commit CATALOG_SHA
+    names. Bump a workflow without regenerating, or regenerate without bumping
+    the workflows, and CI compares one catalog against another's snapshots."""
+    assert _PINNED_SHA is not None, f"{_SHA_FILE} is missing"
+    pins = {}
+    for workflow in ("ci.yml", "docker-publish.yml"):
+        text = (_WORKFLOWS / workflow).read_text()
+        match = re.search(
+            r"repository:\s*greffon/greffon-catalog\s*\n\s*ref:\s*([0-9a-f]{40})",
+            text)
+        assert match, f"{workflow} no longer checks out a pinned greffon-catalog"
+        pins[workflow] = match.group(1)
+    assert set(pins.values()) == {_PINNED_SHA}, (pins, _PINNED_SHA)
