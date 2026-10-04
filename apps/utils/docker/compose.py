@@ -192,10 +192,28 @@ def get_greffon_path(greffon_info):
 
 # Feature #4 (integrations): the set of integration types the catalog
 # may reference via `{{ <type>.<field> }}` in compose YAML AND via
-# `destination.type: <type>` in metadata.json. V1 ships SMTP only; new
-# types slot in additively here AND in the manager (per-type FK on
-# GreffonInstance) AND in the catalog validator.
-KNOWN_INTEGRATION_TYPES = ('smtp',)
+# `destination.type: <type>` in metadata.json. New types slot in
+# additively here AND in the manager (per-type FK on GreffonInstance)
+# AND in the catalog validator.
+#
+# `oidc` exposes ONE field, `issuer`. The manager's OIDC integration
+# type carries only that (`apps/integrations/types/oidc.py`), because
+# per-instance client registration does not exist -- so an entry
+# needing `client_id`/`client_secret` cannot work. The catalog
+# validator gains a matching field allowlist in greffon-catalog#88;
+# until that merges, nothing on the catalog side rejects those names.
+#
+# Note what adding a type here does NOT do: the manager still has to
+# link one to an instance. An operator CAN create an OIDC integration
+# (the type is registered on manager main), but `GreffonInstance`
+# carries a single `smtp_config` FK (`limit_choices_to={'type':
+# 'smtp'}`) and `_build_integrations_payload` has one hardcoded smtp
+# branch -- so `oidc` arrives unset on every instance today and its env
+# keys are stripped.
+# That is the correct behaviour for an unconfigured integration, and it
+# is also why an OIDC greffon cannot yet receive an issuer: the
+# per-instance link is platform-identity Feature #3, not this line.
+KNOWN_INTEGRATION_TYPES = ('smtp', 'oidc')
 
 
 def _is_integration_set(value):
@@ -370,9 +388,35 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
                 if isinstance(env, dict):
                     env.pop(key, None)
                 elif isinstance(env, list):
-                    prefix = f'{key}='
+                    # Read the entry the way compose does: the NAME is
+                    # everything before the first `=`.
+                    #
+                    # Matching `KEY=` alone left a BARE `KEY` in place,
+                    # and that is not an empty value -- it is compose's
+                    # "import this variable from the host" form. So for
+                    # an integration the user never configured, the
+                    # container received whatever the greffer process
+                    # has under that name instead of nothing at all.
+                    #
+                    # Bounded, not unbounded: `compose_env()` already
+                    # scrubs the child environment to
+                    # `_COMPOSE_ENV_ALLOWLIST`, so only those names can
+                    # arrive by that route. The unbounded source is the
+                    # other place compose looks for a bare key, a
+                    # `.env` beside the rendered compose file, which
+                    # `apply_configuration` can write under a
+                    # catalog-supplied destination name.
+                    #
+                    # `.strip()` covers ` KEY`, `KEY ` and `KEY =v`.
+                    # Those are malformed compose and close no live
+                    # hole; they are handled so this matches compose's
+                    # own parsing rather than resting on the spelling
+                    # being unusable, which is the assumption that let
+                    # the bare form through.
                     service['environment'] = [
-                        e for e in env if not (isinstance(e, str) and e.startswith(prefix))
+                        e for e in env
+                        if not (isinstance(e, str)
+                                and e.split('=', 1)[0].strip() == key)
                     ]
 
     # Pass 2 — template-driven pop. We want to pop any env value that
