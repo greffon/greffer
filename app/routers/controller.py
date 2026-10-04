@@ -308,6 +308,14 @@ def start_greffon(
         conf.create_nginx_conf(greffon_info)
         compose.create_volumes_then_copy_files(greffon_info)
         track_compose_child(greffon_info["id"], compose.start(greffon_info))
+    except compose.ConfigRenderError as exc:
+        # The compose BODY failed to render: the sandbox refused it, or the
+        # template is broken. Same clean 422 as a baked-file failure above,
+        # and raised from create_compose, i.e. before any volume copy or
+        # `compose up`, so there is no half-started instance.
+        diag("compose_op", level=logging.WARNING, op="start", outcome="error",
+             duration_ms=round((time.monotonic() - _t0) * 1000))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
         diag("compose_op", level=logging.WARNING, op="start", outcome="error",
              duration_ms=round((time.monotonic() - _t0) * 1000))

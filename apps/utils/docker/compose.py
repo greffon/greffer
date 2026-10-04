@@ -79,9 +79,17 @@ def _harden(env):
 
     ``cycler``/``joiner``/``namespace`` are the documented first hops of the
     classic escape chains, and ``lipsum``/``range`` are of no use to a compose
-    file (``range`` also invites a cheap memory blowup). The catalog uses none
-    of them -- verified across every pinned entry -- so removing them costs
-    nothing and shrinks the surface to what a compose actually needs."""
+    file. The catalog uses none of them -- verified across every pinned entry
+    -- so removing them costs nothing and shrinks the surface to what a
+    compose actually needs.
+
+    What this does NOT do is bound resource use. Removing ``range`` closes
+    one way to allocate, not the class: ``*`` and ``**`` are not intercepted,
+    so ``{{ "A" * (10 ** 8) }}`` is sandbox-legal and renders a 100 MB
+    compose. The sandbox stops code execution; an input/output/time budget
+    around the render is the second half of Feature 1 in the root
+    docs/features/compose-containment/epic.md, scoped there to the custom
+    (untrusted) compose path."""
     for unsafe in ('dict', 'range', 'lipsum', 'cycler', 'joiner', 'namespace'):
         env.globals.pop(unsafe, None)
     return env
@@ -671,8 +679,26 @@ def create_compose(compose, greffon_info):
     # to closing the injection hole. Baked files keep their own STRICT env --
     # a silently-empty secret in a config file is a security failure, whereas
     # a silently-empty compose value is the status quo this change preserves.
-    t = _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose))
-    compose_file = t.render(**greffon_info)
+    #
+    # A render failure is a fact about the catalog entry, not a greffer
+    # fault, so it leaves here as the same ConfigRenderError (-> 422) the
+    # baked-file path already uses, carrying the reason. As a bare exception
+    # it became a 500 whose body said only "internal_error": the manager
+    # forwards whatever status and detail the greffer returns, so the
+    # operator saw no cause and could not tell an unsafe or broken compose
+    # from a transient greffer fault. This covers the SecurityError the
+    # sandbox raises, and the TemplateSyntaxError, UndefinedError and
+    # TypeError a broken template raised before the sandbox existed.
+    #
+    # yaml.dump stays outside the try: a dict that cannot be represented is
+    # greffer-side, and a 500 is the honest answer for that. The compose file
+    # is only written after the render succeeds.
+    dumped = yaml.dump(compose)
+    try:
+        compose_file = _COMPOSE_RENDER_ENV.from_string(dumped).render(**greffon_info)
+    except (TemplateError, TypeError, ValueError) as exc:
+        logger.error("compose render failed for %s: %s", greffon_info.get('id'), exc)
+        raise ConfigRenderError(f"docker-compose.yml: {exc}") from exc
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 

@@ -34,13 +34,38 @@ def _info(instance_id="sandbox-test"):
     }
 
 
-def _render(compose_dict, tmp_path, monkeypatch, instance_id="sandbox-test"):
+def _render(compose_dict, tmp_path, monkeypatch, instance_id="sandbox-test",
+            info=None):
     # monkeypatch, never a bare os.environ assignment: pytest runs the suite in
     # one process, so a leaked GREFFON_PATH follows later tests out of this file
     # (test_settings.py asserts the unset default of /data and would fail).
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
-    compose_mod.create_compose(compose_dict, _info(instance_id))
+    compose_mod.create_compose(compose_dict, info or _info(instance_id))
     return (tmp_path / instance_id / "docker-compose.yml").read_text()
+
+
+def _refused_by_the_sandbox(compose_dict, tmp_path, monkeypatch, info=None):
+    """Render and require a SANDBOX refusal, surfaced as the 422-mapped error.
+
+    create_compose reports a render failure as ConfigRenderError so the router
+    can answer 422 with the reason instead of a bare 500. The cause is still
+    checked: a payload that merely fails to PARSE also becomes a
+    ConfigRenderError, and is no evidence the sandbox did anything."""
+    with pytest.raises(compose_mod.ConfigRenderError) as exc:
+        _render(compose_dict, tmp_path, monkeypatch, info=info)
+    assert isinstance(exc.value.__cause__, SecurityError), (
+        f"refused, but not by the sandbox: {exc.value.__cause__!r}")
+
+
+def _assert_context_untouched(info):
+    """The live deployment dicts must come out exactly as they went in.
+
+    An assertion on the exception alone cannot tell "refused" from "mutated,
+    then crashed": `{% set _ = <mutate> %}{{ 1 / 0 }}` raises either way, and
+    by then the volume already says "/"."""
+    fresh = _info(info["id"])
+    assert info["volumes"] == fresh["volumes"], info["volumes"]
+    assert info["ports"] == fresh["ports"], info["ports"]
 
 
 # The classic Jinja escape chains: each reaches interpreter state through an
@@ -68,10 +93,7 @@ _ESCAPES = [
 def test_attribute_walk_to_the_interpreter_is_refused(payload, tmp_path, monkeypatch):
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"EVIL": payload}}}}
-    # SecurityError specifically, not "any exception": a payload that merely
-    # fails to parse is not evidence the sandbox did anything.
-    with pytest.raises(SecurityError):
-        _render(compose, tmp_path, monkeypatch)
+    _refused_by_the_sandbox(compose, tmp_path, monkeypatch)
 
 
 def test_the_escape_would_have_worked_before_the_sandbox(tmp_path):
@@ -124,15 +146,17 @@ def test_a_template_cannot_mutate_the_live_deployment_context(tmp_path, monkeypa
     payload = '{{ volumes.update({"evil": {"value": "/"}}) }}'
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"X": payload}}}}
-    with pytest.raises(SecurityError):
-        _render(compose, tmp_path, monkeypatch)
+    info = _info()
+    _refused_by_the_sandbox(compose, tmp_path, monkeypatch, info=info)
+    _assert_context_untouched(info)
 
 
 def test_a_template_cannot_append_to_a_live_list(tmp_path, monkeypatch):
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"X": '{{ ports.append(1) }}'}}}}
-    with pytest.raises(SecurityError):
-        _render(compose, tmp_path, monkeypatch)
+    info = _info()
+    _refused_by_the_sandbox(compose, tmp_path, monkeypatch, info=info)
+    _assert_context_untouched(info)
 
 
 # The bound-mutator tests above are not enough on their own: an UNBOUND call
@@ -142,6 +166,9 @@ _UNBOUND_MUTATORS = [
     '{{ dict.setdefault(volumes.data, "value", "/") }}',
     '{{ dict.pop(volumes.data, "value") }}',
     '{{ dict.clear(volumes.data) }}',
+    # Mutate, THEN fail. Asserting only that an exception happened passes
+    # this even with the mutation landed; the context check below does not.
+    '{% set _ = dict.update(volumes.data, {"value": "/"}) %}{{ 1 / 0 }}',
 ]
 
 
@@ -160,10 +187,31 @@ def test_unbound_mutators_cannot_reach_the_live_context(payload, tmp_path,
     mutable-type globals entirely."""
     compose = {"services": {"app": {"image": "nginx:alpine",
                                     "environment": {"EVIL": payload}}}}
-    with pytest.raises(Exception) as exc:
-        _render(compose, tmp_path, monkeypatch)
-    # Whatever the failure, it must not be a silent success.
-    assert exc.value is not None
+    info = _info()
+    with pytest.raises(Exception):
+        _render(compose, tmp_path, monkeypatch, info=info)
+    # The exception is not the evidence; the untouched context is.
+    _assert_context_untouched(info)
+
+
+# The baked-file environment renders catalog `file`/`json` destinations with
+# the same live greffon_info, so it needs the same refusal. Only the compose
+# half was tested: swapping _FILE_RENDER_ENV for a plain SandboxedEnvironment
+# passed the whole suite while letting `volumes.data.update(...)` set a volume
+# to "/", which create_volumes_then_copy_files mounts as `-v /:/root`.
+_FILE_MUTATORS = [
+    '{{ volumes.data.update({"value": "/"}) }}',
+    '{{ ports.append(1) }}',
+    '{{ dict.update(volumes.data, {"value": "/"}) }}',
+]
+
+
+@pytest.mark.parametrize("payload", _FILE_MUTATORS)
+def test_a_baked_file_cannot_mutate_the_live_context_either(payload):
+    info = _info()
+    with pytest.raises(compose_mod.ConfigRenderError):
+        compose_mod._render_baked_file(payload, info, "cfg.conf")
+    _assert_context_untouched(info)
 
 
 def test_the_escape_globals_are_gone(tmp_path, monkeypatch):
