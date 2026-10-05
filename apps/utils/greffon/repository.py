@@ -4,6 +4,7 @@ import os
 import yaml
 from apps.utils.os.network import get_free_ports
 from apps.utils.greffon import sticky_ports
+from apps.utils.greffon.compose_shape import ComposeShapeError, normalize_compose
 from apps.utils.docker import l4_ports
 
 logger = logging.getLogger("greffer")
@@ -16,14 +17,6 @@ def get_compose_file_from_repository(greffon):
             f"HTTP {r.status_code}"
         )
     return yaml.safe_load(r.text)
-
-
-def _split_proto(raw):
-    """'51820/udp' -> ('51820', 'udp'); '8080' -> ('8080', None)."""
-    if '/' in raw:
-        port, proto = raw.rsplit('/', 1)
-        return port, proto.lower()
-    return raw, None
 
 
 # Catalog authors set this label on a service whose app streams responses
@@ -143,6 +136,13 @@ def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
 
 
 def create_greffon_info(compose, greffon):
+    # compose-containment Feature 2: one normalization pass up front. Every
+    # ports/volumes entry is a dict and every networks entry a declared name
+    # past this point, so the loops below read shapes instead of splitting
+    # strings — and the seven legal-syntax constructs that used to surface as
+    # bare AttributeErrors/ValueErrors/KeyErrors (500s) either normalize or
+    # raised a ComposeShapeError (422) inside normalize_compose already.
+    compose = normalize_compose(compose)
     greffon_path = os.path.join(
         os.getenv('GREFFON_PATH', '/data'), greffon['id'])
     internal_network_id = 'greffon_internal_network'
@@ -212,41 +212,26 @@ def create_greffon_info(compose, greffon):
             'containers': {},
             'files': []
         }
-    for _, network_name in enumerate(compose.get('networks', [])):
+    top_networks = compose.get('networks') or {}
+    top_network_names = (list(top_networks) if isinstance(top_networks, dict)
+                         else list(top_networks))
+    for network_name in top_network_names:
+        # 'containers' is a LIST of service names (like the internal
+        # network's above): the rebuild in create_compose_template_from_
+        # greffon iterates it and appends the network to each named service.
         greffon_info['networks'][network_name] = {
             'name': network_name,
             'value': network_name,
-            'containers': {},
+            'containers': [],
             'files': []
         }
     for name, service in compose['services'].items():
-        ports = service.get('ports', [])
-        if type(ports) == list:
-            for port in ports:
-                port_splited = port.split(':')
-                port_container, parsed_proto = _split_proto(port_splited[-1])
-                port_name = f'{name}_{port_container}'
-                manager_port = greffon.get('ports', {}).get(port_name, {})
-                greffon_info['ports'].append({
-                    'port_container': port_container,
-                    'container_name': name,
-                    'port_name': port_name,
-                    'url': manager_port.get('url'),
-                    # Tier/protocol: manager (catalog) is authoritative; fall
-                    # back to parsing "<h>:<c>/udp" from the compose, then to
-                    # the http/tcp defaults.
-                    'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
-                    'exposure_tier': manager_port.get('exposure_tier', 'http'),
-                    # same_port: publish host P -> container P (not declared
-                    # container port) so the app advertises exactly what it
-                    # binds. Manager-declared (L4 only); default off.
-                    'same_port': bool(manager_port.get('same_port', False)),
-                    'streaming': _service_streaming(service),
-                })
-        else:
-            greffon_info['ports'].setdefault(name, {})
-            _, raw_container = port.split(':')
-            port_container, parsed_proto = _split_proto(raw_container)
+        # normalize_compose guarantees lists of dict entries past this point;
+        # the legacy if/else branches for mapping-form ports/volumes were dead
+        # code referencing unbound locals and are gone.
+        for port in service.get('ports', []) or []:
+            port_container = port['target']
+            parsed_proto = port.get('protocol')
             port_name = f'{name}_{port_container}'
             manager_port = greffon.get('ports', {}).get(port_name, {})
             greffon_info['ports'].append({
@@ -254,52 +239,46 @@ def create_greffon_info(compose, greffon):
                 'container_name': name,
                 'port_name': port_name,
                 'url': manager_port.get('url'),
+                # Tier/protocol: manager (catalog) is authoritative; fall
+                # back to the compose-declared protocol, then to the
+                # http/tcp defaults.
                 'protocol': manager_port.get('protocol') or parsed_proto or 'tcp',
                 'exposure_tier': manager_port.get('exposure_tier', 'http'),
+                # same_port: publish host P -> container P (not declared
+                # container port) so the app advertises exactly what it
+                # binds. Manager-declared (L4 only); default off.
                 'same_port': bool(manager_port.get('same_port', False)),
                 'streaming': _service_streaming(service),
             })
-        volumes = service.get('volumes', [])
-        if type(volumes) == list:
-            for volume in service.get('volumes', []):
-                volume_host, volume_container = volume.split(':')
-                if volume_host not in greffon_info['volumes']:
-                    # todo should handle multi containers
-                    greffon_info['volumes'][volume_host] = {
-                        'name': volume_host,
-                        'value': volume_host,
-                        'containers': {
-                            name: {
-                                'path': volume_container
-                            }
-                        },
-                        'files': []
-                    }
-                else:
-                    greffon_info['volumes'][volume_host]['containers'][name] = {
-                        'path': volume_container
-                    }
-        else:
-            volume_host, volume_container = volume.split(':')
+        for volume in service.get('volumes', []) or []:
+            volume_host = volume['source']
+            volume_container = volume['target']
+            volume_mode = volume.get('mode')
             if volume_host not in greffon_info['volumes']:
+                # todo should handle multi containers
                 greffon_info['volumes'][volume_host] = {
                     'name': volume_host,
                     'value': volume_host,
                     'containers': {
                         name: {
-                            'path': volume_container
+                            'path': volume_container,
+                            **({'mode': volume_mode} if volume_mode else {})
                         }
                     },
                     'files': []
                 }
             else:
                 greffon_info['volumes'][volume_host]['containers'][name] = {
-                    'path': volume_container
+                    'path': volume_container,
+                    **({'mode': volume_mode} if volume_mode else {})
                 }
-        networks = service.get('networks', [])
-        if type(networks) == list:
-            for network in networks:
-                greffon_info['networks'][network]['containers'].append(name)
-        else:
-            greffon_info['networks'][networks]['containers'].append(name)
+        for network in service.get('networks', []) or []:
+            # compose's implicit 'default' network is referenceable without
+            # a top-level declaration; the pipeline maps every service onto
+            # greffon_internal_network regardless, so 'default' is a no-op
+            # rather than a registration (registering it would invent a
+            # network the pipeline never uses).
+            if network == 'default':
+                continue
+            greffon_info['networks'][network]['containers'].append(name)
     return greffon_info
