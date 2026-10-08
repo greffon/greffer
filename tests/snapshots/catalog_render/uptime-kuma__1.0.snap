@@ -1,0 +1,36 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3001'
+    restart: unless-stopped
+    volumes:
+    - regress-uptime-kuma_nginx_volume:/etc/nginx/
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-uptime-kuma_uptime_kuma_data:/app/data
+version: '3'
+volumes:
+  regress-uptime-kuma_nginx_volume:
+    name: regress-uptime-kuma_nginx_volume
+  regress-uptime-kuma_uptime_kuma_data:
+    name: regress-uptime-kuma_uptime_kuma_data

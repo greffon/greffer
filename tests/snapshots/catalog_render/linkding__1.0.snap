@@ -1,0 +1,40 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:9090'
+    restart: unless-stopped
+    volumes:
+    - regress-linkding_nginx_volume:/etc/nginx/
+  linkding:
+    environment:
+      LD_CSRF_TRUSTED_ORIGINS: 'https://regress-linkding-0.my.example.test'
+      LD_SUPERUSER_NAME: admin
+      LD_SUPERUSER_PASSWORD: ''
+    image: sissbruecker/linkding:latest
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-linkding_linkding_data:/etc/linkding/data
+version: '3'
+volumes:
+  regress-linkding_linkding_data:
+    name: regress-linkding_linkding_data
+  regress-linkding_nginx_volume:
+    name: regress-linkding_nginx_volume

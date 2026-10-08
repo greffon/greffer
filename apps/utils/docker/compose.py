@@ -5,9 +5,9 @@ import re
 import json
 import logging
 from datauri import DataURI
-from jinja2 import ChainableUndefined, Environment, StrictUndefined, Template, meta, nodes
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, meta, nodes
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
-from jinja2.sandbox import SandboxedEnvironment
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -50,9 +50,55 @@ logger = logging.getLogger(__name__)
 # *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
 # it is NOT an SSTI gate — the sandbox is what stops injection.
 # ``autoescape=False`` because these are config files (JSON/conf), not HTML.
-_FILE_RENDER_ENV = SandboxedEnvironment(
+_FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
-)
+)  # globals hardened below, once _harden is defined
+
+# The compose BODY render. Sandboxed for the same reason as the file render
+# above, but with the LENIENT undefined the body has always had -- see the
+# comment in ``create_compose``. Split from _FILE_RENDER_ENV so neither
+# policy can be changed by accident while editing the other.
+#
+# IMMUTABLE, not merely sandboxed. A plain SandboxedEnvironment blocks the
+# attribute walk to the interpreter but still permits mutating calls on the
+# objects passed to ``render()`` -- and those are the LIVE deployment dicts.
+# ``{{ volumes.update({"x": {"value": "/"}}) }}`` renders as empty output
+# while adding a volume, and ``create_volumes_then_copy_files`` then runs
+# ``docker container create -v /:/root`` (volume.py) and copies attacker
+# content into the host filesystem. Blocking dunder traversal alone leaves
+# that write primitive open, so both envs refuse mutation.
+def _harden(env):
+    """Drop Jinja's default globals that re-open what the sandbox closes.
+
+    ImmutableSandboxedEnvironment refuses a MUTATING call on an immutable
+    target -- but it decides that from the object the method is bound to, so
+    an UNBOUND call slips past: ``dict`` is a Jinja global, and
+    ``{{ dict.update(volumes.x, {"value": "/"}) }}`` checks ``dict`` (the
+    class) rather than the live mapping, renders clean, and rewrites the
+    context. Verified: the bound form raises SecurityError while the unbound
+    form succeeded and set a volume's value to "/", which
+    create_volumes_then_copy_files then mounts as ``-v /:/root``.
+
+    ``cycler``/``joiner``/``namespace`` are the documented first hops of the
+    classic escape chains, and ``lipsum``/``range`` are of no use to a compose
+    file. The catalog uses none of them -- verified across every pinned entry
+    -- so removing them costs nothing and shrinks the surface to what a
+    compose actually needs.
+
+    What this does NOT do is bound resource use. Removing ``range`` closes
+    one way to allocate, not the class: ``*`` and ``**`` are not intercepted,
+    so ``{{ "A" * (10 ** 8) }}`` is sandbox-legal and renders a 100 MB
+    compose. The sandbox stops code execution; an input/output/time budget
+    around the render is the second half of Feature 1 in the root
+    docs/features/compose-containment/epic.md, scoped there to the custom
+    (untrusted) compose path."""
+    for unsafe in ('dict', 'range', 'lipsum', 'cycler', 'joiner', 'namespace'):
+        env.globals.pop(unsafe, None)
+    return env
+
+
+_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(autoescape=False))
+_harden(_FILE_RENDER_ENV)
 
 
 class ConfigRenderError(Exception):
@@ -507,30 +553,15 @@ def _call_consumes(value, name):
     return False
 
 
-# The ONE environment the compose is rendered in -- by the document
-# guard and by `create_compose` itself.
-#
-# ONE, because the guard's whole claim is "the question I ask is the
-# question the render will ask". While these were two environments that
-# claim was false in both directions, and both ways were 500s at
-# `/start/` on composes `main` deploys: a value the guard's environment
-# accepted but the deploy's refused was kept and then failed, and one
-# the guard refused made the document look unrenderable, which silently
-# disabled the net below.
-#
-# SANDBOXED, because catalog text is community-controlled and this
-# module already sandboxes baked files against exactly this
-# (`_FILE_RENDER_ENV`): a plain Environment executes
-# `{{ cycler.__init__.__globals__.os.popen("id").read() }}` on a worker
-# holding the instance's secrets, the manager token and the Docker
-# socket. The strip pass made that worse by rendering values it exists
-# to DELETE, before deleting them.
-#
-# Sandboxing the deploy render is a change to `main`'s behaviour, so it
-# was measured, not assumed: all 32 catalog entries render BYTE
-# IDENTICALLY sandboxed and unsandboxed, in both the configured and
-# unset scenarios (64/64).
-_COMPOSE_RENDER_ENV = SandboxedEnvironment()
+# The compose render environment is `_COMPOSE_RENDER_ENV`, defined ABOVE
+# as the hardened, immutable sandbox (see `_harden`). The strip's document
+# guard and `create_compose` must render in that SAME one, or the guard's
+# claim -- "the question I ask is the question the render will ask" --
+# breaks: a value one environment accepts and the other refuses was a 500
+# at `/start/` on composes `main` deploys, both ways. It is sandboxed
+# because catalog text is community-controlled, and the compose-containment
+# work (greffer#136) made it immutable too, after measuring that every
+# catalog entry renders byte-identically sandboxed and unsandboxed.
 
 
 # Operations that RAISE on `_UnsetField` instead of answering falsily.
@@ -1582,8 +1613,37 @@ def create_compose(compose, greffon_info):
     # `environment`, the other `logging`), so the order is free.
     _inject_instance_log_rotation(compose)
     _delete_unset_integration_env_keys(compose, greffon_info)
-    t = _COMPOSE_RENDER_ENV.from_string(yaml.dump(compose))
-    compose_file = t.render(**_compose_render_context(greffon_info))
+    # Render the compose BODY in the hardened sandbox (`_COMPOSE_RENDER_ENV`
+    # above), never the stock Template: a value of
+    # `{{ cycler.__init__.__globals__.os.popen('id').read() }}` would execute
+    # in this process, which holds the manager token, the Docker socket and
+    # every instance's TLS key. The strip just above DELETES the env keys of
+    # integration types the user did not configure; whatever remains still
+    # goes through the sandbox.
+    #
+    # Rendered with `_compose_render_context`, not bare `greffon_info`: that
+    # is where an unset integration type is bound to `_UnsetIntegration` /
+    # `_UnsetField`, so a guard-only `{{ smtp.* }}` the strip intentionally
+    # KEEPS renders its off-branch instead of raising. The guard and this
+    # render therefore ask the same question.
+    #
+    # ANY exception from render() maps to ConfigRenderError (-> 422), not a
+    # bare 500 whose body says only "internal_error". An evaluation error on
+    # valid Jinja (`{{ 1 // 0 }}`, `{{ 10.0 ** 400 }}`, a recursive macro) is
+    # a fact about the catalog entry, and the detail names the exception TYPE
+    # only, never str(exc), which can carry rendered secret bytes or grow
+    # unbounded. yaml.dump stays OUTSIDE the try: a dict that cannot be
+    # represented is greffer-side, and a 500 is honest there.
+    dumped = yaml.dump(compose)
+    try:
+        compose_file = _COMPOSE_RENDER_ENV.from_string(dumped).render(
+            **_compose_render_context(greffon_info))
+    except Exception as exc:
+        logger.error("compose render failed for %s: %s: %s",
+                     greffon_info.get('id'), type(exc).__name__, exc)
+        raise ConfigRenderError(
+            f"docker-compose.yml failed to render ({type(exc).__name__}); "
+            f"see the greffer log for the cause.") from exc
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 

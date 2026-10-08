@@ -1056,11 +1056,15 @@ class ASymbolDefinedInOneValueAndUsedInAnotherTests(TestCase):
     binding covers `oidc`, not the macro name bound to it.
     """
 
+    # `namespace()` used to be a second vehicle here, but the compose
+    # render environment (greffer#136) drops the `namespace` global
+    # along with `dict`/`cycler`/etc, so a compose using it cannot render
+    # at all, strip or no strip. No catalog entry uses it. A macro is a
+    # language construct, not a global, so it survives and still
+    # exercises the define-in-one-value / use-in-another path.
     CASES = {
         'macro': {'A_DEF': '{% macro u(p) %}{{ oidc.issuer }}{{ p }}{% endmacro %}',
                   'B_USE': '{{ u(1) }}'},
-        'namespace': {'A_DEF': '{% set ns = namespace(v=smtp.host) %}',
-                      'B_USE': '{{ ns.v }}'},
     }
 
     def _run(self, env):
@@ -1177,14 +1181,17 @@ class TheGuardRendersAgainstItsOwnCopyTests(TestCase):
 
 
 class TheContextIsCopiedPerRenderTests(TestCase):
-    """Copying the guard's context ONCE was not enough.
+    """A mutating catalog value cannot corrupt the guard or the context.
 
-    The guard renders twice -- before the strip and after it -- plus
-    once more to name the cause when the restore fires. Sharing one copy
-    across them means a catalog expression that mutates the context
-    corrupts every later verdict,
-    so the guard answers a different question than `create_compose`
-    will ask with its own fresh context. Both directions shipped bugs.
+    Under the plain SandboxedEnvironment this needed a deepcopy of the
+    context per render: `{{ volumes.popitem() }}` executed, so a shared
+    copy got mutated and every later verdict answered a different
+    question than the real render would. The compose render environment
+    (greffer#136) is now IMMUTABLE, so the mutation is refused at the
+    source (SecurityError -> ConfigRenderError -> 422) instead of being
+    copy-isolated. The per-render copy stays as belt-and-braces; these
+    tests pin the guarantee that holds either way: the live context is
+    never mutated, and a mutating value is refused, not silently shipped.
     """
 
     def _create(self, gid, env):
@@ -1198,34 +1205,41 @@ class TheContextIsCopiedPerRenderTests(TestCase):
                 written = pathlib.Path(tmp, gid, 'docker-compose.yml').read_text()
         return yaml.safe_load(written)['services']['app']['environment'] or {}
 
-    def test_a_mutation_that_REMOVES_does_not_un_pop_everything(self):
-        # `popitem()` empties the shared copy on the first render, so
-        # every later render died on it and the guard undid every pop --
-        # shipping glitchtip's `EMAIL_URL` as `smtp://:@`.
-        env = self._create('i1', {
-            'EMAIL_URL': 'smtp://{{ smtp.user }}@{{ smtp.host }}',
-            'SELF': "{{ volumes.popitem() and '' }}",
-        })
-        self.assertNotIn('EMAIL_URL', env)
+    def test_a_mutating_value_is_refused_not_silently_shipped(self):
+        # `popitem()` on the live `volumes` is a host-write primitive.
+        # Under the plain env it executed on a copy and the deploy
+        # shipped anyway; the immutable env refuses it, so the deploy
+        # fails loudly (ConfigRenderError -> 422). No catalog entry
+        # does this.
+        with self.assertRaises(compose_module.ConfigRenderError):
+            self._create('i1', {
+                'EMAIL_URL': 'smtp://{{ smtp.user }}@{{ smtp.host }}',
+                'SELF': "{{ volumes.popitem() and '' }}",
+            })
 
-    def test_a_mutation_that_ADDS_does_not_get_the_guard_to_approve(self):
-        # The mirror: the first render created `v2` in the shared copy,
-        # so the guard approved a document whose real render raised.
-        env = self._create('i2', {
-            'AAA': '{{ volumes.setdefault("v2", volumes["v"]) and oidc.issuer }}',
-            'ZZZ': '{{ volumes.v2.value }}',
-        })
-        self.assertEqual(env.get('ZZZ'), 'vol1')
+    def test_a_mutation_that_ADDS_is_refused_too(self):
+        # The mirror: `setdefault` would create `v2` so a later
+        # `{{ volumes.v2.value }}` resolves. The immutable env refuses
+        # the setdefault, so the deploy fails rather than the guard
+        # approving a document built on a mutation.
+        with self.assertRaises(compose_module.ConfigRenderError):
+            self._create('i2', {
+                'AAA': '{{ volumes.setdefault("v2", volumes["v"]) and oidc.issuer }}',
+                'ZZZ': '{{ volumes.v2.value }}',
+            })
 
     def test_an_ordinary_pop_is_unaffected(self):
         env = self._create('i3', {'H': '{{ oidc.issuer }}', 'X': '1'})
         self.assertEqual(env, {'X': '1'})
 
-    def test_the_helper_does_not_mutate_the_context_it_is_given(self):
+    def test_the_guard_refuses_a_mutating_value_and_keeps_the_context(self):
+        # The mutating render fails under the immutable env, so the
+        # guard reports the document does NOT render, and either way the
+        # live context it was handed is untouched.
         context = {'volumes': {'v1': {'value': 'a'}, 'v2': {'value': 'b'}}}
         compose = {'services': {'app': {'environment': {
             'A': "{{ volumes.popitem() and '' }}"}}}}
-        self.assertTrue(_document_renders(compose, context))
+        self.assertFalse(_document_renders(compose, context))
         self.assertEqual(len(context['volumes']), 2)
 
     def test_two_calls_with_the_same_context_agree(self):
