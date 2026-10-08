@@ -1,0 +1,69 @@
+networks:
+  greffon_internal_network: {}
+services:
+  greffon_nginx:
+    image: nginx:1.20.2-alpine-perl
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports:
+    - '20000:3000'
+    restart: unless-stopped
+    volumes:
+    - regress-umami_nginx_volume:/etc/nginx/
+  umami:
+    depends_on:
+    - umami_db
+    environment:
+      APP_SECRET: ''
+      DATABASE_TYPE: postgresql
+      DATABASE_URL: postgresql://umami:regress-umami@umami_db:5432/umami
+    image: ghcr.io/umami-software/umami:3.1.0
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes: []
+  umami_db:
+    environment:
+      POSTGRES_DB: umami
+      POSTGRES_PASSWORD: 'regress-umami'
+      POSTGRES_USER: umami
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD-SHELL
+      - pg_isready -U umami -d umami
+      timeout: 5s
+    image: postgres:16-alpine
+    labels:
+      com.greffon.backup.dump: pg_dump -U umami -d umami -Fc
+      com.greffon.backup.restore: pg_restore -U umami -d umami --clean --if-exists
+        --no-owner --single-transaction
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - greffon_internal_network
+    ports: []
+    restart: on-failure
+    volumes:
+    - regress-umami_umami_db_data:/var/lib/postgresql/data
+version: '3'
+volumes:
+  regress-umami_nginx_volume:
+    name: regress-umami_nginx_volume
+  regress-umami_umami_db_data:
+    name: regress-umami_umami_db_data

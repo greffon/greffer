@@ -3,9 +3,9 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined, Template
+from jinja2 import StrictUndefined
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
-from jinja2.sandbox import SandboxedEnvironment
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -48,9 +48,55 @@ logger = logging.getLogger(__name__)
 # *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
 # it is NOT an SSTI gate — the sandbox is what stops injection.
 # ``autoescape=False`` because these are config files (JSON/conf), not HTML.
-_FILE_RENDER_ENV = SandboxedEnvironment(
+_FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
-)
+)  # globals hardened below, once _harden is defined
+
+# The compose BODY render. Sandboxed for the same reason as the file render
+# above, but with the LENIENT undefined the body has always had -- see the
+# comment in ``create_compose``. Split from _FILE_RENDER_ENV so neither
+# policy can be changed by accident while editing the other.
+#
+# IMMUTABLE, not merely sandboxed. A plain SandboxedEnvironment blocks the
+# attribute walk to the interpreter but still permits mutating calls on the
+# objects passed to ``render()`` -- and those are the LIVE deployment dicts.
+# ``{{ volumes.update({"x": {"value": "/"}}) }}`` renders as empty output
+# while adding a volume, and ``create_volumes_then_copy_files`` then runs
+# ``docker container create -v /:/root`` (volume.py) and copies attacker
+# content into the host filesystem. Blocking dunder traversal alone leaves
+# that write primitive open, so both envs refuse mutation.
+def _harden(env):
+    """Drop Jinja's default globals that re-open what the sandbox closes.
+
+    ImmutableSandboxedEnvironment refuses a MUTATING call on an immutable
+    target -- but it decides that from the object the method is bound to, so
+    an UNBOUND call slips past: ``dict`` is a Jinja global, and
+    ``{{ dict.update(volumes.x, {"value": "/"}) }}`` checks ``dict`` (the
+    class) rather than the live mapping, renders clean, and rewrites the
+    context. Verified: the bound form raises SecurityError while the unbound
+    form succeeded and set a volume's value to "/", which
+    create_volumes_then_copy_files then mounts as ``-v /:/root``.
+
+    ``cycler``/``joiner``/``namespace`` are the documented first hops of the
+    classic escape chains, and ``lipsum``/``range`` are of no use to a compose
+    file. The catalog uses none of them -- verified across every pinned entry
+    -- so removing them costs nothing and shrinks the surface to what a
+    compose actually needs.
+
+    What this does NOT do is bound resource use. Removing ``range`` closes
+    one way to allocate, not the class: ``*`` and ``**`` are not intercepted,
+    so ``{{ "A" * (10 ** 8) }}`` is sandbox-legal and renders a 100 MB
+    compose. The sandbox stops code execution; an input/output/time budget
+    around the render is the second half of Feature 1 in the root
+    docs/features/compose-containment/epic.md, scoped there to the custom
+    (untrusted) compose path."""
+    for unsafe in ('dict', 'range', 'lipsum', 'cycler', 'joiner', 'namespace'):
+        env.globals.pop(unsafe, None)
+    return env
+
+
+_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(autoescape=False))
+_harden(_FILE_RENDER_ENV)
 
 
 class ConfigRenderError(Exception):
@@ -615,8 +661,61 @@ def create_compose(compose, greffon_info):
     greffon_info = _compute_integrations_context(greffon_info)
     _delete_unset_integration_env_keys(compose, greffon_info)
     _inject_instance_log_rotation(compose)
-    t = Template(yaml.dump(compose))
-    compose_file = t.render(**greffon_info)
+    # Render the compose BODY in a sandbox, not the stock ``Template``.
+    #
+    # The body is attacker-reachable the moment its author is not a reviewer:
+    # a value of ``{{ cycler.__init__.__globals__.os.popen('id').read() }}``
+    # executes in this process, which holds the manager token, the Docker
+    # socket and every instance's TLS private key. That is host root. The
+    # catalog is PR-reviewed, so this is latent rather than live today -- but
+    # the catalog is community-contributed, and custom app deploy would hand
+    # this path unreviewed input by design.
+    #
+    # ``_COMPOSE_RENDER_ENV`` deliberately keeps the LENIENT undefined that
+    # the stock ``Template`` had: a missing ``{{ config.X }}`` still renders
+    # empty here. Tightening that to StrictUndefined is a separate, visible
+    # behaviour change (it would start failing catalog entries that rely on
+    # an empty render) and it belongs to the undefined-policy decision, not
+    # to closing the injection hole. Baked files keep their own STRICT env --
+    # a silently-empty secret in a config file is a security failure, whereas
+    # a silently-empty compose value is the status quo this change preserves.
+    #
+    # A render failure is a fact about the catalog entry, not a greffer
+    # fault, so it leaves here as the same ConfigRenderError (-> 422) the
+    # baked-file path already uses. As a bare exception it became a 500 whose
+    # body said only "internal_error": the manager forwards whatever status
+    # and detail the greffer returns, so the operator saw no cause and could
+    # not tell an unsafe or broken compose from a transient greffer fault.
+    #
+    # ANY exception from render(), not an enumerated few. Naming the classes
+    # (TemplateError/TypeError/ValueError) let evaluation-time errors on valid
+    # Jinja escape as a 500: `{{ 1 // 0 }}` raises ZeroDivisionError,
+    # `{{ 10.0 ** 400 }}` OverflowError, a recursive macro RecursionError, and
+    # a user-supplied `{{ config.X }}` reaches these today. Inside this try
+    # nothing but template evaluation runs, and the env has no custom filters
+    # or globals that could raise a greffer bug, so a broad catch cannot
+    # mislabel a greffer fault as a catalog error. yaml.dump stays OUTSIDE the
+    # try: a dict that cannot be represented is greffer-side, and a 500 is the
+    # honest answer there.
+    #
+    # The forwarded detail names the exception TYPE only, never str(exc). With
+    # the lenient undefined the body keeps, a rendered value can land inside
+    # the message text (a missing-attribute error quotes the base it was read
+    # from, which may be a resolved config value or minted key material), and
+    # the message is unbounded (a large rendered string becomes a large body
+    # the manager logs and forwards). The type is enough for the operator to
+    # know whether the compose is unsafe, malformed, or references something
+    # unset; the full reason goes to the greffer log, which is not caller-
+    # reachable. The compose file is only written after the render succeeds.
+    dumped = yaml.dump(compose)
+    try:
+        compose_file = _COMPOSE_RENDER_ENV.from_string(dumped).render(**greffon_info)
+    except Exception as exc:
+        logger.error("compose render failed for %s: %s: %s",
+                     greffon_info.get('id'), type(exc).__name__, exc)
+        raise ConfigRenderError(
+            f"docker-compose.yml failed to render ({type(exc).__name__}); "
+            f"see the greffer log for the cause.") from exc
     with open(os.path.join(greffon_path, 'docker-compose.yml'), 'w') as temp_file:
         temp_file.write(compose_file)
 

@@ -62,6 +62,37 @@ async def test_start_render_failure_returns_422(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_compose_body_render_failure_returns_422(client: AsyncClient) -> None:
+    """A ConfigRenderError out of create_compose (the sandbox refused the
+    compose body, or the template is broken) is the same clean 422 as a
+    baked-file failure, not a bare 500 whose body says only "internal_error".
+    The manager forwards status and detail as-is, so this is the difference
+    between the operator seeing the cause and seeing nothing. Raised before any
+    volume copy or `compose up`, so there is no half-started instance."""
+    with patch("app.routers.controller.repository") as mock_repo, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.return_value = {"ports": [], "id": "x"}
+        mock_compose.ConfigRenderError = compose.ConfigRenderError
+        mock_compose.create_compose.side_effect = compose.ConfigRenderError(
+            "docker-compose.yml: access to attribute '__init__' of 'Cycler' "
+            "object is unsafe."
+        )
+
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 422
+    assert "is unsafe" in r.json()["detail"]
+    mock_compose.create_volumes_then_copy_files.assert_not_called()
+    mock_compose.start.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_start_success(client: AsyncClient) -> None:
     with patch("app.routers.controller.repository") as mock_repo, patch(
         "app.routers.controller.compose"
