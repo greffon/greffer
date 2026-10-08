@@ -243,14 +243,123 @@ def _normalize_service_networks(entry, service: str) -> list[str]:
     return names
 
 
-def normalize_compose(compose) -> dict:
+# --- Key allowlist (compose-containment Feature 3) -------------------------
+#
+# A positive allowlist, not a denylist: a denylist is defeated by whatever it
+# failed to enumerate (devices, volumes_from, build, ipc, userns_mode, and
+# whatever a future compose spec adds). Trust-scoped, because a flat list
+# breaks the catalog: wireguard/1.0 legitimately uses cap_add, cap_drop,
+# devices and sysctls (PR-reviewed use), and refusing them takes a shipped
+# app offline on its next deploy.
+#
+#   catalog: PR-reviewed input — the broad set including the privileged keys
+#   strict:  unreviewed input (a custom compose) — no privileged keys
+#
+# The greffer-managed keys (ports/volumes/networks) are consumed and rebuilt
+# by the pipeline, not passed through. ``env_file`` is refused in BOTH sets:
+# compose resolves it client-side relative to the project directory, so
+# ``env_file: ../<other-instance>/realm.json`` reads another instance's baked
+# secrets and injects them as environment — the same filesystem reach the
+# bind-mount refusal closes, by another door.
+
+_TOP_KEYS = frozenset({"version", "services", "volumes", "networks"})
+
+_MANAGED_SERVICE_KEYS = frozenset({"ports", "volumes", "networks"})
+
+_PRIVILEGED_SERVICE_KEYS = frozenset(
+    {"cap_add", "cap_drop", "devices", "sysctls"}
+)
+
+_BASE_SERVICE_KEYS = frozenset(
+    {
+        "image", "environment", "command", "entrypoint", "depends_on",
+        "healthcheck", "labels", "restart", "user", "working_dir", "tmpfs",
+        "stop_grace_period", "expose", "init", "platform", "shm_size",
+        "ulimits",
+        # logging: _inject_instance_log_rotation explicitly preserves an
+        # author-declared block instead of injecting the rotation default;
+        # refusing the key would make that documented contract unreachable
+        # (codex review on the pre-fix revision caught the omission).
+        "logging",
+    }
+)
+
+# env_file is deliberately absent from both sets (see block comment), and
+# is NEVER grantable via the operator override: it re-opens the
+# cross-instance baked-secret read, a hole that harms tenants rather than
+# the machine owner who would be granting it.
+_NEVER_GRANTABLE = frozenset({"env_file"})
+
+_SERVICE_KEYS_CATALOG = _BASE_SERVICE_KEYS | _PRIVILEGED_SERVICE_KEYS
+_SERVICE_KEYS_STRICT = _BASE_SERVICE_KEYS
+
+
+def _parse_extra_keys(raw) -> frozenset:
+    """GREFFER_COMPOSE_EXTRA_ALLOWED_KEYS: comma-separated service keys an
+    operator grants on their own node (dedicated greffers make this the
+    machine owner's call). Tolerant of whitespace; empty means none."""
+    if not raw:
+        return frozenset()
+    return frozenset(
+        k.strip() for k in str(raw).split(",") if k.strip()
+    )
+
+
+def _validate_keys(compose, *, strict: bool, extra_keys) -> None:
+    """Refuse every key not on the allowed list, naming the service and key.
+    ``strict`` selects the custom (unreviewed) set; ``extra_keys`` is the
+    operator's per-node grant, added to whichever set is in force."""
+    granted = _parse_extra_keys(extra_keys) - _NEVER_GRANTABLE
+    top_allowed = _TOP_KEYS
+    service_allowed = (_SERVICE_KEYS_STRICT if strict else _SERVICE_KEYS_CATALOG) | granted
+    for top_key in compose:
+        if top_key not in top_allowed:
+            raise _bad(
+                None,
+                top_key,
+                "top-level key not permitted by the compose allowlist"
+                + (" (catalog set)" if not strict else ""),
+                top_key,
+            )
+    # A missing/!dict services block is the shape pass's own named refusal
+    # below; iterating it here would turn that into a KeyError.
+    services = compose.get("services")
+    if not isinstance(services, dict):
+        return
+    for name, service_def in services.items():
+        if not isinstance(service_def, dict):
+            # The shape pass below refuses non-mapping service definitions
+            # with a named error; iterating one here would turn that into
+            # an uncaught TypeError (the bare-500 class this epic kills).
+            continue
+        for key in service_def:
+            if key in service_allowed or key in _MANAGED_SERVICE_KEYS:
+                continue
+            raise _bad(
+                name,
+                key,
+                "key not permitted"
+                + (
+                    " (custom composes use the strict set; ask the operator"
+                    " to grant it via GREFFER_COMPOSE_EXTRA_ALLOWED_KEYS)"
+                    if strict
+                    else " (catalog set)"
+                ),
+                key,
+            )
+
+
+def normalize_compose(compose, *, strict: bool = False, extra_keys=None) -> dict:
     """Validate + normalize a parsed compose in place; return it.
 
-    Raises ``ComposeShapeError`` on the first problem, naming the service and
-    key. Idempotent: normalized shapes pass through unchanged.
+    ``strict`` selects the custom (unreviewed) key set; ``extra_keys`` is the
+    operator's per-node grant (see ``_validate_keys``). Raises
+    ``ComposeShapeError`` on the first problem, naming the service and key.
+    Idempotent: normalized shapes pass through unchanged.
     """
     if not isinstance(compose, dict):
         raise _bad(None, "compose", "top level must be a mapping", compose)
+    _validate_keys(compose, strict=strict, extra_keys=extra_keys)
     services = compose.get("services")
     if not isinstance(services, dict) or not services:
         raise _bad(

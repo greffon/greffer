@@ -518,7 +518,7 @@ class ApplyConfigurationTests(TestCase):
 
                 # Verify the JSON file was written
                 greffon_path = os.path.join(tmpdir, 'test-instance-123')
-                file_path = os.path.join(greffon_path, 'config.json')
+                file_path = os.path.join(greffon_path, 'config', 'config.json')
                 self.assertTrue(os.path.exists(file_path))
                 with open(file_path) as f:
                     content = json.loads(f.read())
@@ -604,7 +604,7 @@ class ApplyConfigurationTests(TestCase):
                 result = apply_configuration(greffon_info, compose)
 
                 greffon_path = os.path.join(tmpdir, 'test-file')
-                file_path = os.path.join(greffon_path, 'upload.bin')
+                file_path = os.path.join(greffon_path, 'config', 'upload.bin')
                 self.assertTrue(os.path.exists(file_path))
                 with open(file_path, 'rb') as f:
                     self.assertEqual(f.read(), b'binary-content')

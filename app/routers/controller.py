@@ -255,9 +255,17 @@ def start_greffon(
     # clean start error rather than an opaque 500 or a silent crash-looping
     # container: a proxy same_port endpoint whose pinned port a neighbour took
     # (409), an exhausted L4 range (409), or an unreachable docker daemon (503).
+    # compose-containment Feature 3: the trust discriminator for the key
+    # allowlist. An inline compose (custom-app foundation Feature 4) is
+    # unreviewed input -> the strict set; the URL-fetch path stays catalog.
+    # The compose_yaml field does not exist on the payload yet, so this is
+    # False for every start today and activates with the inline transport.
+    _compose_strict = bool(greffon.get('compose_yaml'))
     try:
         greffon_info = repository.get_greffon_info(
-            compose_file, greffon, l4_bind_host=l4_bind_host)
+            compose_file, greffon, l4_bind_host=l4_bind_host,
+            strict=_compose_strict,
+            extra_keys=_settings(request).greffer_compose_extra_allowed_keys)
     except ComposeShapeError as exc:
         # compose-containment Feature 2: a compose whose shape the pipeline
         # cannot honour (unsupported construct, malformed entry) fails with

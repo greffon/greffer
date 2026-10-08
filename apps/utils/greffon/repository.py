@@ -53,8 +53,10 @@ def _service_streaming(service):
     return str(labels.get(PROXY_STREAMING_LABEL, '')).strip().lower() in _STREAMING_TRUTHY
 
 
-def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
-    greffon_info = create_greffon_info(compose, greffon)
+def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0',
+                     strict=False, extra_keys=None):
+    greffon_info = create_greffon_info(compose, greffon, strict=strict,
+                                       extra_keys=extra_keys)
     ports = greffon_info['ports']
     greffon_path = os.getenv('GREFFON_PATH', '/data')
     instance_id = greffon['id']
@@ -135,14 +137,18 @@ def get_greffon_info(compose, greffon, l4_bind_host='0.0.0.0'):
     return greffon_info
 
 
-def create_greffon_info(compose, greffon):
-    # compose-containment Feature 2: one normalization pass up front. Every
-    # ports/volumes entry is a dict and every networks entry a declared name
-    # past this point, so the loops below read shapes instead of splitting
-    # strings — and the seven legal-syntax constructs that used to surface as
-    # bare AttributeErrors/ValueErrors/KeyErrors (500s) either normalize or
-    # raised a ComposeShapeError (422) inside normalize_compose already.
-    compose = normalize_compose(compose)
+def create_greffon_info(compose, greffon, strict=False, extra_keys=None):
+    # compose-containment Features 2+3: one normalization pass up front.
+    # Every ports/volumes entry is a dict and every networks entry a declared
+    # name past this point, so the loops below read shapes instead of
+    # splitting strings — and the legal-syntax constructs that used to
+    # surface as bare AttributeErrors/ValueErrors/KeyErrors (500s) either
+    # normalize or raised a ComposeShapeError (422) inside normalize_compose
+    # already. The same pass enforces the trust-scoped key allowlist:
+    # strict=True is the custom (unreviewed) set, selected by the start path
+    # when the manager sends an inline compose; catalog starts keep the
+    # reviewed broad set. extra_keys is the operator's per-node grant.
+    compose = normalize_compose(compose, strict=strict, extra_keys=extra_keys)
     greffon_path = os.path.join(
         os.getenv('GREFFON_PATH', '/data'), greffon['id'])
     internal_network_id = 'greffon_internal_network'
@@ -255,10 +261,17 @@ def create_greffon_info(compose, greffon):
             volume_container = volume['target']
             volume_mode = volume.get('mode')
             if volume_host not in greffon_info['volumes']:
-                # todo should handle multi containers
+                # Feature 3: an UNDECLARED named source is namespaced by
+                # instance id exactly like a top-level-declared one. The
+                # legacy behaviour passed it through verbatim, so two
+                # greffons that each mount 'dd:/data' without a top-level
+                # declaration shared one host volume — the cross-instance
+                # leak class _0001_namespace_catalog_volumes was written to
+                # repair. Declared sources were already prefixed above;
+                # every mount source is namespaced now.
                 greffon_info['volumes'][volume_host] = {
                     'name': volume_host,
-                    'value': volume_host,
+                    'value': f'{greffon["id"]}_{volume_host}',
                     'containers': {
                         name: {
                             'path': volume_container,
