@@ -6,3 +6,4 @@ registry — `registry.all_migrations()` imports us lazily on first use.
 """
 from . import _0001_namespace_catalog_volumes  # noqa: F401
 from . import _0002_purge_staged_key_strays  # noqa: F401
+from . import _0003_namespace_undeclared_volume_mounts  # noqa: F401
