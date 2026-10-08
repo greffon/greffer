@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # (a baked secret silently becoming '' is a security failure). The catalog
 # validator is a SEPARATE, author-facing layer that rejects StrictUndefined
 # *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
-# it is NOT an SSTI gate — the sandbox is what stops injection.
+# it is NOT an SSTI gate -- the sandbox is what stops injection.
 # ``autoescape=False`` because these are config files (JSON/conf), not HTML.
 _FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
     undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
@@ -346,7 +346,7 @@ def _is_integration_set(value):
     """Returns True iff the type's config payload is a non-empty dict.
 
     None, missing, and `{}` all map to "user didn't pick this integration"
-    — we treat empty config the same as absence so the greffer doesn't
+    -- we treat empty config the same as absence so the greffer doesn't
     render half-configured env vars (e.g. host without password) that
     would silently fail the underlying greffon's first SMTP attempt.
     """
@@ -358,7 +358,7 @@ def _compute_integrations_context(greffon_info):
     and into a top-level Jinja variable so catalog templates can reference
     e.g. `{{ smtp.host }}` directly.
 
-    Unset types become empty dicts — Jinja's default Undefined resolves
+    Unset types become empty dicts -- Jinja's default Undefined resolves
     `{{ smtp.host }}` on `{}` to an empty string rather than blowing up
     with AttributeError on None.
 
@@ -367,7 +367,7 @@ def _compute_integrations_context(greffon_info):
     the forgiving binding, and that binding is load-bearing: the strip
     pass cannot be made complete (aliasing and `|map(attribute=...)`
     move a dereference off the name entirely), so something has to
-    survive what it misses. The two mechanisms divide as follows —
+    survive what it misses. The two mechanisms divide as follows --
     the strip pass produces NO KEY, the binding produces an EMPTY VALUE.
     Only the strip pass can deliver the first, which is what glitchtip
     needs: an `EMAIL_URL` present but empty renders `smtp://:@:`, a
@@ -375,15 +375,15 @@ def _compute_integrations_context(greffon_info):
 
     NOTE for the per-instance OIDC blobs of platform-identity Feature #3:
     `_is_integration_set` is `bool(dict)`, so a blob with ANY key reads
-    as configured and switches BOTH mechanisms off. A half-written row —
+    as configured and switches BOTH mechanisms off. A half-written row --
     persisted before client registration finished, or a provider variant
-    with a different shape — therefore reaches the render as a
+    with a different shape -- therefore reaches the render as a
     configured integration.
 
     What happens then depends on the SHAPE of the reference, and the
     quiet case is the likely one:
 
-        {{ oidc.client_secret }}     ''   — Jinja's own default for a
+        {{ oidc.client_secret }}     ''   -- Jinja's own default for a
                                             one-level miss. No error.
         {{ oidc.client_secret.x }}   UndefinedError
         {{ oidc.client_secret|int }} UndefinedError
@@ -391,7 +391,7 @@ def _compute_integrations_context(greffon_info):
     So a half-registered client does NOT reliably fail loudly: the
     commonest shape of all, reading a secret directly, deploys an empty
     string. This is identical to `main` and to any plain dict, so it is
-    not a regression — but Feature #3 must not lean on a refusal that
+    not a regression -- but Feature #3 must not lean on a refusal that
     only covers chained access. Enforce the shape in the catalog
     validator, or have the manager refuse to send an incomplete blob.
     """
@@ -459,7 +459,7 @@ def build_render_context(greffon_info):
 def _render_baked_file(raw, greffon_info, dest_name):
     """Sandboxed strict-render of baked file content (str or bytes). Raises
     ConfigRenderError (-> HTTP 422) on a missing/typo'd variable, an SSTI/
-    security violation, or non-UTF-8 bytes — so none of those leak as a 500 or
+    security violation, or non-UTF-8 bytes -- so none of those leak as a 500 or
     a silently-wrong file. SecurityError is a TemplateError subclass (listed
     explicitly for clarity)."""
     try:
@@ -468,7 +468,7 @@ def _render_baked_file(raw, greffon_info, dest_name):
     except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError,
             TypeError, ValueError) as exc:
         # TypeError/ValueError: e.g. `{{ x | tojson }}` on an undefined x raises
-        # "not JSON serializable" rather than UndefinedError — still a render
+        # "not JSON serializable" rather than UndefinedError -- still a render
         # failure, so a clean 422, not a 500.
         # Log the offending variable name / reason, never the resolved secret.
         logger.error("baked-file render failed for %s: %s", dest_name, exc)
@@ -483,7 +483,7 @@ def _render_json_value(value, greffon_info, dest_name):
     if isinstance(value, str):
         return _render_baked_file(value, greffon_info, dest_name)
     if isinstance(value, dict):
-        # Values only, not keys — templated keys are unneeded and would add a
+        # Values only, not keys -- templated keys are unneeded and would add a
         # duplicate-key failure mode. (Intentional.)
         return {k: _render_json_value(v, greffon_info, dest_name) for k, v in value.items()}
     if isinstance(value, list):
@@ -912,7 +912,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
     """For each known integration type whose config is unset, pop every
     env key in the compose that would expand to an unset-integration
     Jinja reference. This aims at ``absent ⇒ no env var`` regardless of
-    how Jinja renders ``{{ smtp.host }}`` on an empty dict — and,
+    how Jinja renders ``{{ smtp.host }}`` on an empty dict -- and,
     crucially, regardless of whether the catalog destination metadata
     actually reached the greffer for this start. See below for the one
     case where it settles for less.
@@ -1018,7 +1018,7 @@ def _delete_unset_integration_env_keys(compose, greffon_info):
             # 500 it exists to avoid.
             pass
 
-    # Pass 1 — metadata-driven pop (unchanged behavior).
+    # Pass 1 -- metadata-driven pop (unchanged behavior).
     for t in unset_types:
         configurations = greffon_info.get('configurations')
         if not isinstance(configurations, list):
@@ -1418,8 +1418,8 @@ def _compute_instance_context(greffon_info):
     ``instance_id`` to the Jinja render context for catalog metadata
     templating.
 
-    ``instance_url`` is the source of truth — it carries the URL the
-    manager rendered for the first port (``ports[0].url`` — the
+    ``instance_url`` is the source of truth -- it carries the URL the
+    manager rendered for the first port (``ports[0].url`` -- the
     wildcard subdomain ``https://<field-id>.my.<domain>``). That's
     what users hit in the browser and what greffons should bake into
     emails / OAuth redirects / share links.
@@ -1441,7 +1441,7 @@ def _compute_instance_context(greffon_info):
     fallback.
 
     Important semantics: when the manager-supplied URL has no
-    explicit port (TLS default 443 — the wildcard-subdomain case),
+    explicit port (TLS default 443 -- the wildcard-subdomain case),
     ``instance_port`` is the EMPTY STRING, not a fallback to
     ``port_host``. Catalogs that previously rendered
     ``host.docker.internal:51019`` (greffer-local) into user-facing
@@ -1452,7 +1452,7 @@ def _compute_instance_context(greffon_info):
     """
     ports = greffon_info.get('ports') or []
     # instance_url / instance_host / instance_port describe the Tier-A WEB entry
-    # point, so pick the first non-L4 (nginx-proxied) port — never an L4 port,
+    # point, so pick the first non-L4 (nginx-proxied) port -- never an L4 port,
     # whose public endpoint is a raw host:port carried by instance_l4_* instead.
     # A mixed greffon (e.g. a web UI + a raw UDP media/VPN port) would otherwise
     # leak the L4 subdomain into instance_url if the L4 port sorts first. A
@@ -1479,7 +1479,7 @@ def _compute_instance_context(greffon_info):
             parsed = None
             parsed_port = None
 
-    # ``urlparse('abc')`` does NOT raise — it returns a ParseResult
+    # ``urlparse('abc')`` does NOT raise -- it returns a ParseResult
     # with empty scheme/hostname. Treat half-parsed values as invalid
     # so we fall back to the greffer-local defaults instead of leaking
     # a malformed URL into ``instance_url``.
@@ -1491,7 +1491,7 @@ def _compute_instance_context(greffon_info):
 
     if manager_url_valid:
         instance_host = parsed.hostname
-        # Empty when the URL omits an explicit port (default 443) —
+        # Empty when the URL omits an explicit port (default 443) --
         # NOT a fallback to greffer-local port_host. Catalogs that
         # need a host:port form should use inline string ops on
         # ``instance_url`` (e.g. ``{{ instance_url.split('://')[1] }}``)
@@ -1536,7 +1536,7 @@ def _compute_instance_context(greffon_info):
         # Proxy-mode L4 endpoint (the bind-host gate above already means
         # proxy, independent of GREFFER_MODE which is often unset for the
         # default proxy mode). The public host clients dial is the explicit
-        # GREFFER_PUBLIC_HOST, else the manager-callback GREFFER_ADDRESS —
+        # GREFFER_PUBLIC_HOST, else the manager-callback GREFFER_ADDRESS --
         # control plane and data plane share one host in the common single-IP
         # deployment. Never host.docker.internal, which is unreachable by
         # external clients and would break e.g. WireGuard peer configs.
@@ -1599,7 +1599,7 @@ def create_compose(compose, greffon_info):
     greffon_info = _compute_instance_context(greffon_info)
     # Feature #4: bring per-type integration configs into the Jinja
     # context BEFORE rendering, and strip catalog-declared env keys for
-    # any integration type the user didn't pick. Order matters — the
+    # any integration type the user didn't pick. Order matters -- the
     # delete pass runs against the post-template-mutation compose dict
     # but BEFORE Jinja substitution; it pops the SMTP env keys whose
     # values would otherwise be templated `{{ smtp.host }}` strings.
@@ -1691,11 +1691,11 @@ def apply_configuration(greffon_info, compose):
                 remove_compose_file(greffon_info)
                 file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
                 # ``DataURI.data`` is ``bytes`` for base64 data-URIs but ``str``
-                # for percent-encoded ones — normalize before writing/rendering.
+                # for percent-encoded ones -- normalize before writing/rendering.
                 raw = DataURI(configuration['value']['file']).data
                 if destination.get('x-greffon-render'):
                     # _render_baked_file decodes (and turns non-UTF-8 into a
-                    # clean 422) — pass raw str/bytes straight through.
+                    # clean 422) -- pass raw str/bytes straight through.
                     data = _render_baked_file(raw, greffon_info, destination['name']).encode('utf-8')
                 else:
                     data = raw if isinstance(raw, bytes) else raw.encode('utf-8')

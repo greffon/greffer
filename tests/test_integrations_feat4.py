@@ -1,4 +1,4 @@
-# Tests for Feature #4 of the integrations epic — greffer side.
+# Tests for Feature #4 of the integrations epic -- greffer side.
 # Covers:
 #   - Pydantic GreffonStartRequest accepts/defaults the new
 #     `integrations` field (and the wire-compat story: missing field
@@ -120,7 +120,7 @@ class IsIntegrationSetTests(TestCase):
         self.assertTrue(_is_integration_set({'host': 'x'}))
 
     def test_empty_dict_is_unset(self):
-        # Empty config means user didn't fill anything — treat as
+        # Empty config means user didn't fill anything -- treat as
         # "didn't pick this integration" so we don't render half-
         # configured env vars that fail at first send.
         self.assertFalse(_is_integration_set({}))
@@ -129,7 +129,7 @@ class IsIntegrationSetTests(TestCase):
         self.assertFalse(_is_integration_set(None))
 
     def test_non_dict_is_unset(self):
-        # Defensive — pydantic should already reject this on the wire,
+        # Defensive -- pydantic should already reject this on the wire,
         # but in-memory callers can pass anything.
         self.assertFalse(_is_integration_set('host=smtp.x'))
         self.assertFalse(_is_integration_set(['host', 'smtp.x']))
@@ -301,7 +301,7 @@ class DeleteUnsetIntegrationEnvKeysTests(TestCase):
             self.assertIn(k, compose['services']['plausible']['environment'])
 
     def test_no_destinations_for_smtp_is_a_noop(self):
-        # Greffon doesn't reference SMTP at all (e.g. freqtrade) —
+        # Greffon doesn't reference SMTP at all (e.g. freqtrade) --
         # nothing to strip even though smtp is unset.
         compose = {'services': {'app': {'environment': {'KEEP': 'me'}}}}
         info = {
@@ -532,7 +532,7 @@ class GreffonInfoIntegrationsThreadingTests(TestCase):
 
 
 class CreateComposeRenderEndToEndTests(TestCase):
-    """Full Jinja-render path with mocked filesystem — confirms the
+    """Full Jinja-render path with mocked filesystem -- confirms the
     catalog story works end-to-end on greffer side."""
 
     def _render(self, integrations):
@@ -556,7 +556,7 @@ class CreateComposeRenderEndToEndTests(TestCase):
             'integrations': integrations,
             'ports': [{'port_host': 4242}],
         }
-        # Don't actually touch the filesystem — patch out makedirs/open.
+        # Don't actually touch the filesystem -- patch out makedirs/open.
         from unittest.mock import patch, mock_open
         with patch('apps.utils.docker.compose.os.makedirs'), \
              patch('apps.utils.docker.compose.os.path.exists', return_value=True), \
@@ -569,7 +569,7 @@ class CreateComposeRenderEndToEndTests(TestCase):
 
     def test_set_smtp_substitutes_host(self):
         # yaml.dump quotes string values that look domain-y; we accept
-        # either quoting style — what matters is the substituted value.
+        # either quoting style -- what matters is the substituted value.
         rendered = self._render({'smtp': {'host': 'smtp.mailgun.org', 'port': 587}})
         self.assertIn('smtp.mailgun.org', rendered)
         self.assertIn('SMTP_HOST_ADDR:', rendered)

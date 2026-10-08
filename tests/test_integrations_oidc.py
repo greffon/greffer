@@ -1,4 +1,4 @@
-# Tests for the greffer half of platform-identity Feature #3 — making
+# Tests for the greffer half of platform-identity Feature #3 -- making
 # `oidc` a known integration type.
 #
 # The whole feature is one tuple entry, so these tests exist to pin the
@@ -80,7 +80,7 @@ class ComputeOIDCContextTests(TestCase):
         self.assertEqual(out['oidc'], {})
 
     def test_empty_config_counts_as_unset(self):
-        # `{}` means "user didn't pick it", same as absence — a
+        # `{}` means "user didn't pick it", same as absence -- a
         # half-configured OIDC block must not reach the render.
         out = _compute_integrations_context(
             _greffon_info_with_oidc_destinations({'oidc': {}}),
