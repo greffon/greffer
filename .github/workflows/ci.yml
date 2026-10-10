@@ -52,9 +52,12 @@ jobs:
 
       # The catalog render oracle (tests/test_catalog_render_regression.py)
       # renders every catalog entry and diffs it against committed snapshots,
-      # which is the merge gate for any change to the compose render path.
-      # Without this checkout the oracle covers NOTHING and still reports
-      # green, so its coverage guard fails the run rather than skipping.
+      # which is the merge gate for any change to the compose render path —
+      # and the compose allowlist gate (tests/test_compose_allowlist.py)
+      # validates every entry against the key allowlist, so a too-narrow
+      # list cannot take shipped apps offline. One checkout serves both:
+      # GREFFON_CATALOG_DIR is exported for the pytest step, and both gates
+      # read it before falling back to an ancestor search.
       #
       # PINNED to a SHA, deliberately, not tracked to @main: the snapshots are
       # artifacts of one specific catalog state, so following main would turn

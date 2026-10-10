@@ -356,6 +356,13 @@ class Settings(BaseSettings):
     greffer_instance_log_max_size: str = "10m"
     greffer_instance_log_max_file: int = 3
 
+    # compose-containment Feature 3: per-node operator grant of additional
+    # compose SERVICE keys, comma-separated (the machine owner's call on a
+    # dedicated greffer). Added to whichever trust set is in force; the
+    # default is closed. Read by the start path and passed into the compose
+    # allowlist.
+    greffer_compose_extra_allowed_keys: str = ""
+
     @field_validator("greffer_instance_log_max_file", mode="before")
     @classmethod
     def _coerce_log_max_file(cls, v):
