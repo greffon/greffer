@@ -159,6 +159,31 @@ async def test_start_same_port_conflict_returns_409(client: AsyncClient) -> None
 
 
 @pytest.mark.asyncio
+async def test_start_compose_shape_error_returns_422(
+    client: AsyncClient,
+) -> None:
+    # compose-containment Feature 2: an unnormalizable compose is a 422 whose
+    # detail names the offending services.<name>.<key> path — never the bare
+    # 500 the seven uncaught-exception rows used to produce. The exception
+    # class is caught by its import-time name, so the whole-module patch here
+    # exercises exactly the binding the route relies on.
+    from apps.utils.greffon.compose_shape import ComposeShapeError
+
+    with patch("app.routers.controller.repository") as mock_repo:
+        mock_repo.get_compose_file_from_repository.return_value = {}
+        mock_repo.get_greffon_info.side_effect = ComposeShapeError(
+            "app", "ports", "container port must be an integer", "http")
+        r = await client.post(
+            "/api/controller/start/",
+            json=SAMPLE_START_PAYLOAD,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+    assert r.status_code == 422
+    assert "services.app.ports" in r.json()["detail"]
+    assert "container port must be an integer" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_start_range_exhausted_returns_409(client: AsyncClient) -> None:
     from apps.utils.docker.l4_ports import L4PortRangeExhausted
 

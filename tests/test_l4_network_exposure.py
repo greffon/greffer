@@ -5,8 +5,11 @@ The L4 feature lets the manager declare raw TCP/UDP ports (``exposure_tier:
 owning service. Coverage spans the four touched modules:
 
   - apps/utils/os/network.py    — UDP-aware get_free_ports
-  - apps/utils/greffon/repository.py — _split_proto, protocol/tier resolution,
-                                       per-protocol host-port allocation
+  - apps/utils/greffon/compose_shape.py — port protocol parsing (the behavior
+                                       the old repository._split_proto had),
+                                       plus create_greffon_info tier
+                                       resolution, per-protocol host-port
+                                       allocation
   - apps/utils/docker/compose.py     — service-published L4 mappings,
                                        nginx-sidecar L4 exclusion
   - apps/utils/nginx/conf.py         — http_ports filtering (no L4 server block)
@@ -121,27 +124,35 @@ class GetFreePortsUdpTests(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. _split_proto + create_greffon_info protocol / tier resolution
+# 2. compose_shape protocol parsing + create_greffon_info tier resolution
 # ---------------------------------------------------------------------------
 
 class SplitProtoTests(TestCase):
-    """Tests for apps.utils.greffon.repository._split_proto."""
+    """Protocol parsing, at its home since compose-containment Feature 2:
+    apps.utils.greffon.compose_shape._normalize_port (the behavior the old
+    the old repository._split_proto implemented; the behavior moved to
+    compose_shape._normalize_port unchanged)."""
+
+    def _port(self, spec):
+        from apps.utils.greffon.compose_shape import normalize_compose
+        compose = {'services': {'app': {'ports': [spec]}}}
+        return normalize_compose(compose)['services']['app']['ports'][0]
 
     def test_split_udp(self):
-        from apps.utils.greffon.repository import _split_proto
-        self.assertEqual(_split_proto('51820/udp'), ('51820', 'udp'))
+        self.assertEqual(self._port('51820/udp'),
+                         {'target': '51820', 'protocol': 'udp'})
 
     def test_split_tcp_explicit(self):
-        from apps.utils.greffon.repository import _split_proto
-        self.assertEqual(_split_proto('8080/tcp'), ('8080', 'tcp'))
+        self.assertEqual(self._port('8080/tcp'),
+                         {'target': '8080', 'protocol': 'tcp'})
 
     def test_split_no_proto(self):
-        from apps.utils.greffon.repository import _split_proto
-        self.assertEqual(_split_proto('8080'), ('8080', None))
+        self.assertEqual(self._port('8080'),
+                         {'target': '8080', 'protocol': None})
 
     def test_split_uppercase_proto_is_lowered(self):
-        from apps.utils.greffon.repository import _split_proto
-        self.assertEqual(_split_proto('51820/UDP'), ('51820', 'udp'))
+        self.assertEqual(self._port('51820/UDP'),
+                         {'target': '51820', 'protocol': 'udp'})
 
 
 class CreateGreffonInfoL4Tests(TestCase):
