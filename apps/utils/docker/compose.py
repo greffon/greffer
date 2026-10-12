@@ -174,7 +174,13 @@ def create_compose_template_from_greffon(compose, greffon_info):
     for _,volume in greffon_info['volumes'].items():
         for container_name, container in volume['containers'].items():
             compose['services'][container_name].setdefault('volumes', [])
-            compose['services'][container_name]['volumes'].append(f'{volume["value"]}:{container["path"]}')
+            # A preserved short-syntax mount mode (Feature 2: 'v:/p:ro') rides
+            # the rebuilt mapping, so a read-only declaration stays read-only.
+            mode = container.get('mode')
+            mapping = f'{volume["value"]}:{container["path"]}'
+            if mode:
+                mapping = f'{mapping}:{mode}'
+            compose['services'][container_name]['volumes'].append(mapping)
     for _,network in greffon_info['networks'].items():
         for _, container_name in enumerate(network['containers']):
             compose['services'][container_name]['networks'].append(network['value'])

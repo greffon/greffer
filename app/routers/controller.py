@@ -60,6 +60,10 @@ from app.tunnel_config import (
 from apps.utils.docker import compose, instance_logs, l4_ports, observe, volume
 from apps.utils.docker import updater as updater_spawn
 from apps.utils.greffon import repository
+# Bound at import time, NOT accessed as repository.ComposeShapeError at
+# exception time: the route tests patch the whole repository module, and an
+# except clause on a Mock attribute raises TypeError mid-handler.
+from apps.utils.greffon.repository import ComposeShapeError
 from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
@@ -254,6 +258,13 @@ def start_greffon(
     try:
         greffon_info = repository.get_greffon_info(
             compose_file, greffon, l4_bind_host=l4_bind_host)
+    except ComposeShapeError as exc:
+        # compose-containment Feature 2: a compose whose shape the pipeline
+        # cannot honour (unsupported construct, malformed entry) fails with
+        # the offending services.<name>.<key> path, like ConfigRenderError —
+        # a diagnosable 422, never an opaque 500. Runs before any port
+        # allocation or volume write, so nothing half-starts.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except l4_ports.L4SamePortConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except l4_ports.L4PortRangeExhausted as exc:
