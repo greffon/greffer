@@ -369,6 +369,55 @@ class Settings(BaseSettings):
     # allowlist.
     greffer_compose_extra_allowed_keys: str = ""
 
+    # compose-containment Feature 1b (render budget). Sizes in BYTES, the
+    # timeout in seconds; 0 disables that dimension. The memory cap is what
+    # protects the shared controller from compile-time allocation
+    # blow-ups — disabling it on a multi-tenant node is the operator
+    # choosing the risk. render_budget.py reads the env directly (the
+    # log-rotation precedent); these fields document and validate.
+    greffer_render_max_input: int = 1048576
+    greffer_render_max_output: int = 4194304
+    greffer_render_mem_bytes: int = 268435456
+    greffer_render_timeout_seconds: float = 5.0
+
+    @field_validator("greffer_render_max_input", mode="before")
+    @classmethod
+    def _coerce_render_input(cls, v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 1048576
+        return max(n, 0)
+
+    @field_validator("greffer_render_max_output", mode="before")
+    @classmethod
+    def _coerce_render_output(cls, v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 4194304
+        return max(n, 0)
+
+    @field_validator("greffer_render_mem_bytes", mode="before")
+    @classmethod
+    def _coerce_render_mem(cls, v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 268435456
+        return max(n, 0)
+
+    @field_validator("greffer_render_timeout_seconds", mode="before")
+    @classmethod
+    def _coerce_render_timeout(cls, v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return 5.0
+        if not math.isfinite(n):
+            return 5.0  # inf breaks Future.result; nan times out instantly
+        return max(n, 0.0)
+
     @field_validator("greffer_instance_log_max_file", mode="before")
     @classmethod
     def _coerce_log_max_file(cls, v):
