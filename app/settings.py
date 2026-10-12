@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -8,7 +9,12 @@ from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
-
+from apps.utils.docker.limits import (
+    DEFAULT_CPUS,
+    DEFAULT_MEM_LIMIT,
+    DEFAULT_PIDS,
+    parse_size,
+)
 
 # How many renewal attempts must fit inside the renewal window before a
 # certificate expires. Below this one transient failure -- a stalled manager,
@@ -367,6 +373,53 @@ class Settings(BaseSettings):
             return int(v)
         except (TypeError, ValueError):
             return 3
+
+    # Compose resource limits for the greffon INSTANCE containers
+    # (compose-containment Feature 4). Stage 1 is TELEMETRY ONLY: these values
+    # feed the over-limit warnings in the stats digest (apps/utils/docker/
+    # limits.py), calibrating what stage 2 will render as mem_limit / cpus /
+    # pids_limit per service. 0 disables a dimension ('' disables MEM;
+    # an empty CPUS/PIDS falls back to the default, loudly). Defaults and
+    # validator fallbacks bind to limits.py's constants — the single source
+    # the env-reading path also uses — so the two views cannot drift. The
+    # same typo-must-not-crash rule as the log knobs above.
+    greffer_instance_mem_limit: str = DEFAULT_MEM_LIMIT
+    greffer_instance_cpus: float = float(DEFAULT_CPUS)
+    greffer_instance_pids: int = int(DEFAULT_PIDS)
+
+    @field_validator("greffer_instance_mem_limit", mode="before")
+    @classmethod
+    def _coerce_mem_limit(cls, v):
+        # parse_size is overflow/NaN-safe (it checks the scaled product with
+        # math.isfinite), so an operator value like "1e999g" or "1e300g"
+        # lands here as unparseable -> default, never as an OverflowError
+        # escaping Settings() and crash-looping boot.
+        if isinstance(v, str) and (not v.strip() or parse_size(v) is not None):
+            return v
+        return DEFAULT_MEM_LIMIT
+
+    @field_validator("greffer_instance_cpus", mode="before")
+    @classmethod
+    def _coerce_cpus(cls, v):
+        # Same acceptance rule as limits.computed_instance_limits: finite and
+        # non-negative, else the default — a divergent validator would let
+        # Settings hold -1.0 or nan while the telemetry path falls back.
+        try:
+            cpus = float(v)
+        except (TypeError, ValueError):
+            return float(DEFAULT_CPUS)
+        if not math.isfinite(cpus) or cpus < 0:
+            return float(DEFAULT_CPUS)
+        return cpus
+
+    @field_validator("greffer_instance_pids", mode="before")
+    @classmethod
+    def _coerce_pids(cls, v):
+        try:
+            pids = int(v)
+        except (TypeError, ValueError):
+            return int(DEFAULT_PIDS)
+        return pids if pids >= 0 else int(DEFAULT_PIDS)
 
     # Per-greffer concurrency cap on blocking metrics/disk collection
     # (resource-monitoring epic, Feature 2). The pull endpoints offload their

@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import docker
 import requests
 
+from apps.utils.docker import limits
 from apps.utils.docker.compose import (
     STATUS_IGNORE_LABEL,
     STATUS_IGNORE_VALUE,
@@ -409,10 +410,22 @@ def instance_stats(instance_id: str) -> dict | None:
     if not instance_is_deployed(instance_id):
         return None
     containers = list_instance_containers(instance_id)
+    digest = _digest_all(containers)
+    # compose-containment Feature 4, stage 1: compare observed usage against
+    # the computed per-node limits and WARN on exceed (telemetry only — the
+    # digest is pull-driven, so every metrics poll is one calibration
+    # observation). Deliberately not folded into the returned payload: it is
+    # a log signal, not a contract change to the stats endpoint.
+    try:
+        limits.check_limits_observed(instance_id, digest)
+    except Exception:  # noqa: BLE001
+        # Telemetry must never fail a stats read. A bug in the limits pass
+        # degrades to a missing warning line, nothing more.
+        logger.exception("limits telemetry failed instance_id=%s", instance_id)
     return {
         "instance_id": instance_id,
         "captured_at": _now_iso(),
-        "containers": _digest_all(containers),
+        "containers": digest,
     }
 
 
