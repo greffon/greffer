@@ -103,7 +103,7 @@ class RenderFileTests(unittest.TestCase):
                 with patch("apps.utils.docker.compose.remove_compose_file"):
                     build_render_context(info)
                     apply_configuration(info, compose)
-                    path = os.path.join(tmp, info["id"], "realm.json")
+                    path = os.path.join(tmp, info["id"], "config", "realm.json")
                     with open(path, "rb") as f:
                         return f.read()
 
@@ -194,7 +194,7 @@ class RenderJsonTests(unittest.TestCase):
             with patch.dict(os.environ, {"GREFFON_PATH": tmp}):
                 build_render_context(info)
                 apply_configuration(info, {"services": {"backend": {"environment": {}}}})
-                with open(os.path.join(tmp, "inst-json2", "s.json")) as f:
+                with open(os.path.join(tmp, "inst-json2", "config", "s.json")) as f:
                     data = json.load(f)  # raises if the file is not valid JSON
         self.assertEqual(data["secret"], 'ab"cd\\ef')
     def test_json_render_when_flagged(self):
@@ -220,7 +220,7 @@ class RenderJsonTests(unittest.TestCase):
             with patch.dict(os.environ, {"GREFFON_PATH": tmp}):
                 build_render_context(info)
                 apply_configuration(info, {})
-                with open(os.path.join(tmp, "inst-json", "settings.json")) as f:
+                with open(os.path.join(tmp, "inst-json", "config", "settings.json")) as f:
                     data = json.load(f)
         self.assertEqual(data["public_url"], "https://app.example.com")
 

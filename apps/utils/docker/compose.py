@@ -740,11 +740,55 @@ def create_volumes_then_copy_files(greffon_info):
             docker_create_volume(volume)
         docker_copy_file_into_volume(volume)
 
+def _staged_destination_path(greffon_info, destination):
+    """Resolve a file/json destination to a path inside the instance's
+    dedicated ``config/`` staging directory (compose-containment Feature 3).
+
+    The legacy join put baked files in the INSTANCE DIRECTORY ROOT with no
+    normalization, so a ``name`` of ``../<other>/x`` or an absolute path
+    wrote anywhere as the greffer process — and the root also holds
+    greffer-owned control state (``l4_ports.json``, ``.backup_inprogress``,
+    the rendered compose) that a basename-colliding baked file would corrupt.
+    A dedicated non-control subdirectory kills the whole class by
+    construction: names must be BARE file names (no separators, no '..'),
+    and the one node-side write lands under ``<instance>/config/``.
+
+    The destination's ``volume`` is restricted to volumes declared by this
+    instance's compose — never ``greffon_nginx``, whose ``files`` list
+    carries the instance certificate and key and which a destination
+    appending to it could overwrite (a cert swap is a silent MITM of the
+    instance's TLS).
+
+    Raises ``ConfigRenderError`` (clean 422, like every other config
+    authoring failure) rather than writing anywhere unexpected.
+    """
+    name = destination.get('name')
+    if (not isinstance(name, str) or not name
+            or name in ('.', '..')
+            or '/' in name or '\\' in name
+            or name != os.path.basename(name)
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise ConfigRenderError(
+            f"destination name must be a bare file name, got {name!r}")
+    volume = destination.get('volume')
+    volumes = greffon_info.get('volumes') or {}
+    if volume == 'greffon_nginx':
+        raise ConfigRenderError(
+            "destination volume 'greffon_nginx' holds the instance "
+            "certificate; baked files may not target it")
+    if volume not in volumes:
+        raise ConfigRenderError(
+            f"destination volume {volume!r} is not declared by this "
+            "instance's compose")
+    stage_dir = os.path.join(get_greffon_path(greffon_info), 'config')
+    os.makedirs(stage_dir, exist_ok=True)
+    return os.path.join(stage_dir, name)
+
 def apply_configuration(greffon_info, compose):
     for configuration in greffon_info.get('configurations', []):
         for destination in configuration.get('destinations', []):
             if destination['type'] == 'json':
-                file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
+                file_path = _staged_destination_path(greffon_info, destination)
                 value = configuration['value']
                 if destination.get('x-greffon-render'):
                     # Render the value's string leaves, THEN serialize, so
@@ -766,8 +810,10 @@ def apply_configuration(greffon_info, compose):
                 else:
                     compose['services'][destination['container']]['environment'].append(f'{destination["key"]}={configuration["value"].get("value", "")}')
             elif destination['type'] == 'file':
+                # Validate BEFORE the side effect: a refused destination
+                # must not leave the previous rendered compose deleted.
+                file_path = _staged_destination_path(greffon_info, destination)
                 remove_compose_file(greffon_info)
-                file_path = os.path.join(get_greffon_path(greffon_info), destination['name'])
                 # ``DataURI.data`` is ``bytes`` for base64 data-URIs but ``str``
                 # for percent-encoded ones — normalize before writing/rendering.
                 raw = DataURI(configuration['value']['file']).data
