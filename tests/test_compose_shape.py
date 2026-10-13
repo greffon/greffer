@@ -295,6 +295,59 @@ class TestNetworks:
         assert info["networks"]["backend"]["containers"] == ["app"]
 
 
+class TestNginxDirectiveSafety:
+    """compose-containment Feature 5: service names and container ports
+    reach the nginx conf verbatim (upstream/server_name/listen). A name
+    outside compose's charset or a duplicate container port in one service
+    (duplicate `upstream` block — the real nginx [emerg]; shared listen
+    with distinct server_names is LEGAL) refuses with a diagnosis instead
+    of an opaque failed deploy."""
+
+    def test_service_name_charset_refused(self):
+        # "app\n" pins the \Z anchoring: a re.match-with-$ "simplification"
+        # would accept it and inject a newline into server_name (verified
+        # side-by-side in review); "café" pins the ASCII-only charset.
+        for bad in ("my app", "app/x", "app@x", "app:x", "a b",
+                    "app\n", "café"):
+            with pytest.raises(ComposeShapeError, match="service names may only"):
+                normalize_compose({"services": {bad: {"image": "x"}}})
+
+    def test_service_name_charset_accepts_compose_legal(self):
+        normalize_compose({"services": {
+            "web-1": {"image": "x"}, "db.io_2": {"image": "y"},
+            "_a": {"image": "z"}}})  # no raise
+
+    def test_duplicate_container_port_refused(self):
+        # '8080:80' + '8081:80' -> port_name app_80 twice -> duplicate
+        # upstream app_80 -> nginx [emerg] with only a container-name hint.
+        with pytest.raises(ComposeShapeError, match="published more than once"):
+            normalize_compose({"services": {"app": {
+                "image": "x", "ports": ["8080:80", "8081:80"]}}})
+
+    def test_duplicate_container_port_long_syntax_refused(self):
+        with pytest.raises(ComposeShapeError, match="published more than once"):
+            normalize_compose({"services": {"app": {
+                "image": "x",
+                "ports": [{"target": 80, "published": 8080},
+                          {"target": "80", "published": 8081}]}}})
+
+    def test_same_port_across_services_is_fine(self):
+        # Distinct upstreams (app_80, db_80) — legal nginx.
+        normalize_compose({"services": {
+            "app": {"image": "x", "ports": ["80:80"]},
+            "db": {"image": "y", "ports": ["81:80"]}}})  # no raise
+
+    def test_distinct_ports_one_service_is_fine(self):
+        normalize_compose({"services": {"app": {
+            "image": "x", "ports": ["80:80", "443:443"]}}})  # no raise
+
+    def test_end_to_end_via_create_greffon_info(self):
+        compose = {"services": {"app": {
+            "image": "x", "ports": ["8080:80", "8081:80"]}}}
+        with pytest.raises(ComposeShapeError, match="published more than once"):
+            repository.create_greffon_info(compose, _greffon())
+
+
 class TestTopLevel:
     def test_missing_services(self):
         # Epic table row: KeyError; now a named refusal.
