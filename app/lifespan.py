@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from app.workers import start_workers, stop_workers
 from apps.utils.docker.observe import shutdown_stats_pool
+from apps.utils.docker.render_budget import shutdown_render_pool
 
 logger = logging.getLogger("greffer")
 
@@ -62,3 +63,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await stop_workers(tasks)
     finally:
         shutdown_stats_pool()
+        shutdown_render_pool()

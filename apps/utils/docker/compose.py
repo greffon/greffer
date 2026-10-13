@@ -3,9 +3,7 @@ import asyncio
 import json
 import logging
 from datauri import DataURI
-from jinja2 import StrictUndefined
 from jinja2.exceptions import SecurityError, TemplateError, UndefinedError
-from jinja2.sandbox import ImmutableSandboxedEnvironment
 import docker
 import subprocess
 import os
@@ -19,84 +17,24 @@ from urllib.parse import urlparse
 # calls.
 client = docker.from_env(max_pool_size=32)
 
+from apps.utils.docker.render_budget import (
+    RenderBudgetExceeded,
+    render_bounded,
+)
 from apps.utils.docker.volume import docker_copy_file_into_volume, docker_create_volume, docker_is_volume_exist
 
 logger = logging.getLogger(__name__)
 
-# Strict Jinja environment for rendering baked `file`/`json` destination
-# contents (feature: baked-config-files). Unlike the lenient ``Template``
-# used for the compose body, a missing/typo'd variable here MUST raise
-# rather than render to empty string: a baked Keycloak realm with an empty
-# ``{{ config.OIDC_RP_CLIENT_SECRET }}`` is a silent security failure, so we
-# fail the deploy loudly instead. ``autoescape=False`` because these are
-# config files (JSON/conf), not HTML, and we must not HTML-escape values.
-#
-# SANDBOXED: the template string is catalog-author-controlled, and the catalog
-# is community-extensible, so we must assume it can be hostile. A plain
-# Environment would allow server-side template injection -> RCE on this worker
-# (which holds the instance's minted secrets, the greffer's manager token, and
-# Docker socket access), e.g.
-# ``{{ cycler.__init__.__globals__.os.popen('id').read() }}``. SandboxedEnvironment
-# blocks attribute traversal to unsafe objects while still rendering the
-# legitimate ``{{ config.X }}`` / ``{{ instance_url }}`` references. A
-# SecurityError surfaces as a clean ConfigRenderError (-> 422), like any other
-# render failure.
-#
-# StrictUndefined makes a missing/typo'd variable raise rather than render empty
-# (a baked secret silently becoming '' is a security failure). The catalog
-# validator is a SEPARATE, author-facing layer that rejects StrictUndefined
-# *bypass idioms* (``config.get('X')`` / ``| default``) and integration refs;
-# it is NOT an SSTI gate — the sandbox is what stops injection.
-# ``autoescape=False`` because these are config files (JSON/conf), not HTML.
-_FILE_RENDER_ENV = ImmutableSandboxedEnvironment(
-    undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True
-)  # globals hardened below, once _harden is defined
-
-# The compose BODY render. Sandboxed for the same reason as the file render
-# above, but with the LENIENT undefined the body has always had -- see the
-# comment in ``create_compose``. Split from _FILE_RENDER_ENV so neither
-# policy can be changed by accident while editing the other.
-#
-# IMMUTABLE, not merely sandboxed. A plain SandboxedEnvironment blocks the
-# attribute walk to the interpreter but still permits mutating calls on the
-# objects passed to ``render()`` -- and those are the LIVE deployment dicts.
-# ``{{ volumes.update({"x": {"value": "/"}}) }}`` renders as empty output
-# while adding a volume, and ``create_volumes_then_copy_files`` then runs
-# ``docker container create -v /:/root`` (volume.py) and copies attacker
-# content into the host filesystem. Blocking dunder traversal alone leaves
-# that write primitive open, so both envs refuse mutation.
-def _harden(env):
-    """Drop Jinja's default globals that re-open what the sandbox closes.
-
-    ImmutableSandboxedEnvironment refuses a MUTATING call on an immutable
-    target -- but it decides that from the object the method is bound to, so
-    an UNBOUND call slips past: ``dict`` is a Jinja global, and
-    ``{{ dict.update(volumes.x, {"value": "/"}) }}`` checks ``dict`` (the
-    class) rather than the live mapping, renders clean, and rewrites the
-    context. Verified: the bound form raises SecurityError while the unbound
-    form succeeded and set a volume's value to "/", which
-    create_volumes_then_copy_files then mounts as ``-v /:/root``.
-
-    ``cycler``/``joiner``/``namespace`` are the documented first hops of the
-    classic escape chains, and ``lipsum``/``range`` are of no use to a compose
-    file. The catalog uses none of them -- verified across every pinned entry
-    -- so removing them costs nothing and shrinks the surface to what a
-    compose actually needs.
-
-    What this does NOT do is bound resource use. Removing ``range`` closes
-    one way to allocate, not the class: ``*`` and ``**`` are not intercepted,
-    so ``{{ "A" * (10 ** 8) }}`` is sandbox-legal and renders a 100 MB
-    compose. The sandbox stops code execution; an input/output/time budget
-    around the render is the second half of Feature 1 in the root
-    docs/features/compose-containment/epic.md, scoped there to the custom
-    (untrusted) compose path."""
-    for unsafe in ('dict', 'range', 'lipsum', 'cycler', 'joiner', 'namespace'):
-        env.globals.pop(unsafe, None)
-    return env
-
-
-_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(autoescape=False))
-_harden(_FILE_RENDER_ENV)
+# The hardened render environments moved to render_budget.py (compose-
+# containment Feature 1b) so the render CHILD — which imports that module —
+# never imports the docker client (on spawn platforms compose.py's module
+# scope performs a live daemon handshake). Re-exported here for the existing
+# call sites and tests.
+from apps.utils.docker.render_budget import (  # noqa: F401  (re-export)
+    _COMPOSE_RENDER_ENV,
+    _FILE_RENDER_ENV,
+    render_json_bounded,
+)
 
 
 class ConfigRenderError(Exception):
@@ -316,7 +254,10 @@ def _render_baked_file(raw, greffon_info, dest_name):
     explicitly for clarity)."""
     try:
         text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
-        return _FILE_RENDER_ENV.from_string(text).render(**greffon_info)
+        # Feature 1b: budgeted like the body render. RenderBudgetExceeded is
+        # a ValueError, so the tuple below already converts it to the same
+        # clean ConfigRenderError 422.
+        return render_bounded('file', text, greffon_info)
     except (UndefinedError, TemplateError, SecurityError, UnicodeDecodeError,
             TypeError, ValueError) as exc:
         # TypeError/ValueError: e.g. `{{ x | tojson }}` on an undefined x raises
@@ -332,6 +273,10 @@ def _render_json_value(value, greffon_info, dest_name):
     caller ``json.dumps`` the result). Rendering leaves rather than the
     serialized string means ``json.dumps`` escapes the substituted values, so a
     minted secret containing a quote or backslash can't corrupt the JSON."""
+    if value is not None and not isinstance(value, (str,)):
+        # One child round-trip for the whole tree (per-leaf submission was
+        # quadratic: every leaf re-pickled the full context).
+        return render_json_bounded(value, greffon_info)
     if isinstance(value, str):
         return _render_baked_file(value, greffon_info, dest_name)
     if isinstance(value, dict):
@@ -715,7 +660,12 @@ def create_compose(compose, greffon_info):
     # reachable. The compose file is only written after the render succeeds.
     dumped = yaml.dump(compose)
     try:
-        compose_file = _COMPOSE_RENDER_ENV.from_string(dumped).render(**greffon_info)
+        # Feature 1b: the render runs under the budget (input/output caps,
+        # child-process memory + time bound) — see render_budget.py. A cap
+        # violation re-raises below as its own bounded message.
+        compose_file = render_bounded('body', dumped, greffon_info)
+    except RenderBudgetExceeded as exc:
+        raise ConfigRenderError(str(exc)) from exc
     except Exception as exc:
         logger.error("compose render failed for %s: %s: %s",
                      greffon_info.get('id'), type(exc).__name__, exc)
