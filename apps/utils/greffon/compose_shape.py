@@ -31,6 +31,8 @@ a read-only declaration stays read-only.
 
 from __future__ import annotations
 
+import re
+
 # Access modes docker documents for the third short-syntax mount field (the
 # long-syntax ``mode`` key honours ro/rw). A preserved mode is re-rendered
 # onto the rebuilt mapping (Feature 2: a read-only declaration stays
@@ -45,6 +47,10 @@ _PROTOCOLS = frozenset({"tcp", "udp"})
 # compose's implicit default network: a service may reference it without a
 # top-level declaration.
 _IMPLICIT_NETWORKS = frozenset({"default"})
+
+# compose's own service-name charset — also exactly what nginx can
+# interpolate safely into upstream/server_name tokens.
+_NGINX_SAFE_NAME = re.compile(r"[a-zA-Z0-9._-]+\Z")
 
 
 class ComposeShapeError(Exception):
@@ -387,6 +393,21 @@ def normalize_compose(compose, *, strict: bool = False, extra_keys=None) -> dict
         )
 
     for name, service_def in services.items():
+        # compose-containment Feature 5: the service name and each container
+        # port reach the nginx conf VERBATIM (upstream {name}_{port},
+        # server_name {name}.{port}, listen {port}). docker-compose validates
+        # the charset at `up` time, so a bad name today surfaces as an
+        # opaque failed deploy whose injected conf was never read; refusing
+        # here with the name quoted turns it into a diagnosis.
+        if not _NGINX_SAFE_NAME.fullmatch(name or ""):
+            raise _bad(
+                None,
+                "services",
+                "service names may only contain [a-zA-Z0-9._-] (nginx "
+                "interpolates the name into upstream/server_name "
+                "directives)",
+                name,
+            )
         if not isinstance(service_def, dict):
             raise _bad(
                 name, "<service>", "a service definition must be a mapping", service_def
@@ -407,6 +428,33 @@ def normalize_compose(compose, *, strict: bool = False, extra_keys=None) -> dict
                     entries,
                 )
             service_def[key] = [normalizer(e, name) for e in entries]
+        ports = service_def.get("ports")
+        if ports:
+            # Feature 5: the same container port published twice by one
+            # service ('8080:80' + '8081:80') yields the SAME port_name and
+            # therefore a duplicate `upstream` block — nginx [emerg] refuses
+            # to start with only a container-name hint. This is the real
+            # collision (several server blocks sharing a listen with
+            # distinct server_names is legal nginx).
+            # Known over-approximation: if the MANAGER marks the port
+            # tier=l4, http_ports excludes it and no upstream is built, so
+            # 80/tcp + 80/udp both-l4 would be deployable — but manager
+            # port metadata is invisible at this layer. Refusing is the
+            # safe side; revisit only with a tier-aware check at the
+            # repository layer if a real entry needs it.
+            seen = {}
+            for entry in ports:
+                target = entry["target"]
+                if target in seen:
+                    raise _bad(
+                        name,
+                        "ports",
+                        f"container port {target} is published more than "
+                        "once; each container port may appear in only one "
+                        "ports entry (duplicate nginx upstream)",
+                        entry,
+                    )
+                seen[target] = True
         net_entry = service_def.get("networks")
         if net_entry is not None:
             names = _normalize_service_networks(net_entry, name)
