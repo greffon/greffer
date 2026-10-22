@@ -11,20 +11,20 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:9000'
+    - 20000:9000
     restart: unless-stopped
     volumes:
     - regress-mealie_nginx_volume:/etc/nginx/
   mealie:
     environment:
       ALLOW_SIGNUP: 'false'
-      BASE_URL: 'https://regress-mealie-0.my.example.test'
-      SMTP_AUTH_STRATEGY: 'TLS'
-      SMTP_FROM_EMAIL: 'noreply@example.test'
-      SMTP_HOST: 'smtp.example.test'
-      SMTP_PASSWORD: 'pw'
+      BASE_URL: https://regress-mealie-0.my.example.test
+      SMTP_AUTH_STRATEGY: TLS
+      SMTP_FROM_EMAIL: noreply@example.test
+      SMTP_HOST: smtp.example.test
+      SMTP_PASSWORD: pw
       SMTP_PORT: '587'
-      SMTP_USER: 'mailer@example.test'
+      SMTP_USER: mailer@example.test
     image: ghcr.io/mealie-recipes/mealie:v3.19.2
     logging:
       driver: json-file

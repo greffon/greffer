@@ -28,7 +28,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:80'
+    - 20000:80
     restart: unless-stopped
     volumes:
     - regress-freshrss_nginx_volume:/etc/nginx/

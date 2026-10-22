@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3000'
+    - 20000:3000
     restart: unless-stopped
     volumes:
     - regress-umami_nginx_volume:/etc/nginx/
@@ -36,7 +36,7 @@ services:
   umami_db:
     environment:
       POSTGRES_DB: umami
-      POSTGRES_PASSWORD: 'regress-umami'
+      POSTGRES_PASSWORD: regress-umami
       POSTGRES_USER: umami
     healthcheck:
       interval: 10s

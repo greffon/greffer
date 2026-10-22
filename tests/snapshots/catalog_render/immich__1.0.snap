@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:2283'
+    - 20000:2283
     restart: unless-stopped
     volumes:
     - regress-immich_nginx_volume:/etc/nginx/
@@ -22,7 +22,7 @@ services:
     environment:
       DB_DATABASE_NAME: immich
       DB_HOSTNAME: immich_database
-      DB_PASSWORD: 'regress-immich'
+      DB_PASSWORD: regress-immich
       DB_USERNAME: immich
       REDIS_HOSTNAME: immich_redis
     image: ghcr.io/immich-app/immich-server:v2.7.5
@@ -54,7 +54,7 @@ services:
     environment:
       POSTGRES_DB: immich
       POSTGRES_INITDB_ARGS: --data-checksums
-      POSTGRES_PASSWORD: 'regress-immich'
+      POSTGRES_PASSWORD: regress-immich
       POSTGRES_USER: immich
     image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
     logging:

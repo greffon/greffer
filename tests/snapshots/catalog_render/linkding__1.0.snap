@@ -11,13 +11,13 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:9090'
+    - 20000:9090
     restart: unless-stopped
     volumes:
     - regress-linkding_nginx_volume:/etc/nginx/
   linkding:
     environment:
-      LD_CSRF_TRUSTED_ORIGINS: 'https://regress-linkding-0.my.example.test'
+      LD_CSRF_TRUSTED_ORIGINS: https://regress-linkding-0.my.example.test
       LD_SUPERUSER_NAME: admin
       LD_SUPERUSER_PASSWORD: ''
     image: sissbruecker/linkding:latest

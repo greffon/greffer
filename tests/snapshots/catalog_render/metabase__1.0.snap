@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3000'
+    - 20000:3000
     restart: unless-stopped
     volumes:
     - regress-metabase_nginx_volume:/etc/nginx/
@@ -21,18 +21,18 @@ services:
     environment:
       MB_DB_DBNAME: metabase
       MB_DB_HOST: metabase_db
-      MB_DB_PASS: 'regress-metabase'
+      MB_DB_PASS: regress-metabase
       MB_DB_PORT: '5432'
       MB_DB_TYPE: postgres
       MB_DB_USER: metabase
-      MB_EMAIL_FROM_ADDRESS: 'noreply@example.test'
-      MB_EMAIL_SMTP_HOST: 'smtp.example.test'
-      MB_EMAIL_SMTP_PASSWORD: 'pw'
+      MB_EMAIL_FROM_ADDRESS: noreply@example.test
+      MB_EMAIL_SMTP_HOST: smtp.example.test
+      MB_EMAIL_SMTP_PASSWORD: pw
       MB_EMAIL_SMTP_PORT: '587'
-      MB_EMAIL_SMTP_SECURITY: 'starttls'
-      MB_EMAIL_SMTP_USERNAME: 'mailer@example.test'
+      MB_EMAIL_SMTP_SECURITY: starttls
+      MB_EMAIL_SMTP_USERNAME: mailer@example.test
       MB_ENCRYPTION_SECRET_KEY: ''
-      MB_SITE_URL: 'https://regress-metabase-0.my.example.test'
+      MB_SITE_URL: https://regress-metabase-0.my.example.test
     image: metabase/metabase:v0.61.2
     logging:
       driver: json-file
@@ -47,7 +47,7 @@ services:
   metabase_db:
     environment:
       POSTGRES_DB: metabase
-      POSTGRES_PASSWORD: 'regress-metabase'
+      POSTGRES_PASSWORD: regress-metabase
       POSTGRES_USER: metabase
     healthcheck:
       interval: 10s

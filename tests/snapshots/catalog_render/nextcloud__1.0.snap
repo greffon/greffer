@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:80'
+    - 20000:80
     restart: unless-stopped
     volumes:
     - regress-nextcloud_nginx_volume:/etc/nginx/
@@ -19,22 +19,23 @@ services:
     depends_on:
     - nextcloud_db
     environment:
-      MAIL_DOMAIN: 'example.test'
-      MAIL_FROM_ADDRESS: 'noreply'
+      MAIL_DOMAIN: example.test
+      MAIL_FROM_ADDRESS: noreply
       NEXTCLOUD_ADMIN_PASSWORD: ''
       NEXTCLOUD_ADMIN_USER: admin
-      NEXTCLOUD_TRUSTED_DOMAINS: 'regress-nextcloud-0.my.example.test regress-nextcloud-0.my.example.test localhost'
-      OVERWRITECLIURL: 'https://regress-nextcloud-0.my.example.test'
+      NEXTCLOUD_TRUSTED_DOMAINS: regress-nextcloud-0.my.example.test regress-nextcloud-0.my.example.test
+        localhost
+      OVERWRITECLIURL: https://regress-nextcloud-0.my.example.test
       OVERWRITEPROTOCOL: https
       POSTGRES_DB: nextcloud
       POSTGRES_HOST: nextcloud_db
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
-      SMTP_HOST: 'smtp.example.test'
-      SMTP_NAME: 'mailer@example.test'
-      SMTP_PASSWORD: 'pw'
+      SMTP_HOST: smtp.example.test
+      SMTP_NAME: mailer@example.test
+      SMTP_PASSWORD: pw
       SMTP_PORT: '587'
-      SMTP_SECURE: 'tls'
+      SMTP_SECURE: tls
     image: nextcloud:latest
     logging:
       driver: json-file

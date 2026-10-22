@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3456'
+    - 20000:3456
     restart: unless-stopped
     volumes:
     - regress-vikunja_nginx_volume:/etc/nginx/
@@ -21,12 +21,12 @@ services:
       VIKUNJA_DATABASE_TYPE: sqlite
       VIKUNJA_MAILER_ENABLED: 'true'
       VIKUNJA_MAILER_FORCESSL: 'false'
-      VIKUNJA_MAILER_FROMEMAIL: 'noreply@example.test'
-      VIKUNJA_MAILER_HOST: 'smtp.example.test'
-      VIKUNJA_MAILER_PASSWORD: 'pw'
+      VIKUNJA_MAILER_FROMEMAIL: noreply@example.test
+      VIKUNJA_MAILER_HOST: smtp.example.test
+      VIKUNJA_MAILER_PASSWORD: pw
       VIKUNJA_MAILER_PORT: '587'
-      VIKUNJA_MAILER_USERNAME: 'mailer@example.test'
-      VIKUNJA_SERVICE_PUBLICURL: 'https://regress-vikunja-0.my.example.test'
+      VIKUNJA_MAILER_USERNAME: mailer@example.test
+      VIKUNJA_SERVICE_PUBLICURL: https://regress-vikunja-0.my.example.test
       VIKUNJA_SERVICE_SECRET: ''
     image: vikunja/vikunja:latest
     logging:

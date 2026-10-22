@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:80'
+    - 20000:80
     restart: unless-stopped
     volumes:
     - regress-wordpress_nginx_volume:/etc/nginx/
@@ -21,16 +21,17 @@ services:
     environment:
       WORDPRESS_AUTH_KEY: ''
       WORDPRESS_AUTH_SALT: ''
-      WORDPRESS_CONFIG_EXTRA: "define('WP_HOME', 'https://regress-wordpress-0.my.example.test');\ndefine('WP_SITEURL',\
-        \ 'https://regress-wordpress-0.my.example.test');\n// The greffer's per-instance nginx terminates TLS\
-        \ and forwards\n// X-Forwarded-Proto: https, but WordPress/PHP behind Apache\
-        \ won't treat\n// the request as HTTPS unless told to. Without this, is_ssl()\
-        \ is false,\n// mismatches the https WP_SITEURL, and the admin/login flow\
-        \ 301-loops.\nif ( isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO']\
-        \ === 'https' ) {\n    $_SERVER['HTTPS'] = 'on';\n}\n"
+      WORDPRESS_CONFIG_EXTRA: "define('WP_HOME', 'https://regress-wordpress-0.my.example.test');\n\
+        define('WP_SITEURL', 'https://regress-wordpress-0.my.example.test');\n// The\
+        \ greffer's per-instance nginx terminates TLS and forwards\n// X-Forwarded-Proto:\
+        \ https, but WordPress/PHP behind Apache won't treat\n// the request as HTTPS\
+        \ unless told to. Without this, is_ssl() is false,\n// mismatches the https\
+        \ WP_SITEURL, and the admin/login flow 301-loops.\nif ( isset($_SERVER['HTTP_X_FORWARDED_PROTO'])\
+        \ && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {\n    $_SERVER['HTTPS']\
+        \ = 'on';\n}\n"
       WORDPRESS_DB_HOST: wordpress_db
       WORDPRESS_DB_NAME: wordpress
-      WORDPRESS_DB_PASSWORD: 'regress-wordpress'
+      WORDPRESS_DB_PASSWORD: regress-wordpress
       WORDPRESS_DB_USER: wordpress
       WORDPRESS_LOGGED_IN_KEY: ''
       WORDPRESS_LOGGED_IN_SALT: ''
@@ -53,8 +54,8 @@ services:
   wordpress_db:
     environment:
       MARIADB_DATABASE: wordpress
-      MARIADB_PASSWORD: 'regress-wordpress'
-      MARIADB_ROOT_PASSWORD: 'regress-wordpress'
+      MARIADB_PASSWORD: regress-wordpress
+      MARIADB_ROOT_PASSWORD: regress-wordpress
       MARIADB_USER: wordpress
     image: mariadb:11
     logging:
