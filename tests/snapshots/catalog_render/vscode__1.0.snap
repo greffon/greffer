@@ -23,7 +23,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3000'
+    - 20000:3000
     restart: unless-stopped
     volumes:
     - regress-vscode_nginx_volume:/etc/nginx/

@@ -5,19 +5,19 @@ services:
     depends_on:
     - multica_db
     environment:
-      CORS_ALLOWED_ORIGINS: 'https://regress-multica-0.my.example.test'
+      CORS_ALLOWED_ORIGINS: https://regress-multica-0.my.example.test
       DATABASE_URL: postgres://multica:regress-multica@multica_db:5432/multica?sslmode=disable
-      FRONTEND_ORIGIN: 'https://regress-multica-0.my.example.test'
+      FRONTEND_ORIGIN: https://regress-multica-0.my.example.test
       JWT_SECRET: ''
-      MULTICA_APP_URL: 'https://regress-multica-0.my.example.test'
-      MULTICA_PUBLIC_URL: 'https://regress-multica-0.my.example.test'
+      MULTICA_APP_URL: https://regress-multica-0.my.example.test
+      MULTICA_PUBLIC_URL: https://regress-multica-0.my.example.test
       PORT: '8080'
-      RESEND_FROM_EMAIL: 'noreply@example.test'
-      SMTP_HOST: 'smtp.example.test'
-      SMTP_PASSWORD: 'pw'
+      RESEND_FROM_EMAIL: noreply@example.test
+      SMTP_HOST: smtp.example.test
+      SMTP_PASSWORD: pw
       SMTP_PORT: '587'
-      SMTP_TLS: 'starttls'
-      SMTP_USERNAME: 'mailer@example.test'
+      SMTP_TLS: starttls
+      SMTP_USERNAME: mailer@example.test
     image: ghcr.io/multica-ai/multica-backend:v0.3.13
     logging:
       driver: json-file
@@ -40,7 +40,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3000'
+    - 20000:3000
     restart: unless-stopped
     volumes:
     - regress-multica_nginx_volume:/etc/nginx/
@@ -63,7 +63,7 @@ services:
   multica_db:
     environment:
       POSTGRES_DB: multica
-      POSTGRES_PASSWORD: 'regress-multica'
+      POSTGRES_PASSWORD: regress-multica
       POSTGRES_USER: multica
     image: pgvector/pgvector:pg17
     logging:

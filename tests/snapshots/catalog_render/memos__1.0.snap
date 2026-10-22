@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:5230'
+    - 20000:5230
     restart: unless-stopped
     volumes:
     - regress-memos_nginx_volume:/etc/nginx/

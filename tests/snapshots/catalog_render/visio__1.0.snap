@@ -22,13 +22,13 @@ services:
       DB_PASSWORD: ''
       DB_PORT: '5432'
       DB_USER: meet
-      DJANGO_ALLOWED_HOSTS: 'regress-visio-0.my.example.test,regress-visio-0.my.example.test,localhost,backend,gateway'
+      DJANGO_ALLOWED_HOSTS: regress-visio-0.my.example.test,regress-visio-0.my.example.test,localhost,backend,gateway
       DJANGO_CONFIGURATION: Production
-      DJANGO_CSRF_TRUSTED_ORIGINS: 'https://regress-visio-0.my.example.test'
-      DJANGO_EMAIL_FROM: 'noreply@example.test'
-      DJANGO_EMAIL_HOST: 'smtp.example.test'
-      DJANGO_EMAIL_HOST_PASSWORD: 'pw'
-      DJANGO_EMAIL_HOST_USER: 'mailer@example.test'
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://regress-visio-0.my.example.test
+      DJANGO_EMAIL_FROM: noreply@example.test
+      DJANGO_EMAIL_HOST: smtp.example.test
+      DJANGO_EMAIL_HOST_PASSWORD: pw
+      DJANGO_EMAIL_HOST_USER: mailer@example.test
       DJANGO_EMAIL_PORT: '587'
       DJANGO_EMAIL_USE_SSL: 'false'
       DJANGO_EMAIL_USE_TLS: 'true'
@@ -38,14 +38,14 @@ services:
       LIVEKIT_API_SECRET: ''
       LIVEKIT_API_URL: wss://regress-visio-0.my.example.test/livekit
       LIVEKIT_VERIFY_SSL: 'false'
-      LOGIN_REDIRECT_URL: 'https://regress-visio-0.my.example.test'
-      LOGIN_REDIRECT_URL_FAILURE: 'https://regress-visio-0.my.example.test'
-      LOGOUT_REDIRECT_URL: 'https://regress-visio-0.my.example.test'
-      MEDIA_BASE_URL: 'https://regress-visio-0.my.example.test'
-      MEET_BASE_URL: 'https://regress-visio-0.my.example.test'
-      OIDC_OP_AUTHORIZATION_ENDPOINT: 'https://regress-visio-0.my.example.test/identity/realms/meet/protocol/openid-connect/auth'
+      LOGIN_REDIRECT_URL: https://regress-visio-0.my.example.test
+      LOGIN_REDIRECT_URL_FAILURE: https://regress-visio-0.my.example.test
+      LOGOUT_REDIRECT_URL: https://regress-visio-0.my.example.test
+      MEDIA_BASE_URL: https://regress-visio-0.my.example.test
+      MEET_BASE_URL: https://regress-visio-0.my.example.test
+      OIDC_OP_AUTHORIZATION_ENDPOINT: https://regress-visio-0.my.example.test/identity/realms/meet/protocol/openid-connect/auth
       OIDC_OP_JWKS_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/certs
-      OIDC_OP_LOGOUT_ENDPOINT: 'https://regress-visio-0.my.example.test/identity/realms/meet/protocol/openid-connect/logout'
+      OIDC_OP_LOGOUT_ENDPOINT: https://regress-visio-0.my.example.test/identity/realms/meet/protocol/openid-connect/logout
       OIDC_OP_TOKEN_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/token
       OIDC_OP_USER_ENDPOINT: http://keycloak:8080/identity/realms/meet/protocol/openid-connect/userinfo
       OIDC_REDIRECT_ALLOWED_HOSTS: '["https://regress-visio-0.my.example.test"]'
@@ -172,7 +172,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:8083'
+    - 20000:8083
     restart: unless-stopped
     volumes:
     - regress-visio_nginx_volume:/etc/nginx/
@@ -183,7 +183,7 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_PASSWORD: ''
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_HOSTNAME: 'https://regress-visio-0.my.example.test/identity'
+      KC_HOSTNAME: https://regress-visio-0.my.example.test/identity
       KC_HOSTNAME_STRICT: 'false'
       KC_HTTP_ENABLED: 'true'
       KC_HTTP_RELATIVE_PATH: /identity

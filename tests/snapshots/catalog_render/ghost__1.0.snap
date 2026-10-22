@@ -41,13 +41,13 @@ services:
       database__connection__host: db
       database__connection__password: ''
       database__connection__user: root
-      mail__from: 'noreply@example.test'
-      mail__options__auth__pass: 'pw'
-      mail__options__auth__user: 'mailer@example.test'
-      mail__options__host: 'smtp.example.test'
+      mail__from: noreply@example.test
+      mail__options__auth__pass: pw
+      mail__options__auth__user: mailer@example.test
+      mail__options__host: smtp.example.test
       mail__options__port: '587'
       mail__transport: SMTP
-      url: 'https://regress-ghost-0.my.example.test'
+      url: https://regress-ghost-0.my.example.test
     image: ghost:5
     logging:
       driver: json-file
@@ -70,7 +70,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:2368'
+    - 20000:2368
     restart: unless-stopped
     volumes:
     - regress-ghost_nginx_volume:/etc/nginx/

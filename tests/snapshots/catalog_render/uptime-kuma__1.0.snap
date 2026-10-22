@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3001'
+    - 20000:3001
     restart: unless-stopped
     volumes:
     - regress-uptime-kuma_nginx_volume:/etc/nginx/

@@ -26,6 +26,19 @@ class GreffonField(BaseModel):
     destinations: Any
 
 
+class GreffonPreflightRequest(BaseModel):
+    """Custom-app LLD §4.1: the preflight validates a custom compose for
+    deployability (parse + strict allowlist + artifact pinning) before the
+    manager persists anything. Read-only apart from the digest-resolution
+    pull."""
+
+    # Bounded to the same order as GREFFER_RENDER_MAX_INPUT (1 MiB): an
+    # unbounded body is tenant-triggerable CPU/memory before any budget
+    # runs (yaml.safe_load + expression scans) — everything else in this
+    # model caps at 64-512.
+    compose_yaml: str = Field(min_length=1, max_length=1048576)
+
+
 class GreffonStartRequest(BaseModel):
     # `id` is a free-form str in DRF (not UUID), matching what the manager
     # sends today (e.g. "test-instance-123"). Pattern kept permissive to

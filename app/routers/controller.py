@@ -23,6 +23,7 @@ from uuid import UUID
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from app import backup
 from app.auth import require_token
@@ -34,6 +35,7 @@ from app.models.controller import (
     GreffonDecommissionRequest,
     GreffonDecommissionResponse,
     GreffonForgetRequest,
+    GreffonPreflightRequest,
     GreffonRepoOpRequest,
     GreffonRestoreRequest,
     GreffonRestoreResponse,
@@ -219,6 +221,30 @@ def _serialize_instance_op(handler):
         finally:
             lock.release()
     return wrapper
+
+
+@router.post("/preflight/")
+def preflight_greffon(
+    payload: GreffonPreflightRequest,
+    request: Request,
+    _: None = Depends(require_token),
+) -> JSONResponse:
+    """compose-containment Feature 6 / custom-app LLD §4.1: validate a
+    custom compose on the node that would deploy it. The SAME parse and
+    strict-allowlist path as a real start, so a green preflight provably
+    implies a start that parses; image references are pinned to digests by
+    pull+inspect (the one node-side write; unresolvable = error, never an
+    unpinned fallback). Sync def: digest pulls are blocking and run on the
+    threadpool like start."""
+    from apps.utils.greffon import preflight as preflight_mod
+
+    try:
+        result = preflight_mod.run_preflight(
+            payload.compose_yaml,
+            extra_keys=_settings(request).greffer_compose_extra_allowed_keys)
+    except preflight_mod.PreflightError as exc:
+        return JSONResponse({"errors": exc.errors}, status_code=422)
+    return JSONResponse(result)
 
 
 @router.post("/start/")

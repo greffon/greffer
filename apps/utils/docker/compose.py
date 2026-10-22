@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 from apps.utils.docker.render_budget import (  # noqa: F401  (re-export)
     _COMPOSE_RENDER_ENV,
     _FILE_RENDER_ENV,
+    render_compose_tree_bounded,
     render_json_bounded,
 )
 
@@ -645,9 +646,12 @@ def create_compose(compose, greffon_info):
     # a user-supplied `{{ config.X }}` reaches these today. Inside this try
     # nothing but template evaluation runs, and the env has no custom filters
     # or globals that could raise a greffer bug, so a broad catch cannot
-    # mislabel a greffer fault as a catalog error. yaml.dump stays OUTSIDE the
-    # try: a dict that cannot be represented is greffer-side, and a 500 is the
-    # honest answer there.
+    # mislabel a greffer fault as a catalog error. The FINAL yaml.dump
+    # (serializing the already-rendered tree, post-Feature-6) is inside
+    # this try: with safe_load'ed input the render output contains only
+    # str/int/float/bool/None/dict/list, which yaml can always represent,
+    # so an exception from it would be a greffer bug — and wrapping it
+    # 422s rather than 500s, the conservative direction either way.
     #
     # The forwarded detail names the exception TYPE only, never str(exc). With
     # the lenient undefined the body keeps, a rendered value can land inside
@@ -658,12 +662,18 @@ def create_compose(compose, greffon_info):
     # know whether the compose is unsafe, malformed, or references something
     # unset; the full reason goes to the greffer log, which is not caller-
     # reachable. The compose file is only written after the render succeeds.
-    dumped = yaml.dump(compose)
     try:
         # Feature 1b: the render runs under the budget (input/output caps,
-        # child-process memory + time bound) — see render_budget.py. A cap
+        # child-process memory + time bound). Feature 6: STRUCTURE-
+        # PRESERVING — every string LEAF renders in one child job and the
+        # tree is yaml.dump'd once afterwards, replacing
+        # Template(yaml.dump(compose)) whose single-quote escaping could
+        # corrupt Jinja expressions containing single-quoted literals
+        # (TemplateSyntaxError on legal compose; the catalog worked around
+        # it by double-quote convention). Keys never render. A cap
         # violation re-raises below as its own bounded message.
-        compose_file = render_bounded('body', dumped, greffon_info)
+        rendered = render_compose_tree_bounded(compose, greffon_info)
+        compose_file = yaml.dump(rendered)
     except RenderBudgetExceeded as exc:
         raise ConfigRenderError(str(exc)) from exc
     except Exception as exc:

@@ -165,7 +165,13 @@ def _harden(env):
     return env
 
 
-_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(autoescape=False))
+# keep_trailing_newline: the per-LEAF render must preserve a value's own
+# trailing \n (multi-line entrypoints, heredocs, env-file style content) —
+# Jinja strips one trailing newline by default, which silently truncated
+# every multi-line leaf by exactly one \n (found by adversarial review:
+# 4 catalog snapshots diffed by exactly that).
+_COMPOSE_RENDER_ENV = _harden(ImmutableSandboxedEnvironment(
+    autoescape=False, keep_trailing_newline=True))
 _harden(_FILE_RENDER_ENV)
 
 
@@ -254,51 +260,100 @@ def _child_render(which: str, source: str, context: dict) -> str:
         raise rebuilt from None
 
 
-def _child_render_json(tree, context):
-    """Runs IN THE CHILD: render every STRING LEAF of a json-destination
-    value in one job. Per-leaf submission re-pickled the entire context
-    (cert material included) for every leaf — quadratic on real realm
-    documents (codex review: a 5k-leaf doc went 0.6s -> 10.4s)."""
+def _child_render_tree(tree, context, which, _budget=None):
+    """Runs IN THE CHILD: render every STRING LEAF of a tree value in one
+    job (per-leaf submission re-pickled the entire context for every leaf
+    — quadratic on real documents; codex review). which selects the env
+    ('file' for json destinations, 'body' for the compose tree — the
+    Feature-6 structure-preserving render).
+
+    _budget is a one-element JOB-WIDE output accumulator: per-leaf caps
+    alone let N leaves each render just under the cap, so the assembled
+    document exceeded GREFFER_RENDER_MAX_OUTPUT unbounded (codex review).
+    """
+    if _budget is None:
+        _budget = [_knob("GREFFER_RENDER_MAX_OUTPUT", _DEFAULT_OUTPUT)]
     if isinstance(tree, str):
-        max_in = _knob("GREFFER_RENDER_MAX_INPUT", _DEFAULT_INPUT)
-        if max_in and len(tree.encode("utf-8", "surrogatepass")) > max_in:
-            raise RenderBudgetExceeded("input_too_large", max_in)
-        return _child_render("file", tree, context)
+        out = _child_render(which, tree, context)
+        if _budget[0]:
+            _budget[0] -= len(out.encode("utf-8", "surrogatepass"))
+            if _budget[0] < 0:
+                raise RenderBudgetExceeded(
+                    "output_too_large",
+                    _knob("GREFFER_RENDER_MAX_OUTPUT", _DEFAULT_OUTPUT))
+        return out
     if isinstance(tree, dict):
-        return {k: _child_render_json(v, context) for k, v in tree.items()}
+        return {k: _child_render_tree(v, context, which, _budget)
+                for k, v in tree.items()}
     if isinstance(tree, list):
-        return [_child_render_json(v, context) for v in tree]
+        return [_child_render_tree(v, context, which, _budget)
+                for v in tree]
     return tree
+
+
+def _child_render_json(tree, context):
+    return _child_render_tree(tree, context, "file")
 
 
 def render_json_bounded(tree, context) -> object:
     """Budgeted render of a json-destination value's string leaves, in one
     child round-trip (input cap applies per leaf via the child render)."""
+    return _run_tree_job(tree, context, "file")
+
+
+def render_compose_tree_bounded(compose, context) -> object:
+    """Feature 6 structure-preserving render: render every string LEAF of
+    the compose tree under the body env, in ONE child job; the caller then
+    yaml.dump's the result ONCE. Replacing Template(yaml.dump(compose))
+    kills the round-trip fragility class structurally: yaml single-quote
+    escaping (an embedded ' doubled to '') could corrupt any Jinja
+    expression containing a single-quoted literal into a
+    TemplateSyntaxError — and every catalog workaround-by-convention
+    disappears, because values are rendered as Python strings and then
+    serialized by yaml with correct quoting applied exactly once.
+    Keys are NOT rendered (same intentional choice as the json walker).
+    """
+    return _run_tree_job(compose, context, "body")
+
+
+def _run_tree_job(tree, context, which):
     src_len = sum(
         len(leaf.encode("utf-8", "surrogatepass"))
-        for leaf in _iter_string_leaves(tree))
+        for leaf in _iter_string_leaves(tree, keys=True))
     max_in = _knob("GREFFER_RENDER_MAX_INPUT", _DEFAULT_INPUT)
     if max_in and src_len > max_in * 100:
-        # A sane guard for pathological leaf counts; each leaf is itself
-        # input-capped in the child.
+        # Aggregate guard for pathological leaf counts (values AND keys
+        # are counted; each rendered leaf is additionally input-capped in
+        # the child — keys render never, so this aggregate is their only
+        # bound).
         raise RenderBudgetExceeded("input_too_large", max_in * 100)
     mem = _knob("GREFFER_RENDER_MEM_BYTES", _DEFAULT_MEM)
     timeout = _knob("GREFFER_RENDER_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT,
                     as_float=True)
     return _submit_budgeted(
-        lambda pool: pool.submit(_child_render_json, tree, context),
+        lambda pool: pool.submit(_child_render_tree, tree, context, which),
         mem, timeout)
 
 
-def _iter_string_leaves(tree):
+def _iter_string_leaves(tree, keys: bool = False):
+    """Yield every string leaf. keys=False (the render path) walks VALUES
+    only — keys never render (an intentional hardening over the old whole-
+    document template, which templated them: a structure-injection vector).
+    keys=True (the budget accounting path) walks keys TOO, so a compose
+    whose bulk hides in keys cannot exceed the input cap un-counted
+    (review finding: a 3 MiB key passed a 1 MiB cap as 1 counted byte)."""
     if isinstance(tree, str):
         yield tree
     elif isinstance(tree, dict):
+        if keys:
+            for k in tree:
+                if isinstance(k, str):
+                    yield k
         for v in tree.values():
-            yield from _iter_string_leaves(v)
+            yield from _iter_string_leaves(v, keys)
     elif isinstance(tree, list):
         for v in tree:
-            yield from _iter_string_leaves(v)
+            yield from _iter_string_leaves(v, keys)
 
 
 # --- the pool ----------------------------------------------------------------

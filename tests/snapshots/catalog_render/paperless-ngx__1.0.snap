@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:8000'
+    - 20000:8000
     restart: unless-stopped
     volumes:
     - regress-paperless-ngx_nginx_volume:/etc/nginx/
@@ -22,17 +22,17 @@ services:
       PAPERLESS_ADMIN_PASSWORD: ''
       PAPERLESS_ADMIN_USER: admin
       PAPERLESS_DBENGINE: sqlite
-      PAPERLESS_EMAIL_FROM: 'noreply@example.test'
-      PAPERLESS_EMAIL_HOST: 'smtp.example.test'
-      PAPERLESS_EMAIL_HOST_PASSWORD: 'pw'
-      PAPERLESS_EMAIL_HOST_USER: 'mailer@example.test'
+      PAPERLESS_EMAIL_FROM: noreply@example.test
+      PAPERLESS_EMAIL_HOST: smtp.example.test
+      PAPERLESS_EMAIL_HOST_PASSWORD: pw
+      PAPERLESS_EMAIL_HOST_USER: mailer@example.test
       PAPERLESS_EMAIL_PORT: '587'
       PAPERLESS_EMAIL_USE_SSL: 'false'
       PAPERLESS_EMAIL_USE_TLS: 'true'
       PAPERLESS_OCR_LANGUAGE: eng
       PAPERLESS_REDIS: redis://paperless_broker:6379
       PAPERLESS_SECRET_KEY: ''
-      PAPERLESS_URL: 'https://regress-paperless-ngx-0.my.example.test'
+      PAPERLESS_URL: https://regress-paperless-ngx-0.my.example.test
     image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
     logging:
       driver: json-file

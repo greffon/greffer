@@ -11,21 +11,21 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:80'
+    - 20000:80
     restart: unless-stopped
     volumes:
     - regress-vaultwarden_nginx_volume:/etc/nginx/
   vaultwarden:
     environment:
       ADMIN_TOKEN: ''
-      DOMAIN: 'https://regress-vaultwarden-0.my.example.test'
+      DOMAIN: https://regress-vaultwarden-0.my.example.test
       SIGNUPS_ALLOWED: 'true'
-      SMTP_FROM: 'noreply@example.test'
-      SMTP_HOST: 'smtp.example.test'
-      SMTP_PASSWORD: 'pw'
+      SMTP_FROM: noreply@example.test
+      SMTP_HOST: smtp.example.test
+      SMTP_PASSWORD: pw
       SMTP_PORT: '587'
-      SMTP_SECURITY: 'starttls'
-      SMTP_USERNAME: 'mailer@example.test'
+      SMTP_SECURITY: starttls
+      SMTP_USERNAME: mailer@example.test
     image: vaultwarden/server:latest
     logging:
       driver: json-file

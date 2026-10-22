@@ -18,7 +18,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       COLLABORATION_API_URL: http://y-provider:4444/collaboration/api/
       COLLABORATION_BACKEND_BASE_URL: http://backend:8000
-      COLLABORATION_SERVER_ORIGIN: 'https://regress-docs-0.my.example.test'
+      COLLABORATION_SERVER_ORIGIN: https://regress-docs-0.my.example.test
       COLLABORATION_SERVER_SECRET: ''
       COLLABORATION_WS_URL: wss://regress-docs-0.my.example.test/collaboration/ws/
       DB_HOST: postgresql
@@ -26,26 +26,26 @@ services:
       DB_PASSWORD: ''
       DB_PORT: '5432'
       DB_USER: docs
-      DJANGO_ALLOWED_HOSTS: 'regress-docs-0.my.example.test,regress-docs-0.my.example.test,localhost,backend'
+      DJANGO_ALLOWED_HOSTS: regress-docs-0.my.example.test,regress-docs-0.my.example.test,localhost,backend
       DJANGO_CONFIGURATION: Production
-      DJANGO_CSRF_TRUSTED_ORIGINS: 'https://regress-docs-0.my.example.test'
-      DJANGO_EMAIL_FROM: 'noreply@example.test'
-      DJANGO_EMAIL_HOST: 'smtp.example.test'
-      DJANGO_EMAIL_HOST_PASSWORD: 'pw'
-      DJANGO_EMAIL_HOST_USER: 'mailer@example.test'
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://regress-docs-0.my.example.test
+      DJANGO_EMAIL_FROM: noreply@example.test
+      DJANGO_EMAIL_HOST: smtp.example.test
+      DJANGO_EMAIL_HOST_PASSWORD: pw
+      DJANGO_EMAIL_HOST_USER: mailer@example.test
       DJANGO_EMAIL_PORT: '587'
       DJANGO_EMAIL_USE_SSL: 'false'
       DJANGO_EMAIL_USE_TLS: 'true'
       DJANGO_SECRET_KEY: ''
       DJANGO_SETTINGS_MODULE: impress.settings
-      LOGIN_REDIRECT_URL: 'https://regress-docs-0.my.example.test'
-      LOGIN_REDIRECT_URL_FAILURE: 'https://regress-docs-0.my.example.test'
-      LOGOUT_REDIRECT_URL: 'https://regress-docs-0.my.example.test'
-      MEDIA_BASE_URL: 'https://regress-docs-0.my.example.test'
+      LOGIN_REDIRECT_URL: https://regress-docs-0.my.example.test
+      LOGIN_REDIRECT_URL_FAILURE: https://regress-docs-0.my.example.test
+      LOGOUT_REDIRECT_URL: https://regress-docs-0.my.example.test
+      MEDIA_BASE_URL: https://regress-docs-0.my.example.test
       OIDC_AUTH_REQUEST_EXTRA_PARAMS: '{"login_hint": "demo"}'
-      OIDC_OP_AUTHORIZATION_ENDPOINT: 'https://regress-docs-0.my.example.test/identity/realms/docs/protocol/openid-connect/auth'
+      OIDC_OP_AUTHORIZATION_ENDPOINT: https://regress-docs-0.my.example.test/identity/realms/docs/protocol/openid-connect/auth
       OIDC_OP_JWKS_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/certs
-      OIDC_OP_LOGOUT_ENDPOINT: 'https://regress-docs-0.my.example.test/identity/realms/docs/protocol/openid-connect/logout'
+      OIDC_OP_LOGOUT_ENDPOINT: https://regress-docs-0.my.example.test/identity/realms/docs/protocol/openid-connect/logout
       OIDC_OP_TOKEN_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/token
       OIDC_OP_USER_ENDPOINT: http://keycloak:8080/identity/realms/docs/protocol/openid-connect/userinfo
       OIDC_REDIRECT_ALLOWED_HOSTS: '["https://regress-docs-0.my.example.test"]'
@@ -172,7 +172,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:8083'
+    - 20000:8083
     restart: unless-stopped
     volumes:
     - regress-docs_nginx_volume:/etc/nginx/
@@ -183,7 +183,7 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_PASSWORD: ''
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_HOSTNAME: 'https://regress-docs-0.my.example.test/identity'
+      KC_HOSTNAME: https://regress-docs-0.my.example.test/identity
       KC_HOSTNAME_STRICT: 'false'
       KC_HTTP_ENABLED: 'true'
       KC_HTTP_RELATIVE_PATH: /identity
@@ -262,7 +262,7 @@ services:
       COLLABORATION_API_URL: http://y-provider:4444/collaboration/api/
       COLLABORATION_BACKEND_BASE_URL: http://backend:8000
       COLLABORATION_LOGGING: 'true'
-      COLLABORATION_SERVER_ORIGIN: 'https://regress-docs-0.my.example.test'
+      COLLABORATION_SERVER_ORIGIN: https://regress-docs-0.my.example.test
       COLLABORATION_SERVER_SECRET: ''
       Y_PROVIDER_API_BASE_URL: http://y-provider:4444/api/
       Y_PROVIDER_API_KEY: ''

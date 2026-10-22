@@ -10,15 +10,15 @@ services:
       redis:
         condition: service_started
     environment:
-      CSRF_TRUSTED_ORIGINS: 'https://regress-glitchtip-0.my.example.test'
+      CSRF_TRUSTED_ORIGINS: https://regress-glitchtip-0.my.example.test
       DATABASE_URL: postgres://postgres:postgres@glitchtip_db:5432/glitchtip
       DEFAULT_FROM_EMAIL: ''
       EMAIL_URL: smtp+tls://mailer%40example.test:pw@smtp.example.test:587
-      GLITCHTIP_DOMAIN: 'https://regress-glitchtip-0.my.example.test'
+      GLITCHTIP_DOMAIN: https://regress-glitchtip-0.my.example.test
       GLITCHTIP_EVENT_HOT_DAYS: '30'
       GLITCHTIP_FILE_RETENTION_DAYS: '90'
       GLITCHTIP_RETENTION_DAYS: '90'
-      GLITCHTIP_URL: 'https://regress-glitchtip-0.my.example.test'
+      GLITCHTIP_URL: https://regress-glitchtip-0.my.example.test
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ''
     image: glitchtip/glitchtip:latest
@@ -133,7 +133,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:8000'
+    - 20000:8000
     restart: unless-stopped
     volumes:
     - regress-glitchtip_nginx_volume:/etc/nginx/

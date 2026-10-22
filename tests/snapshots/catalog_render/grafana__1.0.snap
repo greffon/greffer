@@ -5,13 +5,13 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ''
       GF_SECURITY_SECRET_KEY: ''
-      GF_SERVER_ROOT_URL: 'https://regress-grafana-0.my.example.test'
+      GF_SERVER_ROOT_URL: https://regress-grafana-0.my.example.test
       GF_SMTP_ENABLED: 'true'
-      GF_SMTP_FROM_ADDRESS: 'noreply@example.test'
-      GF_SMTP_HOST: 'smtp.example.test:587'
-      GF_SMTP_PASSWORD: 'pw'
-      GF_SMTP_STARTTLS_POLICY: 'MandatoryStartTLS'
-      GF_SMTP_USER: 'mailer@example.test'
+      GF_SMTP_FROM_ADDRESS: noreply@example.test
+      GF_SMTP_HOST: smtp.example.test:587
+      GF_SMTP_PASSWORD: pw
+      GF_SMTP_STARTTLS_POLICY: MandatoryStartTLS
+      GF_SMTP_USER: mailer@example.test
     image: grafana/grafana:12.2.1
     logging:
       driver: json-file
@@ -35,7 +35,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:3000'
+    - 20000:3000
     restart: unless-stopped
     volumes:
     - regress-grafana_nginx_volume:/etc/nginx/

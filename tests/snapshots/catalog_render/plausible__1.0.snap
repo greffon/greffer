@@ -11,7 +11,7 @@ services:
     networks:
     - greffon_internal_network
     ports:
-    - '20000:8000'
+    - 20000:8000
     restart: unless-stopped
     volumes:
     - regress-plausible_nginx_volume:/etc/nginx/
@@ -24,17 +24,17 @@ services:
     - plausible_db
     - plausible_events_db
     environment:
-      BASE_URL: 'https://regress-plausible-0.my.example.test'
+      BASE_URL: https://regress-plausible-0.my.example.test
       CLICKHOUSE_DATABASE_URL: http://plausible_events_db:8123/plausible_events_db
       DATABASE_URL: postgres://postgres:postgres@plausible_db:5432/plausible
       DISABLE_REGISTRATION: 'false'
-      MAILER_EMAIL: 'noreply@example.test'
+      MAILER_EMAIL: noreply@example.test
       SECRET_KEY_BASE: ''
-      SMTP_HOST_ADDR: 'smtp.example.test'
+      SMTP_HOST_ADDR: smtp.example.test
       SMTP_HOST_PORT: '587'
       SMTP_HOST_SSL_ENABLED: 'false'
-      SMTP_USER_NAME: 'mailer@example.test'
-      SMTP_USER_PWD: 'pw'
+      SMTP_USER_NAME: mailer@example.test
+      SMTP_USER_PWD: pw
     image: plausible/analytics:latest
     logging:
       driver: json-file

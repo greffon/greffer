@@ -184,6 +184,51 @@ class TestBlowups:
             t.join(timeout=30)
         assert all(e == "budget" for e in errors), errors
 
+    def test_single_quoted_jinja_literal_survives(self, monkeypatch, tmp_path):
+        # Feature 6 round-trip guard: yaml.dump single-quote doubling (an
+        # embedded ' -> '') corrupted any Jinja expression containing a
+        # single-quoted literal into a TemplateSyntaxError under the old
+        # Template(yaml.dump(compose)) pipeline. Structure-preserving
+        # rendering must render it cleanly.
+        monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+        from apps.utils.docker.compose import create_compose
+
+        compose = {"services": {"app": {
+            "image": "x",
+            "environment": {
+                "X": "{{ 'fallback' if not instance_url else 'set' }}",
+            }}}}
+        info = {"id": "rt1", "ports": [], "configurations": [],
+                "integrations": {}}
+        create_compose(compose, info)
+        import yaml as _yaml
+
+        rendered = _yaml.safe_load(open(
+            tmp_path / "rt1" / "docker-compose.yml").read())
+        value = rendered["services"]["app"]["environment"]["X"]
+        assert value in ("fallback", "set"), value
+
+    def test_leaf_trailing_newline_preserved(self):
+        # Regression (adversarial review): Jinja strips one trailing
+        # newline by default; per-leaf rendering silently truncated every
+        # multi-line value by exactly one \n (4 catalog snapshots diffed).
+        from apps.utils.docker.render_budget import _child_render
+
+        out = _child_render("body", "line1\nline2\n", {})
+        assert out == "line1\nline2\n", repr(out)
+
+    def test_keys_count_toward_input_cap(self, monkeypatch):
+        # Regression: the budget walked values only, so a compose whose
+        # bulk lived in KEYS passed the input cap un-counted.
+        # The aggregate guard is max_input * 100, so the key bulk must
+        # exceed THAT to trip (the cap semantics for tree jobs).
+        monkeypatch.setenv("GREFFER_RENDER_MAX_INPUT", "8")
+        monkeypatch.setenv("GREFFER_RENDER_MAX_OUTPUT", "0")
+        tree = {"k" * (8 * 101): "v"}
+        with pytest.raises(RenderBudgetExceeded) as e:
+            render_budget.render_compose_tree_bounded(tree, {})
+        assert e.value.code == "input_too_large"
+
     def test_unknown_render_kind_refused(self):
         with pytest.raises(ValueError, match="unknown render kind"):
             render_budget.render_bounded("bodyy", "ok", _ctx())
@@ -204,10 +249,15 @@ class TestWiring:
 
     def test_body_render_budget_maps_to_config_render_error(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
-        monkeypatch.setenv("GREFFER_RENDER_MAX_INPUT", "8")
-        with pytest.raises(compose.ConfigRenderError, match="input_too_large"):
+        # Feature 6 made the body a TREE job: the input cap is aggregate
+        # (max_in * 100 over keys+values), so trip the JOB-WIDE OUTPUT cap
+        # instead — the wiring assertion (budget -> ConfigRenderError) is
+        # what this test pins.
+        monkeypatch.setenv("GREFFER_RENDER_MAX_OUTPUT", "8")
+        with pytest.raises(compose.ConfigRenderError, match="output_too_large"):
             compose.create_compose(
-                {"services": {"a": {"image": "x"}}},
+                {"services": {"a": {"image": "x",
+                                     "environment": {"K": "vvvvvvvvvv"}}}},
                 {"id": "t1", "ports": [], "configurations": [],
                  "integrations": {}})
 
