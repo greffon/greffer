@@ -257,10 +257,13 @@ def test_the_render_error_detail_is_bounded_and_names_only_the_type(tmp_path,
     expression was reading, quoted back; an unbounded length), and the manager
     both logs and forwards whatever the greffer returns. Interpolating str(exc)
     into the surfaced detail would leak that. Pinned on a failure whose message
-    is known and distinct from the type: ZeroDivisionError, message "integer
-    division by zero"."""
+    is known and distinct from the type: ZeroDivisionError. The fixture uses
+    TRUE division on purpose: `1 / 0` raises "division by zero" on every
+    CPython, while `1 // 0`'s message differs by version ("integer division
+    or modulo by zero" on 3.11) — the assertion must not depend on the
+    interpreter's exact spelling."""
     compose = {"services": {"app": {"image": "nginx:alpine",
-                                    "environment": {"X": "{{ 1 // 0 }}"}}}}
+                                    "environment": {"X": "{{ 1 / 0 }}"}}}}
     with pytest.raises(compose_mod.ConfigRenderError) as exc:
         _render(compose, tmp_path, monkeypatch)
     detail = str(exc.value)
