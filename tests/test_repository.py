@@ -45,6 +45,90 @@ class GetComposeFileFromRepositoryTests(TestCase):
         self.assertEqual(result['services']['app']['image'], 'wordpress:latest')
 
 
+class GetComposeInlineTests(TestCase):
+    """The inline transport branch of get_compose_file_from_repository
+    (custom-app foundation Feature 4)."""
+
+    @patch('apps.utils.greffon.repository.requests')
+    def test_inline_bytes_skip_the_fetch(self, mock_requests):
+        from apps.utils.greffon.repository import (
+            get_compose_file_from_repository,
+        )
+        greffon = {'id': 'i',
+                   'compose_yaml': 'services:\n  app:\n    image: nginx\n'}
+        result = get_compose_file_from_repository(greffon)
+        mock_requests.get.assert_not_called()
+        self.assertEqual(result['services']['app']['image'], 'nginx')
+
+    def test_invalid_inline_yaml_raises_inline_compose_error(self):
+        from apps.utils.greffon.repository import (
+            InlineComposeError, get_compose_file_from_repository,
+        )
+        with self.assertRaises(InlineComposeError) as cm:
+            get_compose_file_from_repository(
+                {'compose_yaml': 'services: [unclosed'})
+        self.assertIn('inline compose_yaml', str(cm.exception))
+
+    def test_alias_dag_refused_at_parse(self):
+        """The adversarial-review P0: a sub-KiB anchor DAG under any
+        allowed key passes every shape check and expands exponentially
+        in the downstream walks. Alias REFERENCES are refused at load —
+        the boundary — not hoped away by walk hardening."""
+        from apps.utils.greffon.repository import (
+            InlineComposeError, get_compose_file_from_repository,
+        )
+        bomb = ['services:', '  app:', '    image: nginx',
+                '    environment:']
+        # 25 levels: ~600 bytes, 2^25 expanded visits if walked naively
+        bomb.append('      a0: &a0 [x]')
+        for i in range(1, 25):
+            bomb.append(f'      a{i}: &a{i} [*a{i-1}, *a{i-1}]')
+        with self.assertRaises(InlineComposeError) as cm:
+            get_compose_file_from_repository(
+                {'compose_yaml': '\n'.join(bomb) + '\n'})
+        self.assertIn('alias', str(cm.exception))
+
+    def test_anchor_without_reference_is_fine(self):
+        """An anchor DEFINITION constructs nothing shared; only the
+        reference is the DAG. Refusing definitions would reject benign
+        input."""
+        from apps.utils.greffon.repository import (
+            get_compose_file_from_repository,
+        )
+        result = get_compose_file_from_repository(
+            {'compose_yaml':
+             'services:\n  app:\n    image: &img nginx\n'
+             '    environment:\n      K: &k v\n'})
+        self.assertEqual(result['services']['app']['image'], 'nginx')
+
+    def test_deeply_nested_inline_yaml_maps_to_inline_compose_error(self):
+        """RecursionError is not a YAMLError; unmapped it escapes the
+        handlers and 500s (adversarial-review P2)."""
+        from apps.utils.greffon.repository import (
+            InlineComposeError, get_compose_file_from_repository,
+        )
+        with self.assertRaises(InlineComposeError):
+            get_compose_file_from_repository(
+                {'compose_yaml': '[' * 1000 + ']' * 1000})
+
+    @patch('apps.utils.greffon.repository.requests')
+    def test_absent_inline_still_fetches_the_url(self, mock_requests):
+        """The catalog path is byte-for-byte the old behavior: no
+        compose_yaml key at all -> requests.get(repository_url)."""
+        from apps.utils.greffon.repository import (
+            get_compose_file_from_repository,
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = 'services:\n  app:\n    image: nginx\n'
+        mock_requests.get.return_value = mock_response
+        result = get_compose_file_from_repository(
+            {'repository_url': 'https://example.com/docker-compose.yml'})
+        mock_requests.get.assert_called_once_with(
+            'https://example.com/docker-compose.yml')
+        self.assertIn('services', result)
+
+
 class CreateGreffonInfoTests(TestCase):
     """Tests for create_greffon_info."""
 

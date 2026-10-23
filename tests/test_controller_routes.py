@@ -93,6 +93,97 @@ async def test_start_compose_body_render_failure_returns_422(client: AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_start_inline_compose_strict_and_no_fetch(
+        client: AsyncClient) -> None:
+    """Custom-app inline transport (foundation Feature 4): a start whose
+    payload carries compose_yaml and NO repository_url passes validation,
+    renders the inline bytes, and the strict allowlist discriminator is
+    True (the containment Feature 3 gate goes live on this path)."""
+    inline = "services:\n  app:\n    image: nginx\n"
+    with patch(
+        "app.routers.controller.repository.get_greffon_info"
+    ) as mock_info, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        mock_info.return_value = {"ports": [], "id": "test-instance-123"}
+        mock_compose.get_compose_template.return_value = {}
+        mock_compose.get_status.return_value = {"status": "running"}
+
+        payload = {k: v for k, v in SAMPLE_START_PAYLOAD.items()
+                   if k != "repository_url"}
+        payload["compose_yaml"] = inline
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 200, r.text
+    # the discriminator: inline bytes => the strict allowlist set
+    self_kwargs = mock_info.call_args.kwargs
+    assert self_kwargs.get("strict") is True
+    # the inline bytes are what get_greffon_info received, parsed
+    compose_arg = mock_info.call_args.args[0]
+    assert compose_arg["services"]["app"]["image"] == "nginx"
+
+
+@pytest.mark.asyncio
+async def test_start_inline_invalid_yaml_returns_422(
+        client: AsyncClient) -> None:
+    """Unparsable inline bytes are the SAME class of clean 422 as a
+    shape refusal: these bytes passed the identical parse in preflight,
+    so divergence means the manager sent something else — name the
+    transport, never a 500, and allocate nothing."""
+    with patch(
+        "app.routers.controller.repository.get_greffon_info"
+    ) as mock_info, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        payload = {k: v for k, v in SAMPLE_START_PAYLOAD.items()
+                   if k != "repository_url"}
+        payload["compose_yaml"] = "services: [unclosed"
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 422
+    assert "not valid YAML" in r.json()["detail"]
+    mock_info.assert_not_called()
+    mock_compose.start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_start_inline_alias_dag_returns_422(client: AsyncClient) -> None:
+    """The adversarial-review P0 end-to-end: an anchor DAG small enough
+    to fit any body cap must be refused at the route (parse boundary),
+    never reach a walk. Nothing is allocated."""
+    bomb = ["services:", "  app:", "    image: nginx", "    environment:",
+            "      a0: &a0 [x]"]
+    for i in range(1, 25):
+        bomb.append(f"      a{i}: &a{i} [*a{i-1}, *a{i-1}]")
+    with patch(
+        "app.routers.controller.repository.get_greffon_info"
+    ) as mock_info, patch(
+        "app.routers.controller.compose"
+    ) as mock_compose, patch("app.routers.controller.conf"):
+        payload = {k: v for k, v in SAMPLE_START_PAYLOAD.items()
+                   if k != "repository_url"}
+        payload["compose_yaml"] = "\n".join(bomb) + "\n"
+        r = await client.post(
+            "/api/controller/start/",
+            json=payload,
+            headers={TOKEN_HEADER: "test-token"},
+        )
+
+    assert r.status_code == 422
+    assert "alias" in r.json()["detail"]
+    mock_info.assert_not_called()
+    mock_compose.start.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_start_success(client: AsyncClient) -> None:
     with patch("app.routers.controller.repository") as mock_repo, patch(
         "app.routers.controller.compose"
@@ -127,6 +218,10 @@ async def test_start_success(client: AsyncClient) -> None:
     body = r.json()
     assert "ports" in body
     assert body["ports"][0]["port_name"] == "app_80"
+
+    # the discriminator's other side: a URL-fetch (catalog) start never
+    # gets the strict set — an inverted discriminator would flip both.
+    assert mock_repo.get_greffon_info.call_args.kwargs.get("strict") is False
 
     mock_repo.get_compose_file_from_repository.assert_called_once()
     mock_repo.get_greffon_info.assert_called_once()

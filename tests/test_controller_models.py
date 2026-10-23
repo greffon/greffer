@@ -89,6 +89,70 @@ def test_stop_request_missing_id() -> None:
         GreffonStopRequest()  # type: ignore[call-arg]
 
 
+def test_start_request_explicit_null_compose_yaml_is_catalog() -> None:
+    """Explicit null == absent: the wire-compat story for a manager that
+    always includes the key."""
+    req = GreffonStartRequest(
+        id="x",
+        repository_url="https://example.com/docker-compose.yml",
+        compose_yaml=None,
+        cert=Certificate(**SAMPLE_CERT),
+    )
+    assert req.compose_yaml is None
+    assert req.repository_url.startswith("https://")
+
+
+def test_start_request_inline_compose_without_url() -> None:
+    """Custom-app inline transport (foundation Feature 4): compose_yaml
+    replaces the URL entirely — repository_url omitted, not empty."""
+    req = GreffonStartRequest(
+        id="x",
+        compose_yaml="services:\n  app:\n    image: nginx\n",
+        cert=Certificate(**SAMPLE_CERT),
+    )
+    assert req.compose_yaml.startswith("services:")
+    assert req.repository_url is None
+
+
+def test_start_request_inline_and_url_both_refused() -> None:
+    """Exactly one compose source: sending both is contradictory (which
+    bytes would run?), so it is refused rather than silently preferring
+    one."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="x",
+            repository_url="https://example.com/compose.yml",
+            compose_yaml="services: {}",
+            cert=Certificate(**SAMPLE_CERT),
+        )
+
+
+def test_start_request_empty_inline_compose_refused() -> None:
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="x", compose_yaml="", cert=Certificate(**SAMPLE_CERT)
+        )
+
+
+def test_start_request_oversized_inline_compose_refused() -> None:
+    """Same 1 MiB bound as the preflight request: an unbounded body is
+    tenant-triggerable memory before any render budget runs."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="x", compose_yaml="a" * 1048577,
+            cert=Certificate(**SAMPLE_CERT),
+        )
+
+
+def test_start_request_empty_repository_url_still_refused() -> None:
+    """The catalog path's min_length floor survives the field becoming
+    optional: '' must not reach requests.get('') and 500."""
+    with pytest.raises(ValidationError):
+        GreffonStartRequest(
+            id="x", repository_url="", cert=Certificate(**SAMPLE_CERT)
+        )
+
+
 def test_start_request_accepts_any_shape_in_ports() -> None:
     """ports is `Any`-typed to match DRF's DictField; anything hashable goes."""
     req = GreffonStartRequest(

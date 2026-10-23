@@ -65,7 +65,7 @@ from apps.utils.greffon import repository
 # Bound at import time, NOT accessed as repository.ComposeShapeError at
 # exception time: the route tests patch the whole repository module, and an
 # except clause on a Mock attribute raises TypeError mid-handler.
-from apps.utils.greffon.repository import ComposeShapeError
+from apps.utils.greffon.repository import ComposeShapeError, InlineComposeError
 from apps.utils.nginx import conf
 
 logger = logging.getLogger("greffer")
@@ -265,7 +265,13 @@ def start_greffon(
     # about, so the extra field is harmless to pass through.
     _refuse_if_updating(_settings(request))
     greffon = payload.model_dump()
-    compose_file = repository.get_compose_file_from_repository(greffon)
+    try:
+        compose_file = repository.get_compose_file_from_repository(greffon)
+    except InlineComposeError as exc:
+        # Custom-app inline transport (Feature 4): unparsable inline bytes
+        # are a 422 like every other refusal the manager can relay, never
+        # a 500. Raised before any port allocation or volume write.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # L4 (Tier-C) ports are published directly on their service. The bind
     # interface depends on this greffer's mode: proxy publishes on the public
     # interface; tunnel binds host-internal (reached by the rathole-client, not
@@ -284,8 +290,9 @@ def start_greffon(
     # compose-containment Feature 3: the trust discriminator for the key
     # allowlist. An inline compose (custom-app foundation Feature 4) is
     # unreviewed input -> the strict set; the URL-fetch path stays catalog.
-    # The compose_yaml field does not exist on the payload yet, so this is
-    # False for every start today and activates with the inline transport.
+    # Live since the inline transport shipped: True exactly when the
+    # payload carried compose_yaml (the model validator guarantees the
+    # URL path never sets it).
     _compose_strict = bool(greffon.get('compose_yaml'))
     try:
         greffon_info = repository.get_greffon_info(

@@ -78,6 +78,21 @@ services:
             run_preflight("services: [unclosed")
         assert e.value.errors[0]["key"] == "compose_yaml"
 
+    def test_alias_reference_refused_at_parse(self):
+        """The preflight's own walks are alias-safe, but a GREEN
+        preflight's bytes go on to /start/, whose render accounting
+        walks in the parent process — refusing the reference at load is
+        what keeps green-preflight bytes safe to relay (transport-PR
+        adversarial review)."""
+        bomb = ("services:\n  app:\n    image: nginx\n"
+                "    environment:\n"
+                "      a0: &a0 [x]\n"
+                "      a1: &a1 [*a0, *a0]\n")
+        with pytest.raises(PreflightError) as e:
+            run_preflight(bomb)
+        assert e.value.errors[0]["key"] == "compose_yaml"
+        assert "alias" in e.value.errors[0]["message"]
+
     def test_unresolvable_image_is_an_error_naming_it(self):
         with patch.object(pf.compose_mod, "client") as client:
             client.images.pull.side_effect = RuntimeError("registry down")
@@ -108,7 +123,16 @@ services:
         # leaf walk (outside every render guard). The fix visits each
         # SHARED container once, so the exponential alias chain resolves
         # in linear visits — this must complete fast, not raise.
+        #
+        # Since the inline-transport PR, tenant composes with alias
+        # REFERENCES are refused at parse (see
+        # test_alias_reference_refused_at_parse) — this test feeds the
+        # walker a DAG built with plain safe_load to keep proving the
+        # dedup itself, as defense in depth for any future parse
+        # boundary that lets aliases through.
         import time
+
+        import yaml as _yaml
 
         compose = "services:\n  app:\n    image: x\n    labels:\n"
         prev_ref = None
@@ -119,11 +143,15 @@ services:
             else:
                 compose += f"      - &a{i} [{prev_ref}, {prev_ref}]\n"
                 prev_ref = f"*a{i}"
-        with patch.object(pf.compose_mod, "client") as client:
-            client.images = _mock_images_ok()
-            t0 = time.monotonic()
-            result = run_preflight(compose)  # completes
+        # plain safe_load still constructs the shared-object DAG; the
+        # walker under test is the preflight's own leaf iterator
+        tree = _yaml.safe_load(compose)
+        t0 = time.monotonic()
+        leaves = list(pf._string_leaves(tree))  # completes
         assert time.monotonic() - t0 < 5.0
+        # linear visits: 20 chain levels + the literal leaves, nothing
+        # exponential
+        assert len(leaves) < 50
 
     def test_visit_budget_catches_huge_structures(self):
         # A genuinely large NON-aliased structure (no dedup to save it)
