@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 
+import docker.errors
 import yaml
 
 from apps.utils.docker import compose as compose_mod
@@ -160,12 +162,121 @@ def _strip_warnings(services: dict) -> list[dict]:
     return warnings
 
 
-def _resolve_image_digests(services: dict) -> dict:
+def _disk_free_bytes(settings) -> int | None:
+    """statvfs on greffon_path — the heartbeat's existing disk-free
+    signal (a real filesystem call; docker df() walks every volume on
+    the host and is the most expensive call in the design). None means
+    "could not read" and the headroom check is skipped (fail-open,
+    logged): a transient statvfs failure must not turn into a wrong
+    create refusal."""
+    try:
+        return shutil.disk_usage(str(settings.greffon_path)).free
+    except OSError as exc:
+        logger.warning(
+            "disk admission could not read free space at %s: %s",
+            settings.greffon_path, exc)
+        return None
+
+
+def _remove_newly_pulled(image: str) -> None:
+    """HLD §9 cleanup: a refused pull must not leave the layers it
+    fetched. Only ever called when the image did NOT exist before this
+    preflight pulled it — removing a pre-existing image would break the
+    neighbour already using it. Contained by design: a cleanup failure
+    is logged, never raised, so it cannot mask the refusal that
+    triggered it."""
+    try:
+        compose_mod.client.images.remove(image)
+    except Exception as exc:  # noqa: BLE001 — contained, see docstring
+        logger.warning(
+            "disk admission cleanup could not remove refused image "
+            "%s: %s", image, exc)
+
+
+def _admit_image(name, image, info, post_id, introduced,
+                  settings) -> None:
+    """Disk admission (HLD §9): judge the image NOW, after the pull —
+    the bytes are on disk, which is exactly what the caps judge — and
+    refuse with a named row (the manager relays it at create time). A
+    refused image the pull just introduced is removed (cleanup pass).
+
+    Grain notes (review-confirmed): the cleanup is per-image — a
+    multi-service create refused on its SECOND image keeps the first
+    image as warm layer cache, never half-deployed state. Size is the
+    VIRTUAL size (all layers incl. shared bases), so a fully-cached
+    image can still trip the margin on a nearly-full disk — a
+    conservative refusal that recovers no space, on purpose: a new app
+    should not deploy onto a disk below the operator's margin."""
+    size = int((info.attrs or {}).get("Size") or 0)
+    if settings.greffer_image_max_bytes and size > settings.greffer_image_max_bytes:
+        if introduced:
+            # By ID, not name: on a moved tag the name still belongs to
+            # the OLD image too, and removing by name could untag
+            # something a neighbour uses (codex).
+            _remove_newly_pulled(post_id or image)
+        gib = 1024 ** 3
+        raise PreflightError([{
+            "service": name,
+            "key": "image",
+            "message": f"image {image!r} is {size / gib:.1f} GiB; the "
+                       f"operator's per-image cap is "
+                       f"{settings.greffer_image_max_bytes / gib:.1f} GiB "
+                       f"(GREFFER_IMAGE_MAX_BYTES)",
+        }])
+    if settings.greffer_image_min_free_bytes:
+        free = _disk_free_bytes(settings)
+        if free is not None and (
+                size + settings.greffer_image_min_free_bytes > free):
+            if introduced:
+                _remove_newly_pulled(post_id or image)
+            mib = 1024 ** 2
+            raise PreflightError([{
+                "service": name,
+                "key": "image",
+                "message": f"image {image!r} is {size / mib:.0f} MiB and "
+                           f"only {free / mib:.0f} MiB is free; the "
+                           f"operator keeps "
+                           f"{settings.greffer_image_min_free_bytes / mib:.0f}"
+                           f" MiB free (GREFFER_IMAGE_MIN_FREE_BYTES)",
+            }])
+
+
+def _resolve_image_digests(services: dict, settings=None) -> dict:
     """Pull+inspect every image: reference and return {service: digest}.
     A reference that cannot be resolved is an error naming the image —
     the artifact pin refuses rather than falling back to unpinned bytes.
+    With `settings`, each pull passes disk admission (HLD §9): the
+    count cap first, then per-image size and free-space checks.
     """
     digests = {}
+    count = 0
+    count_cap_active = bool(settings is not None
+                            and settings.greffer_image_count_max)
+    if count_cap_active:
+        try:
+            # The low-level API, NOT images.list(): the model method
+            # inspects every image (an N+1 storm — 301 daemon calls on a
+            # 300-image node) on the same threadpool token the pulls
+            # hold. One /images/json response carries the whole count
+            # (adversarial review).
+            count = len(compose_mod.client.api.images())
+        except Exception as exc:  # noqa: BLE001 — fail-open, logged
+            count_cap_active = False
+            logger.warning(
+                "disk admission could not count images: %s", exc)
+        else:
+            if count >= settings.greffer_image_count_max:
+                raise PreflightError([{
+                    "service": None,
+                    "key": "image",
+                    "message": f"the node already holds {count} images "
+                               f"(cap {settings.greffer_image_count_max}; "
+                               f"GREFFER_IMAGE_COUNT_MAX)",
+                }])
+    # Images THIS preflight introduces consume count-cap slots as the
+    # loop goes: with one cached image, a cap of 2 and two new images,
+    # the snapshot check alone would let one request land 3 (codex).
+    slots_used = 0
     for name, svc in services.items():
         image = svc.get("image")
         if not isinstance(image, str) or not image:
@@ -179,6 +290,56 @@ def _resolve_image_digests(services: dict) -> dict:
                 "message": "service has no image reference and cannot "
                            "deploy (build is not permitted)",
             }])
+        # Was this IMAGE already on the node before this preflight?
+        # Probed by IDENTITY, not tag presence: a mutable tag can be
+        # cached at digest A while the registry now serves B — the pull
+        # then introduces a NEW image under the same name (codex). When
+        # the probe is unreadable, cleanup is skipped entirely (doubt
+        # means "not ours to delete").
+        pre_id = None
+        pre_unclear = False
+        try:
+            pre_id = compose_mod.client.images.get(image).attrs.get("Id")
+        except docker.errors.ImageNotFound:
+            pre_id = None
+        except Exception as exc:  # noqa: BLE001 — unreadable -> skip cleanup
+            pre_unclear = True
+            logger.warning(
+                "preflight could not check image pre-existence of %s: %s",
+                image, exc)
+        # The pre-pull headroom precondition (HLD §9 "before any pull"):
+        # with the disk already at or below the operator's margin there
+        # is no honest size to declare, and the pull itself could run
+        # the shared disk to ENOSPC — bypassing admission AND cleanup
+        # (codex P1). The exact size-vs-margin judgment still runs
+        # post-pull.
+        if settings is not None and settings.greffer_image_min_free_bytes:
+            free_pre = _disk_free_bytes(settings)
+            if free_pre is not None and (
+                    free_pre <= settings.greffer_image_min_free_bytes):
+                raise PreflightError([{
+                    "service": name,
+                    "key": "image",
+                    "message": f"the node's free space "
+                               f"({free_pre / 1024 ** 2:.0f} MiB) is at or "
+                               f"below the operator's keep-free margin "
+                               f"({settings.greffer_image_min_free_bytes / 1024 ** 2:.0f}"
+                               f" MiB); refusing before pulling {image!r} "
+                               f"(GREFFER_IMAGE_MIN_FREE_BYTES)",
+                }])
+        # A count-cap slot for every image this pull will introduce
+        # (tag absent and probe readable): the snapshot check above
+        # cannot see this request's own additions.
+        if count_cap_active and not pre_unclear and pre_id is None:
+            if count + slots_used >= settings.greffer_image_count_max:
+                raise PreflightError([{
+                    "service": name,
+                    "key": "image",
+                    "message": f"pulling {image!r} would take the node to "
+                               f"{count + slots_used + 1} images (cap "
+                               f"{settings.greffer_image_count_max}; "
+                               f"GREFFER_IMAGE_COUNT_MAX)",
+                }])
         try:
             compose_mod.client.images.pull(image)
             info = compose_mod.client.images.get(image)
@@ -188,7 +349,6 @@ def _resolve_image_digests(services: dict) -> dict:
             ]
             if not repo_digests:
                 raise RuntimeError("image has no repo digest")
-            digests[name] = repo_digests[0]
         except Exception as exc:  # noqa: BLE001 — surfaced as a named row
             logger.warning("preflight digest failed for %s: %s", image, exc)
             raise PreflightError([{
@@ -198,10 +358,22 @@ def _resolve_image_digests(services: dict) -> dict:
                            f"({type(exc).__name__}); an unpinned reference "
                            f"is not deployable",
             }]) from exc
+        digests[name] = repo_digests[0]
+        if settings is not None:
+            post_id = info.attrs.get("Id")
+            # A daemon that omitted Id from inspect would make the
+            # fallback remove-by-name reachable with a moved tag —
+            # unreachable on real engines, but one line to make it
+            # impossible (closure-verified hardening).
+            introduced = (bool(post_id) and not pre_unclear
+                          and pre_id != post_id)
+            if introduced:
+                slots_used += 1
+            _admit_image(name, image, info, post_id, introduced, settings)
     return digests
 
 
-def run_preflight(compose_yaml: str, extra_keys=None) -> dict:
+def run_preflight(compose_yaml: str, extra_keys=None, settings=None) -> dict:
     """Validate a custom compose for deployability. Raises PreflightError
     with 422 rows; returns the LLD §4.1 payload on success."""
     # parse_compose_yaml (compose_shape) refuses alias REFERENCES at
@@ -269,6 +441,7 @@ def run_preflight(compose_yaml: str, extra_keys=None) -> dict:
         "config_candidates": sorted(candidates.values(),
                                     key=lambda c: (c["service"] or "",
                                                    c["key"])),
-        "image_digests": _resolve_image_digests(services),
+        "image_digests": _resolve_image_digests(services,
+                                                settings=settings),
         "warnings": _strip_warnings(services),
     }

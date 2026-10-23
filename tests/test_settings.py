@@ -227,3 +227,50 @@ def test_the_floor_moves_with_the_interval(
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_WINDOW_DAYS", "5")
     monkeypatch.setenv("GREFFER_CERT_RENEWAL_INTERVAL", "21600")
     assert Settings().greffer_cert_renewal_interval == 21600
+
+
+def test_disk_admission_defaults_are_protective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HLD §9: size cap and keep-free margin default ON (protective
+    without refusing legitimate apps); the COUNT cap defaults OFF —
+    images already on the node are mostly the catalog tier's pulls, and
+    charging those to a custom create would refuse tenants for usage
+    they did not cause."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    s = Settings()
+    assert s.greffer_image_max_bytes == 20 * 1024 ** 3
+    assert s.greffer_image_min_free_bytes == 2 * 1024 ** 3
+    assert s.greffer_image_count_max == 0
+
+
+def test_disk_admission_knobs_coerce_bad_input_to_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The typo-must-not-crash rule: junk or negative values land as the
+    per-field default, never as an exception out of Settings() — a
+    crash-looping boot over an optional admission knob is worse than the
+    default."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_IMAGE_MAX_BYTES", "junk")
+    monkeypatch.setenv("GREFFER_IMAGE_MIN_FREE_BYTES", "-5")
+    monkeypatch.setenv("GREFFER_IMAGE_COUNT_MAX", "7")
+    s = Settings()
+    assert s.greffer_image_max_bytes == 20 * 1024 ** 3
+    assert s.greffer_image_min_free_bytes == 2 * 1024 ** 3
+    assert s.greffer_image_count_max == 7
+
+
+def test_disk_admission_accepts_the_platform_size_syntax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sibling limits knobs take "2g"; an operator writing
+    GREFFER_IMAGE_MAX_BYTES="50g" must get 50 GiB, not a silent fall
+    back to the 20 GiB default — a trap 2.5x off intent (adversarial
+    review on the disk-admission PR)."""
+    monkeypatch.setenv("GREFFER_ID", "x")
+    monkeypatch.setenv("GREFFER_IMAGE_MAX_BYTES", "50g")
+    monkeypatch.setenv("GREFFER_IMAGE_MIN_FREE_BYTES", "512m")
+    s = Settings()
+    assert s.greffer_image_max_bytes == 50 * 1024 ** 3
+    assert s.greffer_image_min_free_bytes == 512 * 1024 ** 2

@@ -23,6 +23,12 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     # (``create_app`` -> ``load_or_create_token`` under ``greffon_path``)
     # never writes to the real ``/data`` and never leaks a token across tests.
     monkeypatch.setenv("GREFFON_PATH", str(tmp_path))
+    # Disk admission (HLD §9) defaults ON in production; tests keep it
+    # OFF so preflight route tests never depend on the build machine's
+    # real free space (the admission itself has dedicated unit tests
+    # that pass explicit policies).
+    monkeypatch.setenv("GREFFER_IMAGE_MAX_BYTES", "0")
+    monkeypatch.setenv("GREFFER_IMAGE_MIN_FREE_BYTES", "0")
     return get_settings()
 
 

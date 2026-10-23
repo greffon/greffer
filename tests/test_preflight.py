@@ -208,6 +208,186 @@ services:
         assert result["services"] == ["app"]
 
 
+class TestDiskAdmission:
+    """HLD §9, at the digest pull (the one pull the platform controls):
+    a free-space precondition (pre-pull margin + post-pull size math),
+    per-image size and count caps (accounting for images this very
+    request introduces), and a cleanup pass keyed on image IDENTITY so
+    a refused create leaves nothing behind."""
+
+    def _settings(self, tmp_path, **kw):
+        from app.settings import Settings
+        # Explicit off unless a test overrides: admission tests must
+        # never depend on the build machine's real free space.
+        kw.setdefault("greffer_image_max_bytes", 0)
+        kw.setdefault("greffer_image_min_free_bytes", 0)
+        kw.setdefault("greffer_image_count_max", 0)
+        return Settings(greffer_id="t", greffon_path=str(tmp_path), **kw)
+
+    def _info(self, size, image_id="sha256:bb"):
+        info = MagicMock()
+        info.attrs = {"RepoDigests": sorted(_DIGIST_OK),
+                      "Size": size, "Id": image_id}
+        return info
+
+    def _images(self, size=100 * 1024 ** 2, pre=None, post=None):
+        """images API mock. pre/post steer the IDENTITY story:
+        pre=None -> ImageNotFound (absent); pre=("id", size) -> cached
+        at that id; post defaults to the same id (nothing new)."""
+        import docker.errors
+        images = MagicMock()
+        post = post or self._info(size)
+        if pre is None:
+            images.get.side_effect = [
+                docker.errors.ImageNotFound("not present"), post]
+        else:
+            images.get.side_effect = [pre, post]
+        return images, post
+
+    def test_size_cap_refuses_and_cleans_up_newly_pulled(self, tmp_path):
+        images, _ = self._images(size=100 * 1024 ** 2, pre=None,
+                                 post=self._info(100 * 1024 ** 2,
+                                                 image_id="sha256:new"))
+        settings = self._settings(
+            tmp_path, greffer_image_max_bytes=10 * 1024 ** 2)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            with pytest.raises(PreflightError) as e:
+                run_preflight(_COMPOSE, settings=settings)
+        assert "per-image cap" in e.value.errors[0]["message"]
+        images.remove.assert_called_once_with("sha256:new")
+
+    def test_size_cap_never_removes_a_pre_existing_image(self, tmp_path):
+        cached = self._info(100 * 1024 ** 2, image_id="sha256:same")
+        images, _ = self._images(pre=cached,
+                                 post=self._info(100 * 1024 ** 2,
+                                                 image_id="sha256:same"))
+        settings = self._settings(
+            tmp_path, greffer_image_max_bytes=10 * 1024 ** 2)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            with pytest.raises(PreflightError):
+                run_preflight(_COMPOSE, settings=settings)
+        images.remove.assert_not_called()
+
+    def test_mutable_tag_refresh_cleans_up_only_the_new_image(
+            self, tmp_path):
+        """The tag is cached at digest A, the registry now serves B: the
+        pull introduces a NEW image under the same name — the refusal
+        removes B BY ID, never A (codex)."""
+        cached = self._info(1, image_id="sha256:old-a")
+        new = self._info(100 * 1024 ** 2, image_id="sha256:new-b")
+        images = MagicMock()
+        import docker.errors
+        images.get.side_effect = [cached, new]
+        settings = self._settings(
+            tmp_path, greffer_image_max_bytes=10 * 1024 ** 2)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            with pytest.raises(PreflightError):
+                run_preflight(_COMPOSE, settings=settings)
+        images.remove.assert_called_once_with("sha256:new-b")
+
+    def test_pre_pull_margin_refuses_before_any_pull(self, tmp_path):
+        """codex P1: with the disk ALREADY at/below the keep-free margin
+        the refusal happens BEFORE the pull — a multi-GiB pull on an
+        exhausted disk would run to ENOSPC, bypassing admission and
+        cleanup both."""
+        from types import SimpleNamespace
+        images, _ = self._images(size=1)
+        settings = self._settings(
+            tmp_path, greffer_image_min_free_bytes=5 * 1024 ** 3)
+        with patch.object(pf.compose_mod, "client") as client, \
+                patch.object(pf.shutil, "disk_usage",
+                             return_value=SimpleNamespace(
+                                 free=3 * 1024 ** 3)):
+            client.images = images
+            with pytest.raises(PreflightError) as e:
+                run_preflight(_COMPOSE, settings=settings)
+        assert "keep-free margin" in e.value.errors[0]["message"]
+        images.pull.assert_not_called()
+        images.remove.assert_not_called()
+
+    def test_post_pull_headroom_refuses_and_cleans_up(self, tmp_path):
+        """The exact judgment: free is ABOVE the margin pre-pull, but
+        image size + margin exceeds it — refuse, remove what the pull
+        introduced."""
+        from types import SimpleNamespace
+        images, _ = self._images(
+            size=4 * 1024 ** 3, pre=None,
+            post=self._info(4 * 1024 ** 3, image_id="sha256:big"))
+        settings = self._settings(
+            tmp_path, greffer_image_min_free_bytes=5 * 1024 ** 3)
+        with patch.object(pf.compose_mod, "client") as client, \
+                patch.object(pf.shutil, "disk_usage",
+                             return_value=SimpleNamespace(
+                                 free=6 * 1024 ** 3)):
+            client.images = images
+            with pytest.raises(PreflightError) as e:
+                run_preflight(_COMPOSE, settings=settings)
+        assert "free" in e.value.errors[0]["message"]
+        images.remove.assert_called_once_with("sha256:big")
+
+    def test_free_space_read_failure_fails_open(self, tmp_path):
+        images, _ = self._images(size=1024 ** 2)
+        settings = self._settings(
+            tmp_path, greffer_image_min_free_bytes=5 * 1024 ** 3)
+        with patch.object(pf.compose_mod, "client") as client, \
+                patch.object(pf.shutil, "disk_usage",
+                             side_effect=OSError("no stat for you")):
+            client.images = images
+            result = run_preflight(_COMPOSE, settings=settings)
+        assert result["services"] == ["app"]
+
+    def test_count_cap_refuses_before_any_pull(self, tmp_path):
+        images, _ = self._images(size=1)
+        # the count reads the low-level one-call API, NOT images.list()
+        # (the model method inspects every image — an N+1 storm)
+        settings = self._settings(tmp_path, greffer_image_count_max=2)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            client.api.images.return_value = [MagicMock(), MagicMock()]
+            with pytest.raises(PreflightError) as e:
+                run_preflight(_COMPOSE, settings=settings)
+        assert "already holds 2 images" in e.value.errors[0]["message"]
+        images.pull.assert_not_called()
+
+    def test_count_cap_accounts_for_images_this_request_introduces(
+            self, tmp_path):
+        """codex P2: one cached image, cap 2, two NEW images in one
+        compose — the snapshot check passes, so the SECOND new image
+        must be refused by slot accounting before it is pulled."""
+        import docker.errors
+        compose = ("services:\n"
+                   "  app:\n    image: reg/a:1\n"
+                   "  worker:\n    image: reg/b:1\n")
+        info_a = self._info(1, image_id="sha256:a")
+        info_b = self._info(1, image_id="sha256:b")
+        images = MagicMock()
+        images.get.side_effect = [
+            docker.errors.ImageNotFound("no"), info_a,   # app: new
+            docker.errors.ImageNotFound("no"), info_b,   # worker: new
+        ]
+        settings = self._settings(tmp_path, greffer_image_count_max=2)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            client.api.images.return_value = [MagicMock()]  # 1 cached
+            with pytest.raises(PreflightError) as e:
+                run_preflight(compose, settings=settings)
+        assert "would take the node to 3 images" in e.value.errors[0]["message"]
+        assert images.pull.call_count == 1  # app admitted, worker refused
+
+    def test_no_settings_no_admission(self, tmp_path):
+        # settings=None keeps the unit-callable default: no admission,
+        # byte-for-byte the old behavior (every other test in this file
+        # rides this).
+        images, _ = self._images(size=100 * 1024 ** 3)
+        with patch.object(pf.compose_mod, "client") as client:
+            client.images = images
+            result = run_preflight(_COMPOSE)
+        assert result["services"] == ["app"]
+
+
 class TestPreflightRoute:
     @pytest.mark.asyncio
     async def test_route_200(self, client, monkeypatch):
@@ -232,6 +412,39 @@ class TestPreflightRoute:
         assert r.status_code == 422
         row = r.json()["errors"][0]
         assert row["key"] == "devices"
+
+    @pytest.mark.asyncio
+    async def test_route_threads_admission_settings(self, tmp_path):
+        """The wiring proof: knobs from the app settings reach the
+        digest pull, so a production preflight refuses over-cap images
+        with the same 422 rows. Builds its own app — the shared `client`
+        fixture snapshots settings at creation (admission OFF for
+        environment independence; see conftest)."""
+        import docker.errors
+        from httpx import ASGITransport, AsyncClient
+        from app.main import create_app
+        from app.settings import Settings
+        settings = Settings(
+            greffer_id="test-greffer-id", greffon_path=str(tmp_path),
+            greffer_image_max_bytes=10 * 1024 ** 2,
+            greffer_image_min_free_bytes=0)
+        images = MagicMock()
+        info = MagicMock()
+        info.attrs = {"RepoDigests": sorted(_DIGIST_OK),
+                      "Size": 100 * 1024 ** 2}
+        images.get.side_effect = [
+            docker.errors.ImageNotFound("not present"), info, info]
+        app = create_app(token="test-token", settings=settings)
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test") as ac:
+            with patch.object(pf.compose_mod, "client") as client_docker:
+                client_docker.images = images
+                r = await ac.post(
+                    "/api/controller/preflight/",
+                    json={"compose_yaml": _COMPOSE},
+                    headers={TOKEN_HEADER: "test-token"})
+        assert r.status_code == 422
+        assert "per-image cap" in r.json()["errors"][0]["message"]
 
     @pytest.mark.asyncio
     async def test_route_requires_token(self, client):
