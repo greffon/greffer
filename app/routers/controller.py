@@ -239,9 +239,12 @@ def preflight_greffon(
     from apps.utils.greffon import preflight as preflight_mod
 
     try:
+        # settings threads the disk-admission knobs (HLD §9) into the
+        # digest pull — the one pull the platform controls.
         result = preflight_mod.run_preflight(
             payload.compose_yaml,
-            extra_keys=_settings(request).greffer_compose_extra_allowed_keys)
+            extra_keys=_settings(request).greffer_compose_extra_allowed_keys,
+            settings=_settings(request))
     except preflight_mod.PreflightError as exc:
         return JSONResponse({"errors": exc.errors}, status_code=422)
     return JSONResponse(result)

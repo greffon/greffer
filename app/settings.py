@@ -468,6 +468,50 @@ class Settings(BaseSettings):
             return float(DEFAULT_CPUS)
         return cpus
 
+    # Custom-app disk admission (custom-app foundation HLD §9, Feature 4
+    # slice): the preflight's digest pull is the one pull the platform
+    # controls, so admission lives there. All three knobs are
+    # operator-owned; 0 disables a dimension (the same rule as the
+    # limits above). Defaults: a 20 GiB per-image cap and a 2 GiB
+    # keep-free margin are protective without refusing legitimate
+    # apps; the COUNT cap defaults OFF because images already on the
+    # node are mostly the CATALOG tier's pulls — charging those to a
+    # custom create would refuse tenants for usage they did not cause.
+    # Free space is read with statvfs on greffon_path (the heartbeat's
+    # existing disk-free signal — a real filesystem call, not the
+    # O(all volumes) docker df()): on the standard single-disk install
+    # the data volume and the engine share a disk; split-disk hosts
+    # should rely on the size cap.
+    greffer_image_max_bytes: int = 20 * 1024 ** 3
+    greffer_image_min_free_bytes: int = 2 * 1024 ** 3
+    greffer_image_count_max: int = 0
+
+    @field_validator("greffer_image_max_bytes",
+                     "greffer_image_min_free_bytes",
+                     "greffer_image_count_max", mode="before")
+    @classmethod
+    def _coerce_image_admission(cls, v, info):
+        # The typo-must-not-crash rule: a non-numeric or negative value
+        # lands as that field's protective default, never as an
+        # exception out of Settings() crash-looping boot.
+        defaults = {
+            "greffer_image_max_bytes": 20 * 1024 ** 3,
+            "greffer_image_min_free_bytes": 2 * 1024 ** 3,
+            "greffer_image_count_max": 0,
+        }
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            # Accept the platform's size syntax before giving up: the
+            # sibling limits knobs take "2g", and an operator who writes
+            # GREFFER_IMAGE_MAX_BYTES="50g" must not silently land on the
+            # 20 GiB default — a trap 2.5x off intent (adversarial
+            # review). parse_size returns None for junk.
+            n = parse_size(v) if isinstance(v, str) else None
+            if n is None:
+                return defaults[info.field_name]
+        return n if n >= 0 else defaults[info.field_name]
+
     @field_validator("greffer_instance_pids", mode="before")
     @classmethod
     def _coerce_pids(cls, v):
