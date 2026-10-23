@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # Defense-in-depth: restrict `id` to safe filename-like characters. The id
@@ -44,10 +44,27 @@ class GreffonStartRequest(BaseModel):
     # sends today (e.g. "test-instance-123"). Pattern kept permissive to
     # accept UUIDs and existing ID formats; rejects path-traversal.
     id: str = Field(pattern=_ID_PATTERN, min_length=1, max_length=128)
-    # `min_length=1` matches DRF's `CharField` default (rejects blank).
-    # Otherwise an empty URL reaches `requests.get('')` and 500s instead
-    # of returning a 400 validation error.
-    repository_url: str = Field(min_length=1)
+    # Catalog starts fetch their compose from `repository_url`; custom-app
+    # starts (foundation Feature 4, LLD §4.2) carry the pinned bytes inline
+    # and omit the URL. The requirement is therefore conditional, enforced
+    # by the `_require_compose_source` validator (no inline bytes and no
+    # URL is the same 400 the old required field produced via the
+    # request-validation handler). The min_length floor
+    # stays for the catalog path: an EMPTY string URL must not reach
+    # `requests.get('')` and 500.
+    repository_url: str | None = Field(default=None, min_length=1)
+    # Custom-app foundation Feature 4 (LLD §4.2): the compose bytes travel
+    # in the start request — a custom version has no URL (its compose_path
+    # is ''). Additive and wire-compatible both ways: an old manager omits
+    # it (None -> the URL-fetch path, exactly today's behavior) and an old
+    # greffer ignores it via extra=ignore, then 422s on the missing
+    # repository_url — which the manager's min_greffer_version gate (set to
+    # the release carrying this field) exists to prevent. Bounded to the
+    # same 1 MiB order as GREFFER_RENDER_MAX_INPUT and the preflight
+    # request: an unbounded body is tenant-triggerable memory before any
+    # render budget runs.
+    compose_yaml: str | None = Field(default=None, min_length=1,
+                                     max_length=1048576)
     cert: Certificate
     # Optional in the DRF sense (may be omitted from the payload), but
     # defaulted to an empty container here so the dumped dict always has
@@ -99,6 +116,22 @@ class GreffonStartRequest(BaseModel):
     # epic v3 §4 "Pull-based sidecar replaced by manager-pushed config"
     # and the rollout-ordering section.
     tunnel_client_toml: str | None = None
+
+    @model_validator(mode="after")
+    def _require_compose_source(self):
+        # Exactly one compose source per start: inline bytes (custom apps)
+        # or a repository URL (catalog). Omitting both is the malformed
+        # payload the old required `repository_url` field rejected; sending
+        # both is contradictory (which bytes would run?), so it is refused
+        # rather than silently preferring one.
+        if self.compose_yaml is None and not self.repository_url:
+            raise ValueError(
+                "repository_url is required when compose_yaml is absent "
+                "(catalog starts fetch their compose)")
+        if self.compose_yaml is not None and self.repository_url:
+            raise ValueError(
+                "send compose_yaml or repository_url, not both")
+        return self
 
 
 class GreffonStopRequest(BaseModel):

@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import re
 
+import yaml
+
 # Access modes docker documents for the third short-syntax mount field (the
 # long-syntax ``mode`` key honours ro/rw). A preserved mode is re-rendered
 # onto the rebuilt mapping (Feature 2: a read-only declaration stays
@@ -51,6 +53,42 @@ _IMPLICIT_NETWORKS = frozenset({"default"})
 # compose's own service-name charset — also exactly what nginx can
 # interpolate safely into upstream/server_name tokens.
 _NGINX_SAFE_NAME = re.compile(r"[a-zA-Z0-9._-]+\Z")
+
+
+class AliasForbiddenError(ValueError):
+    """The compose text uses a YAML alias reference (``*anchor``).
+    Raised at PARSE time, before any walk: alias references are what
+    construct shared-object DAGs, and a sub-KiB anchor DAG expands to
+    exponentially many visits in every downstream tree walk that lacks
+    per-id dedup (the start path's render accounting walks in the parent
+    process, outside the child render timeout). Anchor DEFINITIONS
+    without references construct nothing shared and stay legal."""
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader minus alias references. The compose allowlist permits
+    no ``x-`` extension fields (top level is exactly version/services/
+    volumes/networks), so the standard anchor-and-merge pattern was never
+    deployable — refusing the reference at load names that early, at
+    preflight, instead of letting a green preflight relay the bytes to a
+    start that pins the controller on the expanded walk."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise AliasForbiddenError(
+                f"YAML alias reference *{getattr(event, 'anchor', '?')} "
+                f"is not permitted in compose input")
+        return super().compose_node(parent, index)
+
+
+def parse_compose_yaml(text):
+    """Parse compose YAML refusing alias references (AliasForbiddenError)
+    and leaving every other error to the caller as yaml.YAMLError. Used
+    for the inline/tenant paths (start transport and preflight); the
+    catalog URL path keeps its plain safe_load — trusted, curated input,
+    byte-identical behavior."""
+    return yaml.load(text, Loader=_NoAliasLoader)
 
 
 class ComposeShapeError(Exception):

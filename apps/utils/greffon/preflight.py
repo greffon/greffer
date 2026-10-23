@@ -22,7 +22,10 @@ import re
 import yaml
 
 from apps.utils.docker import compose as compose_mod
-from apps.utils.greffon.compose_shape import ComposeShapeError, normalize_compose
+from apps.utils.greffon.compose_shape import (
+    AliasForbiddenError, ComposeShapeError, normalize_compose,
+    parse_compose_yaml,
+)
 
 logger = logging.getLogger("greffer")
 
@@ -201,9 +204,21 @@ def _resolve_image_digests(services: dict) -> dict:
 def run_preflight(compose_yaml: str, extra_keys=None) -> dict:
     """Validate a custom compose for deployability. Raises PreflightError
     with 422 rows; returns the LLD §4.1 payload on success."""
+    # parse_compose_yaml (compose_shape) refuses alias REFERENCES at
+    # load: the preflight's own walks are alias-safe, but a green
+    # preflight's bytes go on to /start/, whose render-accounting walk
+    # runs in the parent process outside the child render timeout — a
+    # sub-KiB anchor DAG there pins the single-worker controller
+    # (adversarial review on the transport PR). The allowlist permits no
+    # x- extension fields, so an anchor pattern was never deployable;
+    # refusing it here names it for the user at create time.
     try:
-        compose = yaml.safe_load(compose_yaml)
-    except yaml.YAMLError as exc:
+        compose = parse_compose_yaml(compose_yaml)
+    except AliasForbiddenError as exc:
+        raise PreflightError([{
+            "service": None, "key": "compose_yaml", "message": str(exc),
+        }]) from exc
+    except (yaml.YAMLError, RecursionError) as exc:
         raise PreflightError([{
             "service": None, "key": "compose_yaml",
             "message": f"not valid YAML "

@@ -4,12 +4,42 @@ import os
 import yaml
 from apps.utils.os.network import get_free_ports
 from apps.utils.greffon import sticky_ports
-from apps.utils.greffon.compose_shape import ComposeShapeError, normalize_compose
+from apps.utils.greffon.compose_shape import (
+    AliasForbiddenError, ComposeShapeError, normalize_compose,
+    parse_compose_yaml,
+)
 from apps.utils.docker import l4_ports
 
 logger = logging.getLogger("greffer")
 
+class InlineComposeError(Exception):
+    """The inline compose bytes are not parseable YAML. Distinct from
+    ComposeShapeError on purpose: these bytes were green-lit by the SAME
+    parse in /preflight/, so unparsable bytes at start mean the manager
+    stored or sent something different from what the node verified — a
+    422 naming the transport, never a 500."""
+
+
 def get_compose_file_from_repository(greffon):
+    # Custom-app inline transport (foundation Feature 4, LLD §4.2): when
+    # the payload carries the compose bytes the URL fetch is SKIPPED —
+    # repository_url is None on that path (the model guarantees exactly
+    # one source), so no empty string ever reaches requests.get.
+    inline = greffon.get('compose_yaml')
+    if inline:
+        # parse_compose_yaml, not plain safe_load: tenant input. It
+        # refuses alias references (an anchor DAG expands exponentially
+        # in every downstream walk — adversarial-review P0) and the
+        # RecursionError catch maps pathologically deep nesting to the
+        # same clean 422 instead of a 500 (P2).
+        try:
+            return parse_compose_yaml(inline)
+        except AliasForbiddenError as exc:
+            raise InlineComposeError(str(exc)) from exc
+        except (yaml.YAMLError, RecursionError) as exc:
+            raise InlineComposeError(
+                f"inline compose_yaml is not valid YAML "
+                f"({getattr(exc, 'problem', None) or exc})") from exc
     r = requests.get(greffon['repository_url'])
     if r.status_code != 200:
         raise Exception(
