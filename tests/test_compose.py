@@ -848,9 +848,11 @@ class GetStatusTests(TestCase):
 
     @patch('apps.utils.docker.compose.client')
     def test_get_status_unlabeled_one_shot_still_counts(self, mock_client):
-        """An exited helper that is neither named 'migrate' nor labeled is
-        counted: the mixed state regresses to 'unknow', which is exactly the
-        bug the label fixes for callers that have not yet adopted it."""
+        """An exited helper that is neither named 'migrate' nor labeled nor
+        a §10 completed one-shot (here: FAILED, exit 1) is counted: the
+        mixed state regresses to 'unknow'. Under HLD §10 the healthy
+        unlabeled case (exit 0, policy no/absent) is detected — see
+        OneShotStatusTests below."""
         from apps.utils.docker.compose import get_status
 
         app = MagicMock()
@@ -861,10 +863,196 @@ class GetStatusTests(TestCase):
         seed.name = 'test-id_createbuckets_1'
         seed.status = 'exited'
         seed.labels = {}
+        seed.attrs = {'State': {'Status': 'exited', 'ExitCode': 1},
+                      'HostConfig': {'RestartPolicy': {'Name': ''}}}
         mock_client.containers.list.return_value = [app, seed]
 
         result = get_status('test-id')
         self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['completed'], [])
+        self.assertEqual(result['exited'],
+                         [{'name': 'test-id_createbuckets_1',
+                           'exit_code': 1}])
+
+
+def _one_shot_container(name, status, *, exit_code=None, policy='',
+                        labels=None, service=None):
+    """A container mock with REALISTIC attrs: the §10 classification
+    reads State.ExitCode and HostConfig.RestartPolicy.Name, and service
+    names come from the compose label."""
+    c = MagicMock()
+    c.name = f'test-id_{name}_1'
+    c.status = status
+    all_labels = {}
+    if service is not None:
+        all_labels['com.docker.compose.service'] = service
+    if labels:
+        all_labels.update(labels)
+    c.labels = all_labels
+    # Daemon-realistic: /containers/json summaries carry State.Status
+    # alongside ExitCode (a `created` container reports ExitCode 0 — the
+    # review's live probe — so the fixture must include Status).
+    c.attrs = {'State': {'Status': status, 'ExitCode': exit_code},
+               'HostConfig': {'RestartPolicy': {'Name': policy}}}
+    return c
+
+
+class OneShotStatusTests(TestCase):
+    """custom-app HLD §10: the restart-policy discriminator. The matrix
+    the design section specifies, one test per row."""
+
+    def _get_status(self, containers):
+        from apps.utils.docker.compose import get_status
+        with patch('apps.utils.docker.compose.client') as mock_client:
+            mock_client.containers.list.return_value = containers
+            return get_status('test-id')
+
+    def test_healthy_one_shot_excluded_app_reports_running(self):
+        # NB: the service is NOT named 'migrate' — the legacy name-skip
+        # must not be what excludes it; only the 10-rule may.
+        app = _one_shot_container('app', 'running', service='app')
+        helper = _one_shot_container('initdb', 'exited', exit_code=0,
+                                     policy='', service='initdb')
+        result = self._get_status([app, helper])
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['completed'], ['initdb'])
+        # completed also rides the exited list (the overlap is by design)
+        self.assertIn({'name': 'initdb', 'exit_code': 0}, result['exited'])
+        # and is absent from the legacy containers list
+        self.assertEqual(result['containers'], [{'status': 'running'}])
+
+    def test_failed_one_shot_stays_loud(self):
+        app = _one_shot_container('app', 'running', service='app')
+        helper = _one_shot_container('initdb', 'exited', exit_code=1,
+                                     policy='', service='initdb')
+        result = self._get_status([app, helper])
+        self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['completed'], [])
+
+    def test_on_failure_rest_counts_not_completed(self):
+        """Catalog mains share the on-failure policy — an on-failure rest
+        is never blessed as completed (HLD §10); labeled on-failure
+        one-shots ride the label."""
+        app = _one_shot_container('app', 'running', service='app')
+        main = _one_shot_container('web', 'exited', exit_code=0,
+                                   policy='on-failure', service='web')
+        result = self._get_status([app, main])
+        self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['completed'], [])
+
+    def test_suppressed_restart_rest_counts(self):
+        """A resting always/unless-stopped container is an
+        operator-intervened stop (manual stop suppresses the policy) —
+        it stays visible. This is also the injected nginx sidecar's
+        shape, which is how a whole-stack graceful stop settles at
+        'stopped'."""
+        app = _one_shot_container('app', 'running', service='app')
+        sidecar = _one_shot_container('greffon_nginx', 'exited',
+                                      exit_code=0,
+                                      policy='unless-stopped',
+                                      service='greffon_nginx')
+        result = self._get_status([app, sidecar])
+        self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['completed'], [])
+
+    def test_all_excluded_aggregate_is_stopped(self):
+        """Containers present, every one completed: the aggregate is
+        'stopped' — never the undeliverable 'unknow' (the callback
+        vocabulary and the cold-backup quiesce-wait both require
+        running/stopped)."""
+        first = _one_shot_container('initdb', 'exited', exit_code=0,
+                                    policy='no', service='initdb')
+        second = _one_shot_container('seed', 'exited', exit_code=0,
+                                     policy='', service='seed')
+        result = self._get_status([first, second])
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(result['containers'], [])
+        self.assertEqual(sorted(result['completed']), ['initdb', 'seed'])
+
+    def test_empty_container_set_keeps_the_unknow_conflation(self):
+        """The documented pre-§10 conflation (empty == mixed == unknow)
+        is preserved; only the ALL-EXCLUDED case changed."""
+        result = self._get_status([])
+        self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['containers'], [])
+
+    def test_label_ignored_in_neither_detail_list(self):
+        app = _one_shot_container('app', 'running', service='app')
+        seed = _one_shot_container(
+            'createbuckets', 'exited', exit_code=1, policy='on-failure',
+            labels={'com.greffon.status': 'ignore'},
+            service='createbuckets')
+        result = self._get_status([app, seed])
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['completed'], [])
+        self.assertEqual(result['exited'], [])
+
+    def test_created_container_has_no_exit_code(self):
+        """The daemon reports ExitCode 0 for a never-run container — the
+        code must be gated on Status == 'exited' or the detail would
+        read as a clean finish (live-daemon probed)."""
+        app = _one_shot_container('app', 'running', service='app')
+        waiting = _one_shot_container('worker', 'created', exit_code=0,
+                                      service='worker')
+        result = self._get_status([app, waiting])
+        self.assertEqual(
+            result['exited'], [{'name': 'worker', 'exit_code': None}])
+
+    def test_paused_container_has_no_exit_code(self):
+        """A paused process is alive (Running=true, ExitCode 0) — it
+        rides the exited list (it is not running) but has not ENDED."""
+        app = _one_shot_container('app', 'paused', exit_code=0,
+                                  service='app')
+        result = self._get_status([app])
+        self.assertEqual(
+            result['exited'], [{'name': 'app', 'exit_code': None}])
+
+    def test_migrate_named_container_in_neither_detail_list(self):
+        """The legacy name-skip excludes from the aggregate AND both
+        detail lists (like the label)."""
+        app = _one_shot_container('app', 'running', service='app')
+        legacy = _one_shot_container('migrate-db', 'exited', exit_code=0,
+                                     policy='', service='migrate-db')
+        result = self._get_status([app, legacy])
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['completed'], [])
+        self.assertEqual(result['exited'], [])
+
+    def test_label_is_primary_over_the_policy_rule(self):
+        """A labeled exited:0 policy-no container lands in NEITHER
+        list: the label is the author's explicit word and stays primary
+        (HLD 10)."""
+        app = _one_shot_container('app', 'running', service='app')
+        seed = _one_shot_container(
+            'initdb', 'exited', exit_code=0, policy='',
+            labels={'com.greffon.status': 'ignore'}, service='initdb')
+        result = self._get_status([app, seed])
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['completed'], [])
+        self.assertEqual(result['exited'], [])
+
+    def test_always_policy_rest_counts(self):
+        """The third suppressed-restart spelling, same branch as
+        unless-stopped."""
+        app = _one_shot_container('app', 'running', service='app')
+        worker = _one_shot_container('worker', 'exited', exit_code=0,
+                                     policy='always', service='worker')
+        result = self._get_status([app, worker])
+        self.assertEqual(result['status'], 'unknow')
+        self.assertEqual(result['completed'], [])
+
+    def test_attrs_without_exit_code_information_never_completes(self):
+        """Defense in depth: a container whose attrs carry no usable
+        ExitCode (mocked daemons, exotic engines) is never classified
+        completed — doubt counts as not-finished."""
+        app = MagicMock()  # attrs is a bare MagicMock
+        app.name = 'test-id_app_1'
+        app.status = 'exited'
+        app.labels = {}
+        result = self._get_status([app])
+        # counted as stopped (single resting container), never completed
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(result['completed'], [])
 
 
 def test_every_docker_compose_invocation_uses_the_scrubbed_env():

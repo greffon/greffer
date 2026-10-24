@@ -918,6 +918,51 @@ STATUS_IGNORE_LABEL = 'com.greffon.status'
 STATUS_IGNORE_VALUE = 'ignore'
 
 
+_COMPOSE_SERVICE_LABEL = 'com.docker.compose.service'
+
+
+def _service_name(container):
+    """The compose SERVICE name (custom-app HLD §10: container names are
+    ``{project}_{service}_1`` and must not be parsed). Falls back to the
+    container name for non-compose containers."""
+    labels = container.labels or {}
+    return labels.get(_COMPOSE_SERVICE_LABEL) or container.name
+
+
+def _exit_code(container):
+    """The container's exit code, or None while it has not ENDED.
+
+    Gated on State.Status == 'exited' because the daemon reports
+    ExitCode 0 for containers that never ran (``created``) and for
+    paused ones (the process is alive) — surfacing that 0 would read
+    as a clean finish (adversarial review, live-daemon probed)."""
+    state = (getattr(container, 'attrs', None) or {}).get('State') or {}
+    return state.get('ExitCode') if state.get('Status') == 'exited' else None
+
+
+def _is_completed_one_shot(container):
+    """custom-app HLD §10: a container at rest in ``exited`` with exit
+    code 0 under restart policy ``no`` (explicit or compose-default
+    absent) is, by construction, a completed one-shot.
+
+    The policy is the discriminator the raw exit code cannot carry:
+    graceful-stop images (nginx — the platform's own sidecar —
+    PostgreSQL, MariaDB, Redis, httpd) exit 0 on ``docker stop``, and a
+    manual stop SUPPRESSES ``always``/``unless-stopped`` — so those
+    policies resting in ``exited`` are operator-intervened stops that
+    must stay visible. ``on-failure`` is deliberately NOT completed:
+    catalog long-running mains share the policy, so policy alone cannot
+    bless an ``on-failure`` rest (labeled on-failure one-shots ride the
+    label, which stays primary)."""
+    if container.status != 'exited':
+        return False
+    attrs = getattr(container, 'attrs', None) or {}
+    state = attrs.get('State') or {}
+    policy = (attrs.get('HostConfig') or {}).get('RestartPolicy') or {}
+    return (state.get('ExitCode') == 0
+            and policy.get('Name') in ('no', ''))
+
+
 def _ignore_for_status(container):
     """Whether a container is excluded from the instance-status computation.
 
@@ -948,26 +993,61 @@ def _ignore_for_status(container):
 
 
 def get_status(greffon_id):
+    """The instance aggregate plus the one-shot detail (custom-app HLD
+    §10).
+
+    ``completed``: service names at ``exited:0`` under restart policy
+    ``no``/absent — excluded from the aggregate like a label-ignored
+    container, so an app plus a healthy migration helper reports
+    ``running``. ``exited``: every non-running non-ignored container
+    with its code (``completed`` names appear here too, by design —
+    ``completed`` answers "what finished", ``exited`` answers "what is
+    not running and how it ended"; a ``created`` container has no code).
+
+    The all-excluded aggregate is ``stopped`` (containers present, all
+    label/legacy/completed): the monitor callback vocabulary cannot
+    deliver ``unknow`` and the cold-backup quiesce-wait would never see
+    "stopped". An EMPTY container set keeps today's documented
+    ``unknow`` conflation with the mixed state (see backup.py).
+    """
     containers = []
+    completed = []
+    exited = []
     is_all_stopped = True
     is_all_running = True
+    saw_any = False
     for container in client.containers.list(all=True, filters={'name': greffon_id}):
         if _ignore_for_status(container):
+            continue
+        saw_any = True
+        if _is_completed_one_shot(container):
+            name = _service_name(container)
+            completed.append(name)
+            exited.append({'name': name, 'exit_code': _exit_code(container)})
             continue
         container_status = container.status
         if container_status != 'running':
             container_status = 'stopped'
             is_all_running = False
+            exited.append({'name': _service_name(container),
+                           'exit_code': _exit_code(container)})
         else:
             is_all_stopped = False
         containers.append({'status': container_status})
-    if is_all_running and not is_all_stopped:
+    if not saw_any:
+        status = 'unknow'
+    elif is_all_running and not is_all_stopped:
         status = 'running'
-    elif not is_all_running and is_all_stopped:
+    elif is_all_stopped:
+        # Everything resting — INCLUDING the all-excluded case (both
+        # flags still True): the aggregate is 'stopped', never the
+        # undeliverable 'unknow' (HLD 10).
         status = 'stopped'
     else:
         status = 'unknow'
     return {
         'status': status,
-        'containers': containers
+        'containers': containers,
+        'completed': completed,
+        'exited': exited,
     }
