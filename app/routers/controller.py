@@ -45,6 +45,7 @@ from app.models.controller import (
     GreffonStopRequest,
     GreffonStopResponse,
     InstanceDiskResponse,
+    InstanceStatusDetailResponse,
     InstanceLogsResponse,
     InstanceStatsResponse,
     RemoteUpdateRequest,
@@ -815,6 +816,22 @@ def greffon_status(greffon_id: UUID) -> GreffonStatusResponse:
     # as part of the port; see hld-api-parity.md § Latent bug.
     result = compose.get_status(str(greffon_id))
     return GreffonStatusResponse(**result)
+
+@router.get("/greffon/{greffon_id}/status/")
+async def greffon_status_detail(
+    greffon_id: UUID, request: Request
+) -> InstanceStatusDetailResponse:
+    """custom-app HLD §10 carrier: the aggregate plus the one-shot
+    detail (``completed`` / ``exited``), for the manager-side relay and
+    the instance detail UI. A DISTINCT path from the legacy bare GET
+    above — its response model and consumers stay untouched (pydantic
+    drops the new keys). Blocking Docker read, offloaded under the
+    metrics limiter like the stats/disk family."""
+    result = await anyio.to_thread.run_sync(
+        compose.get_status, str(greffon_id),
+        limiter=request.app.state.metrics_limiter,
+    )
+    return InstanceStatusDetailResponse(**result)
 
 
 @router.get("/greffon/{greffon_id}/stats/")

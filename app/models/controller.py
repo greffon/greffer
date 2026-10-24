@@ -166,6 +166,23 @@ class GreffonStatusResponse(BaseModel):
     status: str
     containers: list[dict[str, Any]]
 
+class InstanceExitedContainer(BaseModel):
+    """One row of the HLD §10 ``exited`` list: what is not running and
+    how it ended (a ``created`` container has no code yet)."""
+    name: str
+    exit_code: int | None = None
+
+
+class InstanceStatusDetailResponse(BaseModel):
+    """The HLD §10 carrier: the legacy aggregate plus the one-shot
+    detail. ``completed`` names also appear in ``exited`` by design —
+    ``completed`` answers "what finished", ``exited`` answers "what is
+    not running and how it ended"."""
+    status: str
+    containers: list[dict[str, Any]]
+    completed: list[str] = Field(default_factory=list)
+    exited: list[InstanceExitedContainer] = Field(default_factory=list)
+
 
 class BackupDestinationBlock(BaseModel):
     """Manager-brokered per-tenant backup destination (Epic B managed / white-glove

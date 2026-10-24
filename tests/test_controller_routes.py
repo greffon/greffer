@@ -35,6 +35,36 @@ SAMPLE_START_PAYLOAD = {
 
 
 @pytest.mark.asyncio
+async def test_greffon_status_detail_carries_one_shot_fields(
+        client: AsyncClient) -> None:
+    """custom-app HLD 10 carrier: the distinct /status/ read returns the
+    aggregate plus completed/exited; the legacy bare GET keeps its exact
+    shape (pydantic drops the new keys)."""
+    rich = {
+        "status": "running",
+        "containers": [{"status": "running"}],
+        "completed": ["initdb"],
+        "exited": [{"name": "initdb", "exit_code": 0}],
+    }
+    with patch("app.routers.controller.compose.get_status",
+               return_value=rich):
+        r = await client.get(
+            "/api/controller/greffon/11111111-1111-1111-1111-111111111111/status/",
+            headers={TOKEN_HEADER: "test-token"})
+        legacy = await client.get(
+            "/api/controller/greffon/11111111-1111-1111-1111-111111111111/",
+            headers={TOKEN_HEADER: "test-token"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "running"
+    assert body["completed"] == ["initdb"]
+    assert body["exited"] == [{"name": "initdb", "exit_code": 0}]
+    # the legacy endpoint's contract is untouched
+    assert legacy.status_code == 200
+    assert set(legacy.json().keys()) == {"status", "containers"}
+
+
+@pytest.mark.asyncio
 async def test_start_render_failure_returns_422(client: AsyncClient) -> None:
     """A ConfigRenderError out of apply_configuration becomes a clean HTTP 422
     with the detail, and create_compose/start never run (no half-started instance)."""
