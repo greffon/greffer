@@ -9,9 +9,10 @@ FROM debian:bookworm-slim
 # endpoint and greffon/manager#33 for the manager side.
 #
 # slim doesn't include bash, curl, unzip, or dumb-init by default.
+# procps provides pgrep, used by the healthcheck in docker-compose.yml.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash curl ca-certificates dumb-init unzip \
+        bash curl ca-certificates dumb-init procps unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # rathole 0.5.0's published Linux artefacts are asymmetric: amd64 ships
