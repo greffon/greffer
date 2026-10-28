@@ -136,7 +136,18 @@ services:
       # controller writes. Sidecar never writes here.
       - rathole-client-config:/config:ro
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "rathole"]
+      # grep over /proc, not pgrep: the sidecar image ships no pgrep,
+      # so the exec healthcheck fails with "executable file not found"
+      # from the first probe — a permanently-unhealthy container over a
+      # healthy tunnel (found live in the F7 tunnel e2e bring-up; the
+      # control channel was established the whole time). dumb-init keeps
+      # the rathole process a direct child, so its cmdline is always in
+      # the /proc scan.
+      # /proc comm, not cmdline: the probe's own command line contains
+      # "rathole", so a cmdline scan reports an unconfigured sidecar
+      # (entrypoint still waiting for client.toml) as healthy forever
+      # (codex review). comm carries only the executable name.
+      test: ["CMD-SHELL", "grep -qx rathole /proc/[0-9]*/comm"]
       interval: 15s
       timeout: 3s
       retries: 3
